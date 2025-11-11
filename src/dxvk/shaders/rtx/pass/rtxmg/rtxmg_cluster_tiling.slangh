@@ -1,0 +1,381 @@
+/*
+* Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+*
+* Adapted from NVIDIA RTX Mega Geometry SDK for RTX Remix integration
+* Simplified for triangle mesh tessellation (no subdivision surfaces)
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+
+#include "rtx/pass/rtxmg/rtxmg_bindings.slangh"
+
+// Constants
+static const uint kThreadsPerWave = 32;
+static const uint kWavesPerGroup = 4;
+static const uint kThreadsPerGroup = kThreadsPerWave * kWavesPerGroup;
+static const float kEpsilon = 1e-6;
+
+// Tessellation modes (must match RtxmgConfig::AdaptiveTessellationMode)
+static const uint TESS_MODE_UNIFORM = 0;
+static const uint TESS_MODE_WORLD_SPACE_EDGE_LENGTH = 1;
+static const uint TESS_MODE_SPHERICAL_PROJECTION = 2;
+
+// Visibility modes (must match RtxmgConfig::VisibilityMode)
+static const uint VIS_MODE_LIMIT_EDGES = 0;
+static const uint VIS_MODE_SURFACE = 1;
+
+// Cluster tiling parameters (push constants / CB)
+struct ClusterTilingParams {
+  float4x4 matWorldToClip;     // World to clip space transform
+  float4x4 localToWorld;       // Local to world transform
+  float3 cameraPos;            // Camera position in world space
+  uint tessellationMode;       // Tessellation mode
+
+  float2 viewportSize;         // Viewport size in pixels
+  float fineTessellationRate;  // Fine tessellation rate
+  float coarseTessellationRate; // Coarse tessellation rate
+
+  uint4 edgeSegments;          // Edge segments for uniform mode [x,y,z,w]
+  uint maxClusters;            // Maximum cluster count
+  uint maxVertices;            // Maximum vertex count
+  uint maxClasBlocks;          // Maximum CLAS blocks
+
+  uint surfaceStart;           // Start surface index
+  uint surfaceEnd;             // End surface index
+  uint visibilityMode;         // Visibility mode
+  uint enableFrustumCulling;   // Enable frustum culling
+
+  uint enableBackfaceCulling;  // Enable backface culling
+  uint enableHiZCulling;       // Enable HiZ culling
+  uint numHiZLODs;             // Number of HiZ LOD levels
+  float invHiZSize;            // 1.0 / HiZ size
+
+  uint64_t clasDataBaseAddress;           // Base address of CLAS data
+  uint64_t clusterVertexPositionsBaseAddress; // Base address of vertex positions
+
+  // Phase 4: GPU batching support
+  uint enableBatching;         // Enable GPU batching mode (0 = sequential, 1 = batched)
+  uint instanceCount;          // Number of instances in batch
+  uint baseClusterOffset;      // Base offset for writing clusters (for multi-geometry batching)
+  uint globalVertexOffset;     // Global vertex offset for multi-geometry batching
+
+  // Debug parameters
+  int debugSurfaceIndex;
+  int debugLaneIndex;
+  uint _pad2;
+  uint _pad3;
+};
+
+// AABB for visibility testing
+struct Box3 {
+  float3 minPos;
+  float3 maxPos;
+
+  [mutating]
+  void init() {
+    minPos = float3(1e30, 1e30, 1e30);
+    maxPos = float3(-1e30, -1e30, -1e30);
+  }
+
+  [mutating]
+  void include(float3 p) {
+    minPos = min(minPos, p);
+    maxPos = max(maxPos, p);
+  }
+
+  bool valid() {
+    return maxPos.x >= minPos.x && maxPos.y >= minPos.y && maxPos.z >= minPos.z;
+  }
+
+  float3 extent() {
+    return maxPos - minPos;
+  }
+};
+
+// Group shared memory for atomics
+groupshared uint s_clusters;
+groupshared uint s_vertices;
+groupshared uint s_clasBlocks;
+groupshared uint s_triangles;
+
+groupshared uint s_groupClasBlocksOffset;
+groupshared uint s_groupClusterOffset;
+groupshared uint s_groupVertexOffset;
+
+groupshared bool s_allocationSucceeded;
+
+// HiZ visibility test
+bool hiZIsVisible(
+  Texture2DArray<float> hizBuffer,
+  SamplerState hizSampler,
+  ClusterTilingParams params,
+  Box3 aabb)
+{
+  if (aabb.minPos.z <= 0.0)
+    return true; // Behind camera
+
+  // Flip Y for screen space
+  float oldMinY = aabb.minPos.y;
+  float oldMaxY = aabb.maxPos.y;
+  aabb.maxPos.y = params.viewportSize.y - oldMinY;
+  aabb.minPos.y = params.viewportSize.y - oldMaxY;
+
+  // Determine HiZ LOD based on AABB size
+  float invTileSize = 1.0 / 16.0; // HIZ_LOD0_TILE_SIZE = 16
+  float sizeInTiles = max(aabb.maxPos.x - aabb.minPos.x, aabb.maxPos.y - aabb.minPos.y) * invTileSize;
+  uint level = (uint)ceil(log2(sizeInTiles));
+
+  if (level >= params.numHiZLODs)
+    return true;
+
+  // Sample HiZ at appropriate level
+  float2 uv = (aabb.minPos.xy + aabb.maxPos.xy) * 0.5;
+  uv *= invTileSize * params.invHiZSize;
+
+  // Gather 4 texels for conservative test
+  float4 z4 = hizBuffer.Gather(hizSampler, float3(uv, level));
+  float zFar = max(max(z4.x, z4.y), max(z4.z, z4.w));
+
+  return aabb.minPos.z <= zFar;
+}
+
+// Frustum visibility test for surface
+bool frustumCullSurface(
+  ClusterTilingParams params,
+  StructuredBuffer<float3> positions,
+  ByteAddressBuffer indices,
+  uint surfaceId,
+  uint firstIndex,
+  uint indexCount,
+  uint laneId)
+{
+  // Test if all vertices are outside any frustum plane
+  uint signBits = 0xFF;
+
+  for (uint i = laneId; i < indexCount; i += kThreadsPerWave) {
+    uint vertexIndex = indices.Load((firstIndex + i) * 4); // ByteAddressBuffer requires byte offset
+    float3 pos = positions[vertexIndex];
+
+    float4 pWorld = mul(params.localToWorld, float4(pos, 1.0));
+    float4 pClip = mul(params.matWorldToClip, pWorld);
+
+    uint bits = 0;
+    bits |= (pClip.x > pClip.w) ? 1 : 0;   // Right
+    bits |= (pClip.x < -pClip.w) ? 2 : 0;  // Left
+    bits |= (pClip.y > pClip.w) ? 4 : 0;   // Top
+    bits |= (pClip.y < -pClip.w) ? 8 : 0;  // Bottom
+    bits |= (pClip.w < 0) ? 16 : 0;        // Behind
+
+    signBits &= bits;
+  }
+
+  // Reduce across wave
+  signBits = WaveActiveBitAnd(signBits);
+
+  return (signBits == 0); // Visible if not all vertices outside same plane
+}
+
+// Calculate edge tessellation rate
+float calculateEdgeRate(
+  ClusterTilingParams params,
+  float3 posWorld)
+{
+  if (params.tessellationMode == TESS_MODE_UNIFORM) {
+    return 1.0;
+  }
+  else if (params.tessellationMode == TESS_MODE_SPHERICAL_PROJECTION) {
+    float distance = max(length(posWorld - params.cameraPos), 0.01);
+    return params.viewportSize.y * params.fineTessellationRate / distance;
+  }
+  else { // WORLD_SPACE_EDGE_LENGTH
+    return params.fineTessellationRate;
+  }
+}
+
+// Evaluate edge segments for a surface
+void evaluateEdgeSegments(
+  ClusterTilingParams params,
+  StructuredBuffer<float3> positions,
+  ByteAddressBuffer indices,
+  uint surfaceId,
+  uint firstIndex,
+  uint laneId,
+  out uint4 outEdgeSegments)
+{
+  if (params.tessellationMode == TESS_MODE_UNIFORM) {
+    // Use fixed edge segments from params
+    outEdgeSegments = params.edgeSegments;
+    return;
+  }
+
+  // Sample 4 edge midpoints for adaptive tessellation
+  // Assuming quad topology: indices[0,1,2,3] form a quad
+  uint idx0 = indices.Load((firstIndex + 0) * 4);
+  uint idx1 = indices.Load((firstIndex + 1) * 4);
+  uint idx2 = indices.Load((firstIndex + 2) * 4);
+  uint idx3 = indices.Load((firstIndex + 3) * 4);
+
+  float3 edgeMid[4];
+  edgeMid[0] = (positions[idx0] + positions[idx1]) * 0.5;
+  edgeMid[1] = (positions[idx1] + positions[idx2]) * 0.5;
+  edgeMid[2] = (positions[idx2] + positions[idx3]) * 0.5;
+  edgeMid[3] = (positions[idx3] + positions[idx0]) * 0.5;
+
+  // Transform to world space
+  for (uint i = 0; i < 4; ++i) {
+    float4 pWorld = mul(params.localToWorld, float4(edgeMid[i], 1.0));
+    edgeMid[i] = pWorld.xyz;
+  }
+
+  // Calculate edge lengths and rates
+  float3 p0 = positions[idx0];
+  float3 p1 = positions[idx1];
+  float3 p2 = positions[idx2];
+  float3 p3 = positions[idx3];
+
+  float4 pWorld0 = mul(params.localToWorld, float4(p0, 1.0));
+  float4 pWorld1 = mul(params.localToWorld, float4(p1, 1.0));
+  float4 pWorld2 = mul(params.localToWorld, float4(p2, 1.0));
+  float4 pWorld3 = mul(params.localToWorld, float4(p3, 1.0));
+
+  float edgeLengths[4];
+  edgeLengths[0] = length(pWorld1.xyz - pWorld0.xyz);
+  edgeLengths[1] = length(pWorld2.xyz - pWorld1.xyz);
+  edgeLengths[2] = length(pWorld3.xyz - pWorld2.xyz);
+  edgeLengths[3] = length(pWorld0.xyz - pWorld3.xyz);
+
+  // Calculate tessellation rates
+  for (uint i = 0; i < 4; ++i) {
+    float rate = calculateEdgeRate(params, edgeMid[i]);
+    uint segments = (uint)max(1.0, round(edgeLengths[i] * rate));
+    segments = clamp(segments, 1, 11); // Max 11 per edge (template limit)
+
+    outEdgeSegments[i] = segments;
+  }
+}
+
+// Compute stable cluster ID based on UV-space position
+// NOTE: Uses fixed UV grid quantization (256x256) instead of variable tessellation grid.
+// This ensures the same surface region always gets the same ID across frames,
+// regardless of tessellation level changes when camera moves.
+uint computeStableClusterId(uint surfaceId, uint2 clusterOffset, uint2 clusterSize, uint2 numClusters)
+{
+  // Compute cluster's UV center position (0.0 to 1.0 range)
+  // clusterOffset is in grid coordinates, numClusters is total grid dimensions
+  float2 uvCenter = (float2(clusterOffset) + 0.5) / float2(numClusters);
+
+  // Quantize UV to a fixed 256x256 grid to create stable IDs
+  // This is independent of tessellation level
+  uint2 uvQuantized = uint2(uvCenter * 256.0);
+  uvQuantized = clamp(uvQuantized, uint2(0, 0), uint2(255, 255));
+
+  // Hash using FNV-1a algorithm
+  uint hash = 2166136261u; // FNV offset basis
+
+  // Hash surface ID
+  hash ^= surfaceId;
+  hash *= 16777619u; // FNV prime
+
+  // Hash quantized UV position (stable across tessellation level changes)
+  hash ^= uvQuantized.x;
+  hash *= 16777619u;
+  hash ^= uvQuantized.y;
+  hash *= 16777619u;
+
+  // NV-DXVK: Cluster size and grid offsets are NOT hashed
+  // Instead we use UV-space quantization which is stable regardless of tessellation density
+
+  return hash;
+}
+
+// Write cluster data
+void writeCluster(
+  RWStructuredBuffer<Cluster> clustersOut,
+  RWStructuredBuffer<ClusterShadingData> shadingDataOut,
+  RWStructuredBuffer<ClusterIndirectArgs> indirectArgsOut,
+  RWStructuredBuffer<uint64_t> clasAddressesOut,
+  StructuredBuffer<uint64_t> templateAddresses,
+  StructuredBuffer<uint> clasInstantiationBytes,
+  ClusterTilingParams params,
+  uint clusterIndex,
+  uint surfaceId,
+  uint vertexOffset,
+  uint2 clusterOffset,
+  uint2 clusterSize,
+  uint4 edgeSegments,
+  uint localGeometryIndex,
+  uint2 numClusters)  // NV-DXVK: Total cluster grid dimensions for UV calculation
+{
+  // Create cluster structure
+  Cluster cluster;
+  cluster.iSurface = surfaceId;
+  // SDK MATCH: Add global vertex offset for multi-geometry support (no CPU patching needed!)
+  cluster.nVertexOffset = params.globalVertexOffset + vertexOffset;
+  cluster.offsetX = (uint16_t)clusterOffset.x;
+  cluster.offsetY = (uint16_t)clusterOffset.y;
+  cluster.sizeX = (uint8_t)clusterSize.x;
+  cluster.sizeY = (uint8_t)clusterSize.y;
+  cluster.pad0 = 0;
+  cluster.pad1 = 0;
+
+  clustersOut[clusterIndex] = cluster;
+
+  // Compute stable cluster ID FIRST (needed for both shading data and indirect args)
+  // This ensures the same cluster gets the same ID across frames, preventing color flickering in debug views
+  uint stableClusterId = computeStableClusterId(surfaceId, clusterOffset, clusterSize, numClusters);
+
+  // Create shading data
+  ClusterShadingData shadingData;
+  shadingData.edgeSegments[0] = (uint16_t)edgeSegments.x;
+  shadingData.edgeSegments[1] = (uint16_t)edgeSegments.y;
+  shadingData.edgeSegments[2] = (uint16_t)edgeSegments.z;
+  shadingData.edgeSegments[3] = (uint16_t)edgeSegments.w;
+  shadingData.surfaceId = surfaceId;
+  // SDK MATCH: Also add global offset to shading data (used by fill_clusters shader)
+  shadingData.vertexOffset = params.globalVertexOffset + vertexOffset;
+  shadingData.clusterOffsetX = (uint16_t)clusterOffset.x;
+  shadingData.clusterOffsetY = (uint16_t)clusterOffset.y;
+  shadingData.clusterSizeX = (uint8_t)clusterSize.x;
+  shadingData.clusterSizeY = (uint8_t)clusterSize.y;
+  shadingData.stableClusterId = stableClusterId;  // NV-DXVK: Store stable ID for debug visualization
+
+  shadingDataOut[clusterIndex] = shadingData;
+
+  // Create indirect args for cluster instantiation
+  uint templateIndex = (clusterSize.y - 1) * 11 + (clusterSize.x - 1);
+  uint64_t templateAddress = templateAddresses[templateIndex];
+  uint64_t vertexBufferAddress = params.clusterVertexPositionsBaseAddress + vertexOffset * 12; // sizeof(float3)
+
+  ClusterIndirectArgs indirectArgs;
+  indirectArgs.clusterIdOffset = stableClusterId;  // Use stable hash-based ID instead of array index
+  // Pack geometryIndexOffset (24-bit) + reserved (8-bit) into single uint32
+  // geometryIndexOffset takes lower 24 bits, reserved (0) takes upper 8 bits
+  indirectArgs.geometryIndexAndReserved = (localGeometryIndex & 0x00FFFFFF);
+  indirectArgs.clusterTemplate = templateAddress;
+  indirectArgs.vertexBufferStartAddress = vertexBufferAddress;
+  indirectArgs.vertexBufferStrideInBytes = 12; // sizeof(float3)
+
+  indirectArgsOut[clusterIndex] = indirectArgs;
+
+  // Store CLAS address
+  uint clasBytes = clasInstantiationBytes[templateIndex];
+  uint64_t clasAddress = params.clasDataBaseAddress + clusterIndex * clasBytes;
+  clasAddressesOut[clusterIndex] = clasAddress;
+}

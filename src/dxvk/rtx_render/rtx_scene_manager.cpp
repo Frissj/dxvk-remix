@@ -29,6 +29,8 @@
 #include "dxvk_context.h"
 #include "dxvk_buffer.h"
 #include "rtx_context.h"
+#include "rtx_mega_geometry.h"
+#include "rtx_mega_geometry_integration.h"
 #include "rtx_options.h"
 #include "rtx_terrain_baker.h"
 #include "rtx_texture_manager.h"
@@ -47,6 +49,7 @@
 #include "rtx_light_utils.h"
 
 #include "../util/util_globaltime.h"
+#include "rtx_mega_geometry_integration.h"
 
 namespace dxvk {
   SceneManager::SceneManager(DxvkDevice* device)
@@ -213,8 +216,8 @@ namespace dxvk {
             }
             else {
               // Fallback to check object center under view space
-              auto getViewSpacePosition = [](const Matrix4& objectToView) -> float3 {
-                return float3(objectToView[3][0], objectToView[3][1], objectToView[3][2]);
+              auto getViewSpacePosition = [](const Matrix4& objectToView) -> ::float3 {
+                return ::float3(objectToView[3][0], objectToView[3][1], objectToView[3][2]);
               };
               isInsideFrustum = getCamera().getFrustum().CheckSphere(getViewSpacePosition(objectToView), 0);
             }
@@ -435,15 +438,24 @@ namespace dxvk {
   void SceneManager::onFrameEnd(Rc<DxvkContext> ctx) {
     ScopedCpuProfileZone();
 
+    Logger::info(str::format("[SCENE_MANAGER FRAME_END] ========== ENTERING onFrameEnd (Frame ", m_device->getCurrentFrameId(), ") =========="));
+
+    Logger::info("[SCENE_MANAGER FRAME_END] About to call manageTextureVram()");
     manageTextureVram();
+    Logger::info("[SCENE_MANAGER FRAME_END] manageTextureVram() returned");
 
     if (m_enqueueDelayedClear || m_pReplacer->checkForChanges(ctx)) {
+      Logger::info(str::format("[SCENE_MANAGER FRAME_END] Delayed clear or replacer changes detected, calling clear(needWfi=true)"));
       clear(ctx, true);
       m_enqueueDelayedClear = false;
+      Logger::info("[SCENE_MANAGER FRAME_END] clear() returned");
     }
 
+    Logger::info("[SCENE_MANAGER FRAME_END] About to call m_cameraManager.onFrameEnd()");
     m_cameraManager.onFrameEnd();
+    Logger::info("[SCENE_MANAGER FRAME_END] About to call m_instanceManager.onFrameEnd()");
     m_instanceManager.onFrameEnd();
+    Logger::info("[SCENE_MANAGER FRAME_END] Manager onFrameEnd calls completed");
     m_previousFrameSceneAvailable = RtxOptions::enablePreviousTLAS();
 
     m_bufferCache.clear();
@@ -459,19 +471,25 @@ namespace dxvk {
       m_drawCallMeta.ticker = nextTick;
     }
 
+    Logger::info("[SCENE_MANAGER FRAME_END] About to call m_terrainBaker->onFrameEnd()");
     m_terrainBaker->onFrameEnd(ctx);
+    Logger::info("[SCENE_MANAGER FRAME_END] m_terrainBaker->onFrameEnd() returned");
 
     if (m_opacityMicromapManager) {
+      Logger::info("[SCENE_MANAGER FRAME_END] About to call m_opacityMicromapManager->onFrameEnd()");
       m_opacityMicromapManager->onFrameEnd();
+      Logger::info("[SCENE_MANAGER FRAME_END] m_opacityMicromapManager->onFrameEnd() returned");
     }
-    
+
     m_activePOMCount = 0;
     m_startInMediumMaterialIndex = BINDING_INDEX_INVALID;
     m_startInMediumMaterialIndex_inCache = UINT32_MAX;
 
     if (m_uniqueObjectSearchDistance != RtxOptions::uniqueObjectDistance()) {
+      Logger::info("[SCENE_MANAGER FRAME_END] Unique object distance changed, rebuilding spatial maps");
       m_uniqueObjectSearchDistance = RtxOptions::uniqueObjectDistance();
       m_drawCallCache.rebuildSpatialMaps();
+      Logger::info("[SCENE_MANAGER FRAME_END] Spatial maps rebuilt");
     }
 
     // Not currently safe to cache these across frames (due to texture indices and rtx options potentially changing)
@@ -482,13 +500,17 @@ namespace dxvk {
 
     // execute graph updates after all garbage collection is complete (to avoid updating graphs that will just be deleted)
     // RtxOptions will still be pending, so any changes to them will apply next frame.
+    Logger::info("[SCENE_MANAGER FRAME_END] About to call m_graphManager.update()");
     m_graphManager.update(ctx);
+    Logger::info("[SCENE_MANAGER FRAME_END] m_graphManager.update() returned");
 
     // Clear material hashes before the next frame.  These are used by components, so must clear after graphManager updates.
     clearFrameMaterialHashes();
-    
+
     // Clear mesh hashes before the next frame.  These are used by components, so must clear after graphManager updates.
     clearFrameMeshHashes();
+
+    Logger::info(str::format("[SCENE_MANAGER FRAME_END] ========== EXITING onFrameEnd (Frame ", m_device->getCurrentFrameId(), ") =========="));
   }
 
   void SceneManager::onFrameEndNoRTX() {
@@ -852,8 +874,42 @@ namespace dxvk {
 
   SceneManager::ObjectCacheState SceneManager::onSceneObjectAdded(Rc<DxvkContext> ctx, const DrawCallState& drawCallState, BlasEntry* pBlas) {
     // This is a new object.
+
+    // RTX Mega Geometry: Check if tessellated geometry buffers are available
+    // If they are, we need to update the DrawCallState's geometry before processing
+    DrawCallState& mutableDrawCallState = const_cast<DrawCallState&>(drawCallState);
+    if (mutableDrawCallState.tessellatedVertexBuffer != nullptr) {
+      // Access private geometryData through friend access
+      RasterGeometry& geometryData = mutableDrawCallState.geometryData;
+
+      // Create buffer slices for the tessellated geometry
+      const uint32_t vertexStride = mutableDrawCallState.tessellatedVertexStride;
+      const size_t vertexBufferSize = mutableDrawCallState.tessellatedVertexCount * vertexStride;
+      // Use 32-bit indices to support large tessellated meshes (no 65k vertex limit)
+      const size_t indexBufferSize = mutableDrawCallState.tessellatedIndexCount * sizeof(uint32_t);
+
+      DxvkBufferSlice tessellatedPosSlice(mutableDrawCallState.tessellatedVertexBuffer, 0, vertexBufferSize);
+      DxvkBufferSlice tessellatedIdxSlice(mutableDrawCallState.tessellatedIndexBuffer, 0, indexBufferSize);
+
+      // Replace geometry buffers with tessellated data
+      // Vertex format: Position(12) + Normal(12) + TexCoord(8) = 32 bytes
+      geometryData.positionBuffer = RasterBuffer(tessellatedPosSlice, 0, vertexStride, VK_FORMAT_R32G32B32_SFLOAT);
+      geometryData.normalBuffer = RasterBuffer(tessellatedPosSlice, 12, vertexStride, VK_FORMAT_R32G32B32_SFLOAT);
+      geometryData.texcoordBuffer = RasterBuffer(tessellatedPosSlice, 24, vertexStride, VK_FORMAT_R32G32_SFLOAT);
+      // Use 32-bit indices to support large tessellated meshes
+      geometryData.indexBuffer = RasterBuffer(tessellatedIdxSlice, 0, 0, VK_INDEX_TYPE_UINT32);
+
+      // Update counts
+      geometryData.vertexCount = mutableDrawCallState.tessellatedVertexCount;
+      geometryData.indexCount = mutableDrawCallState.tessellatedIndexCount;
+
+      Logger::info(str::format("[RTX Mega Geometry] Using tessellated geometry in scene manager: ",
+                              geometryData.vertexCount, " vertices, ",
+                              geometryData.indexCount, " indices"));
+    }
+
     ObjectCacheState result = processGeometryInfo<true>(ctx, drawCallState, pBlas->modifiedGeometryData);
-    
+
     assert(result == ObjectCacheState::KBuildBVH);
 
     pBlas->frameLastUpdated = m_device->getCurrentFrameId();
@@ -963,6 +1019,167 @@ namespace dxvk {
     
     assert(pBlas != nullptr);
     assert(result != ObjectCacheState::kInvalid);
+
+    // NV-DXVK: Inject cluster BLAS for tessellated geometry
+    // Follows NVIDIA sample pattern: cluster BLASes replace regular triangle BLASes
+    if (drawCallState.clusterBlasGeometryHash != kEmptyHash) {
+      Logger::info(str::format("[RTX Mega Geometry] Checking cluster BLAS injection for hash=0x",
+                              std::hex, drawCallState.clusterBlasGeometryHash, std::dec));
+
+      RtxMegaGeometry* megaGeometry = getMegaGeometry();
+      if (megaGeometry) {
+        // CRITICAL: Get non-const pointer so we can update gpuWorkComplete flag
+        RtxMegaGeometry::TessellatedGeometryCache* cached =
+          const_cast<RtxMegaGeometry::TessellatedGeometryCache*>(
+            megaGeometry->getTessellatedGeometry(drawCallState.clusterBlasGeometryHash));
+
+        if (cached) {
+          Logger::info(str::format("[RTX Mega Geometry] Found cached geometry: hasClusterBLAS=", cached->hasClusterBLAS,
+                                  ", clusterBLAS=", (cached->clusterBLAS.ptr() ? "valid" : "null")));
+        } else {
+          Logger::warn("[RTX Mega Geometry] Cached geometry not found for cluster BLAS hash!");
+        }
+
+        if (cached && cached->hasClusterBLAS && cached->clusterBLAS.ptr()) {
+          uint32_t currentFrame = m_device->getCurrentFrameId();
+          uint32_t cachedFrame = cached->lastUsedFrame;
+          uint32_t framesSinceCache = currentFrame - cachedFrame;
+
+          // ABSOLUTELY SAFE GPU SYNCHRONIZATION: Always verify GPU completion before reuse
+          // NO GUESSWORK - we check the actual fence status every time
+          // Performance optimization: Cache the result so we only check once per BLAS
+
+          bool isSafeToReuse = false;
+
+          if (cached->gpuWorkComplete) {
+            // Already verified in a previous frame - safe to reuse
+            // This is the FAST PATH after first verification
+            isSafeToReuse = true;
+            Logger::info(str::format("[GPU SYNC] Previously verified complete (frame ", cachedFrame,
+                                    ") - safe to reuse without check"));
+          } else if (cached->buildCommandList.ptr()) {
+            // MUST verify GPU completion - this is REQUIRED for correctness
+            Logger::info(str::format("[GPU SYNC] ========== VERIFYING GPU COMPLETION BEFORE REUSE =========="));
+            Logger::info(str::format("[GPU SYNC] Current frame: ", currentFrame, ", BLAS built at frame: ", cachedFrame,
+                                    " (", framesSinceCache, " frames ago)"));
+            Logger::info(str::format("[GPU SYNC] Hash: 0x", std::hex, drawCallState.clusterBlasGeometryHash, std::dec));
+
+            // Step 1: Non-blocking fence check using Vulkan API directly
+            auto t0 = dxvk::high_resolution_clock::now();
+            VkResult fenceStatus = m_device->vkd()->vkGetFenceStatus(m_device->vkd()->device(),
+                                                                      cached->buildCommandList->fence());
+
+            if (fenceStatus == VK_SUCCESS) {
+              // Fence already signaled - GPU work is complete!
+              cached->gpuWorkComplete = true;
+              isSafeToReuse = true;
+              auto t1 = dxvk::high_resolution_clock::now();
+              auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0);
+              Logger::info(str::format("[GPU SYNC] Fence already signaled - GPU complete (checked in ", us.count(), " us)"));
+            } else if (fenceStatus == VK_NOT_READY) {
+              // Step 2: GPU still working - MUST BLOCK AND WAIT (this ensures correctness)
+              Logger::warn(str::format("[GPU SYNC] ========== GPU STILL WORKING - BLOCKING WAIT =========="));
+              Logger::warn(str::format("[GPU SYNC] This will stall the CPU until GPU completes frame ", cachedFrame));
+
+              // BLOCKING WAIT: This is the cost of absolute safety
+              // Better to stall than to crash or get corruption
+              VkResult syncResult = cached->buildCommandList->synchronize();
+              if (syncResult == VK_SUCCESS) {
+                cached->gpuWorkComplete = true;
+                isSafeToReuse = true;
+
+                auto t1 = dxvk::high_resolution_clock::now();
+                auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0);
+                Logger::warn(str::format("[GPU SYNC] *** PIPELINE STALL *** Blocked for ", us.count(),
+                                        " microseconds waiting for GPU"));
+                Logger::warn(str::format("[GPU SYNC] Consider: Increase ring buffer size, reduce geometry complexity, or optimize GPU work"));
+              } else {
+                Logger::err(str::format("[GPU SYNC] ERROR: synchronize() failed with VkResult ", syncResult));
+                isSafeToReuse = false;
+              }
+            } else {
+              // Fence error - something went wrong
+              Logger::err(str::format("[GPU SYNC] ERROR: Fence check failed with VkResult ", fenceStatus));
+              Logger::err(str::format("[GPU SYNC] Hash: 0x", std::hex, drawCallState.clusterBlasGeometryHash, std::dec));
+              isSafeToReuse = false;
+            }
+          } else {
+            // No fence available - CANNOT verify safety
+            Logger::err(str::format("[GPU SYNC] ERROR: No fence available to verify GPU completion!"));
+            Logger::err(str::format("[GPU SYNC] Hash: 0x", std::hex, drawCallState.clusterBlasGeometryHash, std::dec));
+            Logger::err(str::format("[GPU SYNC] This is a bug - cluster BLAS build should always set buildCommandList"));
+            isSafeToReuse = false;
+          }
+
+          if (!isSafeToReuse) {
+            // ABORT: Cannot safely reuse - let regular BLAS path handle it
+            Logger::warn(str::format("[GPU SYNC] ========== ABORTING CLUSTER BLAS REUSE =========="));
+            Logger::warn(str::format("[GPU SYNC] Cannot verify GPU completion - will rebuild with regular BLAS path"));
+            Logger::warn(str::format("[GPU SYNC] Hash: 0x", std::hex, drawCallState.clusterBlasGeometryHash, std::dec));
+          } else {
+            // SAFE TO REUSE: GPU work is verified complete
+            Logger::info(str::format("[CACHE REUSE] ========== SAFELY REUSING CLUSTER BLAS =========="));
+            Logger::info(str::format("[CACHE REUSE] Current frame: ", currentFrame, ", Cached at frame: ", cachedFrame,
+                                    " (", framesSinceCache, " frames ago)"));
+            Logger::info(str::format("[CACHE REUSE] Hash: 0x", std::hex, drawCallState.clusterBlasGeometryHash, std::dec));
+            Logger::info(str::format("[CACHE REUSE] Cluster BLAS address: 0x", std::hex,
+                                    cached->clusterBLAS->getAccelDeviceAddress(), std::dec));
+            Logger::info(str::format("[CACHE REUSE] GPU status: VERIFIED COMPLETE (safe to reuse)"));
+
+          // Production: Wrap cluster BLAS in PooledBlas for integration with TLAS building
+          Rc<PooledBlas> clusterPooledBlas = new PooledBlas();
+          clusterPooledBlas->accelStructure = cached->clusterBLAS;
+          // CRITICAL: Set accelerationStructureReference to 0 for cluster BLASes
+          // GPU patching will write the correct per-geometry BLAS address from blasPtrsBuffer
+          // Using the shared structure address (getAccelDeviceAddress()) is WRONG - all geometries
+          // would reference the same BLAS data, causing GPU crashes
+          clusterPooledBlas->accelerationStructureReference = 0;
+          clusterPooledBlas->frameLastTouched = currentFrame;
+          clusterPooledBlas->isClusterBlas = true;  // Mark as cluster BLAS to prevent rebuilding
+          clusterPooledBlas->clusterBlasGeometryHash = drawCallState.clusterBlasGeometryHash;  // Store for GPU patching
+
+          // Inject into BlasEntry - AccelManager will use this instead of building regular BLAS
+          Logger::info(str::format("[CLUSTER BLAS INJECTION] Setting dynamicBlas on BlasEntry ", (void*)pBlas,
+                                  " with hash=0x", std::hex, drawCallState.clusterBlasGeometryHash, std::dec));
+          pBlas->dynamicBlas = clusterPooledBlas;
+
+          // CRITICAL: Set flag so prepareSceneData knows to enable GPU patching
+          // This ensures ALL TLASes containing cluster instances get GPU patching
+          m_hasClusterBlasThisFrame = true;
+
+          // Track cluster BLAS usage per frame (file-scope so getClusterBlasInjectionCount can access)
+          static uint32_t s_clusterBlasInjectionCount_internal = 0;
+          static uint32_t s_lastFrameId = 0;
+          static uint32_t s_totalClustersUsedThisFrame = 0;
+
+          if (currentFrame != s_lastFrameId) {
+            if (s_clusterBlasInjectionCount_internal > 0) {
+              Logger::info(str::format("[RTXMG STATS] Frame ", s_lastFrameId,
+                                      " used ", s_clusterBlasInjectionCount_internal, " cluster BLAS injections, ",
+                                      s_totalClustersUsedThisFrame, " total clusters in ray tracing"));
+            }
+            s_clusterBlasInjectionCount_internal = 0;
+            s_totalClustersUsedThisFrame = 0;
+            s_lastFrameId = currentFrame;
+          }
+          s_clusterBlasInjectionCount_internal++;
+          s_totalClustersUsedThisFrame += cached->clusterCount;
+
+          Logger::info(str::format("[RTX Mega Geometry] Injected cluster BLAS: hash=0x",
+                                  std::hex, drawCallState.clusterBlasGeometryHash, std::dec,
+                                  ", clusters=", cached->clusterCount,
+                                  ", currentFrame=", currentFrame,
+                                  ", cachedAtFrame=", cached->lastUsedFrame,
+                                  ", framesSince=", framesSinceCache,
+                                  ", totalInjectionsThisFrame=", s_clusterBlasInjectionCount_internal,
+                                  ", totalClustersThisFrame=", s_totalClustersUsedThisFrame,
+                                  " (address will be GPU-patched from blasPtrsBuffer)"));
+          }  // end of: if (!isSafeToReuse) ... else (safe to reuse)
+        }  // end of: if (cached && cached->hasClusterBLAS && cached->clusterBLAS.ptr())
+      } else {
+        Logger::warn("[RTX Mega Geometry] MegaGeometry instance is null!");
+      }
+    }
 
     // Update the input state, so we always have a reference to the original draw call state
     pBlas->frameLastTouched = m_device->getCurrentFrameId();
@@ -1454,6 +1671,19 @@ namespace dxvk {
   void SceneManager::prepareSceneData(Rc<RtxContext> ctx, DxvkBarrierSet& execBarriers) {
     ScopedGpuProfileZone(ctx, "Build Scene");
 
+    // CRITICAL: Manage GPU patching flag for cluster BLASes
+    // This flag persists across ALL command buffer submissions within a frame
+    if (m_hasClusterBlasThisFrame) {
+      Logger::info("[FLAG LIFECYCLE] Setting m_submitContainsInjectRtx = TRUE due to cluster BLAS injection (persists entire frame)");
+      ctx->setSubmitContainsInjectRtx(true);
+      m_hasClusterBlasThisFrame = false;  // Reset for next frame
+    } else {
+      // No cluster BLASes this frame - ensure flag is FALSE
+      // (This resets the flag from previous frame)
+      Logger::info("[FLAG LIFECYCLE] Resetting m_submitContainsInjectRtx = FALSE (no cluster BLASes this frame)");
+      ctx->setSubmitContainsInjectRtx(false);
+    }
+
   #ifdef REMIX_DEVELOPMENT
     if (m_device->getCurrentFrameId() == RtxOptions::dumpAllInstancesOnFrame()) {
       // Print all RtInstances for debugging
@@ -1527,9 +1757,6 @@ namespace dxvk {
     // Call on the other managers to prepare their GPU data for the current scene
     m_accelManager.prepareSceneData(ctx, execBarriers, m_instanceManager);
     m_lightManager.prepareSceneData(ctx, m_cameraManager);
-
-    // Build the TLAS
-    m_accelManager.buildTlas(ctx);
 
     // Todo: These updates require a lot of temporary buffer allocations and memcopies, ideally we should memcpy directly into a mapped pointer provided by Vulkan,
     // but we have to create a buffer to pass to DXVK's updateBuffer for now.
@@ -1652,14 +1879,25 @@ namespace dxvk {
     capturer->step(ctx, ctx->getCommonObjects()->getLastKnownWindowHandle());
 
     // Clear the ray portal data before the next frame
-    m_rayPortalManager.clear();
+  m_rayPortalManager.clear();
 
-    // Check Anti-Culling Support:
-    // When the game doesn't set up the View Matrix, we must disable Anti-Culling to prevent visual corruption.
-    m_isAntiCullingSupported = (getCamera().getViewToWorld() != Matrix4d());
-  }
+  // Check Anti-Culling Support:
+  // When the game doesn't set up the View Matrix, we must disable Anti-Culling to prevent visual corruption.
+  m_isAntiCullingSupported = (getCamera().getViewToWorld() != Matrix4d());
+}
 
-  static_assert(std::is_same_v< decltype(RtSurface::objectPickingValue), ObjectPickingValue>);
+void SceneManager::buildTlas(Rc<RtxContext> ctx) {
+  Logger::info("[SceneManager DEBUG] About to call buildTlas");
+  m_accelManager.buildTlas(ctx);
+  Logger::info("[SceneManager DEBUG] buildTlas returned successfully");
+}
+
+uint32_t SceneManager::getClusterBlasInjectionCount() const {
+  // Return whether any cluster BLASes were injected this frame
+  return m_hasClusterBlasThisFrame ? 1 : 0;
+}
+
+static_assert(std::is_same_v< decltype(RtSurface::objectPickingValue), ObjectPickingValue>);
 
   void SceneManager::submitExternalDraw(Rc<DxvkContext> ctx, ExternalDrawState&& state) {
     if (m_externalSampler == nullptr) {

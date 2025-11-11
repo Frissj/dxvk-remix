@@ -400,15 +400,19 @@ namespace dxvk {
     //
     // In conclusion:
     // - Locking submission here ensures proper Vulkan host synchronization of vkQueueSubmit between NRC's EndFrame call and the DXVK's dxvk-submit thread.
-    // - An "unsynchronized" version of this locking function is used to avoid potential performance regressions with DLSS-FG, even though it is probably
-    //   proper to be ensuring this EndFrame queue submission is done after all work on the dxvk-submit thread has been processed, so this may need to be
-    //   changed in the future (this code should not add any new bugs though as it was never synchronized to begin with).
+    // - CHANGED: Using lockSubmission() instead of lockSubmissionUnsynchronized() to ensure all queued work is submitted BEFORE the EndFrame fence.
+    //   This prevents NRC from freeing resources while they're still in use by the GPU (which causes crashes/hangs with heavy geometry loads like MegaGeometry).
+    //   The performance cost is acceptable vs crashing.
     // - NRC should ideally change this API to avoid doing submissions internally to avoid the need for us to lock submissions or synchronize with the
     //   dxvk-submit thread to begin with as this will never be ideal. If anything it should allow us to submit the fence ourselves on the dxvk-submit
     //   thread and pass the fence in directly or something.
-    m_device->lockSubmissionUnsynchronized();
+
+    Logger::info(str::format("[RTX NRC DEBUG] EndFrame: about to lock submission (pendingSubmissions=", m_device->pendingSubmissions(), ")"));
+    m_device->lockSubmission();  // CRITICAL: Wait for dxvk-submit thread to finish all queued work BEFORE inserting fence
+    Logger::info(str::format("[RTX NRC DEBUG] EndFrame: submission locked, calling NRC EndFrame"));
     const nrc::Status status = m_nrcContext->EndFrame(nativeCmdQueue);
     m_device->unlockSubmission();
+    Logger::info(str::format("[RTX NRC DEBUG] EndFrame: complete, status=", static_cast<int>(status)));
 
     if (status != nrc::Status::OK) {
       ONCE(Logger::err(str::format("[RTX Neural Radiance Cache] EndFrame call failed. Reason: ", getNrcStatusErrorMessage(status))));
@@ -454,14 +458,23 @@ namespace dxvk {
   }
 
   void NrcContext::tryReallocateBuffer(
-    Rc<DxvkBuffer>& buffer, 
-    nrc::vulkan::BufferInfo& bufferInfo, 
+    Rc<DxvkBuffer>& buffer,
+    nrc::vulkan::BufferInfo& bufferInfo,
     const nrc::AllocationInfo& allocationInfo) {
     VkDeviceSize bufferSize = allocationInfo.elementSize * allocationInfo.elementCount;
 
     // Size hasn't changed, early exit
     if (buffer != nullptr && buffer->info().size == bufferSize) {
       return;
+    }
+
+    // CRITICAL: Wait for GPU to finish using old buffer before freeing it
+    // Without this, GPU may access freed memory causing crashes/hangs
+    if (buffer != nullptr) {
+      Logger::warn(str::format("[RTX NRC DEBUG] Waiting for GPU idle before reallocating NRC buffer (oldSize=",
+        buffer->info().size / 1024, "KB, newSize=", bufferSize / 1024, "KB, pendingSubmissions=", m_device->pendingSubmissions(), ")"));
+      m_device->waitForIdle();
+      Logger::info(str::format("[RTX NRC DEBUG] GPU idle complete - safe to reallocate NRC buffer"));
     }
 
     buffer = nullptr;

@@ -1,0 +1,196 @@
+/*
+* Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+*
+* VK_NV_cluster_acceleration_structure extension definitions
+*
+* This extension provides cluster-based acceleration structures for
+* ray tracing highly tessellated geometry with improved memory efficiency
+* and ray traversal performance.
+*
+* Extension specification: VK_NV_cluster_acceleration_structure
+* Required extensions: VK_KHR_acceleration_structure
+*/
+
+#pragma once
+
+#include <vulkan/vulkan.h>
+
+// Extension name
+#define VK_NV_CLUSTER_ACCELERATION_STRUCTURE_EXTENSION_NAME "VK_NV_cluster_acceleration_structure"
+#define VK_NV_CLUSTER_ACCELERATION_STRUCTURE_SPEC_VERSION 1
+
+// New structures
+#define VK_STRUCTURE_TYPE_CLUSTER_ACCELERATION_STRUCTURE_CREATE_INFO_NV \
+  ((VkStructureType)1000565000)
+
+#define VK_STRUCTURE_TYPE_CLUSTER_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_NV \
+  ((VkStructureType)1000565001)
+
+#define VK_STRUCTURE_TYPE_CLUSTER_ACCELERATION_STRUCTURE_COMMAND_INFO_NV \
+  ((VkStructureType)1000565002)
+
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CLUSTER_ACCELERATION_STRUCTURE_FEATURES_NV \
+  ((VkStructureType)1000565003)
+
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CLUSTER_ACCELERATION_STRUCTURE_PROPERTIES_NV \
+  ((VkStructureType)1000565004)
+
+// Cluster acceleration structure build flags
+typedef enum VkClusterAccelerationStructureBuildFlagBitsNV {
+  VK_CLUSTER_ACCELERATION_STRUCTURE_BUILD_PREFER_FAST_TRACE_BIT_NV = 0x00000001,
+  VK_CLUSTER_ACCELERATION_STRUCTURE_BUILD_PREFER_FAST_BUILD_BIT_NV = 0x00000002,
+  VK_CLUSTER_ACCELERATION_STRUCTURE_BUILD_ALLOW_UPDATE_BIT_NV = 0x00000004,
+  VK_CLUSTER_ACCELERATION_STRUCTURE_BUILD_ALLOW_COMPACTION_BIT_NV = 0x00000008,
+} VkClusterAccelerationStructureBuildFlagBitsNV;
+
+typedef VkFlags VkClusterAccelerationStructureBuildFlagsNV;
+
+// Cluster pattern types
+typedef enum VkClusterPatternTypeNV {
+  VK_CLUSTER_PATTERN_TYPE_REGULAR_NV = 0,    // Regular grid pattern
+  VK_CLUSTER_PATTERN_TYPE_SLANTED_NV = 1,    // Slanted grid pattern (for T-junctions)
+  VK_CLUSTER_PATTERN_TYPE_MAX_ENUM_NV = 0x7FFFFFFF
+} VkClusterPatternTypeNV;
+
+// Physical device features
+typedef struct VkPhysicalDeviceClusterAccelerationStructureFeaturesNV {
+  VkStructureType sType;
+  void* pNext;
+  VkBool32 clusterAccelerationStructure;        // Support for cluster acceleration structures
+  VkBool32 clusterAccelerationStructureIndirect; // Support for indirect cluster builds
+} VkPhysicalDeviceClusterAccelerationStructureFeaturesNV;
+
+// Physical device properties
+typedef struct VkPhysicalDeviceClusterAccelerationStructurePropertiesNV {
+  VkStructureType sType;
+  void* pNext;
+  uint32_t maxClusterVertices;           // Maximum vertices per cluster (typically 144 for 12x12)
+  uint32_t maxClusterTriangles;          // Maximum triangles per cluster (typically 242 for 11x11*2)
+  uint32_t maxClusterEdgeLength;         // Maximum edge segments (typically 11)
+  uint32_t clusterAlignment;             // Required alignment for cluster buffers (typically 256)
+  VkDeviceSize maxClusterAccelerationStructureSize; // Maximum CLAS size
+} VkPhysicalDeviceClusterAccelerationStructurePropertiesNV;
+
+// Cluster template descriptor
+// Describes the layout of a cluster template mesh
+typedef struct VkClusterTemplateNV {
+  uint32_t xEdges;              // Number of edges in X direction (1-11)
+  uint32_t yEdges;              // Number of edges in Y direction (1-11)
+  VkClusterPatternTypeNV pattern; // Regular or slanted grid
+  uint32_t reserved;            // Reserved for future use
+} VkClusterTemplateNV;
+
+// Cluster instance data
+// Describes how to instantiate a cluster from a template
+typedef struct VkClusterInstanceDataNV {
+  VkDeviceAddress vertexBufferAddress;   // Base address of vertex data for this cluster
+  uint32_t vertexBufferStrideInBytes;    // Stride between vertices (typically 12 for float3)
+  uint32_t clusterIdOffset;              // Cluster ID for this instance (for shading)
+  uint32_t geometryIndexOffset;          // Geometry index offset (for multi-geometry BLAS)
+  VkDeviceAddress clusterTemplateAddress; // Address of cluster template (CLAS header)
+} VkClusterInstanceDataNV;
+
+// Cluster acceleration structure create info
+typedef struct VkClusterAccelerationStructureCreateInfoNV {
+  VkStructureType sType;
+  const void* pNext;
+  VkClusterTemplateNV clusterTemplate;   // Template describing cluster layout
+  VkDeviceAddress vertexBufferAddress;   // Address of vertex buffer (positions)
+  uint32_t vertexBufferStrideInBytes;    // Stride between vertices
+  VkDeviceAddress normalBufferAddress;   // Optional: Address of normal buffer
+  uint32_t normalBufferStrideInBytes;    // Stride between normals
+  VkClusterAccelerationStructureBuildFlagsNV buildFlags; // Build flags
+} VkClusterAccelerationStructureCreateInfoNV;
+
+// Get device address of a cluster acceleration structure
+typedef struct VkClusterAccelerationStructureDeviceAddressInfoNV {
+  VkStructureType sType;
+  const void* pNext;
+  VkDeviceAddress clasBufferAddress;     // Address of CLAS buffer containing header
+  uint32_t clasOffsetInBytes;            // Offset within CLAS buffer
+} VkClusterAccelerationStructureDeviceAddressInfoNV;
+
+// Command buffer cluster build info
+typedef struct VkClusterAccelerationStructureCommandInfoNV {
+  VkStructureType sType;
+  const void* pNext;
+  VkClusterTemplateNV clusterTemplate;   // Template describing cluster layout
+  VkDeviceAddress dstClasAddress;        // Destination CLAS buffer address
+  VkDeviceAddress srcVertexBufferAddress; // Source vertex buffer
+  uint32_t vertexBufferStrideInBytes;    // Vertex stride
+  VkDeviceAddress srcNormalBufferAddress; // Optional: Source normal buffer
+  uint32_t normalBufferStrideInBytes;    // Normal stride
+  VkClusterAccelerationStructureBuildFlagsNV buildFlags;
+} VkClusterAccelerationStructureCommandInfoNV;
+
+// Function pointers
+typedef void (VKAPI_PTR *PFN_vkGetClusterAccelerationStructureBuildSizesNV)(
+  VkDevice device,
+  const VkClusterAccelerationStructureCreateInfoNV* pCreateInfo,
+  VkDeviceSize* pClasSize);
+
+typedef void (VKAPI_PTR *PFN_vkCmdBuildClusterAccelerationStructureNV)(
+  VkCommandBuffer commandBuffer,
+  const VkClusterAccelerationStructureCommandInfoNV* pInfo);
+
+typedef VkDeviceAddress (VKAPI_PTR *PFN_vkGetClusterAccelerationStructureDeviceAddressNV)(
+  VkDevice device,
+  const VkClusterAccelerationStructureDeviceAddressInfoNV* pInfo);
+
+// Extension function declarations
+#ifndef VK_NO_PROTOTYPES
+VKAPI_ATTR void VKAPI_CALL vkGetClusterAccelerationStructureBuildSizesNV(
+  VkDevice device,
+  const VkClusterAccelerationStructureCreateInfoNV* pCreateInfo,
+  VkDeviceSize* pClasSize);
+
+VKAPI_ATTR void VKAPI_CALL vkCmdBuildClusterAccelerationStructureNV(
+  VkCommandBuffer commandBuffer,
+  const VkClusterAccelerationStructureCommandInfoNV* pInfo);
+
+VKAPI_ATTR VkDeviceAddress VKAPI_CALL vkGetClusterAccelerationStructureDeviceAddressNV(
+  VkDevice device,
+  const VkClusterAccelerationStructureDeviceAddressInfoNV* pInfo);
+#endif
+
+namespace dxvk {
+
+// DXVK wrapper for cluster acceleration structure extension
+class VkClusterAccelExtension {
+public:
+  // Function pointers (loaded via vkGetDeviceProcAddr)
+  PFN_vkGetClusterAccelerationStructureBuildSizesNV vkGetClusterAccelerationStructureBuildSizesNV = nullptr;
+  PFN_vkCmdBuildClusterAccelerationStructureNV vkCmdBuildClusterAccelerationStructureNV = nullptr;
+  PFN_vkGetClusterAccelerationStructureDeviceAddressNV vkGetClusterAccelerationStructureDeviceAddressNV = nullptr;
+
+  // Initialize extension (load function pointers)
+  bool init(VkDevice device, PFN_vkGetDeviceProcAddr getDeviceProcAddr) {
+    if (!device || !getDeviceProcAddr) {
+      return false;
+    }
+
+    vkGetClusterAccelerationStructureBuildSizesNV =
+      reinterpret_cast<PFN_vkGetClusterAccelerationStructureBuildSizesNV>(
+        getDeviceProcAddr(device, "vkGetClusterAccelerationStructureBuildSizesNV"));
+
+    vkCmdBuildClusterAccelerationStructureNV =
+      reinterpret_cast<PFN_vkCmdBuildClusterAccelerationStructureNV>(
+        getDeviceProcAddr(device, "vkCmdBuildClusterAccelerationStructureNV"));
+
+    vkGetClusterAccelerationStructureDeviceAddressNV =
+      reinterpret_cast<PFN_vkGetClusterAccelerationStructureDeviceAddressNV>(
+        getDeviceProcAddr(device, "vkGetClusterAccelerationStructureDeviceAddressNV"));
+
+    return isValid();
+  }
+
+  // Check if extension is available
+  bool isValid() const {
+    return vkGetClusterAccelerationStructureBuildSizesNV != nullptr &&
+           vkCmdBuildClusterAccelerationStructureNV != nullptr &&
+           vkGetClusterAccelerationStructureDeviceAddressNV != nullptr;
+  }
+};
+
+} // namespace dxvk

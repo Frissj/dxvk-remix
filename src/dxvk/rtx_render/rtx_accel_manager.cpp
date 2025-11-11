@@ -28,6 +28,8 @@
 #include "rtx_opacity_micromap_manager.h"
 #include "rtx_scene_manager.h"
 #include "rtx_accel_manager.h"
+#include "rtx_mega_geometry.h"
+#include "rtx_mega_geometry_integration.h"
 
 #include "../d3d9/d3d9_state.h"
 #include "rtx_matrix_helpers.h"
@@ -39,6 +41,8 @@
 #include "rtx/concept/billboard.h"
 
 #include "rtx/pass/common_binding_indices.h"
+
+#include <numeric>  // For std::accumulate
 
 namespace dxvk {
 
@@ -495,6 +499,8 @@ namespace dxvk {
                                     RtxOptions::forceMergeAllMeshes()) &&                                          // Setting to force all meshes into the merged BLAS
                                       instance->surface.instancesToObject == nullptr;                              // Never merge point instancer geometry
 
+      // Route instances to uniqueBlas or merged BLAS based on normal criteria
+      // Cluster BLASes will go through normal path and be patched on GPU afterward (NVIDIA's method)
       if (requestDynamicBlas && !forceMergedBlas) {
         // Since this loop is iterating over instances, and instances can share BLAS, we will build these later after identifying unique ones.
         uniqueBlas[blasEntry].push_back(instance);
@@ -503,9 +509,10 @@ namespace dxvk {
         // TODO (REMIX-3996) will break the assumptions we make here about all instances in a BlasEntry having the same instancesToObject array
         assert(uniqueBlas.find(blasEntry) == uniqueBlas.end());
 
-        if (blasEntry->dynamicBlas != nullptr) {
+        if (blasEntry->dynamicBlas != nullptr && !blasEntry->dynamicBlas->isClusterBlas) {
           // Move the BLAS used by this geometry to the common pool.
           // This also ensures the dynamic blas resource that's still being used by previous TLAS is properly tracked for the next frame
+          // NOTE: Skip this for cluster BLASes - they're prebuilt and should stay in place
           m_blasPool.push_back(std::move(blasEntry->dynamicBlas));
           blasEntry->dynamicBlas = nullptr;
         }
@@ -543,13 +550,53 @@ namespace dxvk {
     }
 
     // Build/Update the dynamic BLAS
+    Logger::info(str::format("[AccelManager DEBUG] Building dynamic BLASes: count=", uniqueBlas.size()));
     for (const std::pair<BlasEntry*, std::vector<RtInstance*>> pair : uniqueBlas) {
       BlasEntry* blasEntry = pair.first;
+      Logger::info(str::format("[AccelManager DEBUG] Processing BLAS entry, instances=", pair.second.size()));
       if (pair.second.size() == 0) {
         continue;
       }
+
+      // Cluster BLASes may have empty buildGeometries - skip them and let GPU patching handle it
+      if (blasEntry->buildGeometries.size() == 0) {
+        Logger::info(str::format("[AccelManager DEBUG] Empty buildGeometries (likely cluster BLAS hash=0x",
+                                std::hex, blasEntry->input.clusterBlasGeometryHash, std::dec, ") - skipping build, adding instances"));
+        trackBlasBuildResources(ctx, execBarriers, blasEntry);
+        for (RtInstance* inst : pair.second) {
+          addBlas(inst, blasEntry, nullptr);
+        }
+        continue;
+      }
+
       assert(blasEntry->buildGeometries.size() == 1); // dynamic BLAS should always have this
       assert(blasEntry->buildRanges.size() == 1); // dynamic BLAS should always have this
+
+      // CRITICAL: Skip BLAS building for cluster BLASes - they're pre-built by RtxMegaGeometry
+      // Cluster BLASes are injected via rtx_scene_manager.cpp and should not be rebuilt here
+      if (blasEntry->dynamicBlas.ptr() && blasEntry->dynamicBlas->isClusterBlas) {
+        Logger::info(str::format("[AccelManager] Skipping BLAS build for cluster BLAS (hash=0x",
+                                std::hex, blasEntry->dynamicBlas->clusterBlasGeometryHash, std::dec, ")"));
+
+        // Still need to add instances to TLAS
+        for (RtInstance* rtInstance : pair.second) {
+          if (rtInstance->surface.instancesToObject == nullptr) {
+            addBlas(rtInstance, blasEntry, nullptr);
+          } else {
+            rtInstance->surface.surfaceIndexOfFirstInstance = m_reorderedSurfaces.size();
+            for (auto& instanceToObject : *rtInstance->surface.instancesToObject) {
+              addBlas(rtInstance, blasEntry, &instanceToObject);
+            }
+          }
+        }
+
+        ctx->getCommandList()->trackResource<DxvkAccess::Read>(blasEntry->dynamicBlas->accelStructure);
+        trackBlasBuildResources(ctx, execBarriers, blasEntry);
+        continue;  // Skip regular BLAS building
+      }
+
+      // Get reference to dynamicBlas for regular (non-cluster) BLAS building
+      Rc<PooledBlas>& selectedBlas = blasEntry->dynamicBlas;
 
       bool forceRebuild = false;
       XXH64_hash_t boundOpacityMicromapHash = kEmptyHash;
@@ -601,7 +648,6 @@ namespace dxvk {
                                                                &buildInfo, &blasEntry->buildRanges[0].primitiveCount, &sizeInfo);
 
       // Try to reuse our dynamic BLAS if it exists
-      Rc<PooledBlas>& selectedBlas = blasEntry->dynamicBlas;
 
       bool build = forceRebuild || !selectedBlas.ptr() || selectedBlas->accelStructure->info().size != sizeInfo.accelerationStructureSize;
 
@@ -725,14 +771,20 @@ namespace dxvk {
       totalPrimitiveIDOffset += primitiveCount;
     }
 
-    buildBlases(ctx, execBarriers, cameraManager, opacityMicromapManager, instanceManager, 
+    buildBlases(ctx, execBarriers, cameraManager, opacityMicromapManager, instanceManager,
                 textures, instances, blasBuckets, blasToBuild, blasRangesToBuild, totalScratchMemory);
   }
 
   void AccelManager::addBlas(RtInstance* instance, BlasEntry* blasEntry, const Matrix4* instanceToObject) {
     // Create an instance for this BLAS
     VkAccelerationStructureInstanceKHR blasInstance = instance->getVkInstance();
-    blasInstance.accelerationStructureReference = blasEntry->dynamicBlas->accelerationStructureReference;
+
+    // For cluster BLASes, dynamicBlas is set during injection and must be used
+    // For regular BLASes, dynamicBlas is null and we keep the address from getVkInstance()
+    if (blasEntry->dynamicBlas != nullptr) {
+      blasInstance.accelerationStructureReference = blasEntry->dynamicBlas->accelerationStructureReference;
+    }
+
     blasInstance.instanceCustomIndex =
       (blasInstance.instanceCustomIndex & ~uint32_t(CUSTOM_INDEX_SURFACE_MASK)) |
       uint32_t(m_reorderedSurfaces.size()) & uint32_t(CUSTOM_INDEX_SURFACE_MASK);
@@ -786,8 +838,125 @@ namespace dxvk {
       m_device->vkd()->vkGetAccelerationStructureBuildSizesKHR(m_device->handle(), VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
                                                                &buildInfo, bucket->primitiveCounts.data(), &sizeInfo);
 
+      // MEGA GEOMETRY INTEGRATION: Compute geometry hash for precise BLAS matching
+      XXH64_hash_t geometryHash = 0;
+      bool usedCachedBlas = false;  // Track if we used a cached BLAS (proper flag instead of NULL signal)
+      PooledBlas* selectedBlas = nullptr;  // Declare here so it's in scope for all paths
+
+      // CRITICAL: This Rc must stay alive for the entire loop iteration
+      // If we use a cached BLAS, this holds the reference to keep it alive
+      Rc<PooledBlas> cachedBlasWrapper;
+
+      if (RtxMegaGeometry::enable() && !RtxMegaGeometry::enableTessellation()) {
+        RtxMegaGeometry* megaGeom = getMegaGeometry();
+        if (megaGeom) {
+          // CRITICAL: RTX Remix uses "merged BLASes" where multiple instances are pre-transformed
+          // to world space and combined into one BLAS (with identity TLAS transform).
+          //
+          // BLAS caching works best for OBJECT-SPACE geometry (transform applied at TLAS level).
+          // We can only do this efficiently for SINGLE-INSTANCE buckets.
+          //
+          // Strategy:
+          // - Single instance (1 object): Cache in object space, NO transform in hash
+          // - Multiple instances (merged): Skip caching (transforms baked in, changes every frame)
+
+          const bool isSingleInstance = (bucket->originalInstances.size() == 1);
+          const bool canCache = isSingleInstance;  // Only cache single-instance BLASes
+
+          if (canCache) {
+            // Hash only geometry data (NOT transforms) for object-space BLAS
+            for (const auto& geom : bucket->geometries) {
+              XXH64_hash_t h = 0;
+              if (geom.geometryType == VK_GEOMETRY_TYPE_TRIANGLES_KHR) {
+                const auto& triangles = geom.geometry.triangles;
+                // Hash geometry properties
+                h = XXH64(&triangles.vertexFormat, sizeof(triangles.vertexFormat), h);
+                h = XXH64(&triangles.vertexStride, sizeof(triangles.vertexStride), h);
+                h = XXH64(&triangles.maxVertex, sizeof(triangles.maxVertex), h);
+                h = XXH64(&triangles.indexType, sizeof(triangles.indexType), h);
+                // Hash buffer addresses (uniquely identifies geometry)
+                h = XXH64(&triangles.vertexData.deviceAddress, sizeof(triangles.vertexData.deviceAddress), h);
+                if (triangles.indexType != VK_INDEX_TYPE_NONE_KHR) {
+                  h = XXH64(&triangles.indexData.deviceAddress, sizeof(triangles.indexData.deviceAddress), h);
+                }
+              }
+              geometryHash = XXH64(&h, sizeof(h), geometryHash);
+            }
+          } else {
+            // Multi-instance merged BLAS: Skip caching entirely
+            // (geometry is pre-transformed, changes whenever any instance moves)
+            goto skip_cache;
+          }
+
+          // Check if we have a cached BLAS for this geometry
+          auto* cachedBlas = megaGeom->lookupBLAS(geometryHash);
+          if (cachedBlas) {
+            // Cache HIT! Reuse the existing BLAS from mega geometry cache
+            ONCE(Logger::info(str::format(
+              "[AccelManager] Mega Geometry BLAS cache HIT: hash=0x", std::hex, geometryHash, std::dec,
+              ", size=", cachedBlas->blasSize / 1024, "KB"
+            )));
+
+            Logger::info("[AccelManager] Cache HIT step 1: Validating resources");
+            // Safety check: Verify cached BLAS has valid resources
+            if (cachedBlas->blasBuffer.ptr() == nullptr) {
+              Logger::err("[AccelManager] Cached BLAS has invalid buffer - falling back to rebuild");
+              // Skip cache and fall through to normal BLAS creation
+              goto skip_cache;
+            }
+
+            Logger::info("[AccelManager] Cache HIT step 2: Creating temporary PooledBlas for cached BLAS");
+            // Create a temporary PooledBlas wrapper that is NOT added to the pool
+            // Cached BLASes don't need pool management since they're already built
+            cachedBlasWrapper = Rc<PooledBlas>(new PooledBlas());
+
+            Logger::info(str::format("[AccelManager] Cache HIT: cachedBlas->blasBuffer.ptr()=", (void*)cachedBlas->blasBuffer.ptr()));
+            cachedBlasWrapper->accelStructure = cachedBlas->blasBuffer;
+            Logger::info(str::format("[AccelManager] Cache HIT: After assignment, cachedBlasWrapper->accelStructure.ptr()=", (void*)cachedBlasWrapper->accelStructure.ptr()));
+
+            cachedBlasWrapper->accelerationStructureReference = cachedBlas->blasBuffer->getAccelDeviceAddress();
+            cachedBlasWrapper->frameLastTouched = currentFrame;
+
+            Logger::info(str::format("[AccelManager] Cache HIT step 3: Got address 0x", std::hex, cachedBlasWrapper->accelerationStructureReference, std::dec));
+
+            // Initialize buildInfo with CURRENT bucket geometry
+            copyAccelerationStructureBuildGeometryInfo(buildInfo, cachedBlasWrapper->buildInfo);
+            cachedBlasWrapper->primitiveCounts = bucket->primitiveCounts;
+
+            // Store raw pointer for use in labels
+            selectedBlas = cachedBlasWrapper.ptr();
+
+            Logger::info("[AccelManager] Cache HIT step 4: Jumping to cached_blas_path (skip normal pool)");
+            // Skip the normal pooling search and build - use special path for cached BLASes
+            usedCachedBlas = true;  // Mark that we used a cached BLAS
+            goto cached_blas_path;
+          }
+        }
+      }
+
+      // If we didn't use a cached BLAS, skip the cached_blas_path code
+      goto skip_cache;
+
+cached_blas_path:  // Special path for cached BLASes (skip pool entirely)
+      Logger::info("[AccelManager] Cached BLAS path: tracking resource for read");
+      Logger::info(str::format("[AccelManager] Cached BLAS path: selectedBlas=", (void*)selectedBlas,
+                              ", accelStructure=", (void*)selectedBlas->accelStructure.ptr()));
+
+      if (!selectedBlas || selectedBlas->accelStructure.ptr() == nullptr) {
+        Logger::err("[AccelManager] Cached BLAS has null accelStructure!");
+        assert(false && "Cached BLAS has null accelStructure");
+      }
+
+      ctx->getCommandList()->trackResource<DxvkAccess::Read>(selectedBlas->accelStructure);
+      Logger::info("[AccelManager] Cached BLAS path: resource tracked successfully");
+
+      // Don't add to build queue - this BLAS is already built
+      // Just create the TLAS instance and we're done
+      goto create_tlas_instance;
+
+skip_cache:  // Fallback label for cache failures
       // Try to find an existing BLAS that is minimally sufficient to fit this bucket of geometries
-      PooledBlas* selectedBlas = nullptr;
+      // selectedBlas already declared above
       for (const auto& blas : m_blasPool) {
         size_t bufferSize = blas->accelStructure->info().size;
         uint32_t paddedLastTouched = blas->frameLastTouched + 1 + (RtxOptions::enablePreviousTLAS() ? 1u : 0u); /* note: +2 because frameLastTouched is unsigned and init'd with UINT32_MAX, and keep the BLAS'es for one extra frame for previous TLAS access */
@@ -813,34 +982,75 @@ namespace dxvk {
 
         m_blasPool.push_back(std::move(newBlas));
       }
+
+blas_selected:  // Label for mega geometry cache hit path
+      Logger::info(str::format("[AccelManager] At blas_selected: usedCachedBlas=", usedCachedBlas));
       assert(selectedBlas);
       selectedBlas->frameLastTouched = currentFrame;
+      Logger::info("[AccelManager] After setting frameLastTouched");
 
-      // Use the selected BLAS for the build
-      buildInfo.dstAccelerationStructure = selectedBlas->accelStructure->getAccelStructure();
-      
-      if (buildInfo.mode == VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR) {
-        // Set the src to the dst if we're updating
-        buildInfo.srcAccelerationStructure = buildInfo.dstAccelerationStructure;
+      if (!usedCachedBlas) {
+        // Use the selected BLAS for the build
+        buildInfo.dstAccelerationStructure = selectedBlas->accelStructure->getAccelStructure();
+
+        if (buildInfo.mode == VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR) {
+          // Set the src to the dst if we're updating
+          buildInfo.srcAccelerationStructure = buildInfo.dstAccelerationStructure;
+        }
+
+        copyAccelerationStructureBuildGeometryInfo(buildInfo, selectedBlas->buildInfo);
+        selectedBlas->primitiveCounts = bucket->primitiveCounts;
+
+        // Allocate a scratch buffer slice
+        const size_t requiredScratchAllocSize = align(sizeInfo.buildScratchSize + m_scratchAlignment, m_scratchAlignment);
+        buildInfo.scratchData.deviceAddress = totalScratchMemory;
+        totalScratchMemory += requiredScratchAllocSize;
+
+        assert(buildInfo.scratchData.deviceAddress % m_scratchAlignment == 0); // Note: Required by the Vulkan specification.
+
+        // Track the lifetime of the BLAS buffers
+        ctx->getCommandList()->trackResource<DxvkAccess::Write>(selectedBlas->accelStructure);
+
+        // Put the merged BLAS into the build queue
+        blasToBuild.push_back(buildInfo);
+        blasRangesToBuild.push_back(bucket->ranges.data());
+      } else {
+        // This BLAS is from cache - already built, just track it for read
+        Logger::info("[AccelManager] Cached BLAS path: tracking resource");
+        ctx->getCommandList()->trackResource<DxvkAccess::Read>(selectedBlas->accelStructure);
+        Logger::info("[AccelManager] Cached BLAS path: resource tracked successfully");
       }
 
-      copyAccelerationStructureBuildGeometryInfo(buildInfo, selectedBlas->buildInfo);
-      selectedBlas->primitiveCounts = bucket->primitiveCounts;
+      Logger::info("[AccelManager] Proceeding to TLAS instance creation");
+      // MEGA GEOMETRY INTEGRATION: Store newly created BLAS in cache
+      // CRITICAL: Only cache if this is NOT already a cached BLAS (usedCachedBlas==false means it's new)
+      if (!usedCachedBlas && geometryHash != 0 && RtxMegaGeometry::enable() && !RtxMegaGeometry::enableTessellation()) {
+        RtxMegaGeometry* megaGeom = getMegaGeometry();
+        if (megaGeom && buildInfo.mode == VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR) {
+          // Only cache if this is a new build (not an update)
+          auto* cachedBlas = megaGeom->lookupBLAS(geometryHash);
+          if (!cachedBlas) {
+            // Cache MISS - store this new BLAS for future reuse
+            RtxMegaGeometry::CachedBLAS newCachedBlas;
+            newCachedBlas.blasBuffer = selectedBlas->accelStructure;
+            newCachedBlas.accelStructure = buildInfo.dstAccelerationStructure;
+            newCachedBlas.vertexCount = 0;  // Not tracked at this level
+            newCachedBlas.triangleCount = std::accumulate(bucket->primitiveCounts.begin(), bucket->primitiveCounts.end(), 0u);
+            newCachedBlas.lastUsedFrame = currentFrame;
+            newCachedBlas.blasSize = sizeInfo.accelerationStructureSize;
+            newCachedBlas.isCompacted = false;
 
-      // Allocate a scratch buffer slice
-      const size_t requiredScratchAllocSize = align(sizeInfo.buildScratchSize + m_scratchAlignment, m_scratchAlignment);
-      buildInfo.scratchData.deviceAddress = totalScratchMemory;
-      totalScratchMemory += requiredScratchAllocSize;
+            megaGeom->cacheBLAS(geometryHash, newCachedBlas);
 
-      assert(buildInfo.scratchData.deviceAddress % m_scratchAlignment == 0); // Note: Required by the Vulkan specification.
+            ONCE(Logger::info(str::format(
+              "[AccelManager] Mega Geometry BLAS cache MISS: hash=0x", std::hex, geometryHash, std::dec,
+              ", building new BLAS (", sizeInfo.accelerationStructureSize / 1024, "KB, ", newCachedBlas.triangleCount, " triangles)"
+            )));
+          }
+        }
+      }
 
-      // Track the lifetime of the BLAS buffers
-      ctx->getCommandList()->trackResource<DxvkAccess::Write>(selectedBlas->accelStructure);
-
-      // Put the merged BLAS into the build queue
-      blasToBuild.push_back(buildInfo);
-      blasRangesToBuild.push_back(bucket->ranges.data());
-
+create_tlas_instance:  // Label for TLAS instance creation (used by cached BLAS path)
       static float identityTransform[3][4] = {
         { 1.f, 0.f, 0.f, 0.f },
         { 0.f, 1.f, 0.f, 0.f },
@@ -848,25 +1058,33 @@ namespace dxvk {
       };
 
       // Append an instance of this merged BLAS to the merged instance list
+      Logger::info("[AccelManager] Creating TLAS instance");
       VkAccelerationStructureInstanceKHR instance {};
       instance.accelerationStructureReference = selectedBlas->accelerationStructureReference;
+
+      // DEBUG: Log BLAS address to check if it's valid
+      Logger::info(str::format("[AccelManager] TLAS instance using BLAS address: 0x",
+                              std::hex, instance.accelerationStructureReference, std::dec));
       instance.flags = bucket->instanceFlags;
       instance.instanceShaderBindingTableRecordOffset = bucket->instanceShaderBindingTableRecordOffset;
       instance.mask = bucket->instanceMask;
-      instance.instanceCustomIndex = 
+      instance.instanceCustomIndex =
         (bucket->customIndexFlags & ~uint32_t(CUSTOM_INDEX_SURFACE_MASK)) |
         (bucket->reorderedSurfacesOffset & uint32_t(CUSTOM_INDEX_SURFACE_MASK));
       memcpy(static_cast<void*>(&instance.transform.matrix[0][0]), &identityTransform[0][0], sizeof(VkTransformMatrixKHR));
 
+      Logger::info("[AccelManager] TLAS instance created, adding to list");
       if (bucket->usesUnorderedApproximations && RtxOptions::enableSeparateUnorderedApproximations())
         m_mergedInstances[Tlas::Unordered].push_back(instance);
       else
         m_mergedInstances[Tlas::Opaque].push_back(instance);
+      Logger::info("[AccelManager] TLAS instance added successfully");
     }
   }
 
   void AccelManager::prepareSceneData(Rc<DxvkContext> ctx, DxvkBarrierSet& execBarriers, InstanceManager& instanceManager) {
     ScopedCpuProfileZone();
+
     bool haveInstances = false;
     for (const auto& instances : m_mergedInstances) {
       if (!instances.empty()) {
@@ -1262,33 +1480,119 @@ namespace dxvk {
   }
 
   void AccelManager::buildTlas(Rc<DxvkContext> ctx) {
-    if (m_vkInstanceBuffer == nullptr)
+    uint32_t frameId = ctx->getDevice()->getCurrentFrameId();
+    Logger::info(str::format("[TLAS TIMING] ========== START TLAS BUILD (frame ", frameId, ") =========="));
+
+    if (m_vkInstanceBuffer == nullptr) {
+      Logger::info(str::format("[TLAS TIMING] vkInstanceBuffer is null, returning early (frame ", frameId, ")"));
       return;
+    }
 
     ScopedGpuProfileZone(ctx, "buildTLAS");
+
+    Logger::info(str::format("[TLAS TIMING] BLAS pool size: ", m_blasPool.size(), " BLASes"));
+    Logger::info(str::format("[TLAS TIMING] Merged instances: Opaque=", m_mergedInstances[Tlas::Opaque].size(),
+                            ", Unordered=", m_mergedInstances[Tlas::Unordered].size()));
 
     // Two barriers in one:
     // Accel build bit - to protect from BLAS builds
     // Transfer bit - to protect from updateBuffer in prepareSceneData
+    Logger::info("[TLAS TIMING] Emitting pre-TLAS barrier (BLAS writes -> TLAS reads)...");
     ctx->emitMemoryBarrier(0,
       VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR | VK_PIPELINE_STAGE_TRANSFER_BIT,
       VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR | VK_ACCESS_TRANSFER_WRITE_BIT,
       VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
       VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR);
+    Logger::info("[TLAS TIMING] Pre-TLAS barrier complete");
 
+    // CRITICAL: Pre-inject cluster BLAS from cache BEFORE patching
+    // This must happen before patchClusterBlasAddresses so it can find cluster BLAS instances
+    // Matches sample's approach where BLAS data is available before FillInstanceDescs
+    Logger::info("[TLAS PRE-INJECTION] Checking for cached cluster BLASes to pre-inject...");
+    RtxMegaGeometry* megaGeometry = getMegaGeometry();
+    if (megaGeometry) {
+      uint32_t preInjectionCount = 0;
+      // Iterate through all surfaces to get BlasEntry objects
+      for (RtInstance* rtInstance : m_reorderedSurfaces) {
+        if (!rtInstance) continue;
+
+        BlasEntry* blasEntry = rtInstance->getBlas();
+        if (!blasEntry || blasEntry->dynamicBlas.ptr()) {
+          continue;  // Skip if no BLAS or already has dynamicBlas
+        }
+
+        // Check if this geometry hash has cluster BLAS in cache
+        XXH64_hash_t geometryHash = blasEntry->input.getHash(RtxOptions::geometryAssetHashRule());
+        if (geometryHash == kEmptyHash) {
+          continue;
+        }
+
+        // Try to get cached cluster BLAS (const_cast to match rtx_scene_manager.cpp pattern)
+        RtxMegaGeometry::TessellatedGeometryCache* cached =
+          const_cast<RtxMegaGeometry::TessellatedGeometryCache*>(
+            megaGeometry->getTessellatedGeometry(geometryHash));
+
+        if (cached && cached->hasClusterBLAS && cached->clusterBLAS.ptr()) {
+          // Check if GPU work is complete
+          bool isSafeToReuse = false;
+
+          if (cached->buildCommandList.ptr()) {
+            // Direct fence check via Vulkan API (matches rtx_scene_manager.cpp:1069-1070)
+            VkResult fenceStatus = m_device->vkd()->vkGetFenceStatus(
+              m_device->vkd()->device(), cached->buildCommandList->fence());
+            isSafeToReuse = (fenceStatus == VK_SUCCESS);
+          }
+
+          if (isSafeToReuse) {
+            // Inject cluster BLAS
+            Rc<PooledBlas> clusterPooledBlas = new PooledBlas();
+            clusterPooledBlas->accelStructure = cached->clusterBLAS;
+            clusterPooledBlas->accelerationStructureReference = 0;  // Will be GPU-patched
+            clusterPooledBlas->frameLastTouched = frameId;
+            clusterPooledBlas->isClusterBlas = true;
+            clusterPooledBlas->clusterBlasGeometryHash = geometryHash;
+
+            blasEntry->dynamicBlas = clusterPooledBlas;
+            preInjectionCount++;
+
+            if (preInjectionCount <= 5) {
+              Logger::info(str::format("[TLAS PRE-INJECTION] Injected cluster BLAS: hash=0x",
+                                      std::hex, geometryHash, std::dec, ", clusters=", cached->clusterCount));
+            }
+          }
+        }
+      }
+      Logger::info(str::format("[TLAS PRE-INJECTION] Pre-injected ", preInjectionCount, " cluster BLASes from cache"));
+    } else {
+      Logger::info("[TLAS PRE-INJECTION] No mega geometry system available");
+    }
+
+    // GPU PATCHING: Patch cluster BLAS addresses in TLAS instance descriptors (NVIDIA sample method)
+    // This matches fill_instance_descs.hlsl from rtxmg demo (line 1155 in rtxmg_renderer.cpp)
+    Logger::info(str::format("[TLAS TIMING] Calling patchClusterBlasAddresses (frame ", frameId, ")..."));
+    patchClusterBlasAddresses(ctx);
+    Logger::info(str::format("[TLAS TIMING] patchClusterBlasAddresses returned (frame ", frameId, ")"));
+
+    Logger::info(str::format("[TLAS TIMING] Tracking ", m_blasPool.size(), " BLAS resources..."));
     for (auto&& blas : m_blasPool) {
       ctx->getCommandList()->trackResource<DxvkAccess::Read>(blas->accelStructure);
     }
+    Logger::info("[TLAS TIMING] BLAS resource tracking complete");
 
+    Logger::info("[TLAS TIMING] Building Opaque TLAS...");
     size_t totalScratchSize = 0;
     internalBuildTlas<Tlas::Opaque>(ctx, totalScratchSize);
+    Logger::info("[TLAS TIMING] Opaque TLAS build complete, building Unordered TLAS...");
     internalBuildTlas<Tlas::Unordered>(ctx, totalScratchSize);
+    Logger::info("[TLAS TIMING] Unordered TLAS build complete");
 
+    Logger::info("[TLAS TIMING] Emitting post-TLAS barrier (TLAS writes -> ray tracing reads)...");
     ctx->emitMemoryBarrier(0,
       VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
       VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
-      VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+      VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
       VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR);
+    Logger::info("[TLAS TIMING] Post-TLAS barrier complete");
 
     // Release the scratch memory so it can be reused by rest of the frame.
     m_scratchBuffer = nullptr;
@@ -1297,11 +1601,271 @@ namespace dxvk {
     if (opacityMicromapManager) {
       opacityMicromapManager->onFinishedBuilding();
     }
+
+    Logger::info("[TLAS TIMING] ========== END TLAS BUILD ==========");
+  }
+
+  void AccelManager::patchClusterBlasAddresses(Rc<DxvkContext> ctx) {
+    // Get mega geometry system to access blasPtrsBuffer and cluster builder
+    RtxMegaGeometry* megaGeometry = getMegaGeometry();
+    if (!megaGeometry) {
+      Logger::info("[GPU PATCHING] No mega geometry system");
+      return;
+    }
+
+    // Get blasPtrsBuffer from mega geometry (populated by cluster extension)
+    Rc<DxvkBuffer> blasPtrsBuffer = megaGeometry->getBlasAddressesBuffer();
+    if (blasPtrsBuffer == nullptr) {
+      Logger::info("[GPU PATCHING] No blasPtrsBuffer - cluster BLASes not built yet");
+      return;
+    }
+
+    // NOTE: Bindless resources are always ready at this point because buildTlas is called
+    // after prepareSceneData in the frame flow (see rtx_context.cpp line 563)
+
+    Logger::info(str::format("[GPU PATCHING] blasPtrsBuffer exists, size=", blasPtrsBuffer->info().size));
+
+    // Build patch entries by iterating through all TLAS instances
+    // Use hash-based lookup to get correct blasPtrsBuffer indices
+    struct PatchEntry {
+      uint32_t tlasInstanceIndex;
+      uint32_t blasBufferIndex;
+    };
+
+    std::vector<PatchEntry> patchEntries;
+    uint32_t tlasInstanceIndex = 0;
+    uint32_t totalInstances = 0;
+    uint32_t clusterBlasInstances = 0;
+
+    // Iterate through all merged instances (same order as TLAS instances)
+    for (const auto& instances : m_mergedInstances) {
+      totalInstances += instances.size();
+      for (const VkAccelerationStructureInstanceKHR& vkInstance : instances) {
+        // Get the RtInstance for this TLAS instance via m_reorderedSurfaces
+        if (tlasInstanceIndex < m_reorderedSurfaces.size()) {
+          RtInstance* rtInstance = m_reorderedSurfaces[tlasInstanceIndex];
+          if (rtInstance) {
+            BlasEntry* blasEntry = rtInstance->getBlas();
+            if (blasEntry) {
+              // Check if this instance has a cluster BLAS
+              bool hasClusterBlas = (blasEntry->dynamicBlas != nullptr &&
+                                    blasEntry->dynamicBlas->isClusterBlas);
+              XXH64_hash_t geometryHash = kEmptyHash;
+              if (hasClusterBlas) {
+                geometryHash = blasEntry->dynamicBlas->clusterBlasGeometryHash;
+              }
+
+              if (tlasInstanceIndex < 5) {
+                Logger::info(str::format("[GPU PATCHING DEBUG] Instance ", tlasInstanceIndex,
+                                        ", BlasEntry=", (void*)blasEntry,
+                                        ", hasDynamicBlas=", (blasEntry->dynamicBlas != nullptr),
+                                        ", isClusterBlas=", hasClusterBlas,
+                                        ", geometryHash=0x", std::hex, geometryHash, std::dec));
+              }
+
+              // CRITICAL: Use hash-based lookup to get correct blasPtrsBuffer index
+              // The blasPtrsBuffer is populated by cluster builder in geometry hash order,
+              // NOT in TLAS instance order, so we must look up the correct index
+              if (hasClusterBlas && geometryHash != kEmptyHash) {
+                clusterBlasInstances++;
+                int32_t blasBufferIndex = megaGeometry->getBlasBufferIndex(geometryHash);
+                if (blasBufferIndex >= 0) {
+                  patchEntries.push_back({ tlasInstanceIndex, static_cast<uint32_t>(blasBufferIndex) });
+
+                  if (patchEntries.size() <= 5) {
+                    Logger::info(str::format("[GPU PATCHING] Found cluster BLAS instance: tlasIdx=", tlasInstanceIndex,
+                                            ", hash=0x", std::hex, geometryHash, std::dec,
+                                            ", blasBufferIdx=", blasBufferIndex));
+                  }
+                } else {
+                  Logger::warn(str::format("[GPU PATCHING] Hash map lookup failed for hash=0x",
+                                          std::hex, geometryHash, std::dec,
+                                          " (one-frame delay - will work next frame)"));
+                }
+              }
+            }
+          }
+        }
+        tlasInstanceIndex++;
+      }
+    }
+
+    Logger::info(str::format("[GPU PATCHING] Scanned ", totalInstances, " instances, found ",
+                            clusterBlasInstances, " cluster BLAS instances, ",
+                            patchEntries.size(), " patches ready (hash-based indices)"));
+
+    if (patchEntries.empty()) {
+      return;  // No cluster BLASes to patch
+    }
+
+    Logger::info(str::format("[GPU PATCHING] Patching ", patchEntries.size(),
+                            " cluster BLAS instances in TLAS using GPU shader"));
+
+    // Create/update patch entries buffer
+    const size_t patchEntriesSize = patchEntries.size() * sizeof(PatchEntry);
+    static Rc<DxvkBuffer> patchEntriesBuffer;
+
+    DxvkBufferCreateInfo bufferInfo = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bufferInfo.stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+    bufferInfo.access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    bufferInfo.size = patchEntriesSize;
+
+    if (patchEntriesBuffer == nullptr || patchEntriesBuffer->info().size < patchEntriesSize) {
+      patchEntriesBuffer = m_device->createBuffer(bufferInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                                                  DxvkMemoryStats::Category::RTXAccelerationStructure,
+                                                  "Cluster BLAS Patch Entries");
+    }
+
+    // Upload patch entries to GPU
+    ctx->writeToBuffer(patchEntriesBuffer, 0, patchEntriesSize, patchEntries.data());
+
+    // Barrier to ensure patch entries are visible to shader
+    ctx->emitMemoryBarrier(0,
+      VK_PIPELINE_STAGE_TRANSFER_BIT,
+      VK_ACCESS_TRANSFER_WRITE_BIT,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      VK_ACCESS_SHADER_READ_BIT);
+
+    // CRITICAL: Barrier to ensure cluster extension's BLAS address writes are visible to GPU patching shader!
+    // The cluster extension writes BLAS addresses at Frame N-1 end using VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR.
+    // Our GPU patching shader (Frame N) reads those addresses using VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT.
+    // This barrier ensures Frame N-1's writes complete before Frame N's reads.
+    // This matches the NVIDIA RTX Mega Geometry SDK synchronization pattern (they do it implicitly via NVRHI).
+    Logger::info("[GPU PATCHING DEBUG] Emitting barrier for blasAddresses buffer (cluster extension writes → compute shader reads)...");
+    ctx->emitMemoryBarrier(0,
+      VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+      VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      VK_ACCESS_SHADER_READ_BIT);
+    Logger::info("[GPU PATCHING DEBUG] Barrier emitted successfully");
+
+    // SDK MATCH: No ring buffering - single-frame buffers with GPU sync
+    // NVIDIA sample doesn't use ring buffers, it rebuilds every frame
+    // GPU synchronization is handled by the barrier above (lines 1674-1678)
+    uint32_t blasAddressesBaseIndex = 0;  // No ring buffer offset
+
+    Logger::info(str::format("[GPU PATCHING] Frame ", m_device->getCurrentFrameId(),
+                            " - no ring buffering (SDK-matching)"));
+
+    // Log buffer sizes for validation
+    uint32_t totalMergedInstances = m_mergedInstances[Tlas::Opaque].size() + m_mergedInstances[Tlas::Unordered].size();
+    Logger::info(str::format("[GPU PATCHING DEBUG] Buffer sizes: patchEntries=", patchEntriesSize,
+                            " bytes (", patchEntries.size(), " entries), blasPtrsBuffer=",
+                            blasPtrsBuffer->info().size, " bytes, instanceDescsBuffer=",
+                            m_vkInstanceBuffer->info().size, " bytes (", totalMergedInstances, " instances)"));
+
+    // SDK MATCH: Create constant buffer for params (binding 0), NOT push constants!
+    struct {
+      uint32_t numPatchEntries;
+      uint32_t blasAddressesBaseIndex;  // Ring buffer offset for this frame
+      uint32_t _pad1;
+      uint32_t _pad2;
+    } params;
+    params.numPatchEntries = static_cast<uint32_t>(patchEntries.size());
+    params.blasAddressesBaseIndex = blasAddressesBaseIndex;
+    params._pad1 = 0;
+    params._pad2 = 0;
+
+    Logger::info(str::format("[GPU PATCHING DEBUG] Params: numPatchEntries=", params.numPatchEntries,
+                            ", blasAddressesBaseIndex=", params.blasAddressesBaseIndex));
+
+    // Log first few patch entries for debugging
+    for (size_t i = 0; i < std::min(size_t(5), patchEntries.size()); i++) {
+      Logger::info(str::format("[GPU PATCHING DEBUG] PatchEntry[", i, "]: tlasIdx=",
+                              patchEntries[i].tlasInstanceIndex, ", blasBufferIdx=",
+                              patchEntries[i].blasBufferIndex, " (ring-adjusted: ",
+                              blasAddressesBaseIndex + patchEntries[i].blasBufferIndex, ")"));
+    }
+
+    DxvkBufferCreateInfo cbInfo = {};
+    cbInfo.size = align(sizeof(params), 256);
+    cbInfo.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    cbInfo.stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    cbInfo.access = VK_ACCESS_UNIFORM_READ_BIT;
+    Rc<DxvkBuffer> patchTlasParamsBuffer = m_device->createBuffer(
+      cbInfo,
+      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+      DxvkMemoryStats::Category::RTXBuffer,
+      "RTXMG Patch TLAS Params");
+
+    ctx->updateBuffer(patchTlasParamsBuffer, 0, sizeof(params), &params);
+    Logger::info(str::format("[GPU PATCHING DEBUG] Constant buffer created and updated"));
+    Logger::info(str::format("[GPU PATCHING DEBUG] ========== ABOUT TO DISPATCH GPU PATCHING SHADER =========="));
+    Logger::info(str::format("[GPU PATCHING DEBUG] Will patch ", params.numPatchEntries, " TLAS instances with BLAS addresses"));
+    Logger::info(str::format("[GPU PATCHING DEBUG] Reading BLAS addresses from blasAddresses[", params.blasAddressesBaseIndex, "...]"));
+    Logger::info(str::format("[GPU PATCHING DEBUG] Writing to instance descriptors in TLAS build buffer"));
+
+    // Bind and dispatch shader (accessed via mega geometry to avoid header include issues)
+    Rc<DxvkShader> shader = megaGeometry->getPatchTlasInstanceShader();
+    if (shader == nullptr) {
+      Logger::err("[GPU PATCHING ERROR] GPU patching shader is NULL!");
+      return;
+    }
+
+    // CRITICAL: Bind shader FIRST
+    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, shader);
+    Logger::info(str::format("[GPU PATCHING DEBUG] Compute shader bound: ", shader->debugName()));
+
+    // SDK MATCH: Bind constant buffer at binding 0
+    ctx->bindResourceBuffer(0, DxvkBufferSlice(patchTlasParamsBuffer, 0, sizeof(params)));
+
+    // Bind shader resources - BINDINGS SHIFTED +1: 0→1, 1→2, 2→3
+    // Binding 1: patchEntries (TLAS index → blasPtrsBuffer index mapping) - shifted +1
+    ctx->bindResourceBuffer(1, DxvkBufferSlice(patchEntriesBuffer, 0, patchEntriesSize));
+
+    // Binding 2: blasAddresses (from cluster extension, ring-buffered) - shifted +1
+    ctx->bindResourceBuffer(2, DxvkBufferSlice(blasPtrsBuffer, 0, blasPtrsBuffer->info().size));
+    Logger::warn(str::format("[GPU PATCHING BUFFERS] blasPtrsBuffer bound: address=0x", std::hex,
+                            blasPtrsBuffer->getDeviceAddress(), std::dec,
+                            ", size=", blasPtrsBuffer->info().size, " bytes"));
+
+    // Binding 3: instanceDescsBuffer (TLAS instances to patch) - shifted +1
+    ctx->bindResourceBuffer(3, DxvkBufferSlice(m_vkInstanceBuffer, 0, m_vkInstanceBuffer->info().size));
+    Logger::warn(str::format("[GPU PATCHING BUFFERS] instanceDescsBuffer bound: address=0x", std::hex,
+                            m_vkInstanceBuffer->getDeviceAddress(), std::dec,
+                            ", size=", m_vkInstanceBuffer->info().size, " bytes"));
+
+    // Dispatch compute shader (256 threads per group)
+    const uint32_t threadsPerGroup = 256;
+    const uint32_t numGroups = (params.numPatchEntries + threadsPerGroup - 1) / threadsPerGroup;
+    Logger::info(str::format("[GPU PATCHING DEBUG] Dispatching compute shader: ", numGroups,
+                            " workgroups × ", threadsPerGroup, " threads = ", numGroups * threadsPerGroup, " total threads"));
+    Logger::info(str::format("[GPU PATCHING DEBUG] (Processing ", params.numPatchEntries, " patch entries)"));
+    Logger::info(str::format("[GPU PATCHING DISPATCH] vkCmdDispatch(", numGroups, ", 1, 1) - ABOUT TO CALL"));
+
+    ctx->dispatch(numGroups, 1, 1);
+
+    Logger::info(str::format("[GPU PATCHING DISPATCH] vkCmdDispatch RETURNED SUCCESSFULLY"));
+    Logger::info(str::format("[GPU PATCHING DEBUG] ========== GPU PATCHING SHADER DISPATCHED =========="));
+    Logger::info(str::format("[GPU PATCHING DEBUG] Shader will read ", params.numPatchEntries, " BLAS addresses and patch instance buffer"));
+
+    // Barrier to ensure GPU patching writes complete before TLAS build reads
+    // CRITICAL: vkCmdBuildAccelerationStructures reads the instance descriptor buffer
+    // - Source: Compute shader writes to buffer (VK_ACCESS_SHADER_WRITE_BIT)
+    // - Dest: TLAS build reads instance buffer (VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR)
+    // The NVIDIA sample uses this pattern for FillInstanceDescs → buildTopLevelAccelStruct
+    Logger::info(str::format("[GPU PATCHING BARRIER] ========== EMITTING POST-PATCH BARRIER =========="));
+    Logger::info(str::format("[GPU PATCHING BARRIER] Ensuring compute shader writes complete before TLAS build"));
+    Logger::info(str::format("[GPU PATCHING BARRIER] Source: VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT"));
+    Logger::info(str::format("[GPU PATCHING BARRIER] Dest: VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR"));
+    ctx->emitMemoryBarrier(0,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      VK_ACCESS_SHADER_WRITE_BIT,
+      VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+      VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR);
+    Logger::info(str::format("[GPU PATCHING DEBUG] Memory barrier emitted successfully"));
+
+    Logger::info(str::format("[GPU PATCHING] Dispatched shader: ", numGroups, " workgroups, ",
+                            patchEntries.size(), " patches"));
+    Logger::info("[GPU PATCHING] patchClusterBlasAddresses complete, returning");
   }
 
   template<Tlas::Type type>
   void AccelManager::internalBuildTlas(Rc<DxvkContext> ctx, size_t& totalScratchSize) {
     static constexpr const char* names[] = { "TLAS_Opaque", "TLAS_NonOpaque" };
+    Logger::info(str::format("[TLAS BUILD DEBUG] ========== Starting internalBuildTlas for ", names[type],
+                            " (Frame ", m_device->getCurrentFrameId(), ") =========="));
     ScopedGpuProfileZone(ctx, names[type]);
     const VkBuildAccelerationStructureFlagsKHR flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR | VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR | additionalAccelerationStructureFlags();
 
@@ -1312,6 +1876,8 @@ namespace dxvk {
     VkAccelerationStructureGeometryInstancesDataKHR instancesVk { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR };
     instancesVk.arrayOfPointers = VK_FALSE;
     instancesVk.data.deviceAddress = m_vkInstanceBuffer->getDeviceAddress();
+    Logger::info(str::format("[TLAS BUILD DEBUG] Instance buffer device address: 0x", std::hex,
+                            instancesVk.data.deviceAddress, std::dec));
 
     // Rewind address to tlas start
     for (size_t n = 0; n < type; ++n) {
@@ -1371,7 +1937,34 @@ namespace dxvk {
     const VkAccelerationStructureBuildRangeInfoKHR* pBuildOffsetInfo = &buildOffsetInfo;
 
     // Build the TLAS
+    Logger::info(str::format("[TLAS TIMING]   vkCmdBuildAccelerationStructures for ", names[type],
+                            ": instances=", numInstances,
+                            ", accelSize=", sizeInfo.accelerationStructureSize / 1024, " KB",
+                            ", scratchSize=", sizeInfo.buildScratchSize / 1024, " KB"));
+    Logger::info(str::format("[TLAS BUILD] ========== ABOUT TO BUILD TLAS: ", names[type], " =========="));
+    Logger::info(str::format("[TLAS BUILD] Number of instances: ", numInstances));
+    Logger::info(str::format("[TLAS BUILD] Acceleration structure size: ", sizeInfo.accelerationStructureSize, " bytes"));
+    Logger::info(str::format("[TLAS BUILD] Scratch size: ", sizeInfo.buildScratchSize, " bytes"));
+    Logger::info(str::format("[TLAS BUILD] buildInfo.type: ", buildInfo.type == VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR ? "TOP_LEVEL" : "UNKNOWN"));
+    Logger::info(str::format("[TLAS BUILD] buildInfo.flags: 0x", std::hex, buildInfo.flags, std::dec));
+    Logger::info(str::format("[TLAS BUILD] buildInfo.mode: ", buildInfo.mode == VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR ? "BUILD" : "UPDATE"));
+    Logger::info(str::format("[TLAS BUILD] buildInfo.srcAccelerationStructure: ", buildInfo.srcAccelerationStructure ? "valid" : "NULL"));
+    Logger::info(str::format("[TLAS BUILD] buildInfo.dstAccelerationStructure: 0x", std::hex,
+                            (uint64_t)buildInfo.dstAccelerationStructure, std::dec));
+    Logger::info(str::format("[TLAS BUILD] buildInfo.scratchData.deviceAddress: 0x", std::hex,
+                            buildInfo.scratchData.deviceAddress, std::dec));
+    Logger::info(str::format("[TLAS BUILD] instancesVk.data.deviceAddress: 0x", std::hex,
+                            topASGeometry.geometry.instances.data.deviceAddress, std::dec));
+    Logger::info(str::format("[TLAS BUILD] instancesVk.arrayOfPointers: ", topASGeometry.geometry.instances.arrayOfPointers ? "TRUE" : "FALSE"));
+    Logger::info(str::format("[TLAS BUILD] buildOffsetInfo.primitiveCount: ", buildOffsetInfo.primitiveCount));
+    Logger::info(str::format("[TLAS BUILD] buildOffsetInfo.primitiveOffset: ", buildOffsetInfo.primitiveOffset));
+    Logger::info(str::format("[TLAS BUILD] CALLING vkCmdBuildAccelerationStructuresKHR NOW..."));
+
     ctx->getCommandList()->vkCmdBuildAccelerationStructuresKHR(1, &buildInfo, &pBuildOffsetInfo);
+
+    Logger::info(str::format("[TLAS BUILD] ========== vkCmdBuildAccelerationStructuresKHR RETURNED =========="));
+    Logger::info(str::format("[TLAS BUILD] TLAS build command for ", names[type], " submitted successfully"));
+    Logger::info(str::format("[TLAS TIMING]   ", names[type], " build command submitted"));
 
     ctx->getCommandList()->trackResource<DxvkAccess::Write>(tlas.accelStructure);
     ctx->getCommandList()->trackResource<DxvkAccess::Write>(m_scratchBuffer);

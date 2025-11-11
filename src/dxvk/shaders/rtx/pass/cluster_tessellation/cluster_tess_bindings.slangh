@@ -1,0 +1,79 @@
+/*
+* Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+#pragma once
+
+// Cluster Tessellation Bindings
+// RTX Mega Geometry cluster-based tessellation compute shader
+
+// Push constants
+struct ClusterTessellationArgs {
+  uint32_t numTriangles;       // Number of input triangles
+  uint32_t gridSize;           // Tessellation grid size (e.g., 12 for 12x12)
+  uint32_t hasNormals;         // 1 if normal buffer is valid
+  uint32_t hasTexcoords;       // 1 if texcoord buffer is valid
+  uint64_t vertexBufferAddress; // Base address of vertex buffer for cluster instances
+  uint32_t pad0;
+  uint32_t pad1;
+};
+
+[[vk::push_constant]]
+ClusterTessellationArgs cb;
+
+// Input buffers - read-only geometry data
+layout(binding = 0) StructuredBuffer<float3> inputPositions;
+layout(binding = 1) StructuredBuffer<float3> inputNormals;
+layout(binding = 2) StructuredBuffer<float2> inputTexcoords;
+layout(binding = 3) StructuredBuffer<uint> inputIndices;
+
+// Output buffers - GPU-resident tessellated geometry
+// Interleaved vertex format: Position(12) + Normal(12) + TexCoord(8) = 32 bytes
+layout(binding = 4) RWByteAddressBuffer outputVertexBuffer;
+layout(binding = 5) RWStructuredBuffer<uint> outputIndexBuffer;
+
+// Cluster metadata output (matches SDK pattern from compute_cluster_tiling.hlsl)
+// This buffer is written by cluster tiling pass and read by BLAS building
+struct Cluster {
+  uint32_t iSurface;        // Surface index
+  uint32_t nVertexOffset;   // Vertex offset
+  uint16_t offsetX;         // X offset in grid
+  uint16_t offsetY;         // Y offset in grid
+  uint8_t sizeX;            // Cluster X size (edges)
+  uint8_t sizeY;            // Cluster Y size (edges)
+  uint8_t pad0;
+  uint8_t pad1;
+};
+
+// Cluster instance data for BLAS building
+// Maps to VkClusterAccelerationStructureInstantiateClusterInfoNV
+// IMPORTANT: Field order and packing MUST match Vulkan SDK structure exactly!
+struct ClusterInstanceData {
+  uint32_t clusterIdOffset;             // Unique cluster ID
+  uint32_t geometryIndexOffset;         // Geometry index (24-bit) + reserved (8-bit) bitfield
+  uint64_t clusterTemplateAddress;      // Device address of CLAS template
+  uint64_t vertexBufferAddress;         // Device address of vertex data
+  uint32_t vertexBufferStrideInBytes;   // Stride between vertices (12 for float3)
+  uint32_t pad0;                        // Padding for alignment
+};
+
+layout(binding = 6) RWStructuredBuffer<Cluster> outputClustersBuffer;
+layout(binding = 7) RWStructuredBuffer<ClusterInstanceData> outputClusterInstancesBuffer;
+layout(binding = 8) StructuredBuffer<uint64_t> inputTemplateAddresses;

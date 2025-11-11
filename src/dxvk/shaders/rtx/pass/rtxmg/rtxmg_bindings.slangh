@@ -1,0 +1,95 @@
+/*
+* Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+*
+* RTX Mega Geometry binding definitions for Slang
+*/
+
+#pragma once
+
+// Cluster structure (must match rtxmg_cluster.h)
+struct Cluster {
+  uint iSurface;        // Surface index
+  uint nVertexOffset;   // Vertex offset
+  uint16_t offsetX;     // Cluster X offset in grid
+  uint16_t offsetY;     // Cluster Y offset in grid
+  uint8_t sizeX;        // Cluster X size (quads)
+  uint8_t sizeY;        // Cluster Y size (quads)
+  uint8_t pad0;
+  uint8_t pad1;
+};
+
+// Cluster shading data (must match rtxmg_cluster.h)
+struct ClusterShadingData {
+  uint16_t edgeSegments[4];  // Edge segment counts
+  float2 texcoords[4];       // Corner texture coordinates
+  uint surfaceId;            // Surface identifier
+  uint vertexOffset;         // Offset into vertex buffer
+  uint16_t clusterOffsetX;   // Cluster grid offset X
+  uint16_t clusterOffsetY;   // Cluster grid offset Y
+  uint8_t clusterSizeX;      // Cluster size X
+  uint8_t clusterSizeY;      // Cluster size Y
+  uint16_t pad0;
+  uint stableClusterId;      // NV-DXVK: Stable cluster ID (excludes size for camera-stable visualization)
+};
+
+// Cluster instantiation indirect args (matches VkClusterAccelerationStructureInstantiateClusterInfoNV)
+// SDK Format:
+//   uint32_t clusterIdOffset
+//   uint32_t geometryIndexOffset:24 + reserved:8 (packed into single uint32)
+//   VkDeviceAddress clusterTemplateAddress (uint64)
+//   VkStridedDeviceAddressNV vertexBuffer (struct with startAddress uint64 + strideInBytes uint64)
+// Total: 32 bytes
+struct ClusterIndirectArgs {
+  uint clusterIdOffset;                   // Offset 0, 4 bytes
+  uint geometryIndexAndReserved;          // Offset 4, 4 bytes (24-bit geomIndex + 8-bit reserved, packed)
+  uint64_t clusterTemplate;               // Offset 8, 8 bytes
+  uint64_t vertexBufferStartAddress;      // Offset 16, 8 bytes
+  uint64_t vertexBufferStrideInBytes;     // Offset 24, 8 bytes
+  // Total: 32 bytes
+};
+
+// Grid sampler (must match rtxmg_cluster.h)
+struct GridSampler {
+  uint16_t edgeSegments[4];  // [x, y, z, w] edge segments
+};
+
+// Tessellation counters (must match rtxmg_counters.h)
+struct TessellationCounters {
+  uint clusters;           // Number of clusters generated
+  uint desiredClusters;    // Number of clusters desired
+  uint desiredVertices;    // Number of vertices desired
+  uint desiredTriangles;   // Number of triangles desired
+  uint desiredClasBlocks;  // Number of CLAS blocks desired
+  uint pad0;
+  uint pad1;
+  uint pad2;
+};
+
+// Surface metadata
+struct SurfaceInfo {
+  uint firstVertex;
+  uint vertexCount;
+  uint firstIndex;
+  uint indexCount;
+  uint materialId;
+  uint geometryId;
+  uint pad0;
+  uint pad1;
+};
+
+// Instance data for GPU batching (Phase 4 - must match rtxmg_cluster_builder.h)
+struct InstanceData {
+  uint64_t inputPositionBuffer;    // Device address to input positions
+  uint64_t inputNormalBuffer;      // Device address to input normals
+  uint64_t inputTexcoordBuffer;    // Device address to input texcoords
+  uint64_t inputIndexBuffer;       // Device address to input indices
+  uint vertexCount;                // Number of vertices in this instance
+  uint indexCount;                 // Number of indices in this instance
+  uint vertexOffset;               // Offset into global output vertex buffer
+  uint indexOffset;                // Offset into global output index buffer
+  uint clusterOffset;              // Offset into global cluster buffer
+  uint surfaceId;                  // Material/surface ID
+  float4x4 transform;              // Per-instance transform matrix (16 floats = 64 bytes)
+  // Total: 128 bytes per instance
+};

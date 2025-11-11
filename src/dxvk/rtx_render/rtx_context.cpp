@@ -42,6 +42,7 @@
 #include "rtx_restir_gi_rayquery.h"
 #include "rtx_composite.h"
 #include "rtx_debug_view.h"
+#include "rtx_mega_geometry_integration.h"
 
 #include "rtx/pass/common_binding_indices.h"
 #include "rtx/pass/raytrace_args.h"
@@ -189,9 +190,15 @@ namespace dxvk {
     reportCpuSimdSupport();
 
     GlobalTime::get().init(RtxOptions::timeDeltaBetweenFrames());
+
+    // Initialize RTX Mega Geometry system
+    initializeMegaGeometry(m_device.ptr());
   }
 
   RtxContext::~RtxContext() {
+    // Shutdown RTX Mega Geometry system
+    shutdownMegaGeometry();
+
     getCommonObjects()->metaExporter().waitForAllExportsToComplete();
 
     if (m_screenshotFrameNum != -1 || m_terminateAppFrameNum != -1) {
@@ -525,14 +532,31 @@ namespace dxvk {
       // Note: Update the Reflex mode in case the option has changed.
       reflex.updateMode();
 
+      Logger::info("[FLAG LIFECYCLE] Setting m_submitContainsInjectRtx = TRUE in injectRTX()");
       m_submitContainsInjectRtx = true;
       m_cachedReflexFrameId = cachedReflexFrameId;
 
       // Update all the GPU buffers needed to describe the scene
+      // CRITICAL: Check cluster BLAS injection status BEFORE calling prepareSceneData,
+      // because prepareSceneData resets the flag! We need to capture this early.
+      Logger::info(str::format("[RTX CONTEXT DEBUG] Frame ", m_device->getCurrentFrameId(), " - About to check cluster BLAS status"));
+      uint32_t clusterBlasCount = getSceneManager().getClusterBlasInjectionCount();
+      Logger::info(str::format("[RTX CONTEXT DEBUG] Frame ", m_device->getCurrentFrameId(),
+                              " - Cluster BLAS count BEFORE prepareSceneData: ", clusterBlasCount));
+
+      Logger::info(str::format("[RTX CONTEXT DEBUG] Frame ", m_device->getCurrentFrameId(), " - About to call prepareSceneData"));
       getSceneManager().prepareSceneData(this, m_execBarriers);
-      
+      Logger::info(str::format("[RTX CONTEXT DEBUG] Frame ", m_device->getCurrentFrameId(), " - prepareSceneData returned"));
+
       // If we really don't have any RT to do, just bail early (could be UI/menus rendering)
-      if (getSceneManager().getSurfaceBuffer() != nullptr) {
+      // CRITICAL: We MUST call buildTlas if cluster BLASes were injected, even if there's no surface buffer!
+      // Otherwise the TLAS will have invalid BLAS references and cause GPU crashes.
+      Logger::info(str::format("[RTX CONTEXT DEBUG] Frame ", m_device->getCurrentFrameId(), " - About to check surface buffer"));
+      bool hasSurfaces = (getSceneManager().getSurfaceBuffer() != nullptr);
+      Logger::info(str::format("[RTX CONTEXT] Frame ", m_device->getCurrentFrameId(),
+                              " has surfaces: ", hasSurfaces ? "YES" : "NO",
+                              ", cluster BLASes injected: ", clusterBlasCount > 0 ? "YES" : "NO"));
+      if (hasSurfaces || clusterBlasCount > 0) {
 
         VkExtent3D downscaledExtent = onFrameBegin(targetImage->info().extent);
 
@@ -546,16 +570,30 @@ namespace dxvk {
         rtOutput.m_primaryDepth = rtOutput.m_primaryDepthQueue.get();
         rtOutput.m_primaryScreenSpaceMotionVector = rtOutput.m_primaryScreenSpaceMotionVectorQueue.get();
 
+        // Update RTX Mega Geometry per frame (build BLAS, update HiZ)
+        updateMegaGeometryPerFrame(this, getSceneManager(), rtOutput.m_primaryDepth.view);
+
         getCommonObjects()->getTextureManager().prepareSamplerFeedback(this);
 
+        // Build TLAS (cluster BLAS addresses will be patched later on GPU in flushCommandList)
+        Logger::info(str::format("[RTX CONTEXT] About to call buildTlas (frame ", m_device->getCurrentFrameId(), ")"));
+        getSceneManager().buildTlas(this);
+        Logger::info(str::format("[RTX CONTEXT] buildTlas returned (frame ", m_device->getCurrentFrameId(), ")"));
+
         // Generate ray tracing constant buffer
+        Logger::info(str::format("[RTX CONTEXT] About to call updateRaytraceArgsConstantBuffer (frame ", m_device->getCurrentFrameId(), ")"));
         updateRaytraceArgsConstantBuffer(rtOutput, downscaledExtent, targetImage->info().extent);
+        Logger::info(str::format("[RTX CONTEXT] updateRaytraceArgsConstantBuffer returned (frame ", m_device->getCurrentFrameId(), ")"));
 
         // Volumetric Lighting
+        Logger::info(str::format("[RTX CONTEXT] About to call dispatchVolumetrics (frame ", m_device->getCurrentFrameId(), ")"));
         dispatchVolumetrics(rtOutput);
-        
+        Logger::info(str::format("[RTX CONTEXT] dispatchVolumetrics returned (frame ", m_device->getCurrentFrameId(), ")"));
+
         // Path Tracing
+        Logger::info(str::format("[RTX CONTEXT] About to call dispatchPathTracing (frame ", m_device->getCurrentFrameId(), ")"));
         dispatchPathTracing(rtOutput);
+        Logger::info(str::format("[RTX CONTEXT] dispatchPathTracing returned (frame ", m_device->getCurrentFrameId(), ")"));
 
         // Neural Radiance Cache
         m_common->metaNeuralRadianceCache().dispatchTrainingAndResolve(*this, rtOutput);
@@ -659,48 +697,70 @@ namespace dxvk {
         // Debug view
         dispatchDebugView(srcImage, rtOutput, captureScreenImage);
 
+        Logger::info(str::format("[RTX CONTEXT] About to call dispatchDLFG (frame ", m_device->getCurrentFrameId(), ")"));
         dispatchDLFG();
+        Logger::info(str::format("[RTX CONTEXT] dispatchDLFG returned (frame ", m_device->getCurrentFrameId(), ")"));
 
         // Blit to the game target
         {
           ScopedGpuProfileZone(this, "Blit to Game");
-          
+
+          Logger::info(str::format("[RTX CONTEXT] About to call blitImageHelper (frame ", m_device->getCurrentFrameId(), ")"));
           // Note: the resolution between srcImage and dstImage always matches
           // so we can use the same blit with nearest neighbor filtering
           assert(srcImage->info().extent == targetImage->info().extent);
           blitImageHelper(this, srcImage, targetImage, VkFilter::VK_FILTER_NEAREST);
+          Logger::info(str::format("[RTX CONTEXT] blitImageHelper returned (frame ", m_device->getCurrentFrameId(), ")"));
         }
 
         // Log stats when an image is taken
         if (captureScreenImage) {
+          Logger::info("[RTX CONTEXT] About to call logStatistics");
           getSceneManager().logStatistics();
+          Logger::info("[RTX CONTEXT] logStatistics returned");
         }
 
+        Logger::info(str::format("[RTX CONTEXT] About to call metaNeuralRadianceCache().onFrameEnd (frame ", m_device->getCurrentFrameId(), ")"));
         m_common->metaNeuralRadianceCache().onFrameEnd(rtOutput);
-        getSceneManager().onFrameEnd(this);
+        Logger::info(str::format("[RTX CONTEXT] metaNeuralRadianceCache().onFrameEnd returned (frame ", m_device->getCurrentFrameId(), ")"));
 
+        Logger::info(str::format("[RTX CONTEXT] About to call getSceneManager().onFrameEnd (frame ", m_device->getCurrentFrameId(), ")"));
+        getSceneManager().onFrameEnd(this);
+        Logger::info(str::format("[RTX CONTEXT] getSceneManager().onFrameEnd returned (frame ", m_device->getCurrentFrameId(), ")"));
+
+        Logger::info(str::format("[RTX CONTEXT] About to call rtOutput.onFrameEnd (frame ", m_device->getCurrentFrameId(), ")"));
         rtOutput.onFrameEnd();
+        Logger::info(str::format("[RTX CONTEXT] rtOutput.onFrameEnd returned (frame ", m_device->getCurrentFrameId(), ")"));
       }
 
       m_previousInjectRtxHadScene = true;
     } else {
+      Logger::info(str::format("[RTX CONTEXT] No surfaces or cluster BLASes, calling clear (frame ", m_device->getCurrentFrameId(), ")"));
       getSceneManager().clear(this, m_previousInjectRtxHadScene);
       m_previousInjectRtxHadScene = false;
 
+      Logger::info(str::format("[RTX CONTEXT] Calling onFrameEndNoRTX (frame ", m_device->getCurrentFrameId(), ")"));
       getSceneManager().onFrameEndNoRTX();
+      Logger::info(str::format("[RTX CONTEXT] onFrameEndNoRTX returned (frame ", m_device->getCurrentFrameId(), ")"));
     }
 
     // Reset the fog state to get it re-discovered on the next frame
     getSceneManager().clearFogState();
 
     // apply changes to RtxOptions after the frame has ended
+    Logger::info(str::format("[RTX CONTEXT] About to apply pending RtxOption values (frame ", m_device->getCurrentFrameId(), ")"));
     RtxOption<bool>::applyPendingValuesOptionLayers();
     RtxOption<bool>::applyPendingValues(m_device.ptr());
+    Logger::info(str::format("[RTX CONTEXT] RtxOption values applied (frame ", m_device->getCurrentFrameId(), ")"));
 
     // Update stats
+    Logger::info(str::format("[RTX CONTEXT] About to call updateMetrics (frame ", m_device->getCurrentFrameId(), ")"));
     updateMetrics(gpuIdleTimeMilliseconds);
+    Logger::info(str::format("[RTX CONTEXT] updateMetrics returned (frame ", m_device->getCurrentFrameId(), ")"));
 
     m_resetHistory = false;
+
+    Logger::info(str::format("[RTX CONTEXT] ========== EXITING injectRTX (frame ", m_device->getCurrentFrameId(), ") =========="));
   }
 
   void RtxContext::endFrame(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targetImage, bool callInjectRtx) {
@@ -797,6 +857,10 @@ namespace dxvk {
 
     RasterGeometry& geoData = drawCallState.geometryData;
     DrawCallTransforms& transformData = drawCallState.transformData;
+
+    // Process geometry through RTX Mega Geometry tessellation
+    // This modifies drawCallState.geometryData buffers in-place before RTX Remix processes them
+    processGeometryWithMegaGeometry(this, params, drawCallState, geoData, getSceneManager());
 
     assert(geoData.futureGeometryHashes.valid());
     assert(geoData.positionBuffer.defined());
@@ -1715,6 +1779,21 @@ namespace dxvk {
       getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE),
       srcImage, rtOutput, *m_common);
 
+    // Render RTX Mega Geometry debug visualization
+    {
+      const uint32_t debugViewIndex = debugView.getDebugViewIndex();
+      DxvkImageViewCreateInfo viewInfo;
+      viewInfo.type = VK_IMAGE_VIEW_TYPE_2D;
+      viewInfo.format = srcImage->info().format;
+      viewInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT;
+      viewInfo.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+      viewInfo.minLevel = 0;
+      viewInfo.numLevels = 1;
+      viewInfo.minLayer = 0;
+      viewInfo.numLayers = 1;
+      renderMegaGeometryDebugView(this, m_device->createImageView(srcImage, viewInfo), debugViewIndex);
+    }
+
     if (captureScreenImage) {
       // For overlayed debug views, we preserve the post tonemapping naming since the post tonemapped image is a base image.
       // The benefit is retention of most of the existing testing pipeline.
@@ -2020,16 +2099,67 @@ namespace dxvk {
     // flush the residue
     tryHandleSky(nullptr, nullptr);
 
+    // Track submission timing and queue depth
+    static auto s_lastSubmitTime = std::chrono::high_resolution_clock::now();
+    static uint32_t s_submitCount = 0;
+    static uint32_t s_lastFrameId = 0;
+
+    auto submitStartTime = std::chrono::high_resolution_clock::now();
+    auto timeSinceLastSubmit = std::chrono::duration_cast<std::chrono::milliseconds>(
+        submitStartTime - s_lastSubmitTime).count();
+
+    uint32_t currentFrameId = m_device->getCurrentFrameId();
+    if (currentFrameId != s_lastFrameId) {
+      if (s_submitCount > 0) {
+        Logger::info(str::format("[RTXMG GPU STATS] Frame ", s_lastFrameId,
+                                " had ", s_submitCount, " command buffer submissions"));
+      }
+      s_submitCount = 0;
+      s_lastFrameId = currentFrameId;
+    }
+    s_submitCount++;
+
+    // NOTE: GPU patching is now handled in AccelManager::buildTlas() (line 1504)
+    // This matches NVIDIA's approach where FillInstanceDescs is called immediately before buildTopLevelAccelStruct
+    // Removed redundant patching call here that was causing early-frame bindless issues
+
+    Logger::info(str::format("[GPU SUBMIT TIMING] >>>>>> ABOUT TO SUBMIT GPU COMMAND BUFFER <<<<<<",
+                            " (frame=", currentFrameId,
+                            ", submitCount=", s_submitCount,
+                            ", timeSinceLastSubmit=", timeSinceLastSubmit, "ms)"));
+    Logger::info("[GPU SUBMIT TIMING] Calling endRecording()...");
+    auto commandList = this->endRecording();
+    Logger::info("[GPU SUBMIT TIMING] endRecording() complete, calling submitCommandList()...");
+    Logger::info(str::format("[GPU SUBMIT] ========== SUBMITTING COMMAND BUFFER =========="));
+    Logger::info(str::format("[GPU SUBMIT] Frame: ", currentFrameId));
+    Logger::info(str::format("[GPU SUBMIT] Submit count: ", s_submitCount));
+    Logger::info(str::format("[GPU SUBMIT] Contains inject RTX: ", m_submitContainsInjectRtx ? "YES" : "NO"));
+    Logger::info(str::format("[GPU SUBMIT] Reflex frame ID: ", m_cachedReflexFrameId));
+    Logger::info(str::format("[GPU SUBMIT] Command list valid: ", (commandList != nullptr) ? "YES" : "NO"));
+    Logger::info(str::format("[GPU SUBMIT] ========== CALLING m_device->submitCommandList() =========="));
+
     m_device->submitCommandList(
-      this->endRecording(),
+      commandList,
       VK_NULL_HANDLE,
       VK_NULL_HANDLE,
       m_submitContainsInjectRtx,
       m_cachedReflexFrameId);
-    
-    // Reset this now that we've completed the submission
-    m_submitContainsInjectRtx = false;
-    
+
+    Logger::info(str::format("[GPU SUBMIT] ========== submitCommandList() RETURNED =========="));
+
+    auto submitEndTime = std::chrono::high_resolution_clock::now();
+    auto submitDuration = std::chrono::duration_cast<std::chrono::milliseconds>(
+        submitEndTime - submitStartTime).count();
+
+    Logger::info(str::format("[GPU SUBMIT TIMING] >>>>>> GPU COMMAND BUFFER SUBMITTED SUCCESSFULLY <<<<<<",
+                            " (took ", submitDuration, "ms)"));
+    Logger::info(str::format("[GPU SUBMIT] No errors, submission successful"));
+    s_lastSubmitTime = submitEndTime;
+
+    // NOTE: m_submitContainsInjectRtx is NO LONGER reset here!
+    // For cluster BLASes, the flag must persist across ALL command buffer submissions in a frame
+    // It will be reset at the start of the next frame in SceneManager::prepareSceneData()
+
     this->beginRecording(
       m_device->createCommandList());
 

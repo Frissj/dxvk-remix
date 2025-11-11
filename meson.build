@@ -803,6 +803,6 @@ if dxvk_is_ninja
   endif
 endif # dxvk_is_ninja
 
-if fs.is_dir('nv-private')
-  subdir('nv-private')
-endif
+# if fs.is_dir('nv-private')
+#   subdir('nv-private')
+# endif

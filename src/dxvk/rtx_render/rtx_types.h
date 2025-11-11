@@ -667,6 +667,7 @@ private:
   friend class TerrainBaker;
   friend struct RemixAPIPrivateAccessor;
   friend class RtxParticleSystemManager;
+  friend class RtxMegaGeometryIntegration;
 
   bool finalizeGeometryHashes();
   void finalizeGeometryBoundingBox();
@@ -678,6 +679,22 @@ private:
 
   RasterGeometry geometryData;
 
+public:
+  // RTX Mega Geometry: Tessellated geometry buffers
+  // These are created in commitGeometryToRT() when tessellation is enabled
+  // Made public for rtx_mega_geometry_integration.cpp access
+  Rc<DxvkBuffer> tessellatedVertexBuffer;
+  Rc<DxvkBuffer> tessellatedIndexBuffer;
+  uint32_t tessellatedVertexCount = 0;
+  uint32_t tessellatedIndexCount = 0;
+  uint32_t tessellatedVertexStride = 0;
+
+  // RTX Mega Geometry: Cluster BLAS geometry hash
+  // Set when tessellated geometry with cluster BLAS is used
+  // Used by SceneManager to inject cluster BLAS instead of building regular BLAS
+  XXH64_hash_t clusterBlasGeometryHash = kEmptyHash;
+
+private:
   // Note: This represents the original material from the D3D9 side, which will always be a LegacyMaterialData
   // whereas the replacement material data used for rendering will be a full MaterialData.
   LegacyMaterialData materialData;
@@ -708,6 +725,12 @@ struct PooledBlas : public RcObject {
   // Keep a copy of the build info so we can validate BLAS update compatibility
   VkAccelerationStructureBuildGeometryInfoKHR buildInfo = {};
   std::vector<uint32_t> primitiveCounts {};
+
+  // Flag to indicate this is a prebuilt cluster BLAS that should not be rebuilt/moved
+  bool isClusterBlas = false;
+
+  // Geometry hash for cluster BLASes (used for GPU-side TLAS patching)
+  XXH64_hash_t clusterBlasGeometryHash = kEmptyHash;
 
   explicit PooledBlas();
   ~PooledBlas();

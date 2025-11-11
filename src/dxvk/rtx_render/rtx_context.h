@@ -91,6 +91,16 @@ namespace dxvk {
     void onPresent(Rc<DxvkImage> targetImage = nullptr);
 
     /**
+      * \brief Set flag indicating this command submission contains cluster BLAS injections
+      *
+      * Called by SceneManager when cluster BLASes are injected. Triggers GPU patching
+      * of TLAS instance descriptors to fill in cluster BLAS addresses from blasPtrsBuffer.
+      *
+      * \param [in] value: true if this submit contains cluster BLAS injections
+      */
+    void setSubmitContainsInjectRtx(bool value) { m_submitContainsInjectRtx = value; }
+
+    /**
       * \brief Set D3D9 specific constant buffers
       *
       * \param [in] vsFixedFunctionConstants: resource idx of the constant buffer for FF vertex shaders
@@ -152,6 +162,16 @@ namespace dxvk {
 #ifdef REMIX_DEVELOPMENT
       m_currentPassStage = currentFramePassStage;
 #endif
+    }
+
+    // Public wrappers for protected pipeline state management
+    // Used to ensure clean state transitions around RTXMG compute work
+    inline void flushRenderPass(bool suspend) {
+      this->spillRenderPass(suspend);
+    }
+
+    inline void cleanupComputePipeline() {
+      this->unbindComputePipeline();
     }
 
   protected:

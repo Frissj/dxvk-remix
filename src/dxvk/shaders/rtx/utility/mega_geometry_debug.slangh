@@ -1,0 +1,198 @@
+/*
+* Copyright (c) 2023-2025, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+#pragma once
+
+// RTX Mega Geometry Debug Visualization
+// Provides functions to visualize cluster-based tessellation data during ray tracing
+
+// Debug view modes (900-907)
+static const uint MEGA_GEOMETRY_DEBUG_VIEW_NONE = 0;
+static const uint MEGA_GEOMETRY_DEBUG_VIEW_CLUSTER_ID = 900;
+static const uint MEGA_GEOMETRY_DEBUG_VIEW_TESSELLATION_DENSITY = 901;
+static const uint MEGA_GEOMETRY_DEBUG_VIEW_SURFACE_UV = 902;
+static const uint MEGA_GEOMETRY_DEBUG_VIEW_SURFACE_INDEX = 903;
+static const uint MEGA_GEOMETRY_DEBUG_VIEW_VERTEX_NORMALS = 904;
+static const uint MEGA_GEOMETRY_DEBUG_VIEW_WIREFRAME = 905;
+static const uint MEGA_GEOMETRY_DEBUG_VIEW_HIZ_VISUALIZATION = 906;
+static const uint MEGA_GEOMETRY_DEBUG_VIEW_CLUSTER_BOUNDS = 907;
+
+// Cluster ID retrieval using SPV_NV_cluster_acceleration_structure extension
+#ifdef __spirv__
+[[vk::ext_extension("SPV_NV_cluster_acceleration_structure")]]
+[[vk::ext_capability(5437)]]
+[[vk::ext_builtin_input(5436)]]
+static const int g_ClusterIDNV;
+
+uint32_t getClusterID()
+{
+  return (uint32_t)g_ClusterIDNV;
+}
+#else
+// Fallback for when cluster extension is not available
+uint32_t getClusterID()
+{
+  return 0;
+}
+#endif
+
+// Hash function for consistent color generation
+uint32_t murmurHash(uint32_t seed, uint32_t value)
+{
+  seed ^= value;
+  seed *= 0x5bd1e995;
+  seed ^= seed >> 15;
+  return seed;
+}
+
+// Convert hash to RGB color
+float3 hashToColor(uint32_t hash)
+{
+  float r = float((hash >> 0) & 0xFF) / 255.0;
+  float g = float((hash >> 8) & 0xFF) / 255.0;
+  float b = float((hash >> 16) & 0xFF) / 255.0;
+  return float3(r, g, b);
+}
+
+// Heat map visualization (blue -> green -> red)
+float3 heatMapColor(float t)
+{
+  t = saturate(t);
+  if (t < 0.5)
+    return lerp(float3(0.0, 0.0, 1.0), float3(0.0, 1.0, 0.0), t * 2.0);
+  else
+    return lerp(float3(0.0, 1.0, 0.0), float3(1.0, 0.0, 0.0), (t - 0.5) * 2.0);
+}
+
+// Check if a mega geometry debug view is active
+bool isMegaGeometryDebugViewActive(uint debugView)
+{
+  return debugView >= MEGA_GEOMETRY_DEBUG_VIEW_CLUSTER_ID &&
+         debugView <= MEGA_GEOMETRY_DEBUG_VIEW_CLUSTER_BOUNDS;
+}
+
+// Apply mega geometry debug visualization to surface color
+// Returns true if debug view was applied (and color was modified)
+bool applyMegaGeometryDebugView(
+  uint debugView,
+  float3 surfaceNormal,
+  float2 surfaceUV,
+  uint surfaceIndex,
+  inout float3 albedo)
+{
+  if (!isMegaGeometryDebugViewActive(debugView))
+    return false;
+
+  // Get cluster ID from hardware builtin (may be 0 if cluster extension not available)
+  // Note: This returns the clusterIdOffset we set during BLAS building
+  uint32_t clusterId = getClusterID();
+
+  // NV-DXVK: Use UV-based stable ID when cluster acceleration structures aren't available
+  // Quantize UV to 256x256 grid and hash for camera-stable visualization
+  uint2 uvQuantized = uint2(frac(surfaceUV) * 256.0);
+  uvQuantized = clamp(uvQuantized, uint2(0, 0), uint2(255, 255));
+
+  uint32_t uvBasedId = murmurHash(0x9E3779B9, surfaceIndex);  // Start with surface as seed
+  uvBasedId = murmurHash(uvBasedId, uvQuantized.x);
+  uvBasedId = murmurHash(uvBasedId, uvQuantized.y);
+
+  // Use cluster ID if available (from CLAS), otherwise use UV-based stable ID
+  uint32_t visualizationId = (clusterId != 0) ? clusterId : uvBasedId;
+
+  float3 debugColor = albedo;
+
+  switch (debugView)
+  {
+    case MEGA_GEOMETRY_DEBUG_VIEW_CLUSTER_ID:
+    {
+      // Hash visualization ID to unique color (cluster ID or surface index)
+      uint32_t hash = murmurHash(0x9E3779B9, visualizationId);
+      debugColor = hashToColor(hash);
+      break;
+    }
+
+    case MEGA_GEOMETRY_DEBUG_VIEW_TESSELLATION_DENSITY:
+    {
+      // Show tessellation density as heat map
+      // Use visualization ID modulo to approximate density
+      float density = saturate(float(visualizationId % 100) / 100.0);
+      debugColor = heatMapColor(density);
+      break;
+    }
+
+    case MEGA_GEOMETRY_DEBUG_VIEW_SURFACE_UV:
+    {
+      // Visualize UV coordinates as RGB (U=red, V=green)
+      debugColor = float3(frac(surfaceUV.x), frac(surfaceUV.y), 0.0);
+      break;
+    }
+
+    case MEGA_GEOMETRY_DEBUG_VIEW_SURFACE_INDEX:
+    {
+      // Hash surface index to unique color
+      uint32_t hash = murmurHash(0x9E3779B9, surfaceIndex);
+      debugColor = hashToColor(hash);
+      break;
+    }
+
+    case MEGA_GEOMETRY_DEBUG_VIEW_VERTEX_NORMALS:
+    {
+      // Visualize normals as RGB colors (remap -1..1 to 0..1)
+      debugColor = surfaceNormal * 0.5 + 0.5;
+      break;
+    }
+
+    case MEGA_GEOMETRY_DEBUG_VIEW_WIREFRAME:
+    {
+      // Show wireframe using UV coordinates
+      float2 gridUV = frac(surfaceUV * 8.0);
+      bool isEdge = (gridUV.x < 0.05 || gridUV.y < 0.05);
+      uint32_t hash = murmurHash(0x9E3779B9, visualizationId);
+      float3 baseColor = hashToColor(hash);
+      debugColor = isEdge ? float3(1.0, 1.0, 1.0) : baseColor * 0.3;
+      break;
+    }
+
+    case MEGA_GEOMETRY_DEBUG_VIEW_HIZ_VISUALIZATION:
+    {
+      // HIZ visualization is not available in closest hit
+      // Fall back to showing cluster/surface ID with blue tint
+      uint32_t hash = murmurHash(0x9E3779B9, visualizationId);
+      debugColor = hashToColor(hash) * float3(0.5, 0.5, 1.0);
+      break;
+    }
+
+    case MEGA_GEOMETRY_DEBUG_VIEW_CLUSTER_BOUNDS:
+    {
+      // Visualize cluster/surface spatial distribution
+      // Hash both ID and spatial position for color
+      uint32_t hash = murmurHash(visualizationId, asuint(surfaceUV.x + surfaceUV.y));
+      debugColor = hashToColor(hash);
+      break;
+    }
+
+    default:
+      return false;
+  }
+
+  albedo = debugColor;
+  return true;
+}

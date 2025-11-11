@@ -343,7 +343,7 @@ namespace dxvk {
           DxvkDeviceFeatures  enabledFeatures) {
     DxvkDeviceExtensions devExtensions;
 
-    std::array<DxvkExt*, 43> devExtensionList = {{
+    std::array<DxvkExt*, 44> devExtensionList = {{
       &devExtensions.amdMemoryOverallocationBehaviour,
       &devExtensions.amdShaderFragmentMask,
       &devExtensions.ext4444Formats,
@@ -380,6 +380,7 @@ namespace dxvk {
       &devExtensions.khrPushDescriptor,
       &devExtensions.khrShaderInt8Float16Types,
       &devExtensions.nvRayTracingInvocationReorder,
+      &devExtensions.nvClusterAccelerationStructure,
       &devExtensions.khrSynchronization2,
       &devExtensions.extOpacityMicromap,
       &devExtensions.nvLowLatency,
@@ -597,6 +598,14 @@ namespace dxvk {
         m_deviceFeatures.extShaderAtomicFloat.shaderBufferFloat32AtomicAdd;
     }
     // NV-DXVK end
+
+    if (devExtensions.nvClusterAccelerationStructure) {
+      enabledFeatures.nvClusterAccelerationStructureFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CLUSTER_ACCELERATION_STRUCTURE_FEATURES_NV;
+      enabledFeatures.nvClusterAccelerationStructureFeatures.pNext =
+        std::exchange(enabledFeatures.core.pNext, &enabledFeatures.nvClusterAccelerationStructureFeatures);
+      enabledFeatures.nvClusterAccelerationStructureFeatures.clusterAccelerationStructure =
+        m_deviceFeatures.nvClusterAccelerationStructureFeatures.clusterAccelerationStructure;
+    }
 
     // NV-DXVK start: Integrate Aftermath
     if (devExtensions.nvDeviceDiagnostics && instance->options().enableAftermath) {
@@ -1002,6 +1011,12 @@ namespace dxvk {
       m_deviceInfo.khrDeviceDriverProperties.pNext = std::exchange(m_deviceInfo.core.pNext, &m_deviceInfo.khrDeviceDriverProperties);
     }
 
+    if (m_deviceExtensions.supports(VK_NV_CLUSTER_ACCELERATION_STRUCTURE_EXTENSION_NAME)) {
+      m_deviceInfo.nvClusterAccelerationStructureProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CLUSTER_ACCELERATION_STRUCTURE_PROPERTIES_NV;
+      m_deviceInfo.nvClusterAccelerationStructureProperties.pNext =
+        std::exchange(m_deviceInfo.core.pNext, &m_deviceInfo.nvClusterAccelerationStructureProperties);
+    }
+
     if (m_deviceExtensions.supports(VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME)) {
       m_deviceInfo.khrShaderFloatControls.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES_KHR;
       m_deviceInfo.khrShaderFloatControls.pNext = std::exchange(m_deviceInfo.core.pNext, &m_deviceInfo.khrShaderFloatControls);
@@ -1120,6 +1135,12 @@ namespace dxvk {
       m_deviceFeatures.khrDeviceRayTracingPipelineFeatures.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.khrDeviceRayTracingPipelineFeatures);
     }
 
+    if (m_deviceExtensions.supports(VK_NV_CLUSTER_ACCELERATION_STRUCTURE_EXTENSION_NAME)) {
+      m_deviceFeatures.nvClusterAccelerationStructureFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CLUSTER_ACCELERATION_STRUCTURE_FEATURES_NV;
+      m_deviceFeatures.nvClusterAccelerationStructureFeatures.pNext =
+        std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.nvClusterAccelerationStructureFeatures);
+    }
+
     if (m_deviceExtensions.supports(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME)) {
       m_deviceFeatures.khrBufferDeviceAddress.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES_KHR;
       m_deviceFeatures.khrBufferDeviceAddress.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.khrBufferDeviceAddress);
@@ -1225,6 +1246,8 @@ namespace dxvk {
       "\n", VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME,
       "\n  vertexAttributeInstanceRateDivisor     : ", features.extVertexAttributeDivisor.vertexAttributeInstanceRateDivisor ? "1" : "0",
       "\n  vertexAttributeInstanceRateZeroDivisor : ", features.extVertexAttributeDivisor.vertexAttributeInstanceRateZeroDivisor ? "1" : "0",
+      "\n", VK_NV_CLUSTER_ACCELERATION_STRUCTURE_EXTENSION_NAME,
+      "\n  clusterAccelerationStructure           : ", features.nvClusterAccelerationStructureFeatures.clusterAccelerationStructure ? "1" : "0",
       "\n", VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME,
       "\n  bufferDeviceAddress                    : ", features.khrBufferDeviceAddress.bufferDeviceAddress));
   }

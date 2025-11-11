@@ -677,12 +677,8 @@ namespace dxvk {
     const VkIndexType indexBufferType = getOptimalIndexFormat(input.vertexCount);
     const uint32_t indexStride = (indexBufferType == VK_INDEX_TYPE_UINT16) ? 2 : 4;
 
-    // TODO: Dont support 32-bit indices here yet
-    if (indexBufferType != VK_INDEX_TYPE_UINT16 || (input.indexBuffer.defined() && input.indexBuffer.indexType() != VK_INDEX_TYPE_UINT16)) {
-      ONCE(Logger::err("Not implemented yet, generating indices for a mesh which has 32-bit indices"));
-      return false;
-    }
-
+    // RTX Mega Geometry: Enable 32-bit index support for large tessellated meshes
+    // The shader already handles both 16-bit and 32-bit indices via indexStride
     assert(output->info().size == align(indexCount * indexStride, CACHE_LINE_SIZE));
 
     // Prepare shader arguments

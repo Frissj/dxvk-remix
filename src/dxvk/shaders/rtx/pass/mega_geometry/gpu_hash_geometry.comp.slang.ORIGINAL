@@ -1,0 +1,120 @@
+/*
+* GPU-side geometry hashing for mega geometry cache
+* Hashes vertex position data directly on GPU to avoid CPU readback
+*
+* ORIGINAL COMPLETE IMPLEMENTATION
+* This version was fully functional but causes GPU timeout when dispatched.
+* The timeout occurs AFTER the shader executes successfully, suggesting a
+* pipeline state, descriptor binding, or synchronization issue rather than
+* a problem with the shader code itself.
+*
+* Preserved: 2025-11-06
+*/
+
+#include "rtx/utility/common.slangh"
+
+layout(binding = 0)
+ByteAddressBuffer VertexPositions;
+
+layout(binding = 1)
+ByteAddressBuffer Indices;
+
+layout(binding = 2)
+RWByteAddressBuffer HashOutput;
+
+struct PushConstants {
+  uint vertexCount;
+  uint indexCount;
+  uint positionStride;  // In floats (e.g., 3 for vec3, 4 for padded vec4)
+  uint hasIndices;
+  uint positionBufferOffset;  // Byte offset into position buffer
+  uint indexBufferOffset;     // Byte offset into index buffer
+  uint indexIs16Bit;          // 1 if indices are uint16, 0 if uint32
+};
+
+layout(push_constant)
+ConstantBuffer<PushConstants> cb;
+
+// FNV-1a 64-bit constants (constructed from two 32-bit values)
+static const uint64_t FNV_OFFSET_BASIS = (uint64_t(0xcbf29ce4) << 32) | uint64_t(0x84222325);
+static const uint64_t FNV_PRIME = (uint64_t(0x00000100) << 32) | uint64_t(0x000001b3);
+
+// Simple 64-bit hash function (FNV-1a variant)
+uint64_t hash64(uint64_t hash, uint value) {
+  hash ^= uint64_t(value);
+  hash *= FNV_PRIME;
+  return hash;
+}
+
+groupshared uint64_t localHashes[64];
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void main(uint3 threadId : SV_GroupThreadID, uint3 globalId : SV_DispatchThreadID) {
+  uint tid = threadId.x;
+  uint gid = globalId.x;
+
+  uint64_t myHash = FNV_OFFSET_BASIS;
+
+  // Hash vertex positions (only x,y,z components, skip padding)
+  // Note: We bind the whole buffer and use positionBufferOffset to account for the slice
+  uint verticesPerThread = (cb.vertexCount + 63) / 64;
+  for (uint i = 0; i < verticesPerThread; i++) {
+    uint vertexIndex = gid + i * 64;
+    if (vertexIndex < cb.vertexCount) {
+      // ByteOffset = sliceOffset + vertexIndex * stride * sizeof(float)
+      uint byteOffset = cb.positionBufferOffset + vertexIndex * cb.positionStride * 4;
+
+      // Hash x, y, z as raw bits
+      uint x = VertexPositions.Load(byteOffset + 0);
+      uint y = VertexPositions.Load(byteOffset + 4);
+      uint z = VertexPositions.Load(byteOffset + 8);
+
+      myHash = hash64(myHash, x);
+      myHash = hash64(myHash, y);
+      myHash = hash64(myHash, z);
+    }
+  }
+
+  // Hash indices if present
+  if (cb.hasIndices != 0) {
+    uint indicesPerThread = (cb.indexCount + 63) / 64;
+    for (uint i = 0; i < indicesPerThread; i++) {
+      uint indexIdx = gid + i * 64;
+      if (indexIdx < cb.indexCount) {
+        uint indexValue;
+        if (cb.indexIs16Bit != 0) {
+          // 16-bit indices: Load as ushort, need to handle alignment
+          uint byteOffset = cb.indexBufferOffset + indexIdx * 2;
+          uint dwordOffset = byteOffset & ~3;  // Align to 4-byte boundary
+          uint dword = Indices.Load(dwordOffset);
+          // Extract the correct 16-bit value based on alignment
+          indexValue = (byteOffset & 2) ? (dword >> 16) : (dword & 0xFFFF);
+        } else {
+          // 32-bit indices
+          indexValue = Indices.Load(cb.indexBufferOffset + indexIdx * 4);
+        }
+        myHash = hash64(myHash, indexValue);
+      }
+    }
+  }
+
+  // Store local hash
+  localHashes[tid] = myHash;
+  GroupMemoryBarrierWithGroupSync();
+
+  // Parallel reduction to combine all hashes
+  for (uint stride = 32; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      localHashes[tid] = hash64(localHashes[tid], uint(localHashes[tid + stride]));
+    }
+    GroupMemoryBarrierWithGroupSync();
+  }
+
+  // Thread 0 writes final result
+  if (tid == 0) {
+    // Store 64-bit hash as two 32-bit values
+    uint64_t finalHash = localHashes[0];
+    HashOutput.Store2(0, uint2(uint(finalHash & 0xFFFFFFFF), uint(finalHash >> 32)));
+  }
+}

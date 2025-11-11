@@ -165,19 +165,24 @@ namespace dxvk {
           // this work for best latency reduction while minimizing performance impact.  So we tag the submit
           // upstream (RtxContext) which contains the injectRTX call as the one we want to wrap with Reflex markers.
           // NV-DXVK start: Reflex render submit
-          if (entry.submit.insertReflexRenderMarkers) {
-            reflex.beginRendering(entry.submit.cachedReflexFrameId);
-          }
-
-          status = entry.submit.cmdList->submit(
-            entry.submit.waitSync,
-            entry.submit.wakeSync);
-
-          if (entry.submit.insertReflexRenderMarkers) {
-            reflex.endRendering(entry.submit.cachedReflexFrameId);
-          }
-          // NV-DXVK end
+        if (entry.submit.insertReflexRenderMarkers) {
+          reflex.beginRendering(entry.submit.cachedReflexFrameId);
         }
+
+        Logger::info(str::format("[DxvkSubmissionQueue] Preparing submit: waitSemaphore=0x", std::hex, entry.submit.waitSync,
+          ", wakeSemaphore=0x", entry.submit.wakeSync, std::dec,
+          ", insertMarkers=", entry.submit.insertReflexRenderMarkers));
+
+        status = entry.submit.cmdList->submit(
+          entry.submit.waitSync,
+          entry.submit.wakeSync);
+
+        if (entry.submit.insertReflexRenderMarkers) {
+          reflex.endRendering(entry.submit.cachedReflexFrameId);
+        }
+        // NV-DXVK end
+        Logger::info(str::format("[DxvkSubmissionQueue] Submit result: ", status));
+      }
         // NV-DXVK start: DLFG integration
         else if (entry.frameInterpolation.valid()) {
           // stash frame interpolation data for next present call
@@ -242,9 +247,12 @@ namespace dxvk {
       lock = std::unique_lock<dxvk::mutex>(m_mutex);
 
       if (status == VK_SUCCESS) {
+        Logger::info("[DxvkSubmissionQueue] Submission succeeded");
         if (entry.submit.cmdList != nullptr)
           m_finishQueue.push(std::move(entry));
       } else if (status == VK_ERROR_DEVICE_LOST || entry.submit.cmdList != nullptr) {
+        Logger::err(str::format("[DxvkSubmissionQueue] Submission failure: ", status,
+          ", pending=", m_pending, ", finishQueue=", m_finishQueue.size(), ", submitQueue=", m_submitQueue.size()));
         Logger::err(str::format("DxvkSubmissionQueue: Command submission failed: ", status));
         m_lastError = status;
         

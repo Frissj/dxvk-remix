@@ -70,12 +70,44 @@ namespace dxvk {
       const auto path = getFilePath(fileName);
 
       if (!path.empty()) {
+#ifdef _WIN32
+        // NV-DXVK start: Use Windows native file handle with FILE_FLAG_WRITE_THROUGH
+        // This bypasses OS cache and forces immediate disk writes, making logs crash-safe
+        uint32_t attempt = 0;
+        while (attempt < 4) {
+          m_hFile = CreateFileA(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, NULL,
+                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, NULL);
+          if (m_hFile != INVALID_HANDLE_VALUE) {
+            break;
+          }
+          attempt++;
+        }
+        if (m_hFile == INVALID_HANDLE_VALUE) {
+          OutputDebugStringA("[DXVK] Failed to create log file with FILE_FLAG_WRITE_THROUGH\n");
+        }
+        // NV-DXVK end
+#else
         m_fileStream = std::ofstream(str::tows(path.c_str()).c_str());
         assert(m_fileStream.is_open());
+        if (m_fileStream.is_open()) {
+          m_fileStream << std::unitbuf;
+        }
+#endif
       }
     }
   }
   
+  Logger::~Logger() {
+#ifdef _WIN32
+    // NV-DXVK start: Close Windows file handle
+    if (m_hFile != INVALID_HANDLE_VALUE) {
+      CloseHandle(m_hFile);
+      m_hFile = INVALID_HANDLE_VALUE;
+    }
+    // NV-DXVK end
+#endif
+  }
+
   void Logger::initRtxLog() {
     s_instance = std::move(Logger("remix-dxvk.log"));
   }
@@ -132,9 +164,21 @@ namespace dxvk {
         }
         // NV-DXVK end
 
+#ifdef _WIN32
+        // NV-DXVK start: Use WriteFile with FILE_FLAG_WRITE_THROUGH handle for crash-safe logging
+        if (m_hFile != INVALID_HANDLE_VALUE) {
+          std::string logLine = std::string(timeString) + prefix + line + "\n";
+          DWORD bytesWritten;
+          WriteFile(m_hFile, logLine.c_str(), static_cast<DWORD>(logLine.length()), &bytesWritten, NULL);
+          // No flush needed - FILE_FLAG_WRITE_THROUGH guarantees immediate disk write
+        }
+        // NV-DXVK end
+#else
         if (m_fileStream) {
           m_fileStream << timeString << prefix << line << std::endl;
+          m_fileStream.flush();
         }
+#endif
       }
     }
   }
@@ -181,6 +225,11 @@ namespace dxvk {
     m_minLevel = other.m_minLevel;
     m_doublePrintToStdErr = other.m_doublePrintToStdErr;
     std::swap(m_fileStream, other.m_fileStream);
+#ifdef _WIN32
+    // NV-DXVK start: Transfer Windows file handle
+    std::swap(m_hFile, other.m_hFile);
+    // NV-DXVK end
+#endif
     return *this;
   }
   

@@ -1,0 +1,157 @@
+/*
+* Copyright (c) 2023-2025, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+
+// RTX Mega Geometry: Common Shader Definitions
+// Shared structures and constants for cluster-based tessellation
+
+#ifndef CLUSTER_COMMON_SLANGH
+#define CLUSTER_COMMON_SLANGH
+
+// Cluster constants
+static const uint kMaxClusterEdgeSegments = 11;
+static const uint kMaxClusterVertices = 144; // (11+1)*(11+1)
+static const uint kMaxClusterTriangles = 242; // 11*11*2
+
+/**
+ * Cluster vertex data
+ */
+struct ClusterVertex {
+  float3 position;
+  float3 normal;
+  float2 texCoord;
+  uint clusterId;
+};
+
+/**
+ * Cluster shading data
+ */
+struct ClusterShadingData {
+  uint surfaceIndex;
+  uint patchIndex;
+  uint materialId;
+  uint instanceId;
+
+  float2 uvMin;
+  float2 uvMax;
+
+  float lodLevel;
+  uint vertexOffset;
+  uint indexOffset;
+  uint vertexCount;
+
+  uint triangleCount;
+  uint gridSizeX;
+  uint gridSizeY;
+  uint visible;
+};
+
+/**
+ * Cluster tiling info
+ */
+struct ClusterTilingInfo {
+  uint surfaceIndex;
+  uint instanceId;
+  uint clusterCountX;
+  uint clusterCountY;
+
+  uint totalClusters;
+  uint baseClusterId;
+  uint gridSizeX;
+  uint gridSizeY;
+
+  float4x4 localToWorld;
+
+  float4 boundingBoxMin;
+  float4 boundingBoxMax;
+};
+
+/**
+ * Surface info (subdivision surface metadata)
+ */
+struct SurfaceInfo {
+  uint vertexCount;
+  uint faceCount;
+  uint patchCount;
+  uint materialId;
+
+  float3 boundingBoxMin;
+  float pad0;
+  float3 boundingBoxMax;
+  float pad1;
+
+  float3 corner0;
+  float pad2;
+  float3 corner1;
+  float pad3;
+  float3 corner2;
+  float pad4;
+  float3 corner3;
+  float pad5;
+};
+
+/**
+ * Instance info
+ */
+struct InstanceInfo {
+  uint instanceId;
+  uint surfaceIndex;
+  uint materialId;
+  uint pad;
+
+  float4x4 localToWorld;
+  float4x4 worldToLocal;
+};
+
+/**
+ * Tessellation mode
+ */
+static const uint TESS_MODE_UNIFORM = 0;
+static const uint TESS_MODE_WORLD_SPACE_EDGE_LENGTH = 1;
+static const uint TESS_MODE_SPHERICAL_PROJECTION = 2;
+
+/**
+ * Visibility mode
+ */
+static const uint VIS_MODE_SURFACE = 0;
+static const uint VIS_MODE_LIMIT_EDGES = 1;
+
+/**
+ * Cluster statistics
+ */
+struct ClusterStatistics {
+  uint totalClusters;
+  uint visibleClusters;
+  uint culledByHiZ;
+  uint culledByFrustum;
+
+  uint culledByBackface;
+  uint totalVertices;
+  uint totalTriangles;
+  uint memoryUsedBytes;
+
+  float avgTessellationRate;
+  float minEdgeLength;
+  float maxEdgeLength;
+  uint pad[5];
+};
+
+#endif // CLUSTER_COMMON_SLANGH

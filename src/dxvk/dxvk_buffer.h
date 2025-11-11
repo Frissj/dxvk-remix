@@ -140,6 +140,7 @@ namespace dxvk {
    */
   class DxvkBuffer : public DxvkResource {
     friend class DxvkBufferView;
+    friend class DxvkAccelStructure;  // NV-DXVK: Allow cluster BLAS wrapping
   public:
     
     DxvkBuffer(

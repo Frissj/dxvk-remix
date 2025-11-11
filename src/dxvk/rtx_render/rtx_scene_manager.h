@@ -152,6 +152,7 @@ public:
   
   const InstanceManager& getInstanceManager() const { return m_instanceManager; }
   const AccelManager& getAccelManager() const { return m_accelManager; }
+  AccelManager& getAccelManager() { return m_accelManager; }
   const LightManager& getLightManager() const { return m_lightManager; }
   const GraphManager& getGraphManager() const { return m_graphManager; }
   const RayPortalManager& getRayPortalManager() const { return m_rayPortalManager; }
@@ -193,6 +194,8 @@ public:
   void clear(Rc<DxvkContext> ctx, bool needWfi);
   void garbageCollection();
   void prepareSceneData(Rc<RtxContext> ctx, class DxvkBarrierSet& execBarriers);
+  void buildTlas(Rc<RtxContext> ctx);
+  uint32_t getClusterBlasInjectionCount() const;
 
   void onFrameEnd(Rc<DxvkContext> ctx);
   void onFrameEndNoRTX();
@@ -359,6 +362,9 @@ private:
 
   // Mesh hash tracking for current frame (hash -> count)
   std::unordered_map<XXH64_hash_t, uint32_t> m_currentFrameMeshHashes;
+
+  // Flag indicating cluster BLASes were injected this frame (triggers GPU patching)
+  bool m_hasClusterBlasThisFrame = false;
 };
 
 }  // namespace nvvk

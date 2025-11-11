@@ -311,6 +311,14 @@ namespace dxvk {
     rayPipelineInfo.layout = m_layout->pipelineLayout();
     rayPipelineInfo.basePipelineIndex = -1;
     rayPipelineInfo.flags = m_shaders.pipelineFlags;
+
+    VkRayTracingPipelineClusterAccelerationStructureCreateInfoNV clusterPipelineInfo{
+      VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CLUSTER_ACCELERATION_STRUCTURE_CREATE_INFO_NV };
+    if (m_pipeMgr->m_device->extensions().nvClusterAccelerationStructure) {
+      clusterPipelineInfo.allowClusterAccelerationStructure = VK_TRUE;
+      clusterPipelineInfo.pNext = const_cast<void*>(rayPipelineInfo.pNext);
+      rayPipelineInfo.pNext = &clusterPipelineInfo;
+    }
     
     auto& rtProperties = m_pipeMgr->m_device->properties().khrDeviceRayTracingPipelineProperties;
     THROW_IF_FALSE(rtProperties.maxRayRecursionDepth >= rayPipelineInfo.maxPipelineRayRecursionDepth);

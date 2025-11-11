@@ -338,6 +338,7 @@ namespace dxvk {
     DxvkExt nvDeviceDiagnosticCheckpoints     = { VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME,       DxvkExtMode::Optional };
     // NV-DXVK end
     DxvkExt nvRayTracingInvocationReorder     = { VK_NV_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME,      DxvkExtMode::Optional };
+    DxvkExt nvClusterAccelerationStructure    = { "VK_NV_cluster_acceleration_structure",                  DxvkExtMode::Optional };
 
     // Opacity micromap
     DxvkExt khrSynchronization2               = { VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME,                  DxvkExtMode::Optional };

@@ -119,12 +119,22 @@ namespace dxvk {
     
     /**
      * \brief Synchronizes command buffer execution
-     * 
+     *
      * Waits for the fence associated with
      * this command buffer to get signaled.
      * \returns Synchronization status
      */
     VkResult synchronize();
+
+    /**
+     * \brief Get the fence for this command list
+     *
+     * Used for checking fence status without blocking.
+     * \returns The Vulkan fence handle
+     */
+    VkFence fence() const {
+      return m_fence;
+    }
     
     /**
      * \brief Stat counters

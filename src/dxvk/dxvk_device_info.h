@@ -25,6 +25,7 @@ namespace dxvk {
     VkPhysicalDeviceDriverPropertiesKHR                       khrDeviceDriverProperties;
     VkPhysicalDeviceRayTracingPipelinePropertiesKHR           khrDeviceRayTracingPipelineProperties;
     VkPhysicalDeviceAccelerationStructurePropertiesKHR        khrDeviceAccelerationStructureProperties;
+    VkPhysicalDeviceClusterAccelerationStructurePropertiesNV  nvClusterAccelerationStructureProperties;
     VkPhysicalDeviceFloatControlsPropertiesKHR                khrShaderFloatControls;
     VkPhysicalDeviceOpacityMicromapPropertiesEXT              extOpacityMicromapProperties;
     VkPhysicalDeviceRayTracingInvocationReorderPropertiesNV   nvRayTracingInvocationReorderProperties;
@@ -54,6 +55,7 @@ namespace dxvk {
   	VkPhysicalDeviceRayQueryFeaturesKHR	                      khrRayQueryFeatures;
     VkPhysicalDeviceRayTracingPipelineFeaturesKHR	            khrDeviceRayTracingPipelineFeatures;
   	VkPhysicalDeviceAccelerationStructureFeaturesKHR          khrAccelerationStructureFeatures;
+    VkPhysicalDeviceClusterAccelerationStructureFeaturesNV    nvClusterAccelerationStructureFeatures;
     VkPhysicalDeviceShaderAtomicFloatFeaturesEXT              extShaderAtomicFloat;
     VkPhysicalDeviceDiagnosticsConfigFeaturesNV               nvDeviceDiagnosticsConfig;
     VkPhysicalDeviceBufferDeviceAddressFeaturesKHR            khrBufferDeviceAddress;

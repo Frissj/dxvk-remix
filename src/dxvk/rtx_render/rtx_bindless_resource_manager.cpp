@@ -121,13 +121,17 @@ namespace dxvk {
 
   void BindlessResourceManager::prepareSceneData(const Rc<DxvkContext> ctx, const std::vector<TextureRef>& rtTextures, const std::vector<RaytraceBuffer>& rtBuffers, const std::vector<Rc<DxvkSampler>>& samplers) {
     ScopedCpuProfileZone();
-    if (m_frameLastUpdated == m_device->getCurrentFrameId()) {
-      Logger::debug("Updating bindless tables multiple times per frame...");
+    uint32_t currentFrameId = m_device->getCurrentFrameId();
+    Logger::info(str::format("[BINDLESS] prepareSceneData called: m_frameLastUpdated=", m_frameLastUpdated, ", currentFrameId=", currentFrameId));
+
+    if (m_frameLastUpdated == currentFrameId) {
+      Logger::info("[BINDLESS] Already updated this frame, returning early");
       return;
     }
 
     // Increment
     m_globalBindlessDescSetIdx = nextIdx();
+    Logger::info(str::format("[BINDLESS] Updating bindless tables for frame ", currentFrameId));
 
     const VkDescriptorImageInfo dummyImage = m_device->getCommon()->dummyResources().imageViewDescriptor(VK_IMAGE_VIEW_TYPE_2D, true);
     const VkDescriptorBufferInfo dummyBuffer = m_device->getCommon()->dummyResources().bufferDescriptor();
@@ -137,7 +141,8 @@ namespace dxvk {
     createDescriptorSet<VK_DESCRIPTOR_TYPE_STORAGE_BUFFER>(ctx, rtBuffers, dummyBuffer);
     createDescriptorSet<VK_DESCRIPTOR_TYPE_SAMPLER>(ctx, samplers, dummySampler);
 
-    m_frameLastUpdated = m_device->getCurrentFrameId();
+    m_frameLastUpdated = currentFrameId;
+    Logger::info(str::format("[BINDLESS] Bindless tables updated, m_frameLastUpdated now = ", m_frameLastUpdated));
   }
 
   BindlessResourceManager::BindlessTable::~BindlessTable() {

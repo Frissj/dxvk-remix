@@ -105,6 +105,9 @@ public:
 
   void buildTlas(Rc<DxvkContext> ctx);
 
+  // GPU patching of cluster BLAS addresses in TLAS instance descriptors
+  void patchClusterBlasAddresses(Rc<DxvkContext> ctx);
+
   // Returns the number of live BLAS objects
   static uint32_t getBlasCount();
 

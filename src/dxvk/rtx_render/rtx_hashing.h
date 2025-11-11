@@ -62,7 +62,14 @@ namespace dxvk {
 
     const uint32_t LegacyAssetHash1 = (1 << (uint32_t)HashComponents::LegacyPositions1)
                                     | (1 << (uint32_t)HashComponents::LegacyIndices);
-    const uint32_t Total = 5;
+
+    // Geometry-only hash for mega geometry caching
+    // ONLY positions + indices, excludes layout/shader that vary per draw call
+    // Stable for static geometry across frames, changes for deforming geometry
+    const uint32_t GeometryDataOnly = (1 << (uint32_t)HashComponents::VertexPosition)
+                                    | (1 << (uint32_t)HashComponents::Indices);
+
+    const uint32_t Total = 6;
   }
 
   // Structure contains data required to perform a hash operation on specific data

@@ -52,7 +52,7 @@ namespace dxvk {
     // NV-DXVK start: pass log level as param
     Logger(const std::string& fileName, const LogLevel logLevel = getMinLogLevel());
     // NV-DXVK end
-    ~Logger() = default;
+    ~Logger();
     
     // NV-DXVK start: special init pathway for remix logs
     static void initRtxLog();
@@ -80,14 +80,20 @@ namespace dxvk {
     
     dxvk::mutex   m_mutex;
     std::ofstream m_fileStream;
-    
+
+#ifdef _WIN32
+    // NV-DXVK start: Use Windows native file handle for crash-safe logging
+    HANDLE m_hFile = INVALID_HANDLE_VALUE;
+    // NV-DXVK end
+#endif
+
     void emitMsg(LogLevel level, const std::string& message);
-    
+
     static LogLevel getMinLogLevel();
     static std::string getFilePath(const std::string& fileName);
 
     Logger& operator=(Logger&& other);
 
   };
-  
+
 }

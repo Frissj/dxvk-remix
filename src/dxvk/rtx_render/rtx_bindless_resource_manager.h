@@ -53,6 +53,10 @@ namespace dxvk {
       return m_tables[type][currentIdx()]->layout;
     }
 
+    uint32_t getFrameLastUpdated() const {
+      return m_frameLastUpdated;
+    }
+
   private:
 
     struct BindlessTable {

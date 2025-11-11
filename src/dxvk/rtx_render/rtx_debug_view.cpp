@@ -329,6 +329,32 @@ namespace dxvk {
                                                   "  1: World Normal\n"
                                                   "  2: World Tangent\n"
                                                   "  3: World Bitangent" },
+
+        // RTX Mega Geometry Debug Views (Always-On Cluster Tessellation)
+        {DEBUG_VIEW_MEGA_GEOMETRY_CLUSTER_ID,               "Mega Geometry: Cluster ID",
+                                                            "Shows unique ID for each tessellated cluster.\n"
+                                                            "Colors indicate different clusters in the scene."},
+        {DEBUG_VIEW_MEGA_GEOMETRY_TESSELLATION_DENSITY,     "Mega Geometry: Tessellation Density",
+                                                            "Heat map visualization: Blue (low) -> Green (medium) -> Red (high)\n"
+                                                            "Shows adaptive tessellation density per cluster based on screen-space size."},
+        {DEBUG_VIEW_MEGA_GEOMETRY_SURFACE_UV,               "Mega Geometry: Surface UV Coordinates",
+                                                            "Shows parametric UV coordinates on tessellated subdivision surfaces.\n"
+                                                            "Useful for verifying texture coordinate interpolation."},
+        {DEBUG_VIEW_MEGA_GEOMETRY_SURFACE_INDEX,            "Mega Geometry: Surface Index",
+                                                            "Shows which base surface each cluster belongs to.\n"
+                                                            "Each color represents a different source surface."},
+        {DEBUG_VIEW_MEGA_GEOMETRY_VERTEX_NORMALS,           "Mega Geometry: Vertex Normals",
+                                                            "Shows interpolated vertex normals on tessellated geometry.\n"
+                                                            "RGB maps to XYZ normal components."},
+        {DEBUG_VIEW_MEGA_GEOMETRY_WIREFRAME,                "Mega Geometry: Wireframe Overlay",
+                                                            "Overlays cluster wireframe on rendered geometry.\n"
+                                                            "Shows tessellation grid structure."},
+        {DEBUG_VIEW_MEGA_GEOMETRY_HIZ_VISUALIZATION,        "Mega Geometry: HiZ Culling Visualization",
+                                                            "Shows results of hierarchical Z-buffer occlusion culling.\n"
+                                                            "Green = visible clusters, Red = culled clusters."},
+        {DEBUG_VIEW_MEGA_GEOMETRY_CLUSTER_BOUNDS,           "Mega Geometry: Cluster Bounding Boxes",
+                                                            "Shows axis-aligned bounding boxes for each cluster.\n"
+                                                            "Useful for debugging spatial acceleration structures."},
     } };
 
   // Note: this does a linear search through the debug view vector so do not use it in performance critical code

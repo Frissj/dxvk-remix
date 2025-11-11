@@ -1350,10 +1350,12 @@ namespace dxvk {
 
     // Developer Options
     static bool areValidationLayersEnabled() {
-#ifndef _DEBUG
-      return enableValidationLayers();
-#else
+      // TEMPORARY: Force validation layers ON for RTXMG debugging
       return true;
+#ifndef _DEBUG
+      //return enableValidationLayers();
+#else
+      //return true;
 #endif
     }
 
