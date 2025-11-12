@@ -291,11 +291,19 @@ namespace dxvk {
       return;
     }
 
+    // Step 3: SAMPLE MATCH - Inject cluster BLASes into scene instances (BEFORE TLAS build)
+    // This is CPU-side only - modifies instance BLAS references in the scene
+    // Must happen after BLAS build but before TLAS upload/build
+    Logger::info("[RTXMG BUILD ACCEL] Injecting cluster BLASes into scene instances...");
+    SceneManager& sceneManager = ctx->getCommonObjects()->getSceneManager();
+    injectClusterBlasesIntoScene(rtxCtx, sceneManager, this);
+    Logger::info("[RTXMG BUILD ACCEL] Cluster BLAS injection complete");
+
     // NOTE: Do NOT flush here! TLAS build must happen in the same command buffer for barriers to work.
     // NVIDIA's sample (rtxmg_renderer.cpp:1062-1160) does BuildAccel → FillInstanceDescs → buildTopLevelAccelStruct
     // ALL IN THE SAME COMMAND LIST with NO flush between them.
     // Barriers only work within the same command buffer!
-    Logger::info(str::format("[RTXMG BUILD ACCEL] COMPLETE: Built unified CLAS+BLAS for ",
+    Logger::info(str::format("[RTXMG BUILD ACCEL] COMPLETE: Built unified CLAS+BLAS+Injected for ",
                             m_frameDrawCalls.size(), " instances (NO flush - TLAS will build in same command buffer)"));
 
     // NOTE: CPU-side readback of blasPtrsBuffer returns all zeros (confirmed in both IMPLICIT and

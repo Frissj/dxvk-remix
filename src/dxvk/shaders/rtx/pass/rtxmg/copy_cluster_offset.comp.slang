@@ -23,13 +23,13 @@ struct CopyClusterOffsetParams {
 };
 
 // Constant buffer (SDK MATCH: binding 0, NOT push constants!)
-[[vk::binding(0)]] ConstantBuffer<CopyClusterOffsetParams> cb;
+[[vk::binding(0, 0)]] ConstantBuffer<CopyClusterOffsetParams> cb;
 
 // Input: tessellation counters (written by compute_cluster_tiling) - shifted +1
-[[vk::binding(1)]] StructuredBuffer<TessellationCounters> tessCountersIn;
+[[vk::binding(1, 0)]] StructuredBuffer<TessellationCounters> tessCountersIn;
 
 // Output: cluster offset/count pairs - shifted +1
-[[vk::binding(2)]] RWStructuredBuffer<uint2> clusterOffsetCountsOut;
+[[vk::binding(2, 0)]] RWStructuredBuffer<uint2> clusterOffsetCountsOut;
 
 [shader("compute")]
 [numthreads(kThreadsPerGroup, 1, 1)]

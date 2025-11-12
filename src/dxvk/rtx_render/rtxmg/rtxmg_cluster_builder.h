@@ -323,9 +323,9 @@ public:
     uint32_t requiredVertices,
     const RtxmgConfig& config);
 
-  // Get current frame's ring buffer instance buffer (for copying to persistent storage)
+  // Get current frame's instance buffer (for copying to persistent storage)
   Rc<DxvkBuffer> getRingBufferInstanceBuffer() {
-    return m_frameBuffers[m_currentFrameIndex].instanceBuffer.getBuffer();
+    return m_frameBuffers.instanceBuffer.getBuffer();
   }
 
 private:
@@ -360,7 +360,7 @@ private:
   VkDeviceSize getClusterTemplateAlignment() const;
   VkDeviceSize getClusterScratchAlignment() const;
   VkDeviceSize getInstanceStride() const;
-  uint32_t getNextCounterBufferIndex() { return (m_currentCounterBufferIndex + 1) % COUNTER_BUFFER_COUNT; }
+  // Removed ring buffer indexing - using single buffers with GPU sync like NVIDIA sample
 
   // Error handling & recovery (Phase 3)
   bool validateInputGeometry(const ClusterInputGeometry& input, const char* context);
@@ -397,6 +397,16 @@ private:
   // HiZ pyramid management (Phase 4)
   void createHiZPyramid(uint32_t width, uint32_t height);
   void generateHiZPyramid(RtxContext* ctx, const Rc<DxvkImageView>& depthBuffer);
+
+  // Copy cluster offset for a single instance (GPU-driven offsets)
+  // Matches NVIDIA sample pattern: cluster_accel_builder.cpp line 1018-1055
+  void copyClusterOffset(
+    RtxContext* ctx,
+    uint32_t instanceIndex,
+    uint32_t totalInstances,
+    Rc<DxvkBuffer> paramsBuffer,
+    const DxvkBufferSlice& tessCountersBuffer,
+    const DxvkBufferSlice& clusterOffsetCountsBuffer);
   void resizeHiZIfNeeded(uint32_t width, uint32_t height);
   void queueCounterReadback(RtxContext* ctx);
   void resolvePendingCounterReadback(uint32_t slotIndex);
@@ -461,22 +471,20 @@ private:
   static constexpr size_t STORAGE_BUFFER_ALIGNMENT = 16; // Common SSBO alignment
   static constexpr size_t VERTEX_BUFFER_ALIGNMENT = 4;   // Float alignment
 
-  // Tessellation counters buffer (N-buffering support)
-  static constexpr uint32_t COUNTER_BUFFER_COUNT = 3;  // Triple buffering
-  RtxmgBuffer<TessellationCounters> m_tessCountersBuffer[COUNTER_BUFFER_COUNT];
-  Rc<DxvkBuffer> m_tessCountersReadback[COUNTER_BUFFER_COUNT];
-  bool m_counterReadbackReady[COUNTER_BUFFER_COUNT] = {};
+  // Tessellation counters buffer (SINGLE buffer with GPU sync - SDK MATCH)
+  RtxmgBuffer<TessellationCounters> m_tessCountersBuffer;
+  Rc<DxvkBuffer> m_tessCountersReadback;
+  bool m_counterReadbackReady = false;
   TessellationCounters m_lastCompletedCounters = {};
   bool m_lastCompletedCountersValid = false;
   uint64_t m_frameSerial = 0;
   uint64_t m_lastCounterCopyFrame = 0;
-  uint32_t m_currentCounterBufferIndex = 0;
 
-  // SDK-matching indirect buffers for GPU-driven cluster pipeline
+  // SDK-matching indirect buffers for GPU-driven cluster pipeline (SINGLE buffers - SDK MATCH)
   // Sample: m_clusterOffsetCountsBuffer stores per-instance cluster offsets and counts
   // Sample: m_fillClustersDispatchIndirectBuffer stores indirect dispatch args for fill_clusters
-  RtxmgBuffer<ClusterOffsetCount> m_clusterOffsetCountsBuffer[COUNTER_BUFFER_COUNT];     // Per-instance cluster offsets (zeroed each frame)
-  RtxmgBuffer<VkDispatchIndirectCommand> m_fillClustersDispatchIndirectBuffer[COUNTER_BUFFER_COUNT];  // Indirect dispatch (zeroed each frame)
+  RtxmgBuffer<ClusterOffsetCount> m_clusterOffsetCountsBuffer;     // Per-instance cluster offsets (cleared via GPU each frame)
+  RtxmgBuffer<VkDispatchIndirectCommand> m_fillClustersDispatchIndirectBuffer;  // Indirect dispatch args (cleared via GPU each frame)
 
   // Frame index for BuildAccel (SDK: m_buildAccelFrameIndex)
   // Only advances when buildStructuredCLASes runs, NOT every updatePerFrame
@@ -537,7 +545,7 @@ private:
   };
   RtxmgBuffer<ClusterIndirectArgs> m_clusterIndirectArgs;
 
-  // Frame-wide instantiation buffers (shared by all geometries, ring buffered for GPU lag)
+  // Frame-wide instantiation buffers (SINGLE buffers with GPU sync - SDK MATCH)
   // PROPER BATCHING: All geometries in a frame use the same buffers, instantiated in a single GPU call
   struct FrameInstantiationBuffers {
     RtxmgBuffer<uint8_t> scratchBuffer;
@@ -546,10 +554,9 @@ private:
     RtxmgBuffer<uint8_t> instanceBuffer;
     uint32_t usedClusters = 0;       // Track how many clusters used this frame
     uint32_t allocatedClusters = 0;  // Total capacity
+    VkFence lastUsedFence = VK_NULL_HANDLE;  // GPU sync for safe reuse
   };
-  static constexpr uint32_t kFramesInFlight = 3;  // Keep buffers alive for 3 frames
-  FrameInstantiationBuffers m_frameBuffers[kFramesInFlight];
-  uint32_t m_currentFrameIndex = 0;
+  FrameInstantiationBuffers m_frameBuffers;  // SINGLE buffer, no ring buffering
 
   // Frame-wide acceleration structures (persistent across frames, matches sample's ClusterAccels)
   ClusterAccels m_frameAccels;

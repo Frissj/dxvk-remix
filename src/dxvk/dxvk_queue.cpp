@@ -259,10 +259,10 @@ namespace dxvk {
         if (m_device->config().enableAftermath) {
           // Stall the pending exception until aftermath has finished writing (or hits some error)
           uint32_t counter = 0;
-          GFSDK_Aftermath_CrashDump_Status aftermathStatus = GFSDK_Aftermath_CrashDump_Status_NotStarted; 
-          
+          GFSDK_Aftermath_CrashDump_Status aftermathStatus = GFSDK_Aftermath_CrashDump_Status_NotStarted;
+
           static const uint32_t kTimeoutPreventionLimit = 5000;
-          
+
           while (counter < kTimeoutPreventionLimit) {
             GFSDK_Aftermath_GetCrashDumpStatus(&aftermathStatus);
 
@@ -274,7 +274,10 @@ namespace dxvk {
             counter += kTimeoutPerTry;
           }
         }
-        m_device->waitForIdle();
+        // Only wait for idle if device is not lost - device lost means GPU is dead and can't become idle
+        if (status != VK_ERROR_DEVICE_LOST) {
+          m_device->waitForIdle();
+        }
       }
 
       m_submitQueue.pop();

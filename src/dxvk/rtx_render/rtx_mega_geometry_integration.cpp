@@ -43,6 +43,10 @@ namespace dxvk {
   // Singleton mega geometry system
   static std::unique_ptr<RtxMegaGeometry> s_megaGeometry = nullptr;
 
+  // Per-frame deduplication: track geometries already tessellated this frame to avoid re-work
+  // Key: geometry hash, Value: frame ID when last tessellated
+  static std::unordered_map<XXH64_hash_t, uint32_t> s_geometryTessellationCache;
+
   void initializeMegaGeometry(DxvkDevice* device) {
     if (!s_megaGeometry) {
       Logger::info("[RTX Mega Geometry Integration] Initializing ALWAYS-ON cluster tessellation");
@@ -378,6 +382,22 @@ namespace dxvk {
       return false; // Use original geometry - too small for subdivision tessellation
     }
 
+    // CRITICAL FIX: Per-frame deduplication - skip re-tessellation if geometry already tessellated this frame
+    // This avoids 4+ seconds of redundant GPU work per frame
+    uint32_t currentFrameId = ctx->getDevice()->getCurrentFrameId();
+    auto it = s_geometryTessellationCache.find(geomHash);
+    if (it != s_geometryTessellationCache.end() && it->second == currentFrameId) {
+      Logger::info(str::format("[RTX Mega Geometry DEDUP] Skipping re-tessellation of geometry hash=0x",
+                              std::hex, geomHash, std::dec,
+                              " (already tessellated this frame)"));
+      // Set the hash anyway so GPU patching finds it
+      const_cast<DrawCallState&>(drawCallState).clusterBlasGeometryHash = geomHash;
+      return true;  // Geometry already handled
+    }
+
+    // Mark this geometry as tessellated this frame
+    s_geometryTessellationCache[geomHash] = currentFrameId;
+
     Logger::info(str::format("[RTX Mega Geometry] Queueing geometry for batched tessellation: hash=0x",
                             std::hex, geomHash, std::dec,
                             ", verts=", geoData.vertexCount, ", indices=", geoData.indexCount));
@@ -441,6 +461,12 @@ namespace dxvk {
 
     ScopedGpuProfileZone(ctx, "RTX Mega Geometry: Frame Update");
 
+    // NOTE: Do NOT clear tessellation cache - keep it across frames to cache BLASes for unchanged geometry
+    // Only geometries that appear this frame get tessellated, others reuse cached BLASes
+    uint32_t currentFrameId = ctx->getDevice()->getCurrentFrameId();
+    Logger::info(str::format("[RTX Mega Geometry] Frame ", currentFrameId, ": Cache has ",
+                            s_geometryTessellationCache.size(), " geometries from previous frames"));
+
     // CRITICAL: Rotate frame buffers BEFORE building any geometry this frame
     // This resets the cluster counter and ensures proper ring buffering for GPU lag
     RtxmgConfig config;  // Default config from options
@@ -462,13 +488,29 @@ namespace dxvk {
       s_megaGeometry->updateHiZ(ctx, depthBuffer);
     }
 
-    // Build cluster acceleration structures for all geometry submitted this frame
-    s_megaGeometry->buildClusterAccelerationStructuresForFrame(ctx);
+    // CRITICAL: Ensure all tessellation work is COMPLETE before cluster acceleration structures
+    // The tessellation shaders write to buffers that the cluster extension will read
+    // Without explicit sync, GPU can deadlock or corrupt memory
+    ctx->emitMemoryBarrier(0,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+      VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+      VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_SHADER_READ_BIT);
 
-    // Read back statistics if enabled
-    if (RtxMegaGeometry::showStatistics()) {
-      s_megaGeometry->readbackStatistics(ctx);
-    }
+    // Build cluster acceleration structures for all geometry submitted this frame
+    // This now includes BLAS building AND cluster BLAS injection into scene instances
+    // (matching NVIDIA sample structure: BuildAccel → FillInstanceDescs → buildTopLevelAccelStruct)
+    s_megaGeometry->buildClusterAccelerationStructuresForFrame(ctx);
+    // NOTE: injectClusterBlasesIntoScene() is now called internally in buildClusterAccelerationStructuresForFrame()
+    // DO NOT call it again here - it's already been done!
+
+    // DISABLED: readbackStatistics() does synchronous GPU mapPtr() which causes 900ms+ stalls per frame
+    // This is why the sample uses async Download with true flag instead of CPU readback
+    // Statistics readback is not needed for correctness, only for debug info
+    // To avoid GPU sync overhead, just don't call it
+    // if (RtxMegaGeometry::showStatistics()) {
+    //   s_megaGeometry->readbackStatistics(ctx);
+    // }
 
     // NOTE: SDK sample does NOT flush here - keeps BLAS+TLAS in same command buffer
     // Flushing here causes massive GPU sync overhead (3+ second stalls)
@@ -504,6 +546,68 @@ namespace dxvk {
    *
    * In always-on mode, this always returns true (unless disabled via options).
    */
+  void injectClusterBlasesIntoScene(
+    RtxContext* ctx,
+    SceneManager& sceneManager,
+    RtxMegaGeometry* megaGeometry) {
+
+    if (!megaGeometry || !megaGeometry->getClusterBuilder()) {
+      return;
+    }
+
+    uint32_t frameId = ctx->getDevice()->getCurrentFrameId();
+    Logger::info(str::format("[CLUSTER INJECTION] Starting cluster BLAS injection (frame ", frameId, ")"));
+
+    // Get the frame's unified cluster BLAS (all geometries in one structure)
+    const ClusterAccels& frameAccels = megaGeometry->getClusterBuilder()->getFrameAccels();
+    if (!frameAccels.blasAccelStructure.ptr()) {
+      Logger::warn("[CLUSTER INJECTION] No cluster BLAS built this frame - skipping injection");
+      return;
+    }
+
+    // Get all TLAS instances that will be rendered
+    const auto& orderedInstances = sceneManager.getAccelManager().getOrderedInstances();
+    uint32_t injectedCount = 0;
+
+    // Create shared PooledBlas wrapper for the frame's unified cluster BLAS
+    Rc<PooledBlas> clusterPooledBlas = new PooledBlas();
+    clusterPooledBlas->accelStructure = frameAccels.blasAccelStructure;
+    // Get the actual BLAS GPU address from the acceleration structure
+    if (frameAccels.blasAccelStructure != nullptr) {
+      clusterPooledBlas->accelerationStructureReference = frameAccels.blasAccelStructure->getAccelDeviceAddress();
+      Logger::info(str::format("[CLUSTER INJECTION] BLAS GPU address: 0x", std::hex,
+                              clusterPooledBlas->accelerationStructureReference, std::dec));
+    } else {
+      Logger::err("[CLUSTER INJECTION] blasAccelStructure is null!");
+      clusterPooledBlas->accelerationStructureReference = 0;
+    }
+    clusterPooledBlas->frameLastTouched = frameId;
+    clusterPooledBlas->isClusterBlas = true;
+
+    // For ALL instances in TLAS, inject the cluster BLAS
+    // PRODUCTION: In ALWAYS-ON mode, ALL geometry is tessellated into this unified BLAS
+    for (RtInstance* rtInstance : orderedInstances) {
+      if (!rtInstance) continue;
+
+      BlasEntry* blasEntry = rtInstance->getBlas();
+      if (!blasEntry) continue;
+
+      // Skip if dynamicBlas already set (e.g., from previous frame cache hit in scene manager)
+      if (blasEntry->dynamicBlas != nullptr) {
+        Logger::info("[CLUSTER INJECTION] Instance already has dynamicBlas set, skipping");
+        continue;
+      }
+
+      // Inject cluster BLAS - GPU patching will handle per-geometry address lookup
+      blasEntry->dynamicBlas = clusterPooledBlas;
+      injectedCount++;
+    }
+
+    Logger::info(str::format("[CLUSTER INJECTION] ========== COMPLETE =========="));
+    Logger::info(str::format("[CLUSTER INJECTION] Total injected: ", injectedCount,
+                            " instances with cluster BLAS (frame ", frameId, ")"));
+  }
+
   bool shouldUseMegaGeometry(const DrawCallState& drawCallState) {
     // Always-on mode: all geometry uses RTXMG if enabled
     return RtxMegaGeometry::enable();

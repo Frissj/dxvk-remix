@@ -98,6 +98,21 @@ namespace dxvk {
     const Rc<DxvkImageView>& depthBuffer);
 
   /**
+   * \brief Inject cluster BLASes into scene's instance system
+   *
+   * Called after cluster BLASes are built to set dynamicBlas on all instances that have cluster geometry.
+   * This enables TLAS GPU patching to find and use the cluster BLASes.
+   *
+   * \param [in] ctx The RTX context
+   * \param [in] sceneManager Scene manager with RtInstances
+   * \param [in] megaGeometry The RTX Mega Geometry system with cluster builder
+   */
+  void injectClusterBlasesIntoScene(
+    RtxContext* ctx,
+    SceneManager& sceneManager,
+    RtxMegaGeometry* megaGeometry);
+
+  /**
    * \brief Render RTXMG debug visualization
    *
    * \param [in] ctx The RTX context

@@ -28,7 +28,6 @@
 #include "rtx/utility/froxel.slangh"
 #include "rtx/utility/gbuffer_helpers.slangh"
 #include "rtx/utility/debug_view_helpers.slangh"
-#include "rtx/utility/mega_geometry_debug.slangh"
 #include "rtx/concept/camera/camera.slangh"
 #include "rtx/concept/ray/ray.slangh"
 #include "rtx/concept/surface/surface.slangh"
@@ -782,26 +781,6 @@ void geometryResolverVertexOutputDebugView(
     storeInDebugView(pixelCoordinate, continueSample);
 
     break;
-
-  case 900: // MEGA_GEOMETRY_DEBUG_VIEW_CLUSTER_ID
-  case 901: // MEGA_GEOMETRY_DEBUG_VIEW_TESSELLATION_DENSITY
-  case 902: // MEGA_GEOMETRY_DEBUG_VIEW_SURFACE_UV
-  case 903: // MEGA_GEOMETRY_DEBUG_VIEW_SURFACE_INDEX
-  case 904: // MEGA_GEOMETRY_DEBUG_VIEW_VERTEX_NORMALS
-  case 905: // MEGA_GEOMETRY_DEBUG_VIEW_WIREFRAME
-  case 906: // MEGA_GEOMETRY_DEBUG_VIEW_HIZ_VISUALIZATION
-  case 907: // MEGA_GEOMETRY_DEBUG_VIEW_CLUSTER_BOUNDS
-  {
-    float3 debugColor = float3(0.0, 0.0, 0.0);
-    applyMegaGeometryDebugView(
-      cb.debugView,
-      surfaceInteraction.interpolatedNormal,
-      surfaceInteraction.textureCoordinates,
-      rayInteraction.surfaceIndex,
-      debugColor);
-    storeInDebugView(pixelCoordinate, debugColor);
-    break;
-  }
 
   case DEBUG_VIEW_VOLUME_RADIANCE_DEPTH_LAYERS: {
     const Camera camera = cb.camera;

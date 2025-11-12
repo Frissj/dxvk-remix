@@ -28,14 +28,14 @@ struct HiZGenerateParams {
 };
 
 // Constant buffer (SDK MATCH: binding 0, NOT push constants!)
-[[vk::binding(0)]] ConstantBuffer<HiZGenerateParams> cb;
+[[vk::binding(0, 0)]] ConstantBuffer<HiZGenerateParams> cb;
 
 // Input: Previous mip level (or depth buffer for mip 0) - shifted +1
-[[vk::binding(1)]] Texture2D<float> srcDepth;
-[[vk::binding(2)]] SamplerState depthSampler;
+[[vk::binding(1, 0)]] Texture2D<float> srcDepth;
+[[vk::binding(2, 0)]] SamplerState depthSampler;
 
 // Output: Next mip level - shifted +1
-[[vk::binding(3)]] RWTexture2DArray<float> hizPyramid;
+[[vk::binding(3, 0)]] RWTexture2DArray<float> hizPyramid;
 
 // Convert depth buffer value to linear depth
 float linearizeDepth(float depth, float near, float far) {

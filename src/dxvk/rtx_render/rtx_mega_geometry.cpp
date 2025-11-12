@@ -313,12 +313,17 @@ namespace dxvk {
     // Dispatch compute shader to calculate cluster layout per instance
     const VkExtent3D workgroups = util::computeBlockCount(VkExtent3D{ 1024, 1, 1 }, VkExtent3D{ 64, 1, 1 });
 
+    // DISABLED: This is placeholder code that was causing descriptor set layout mismatches
+    // The shader ComputeClusterTilingShader expects descriptor set 0, but no resources were ever bound.
+    // This function is never called (dispatchTessellation is not used in the actual tessellation pipeline).
+    // The real tessellation happens in tessellateCollectedGeometry() which is called from updateMegaGeometryPerFrame().
+    //
     // Bind resources
     // Note: In a full implementation, these would be bound from actual scene data
     // For now, this sets up the pipeline correctly for compilation
 
-    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, ComputeClusterTilingShader::getShader());
-    ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
+    // COMMENTED OUT: ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, ComputeClusterTilingShader::getShader());
+    // COMMENTED OUT: ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
   }
 
   void RtxMegaGeometry::fillClusterData(Rc<DxvkContext> ctx) {
@@ -327,8 +332,13 @@ namespace dxvk {
     // Dispatch compute shader to tessellate subdivision surfaces into cluster vertices
     const VkExtent3D workgroups = util::computeBlockCount(VkExtent3D{ 2048, 1, 1 }, VkExtent3D{ 64, 1, 1 });
 
-    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, FillClusterDataShader::getShader());
-    ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
+    // DISABLED: This is placeholder code that was causing descriptor set layout mismatches
+    // The shader FillClusterDataShader expects descriptor set 0, but no resources were ever bound.
+    // This function is never called (dispatchTessellation is not used in the actual tessellation pipeline).
+    // The real tessellation happens in tessellateCollectedGeometry() which is called from updateMegaGeometryPerFrame().
+
+    // COMMENTED OUT: ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, FillClusterDataShader::getShader());
+    // COMMENTED OUT: ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
   }
 
   void RtxMegaGeometry::dispatchTessellation(Rc<DxvkContext> ctx) {
@@ -841,21 +851,22 @@ namespace dxvk {
       entry.blasSizeBytes = clusterBlasSize > 0 ? clusterBlasSize : entry.clusterBLAS->info().size;
       // entry.memorySizeBytes += blasBytes;  // REMOVED - causes massive overcounting
 
-      // CRITICAL GPU SYNCHRONIZATION: Store command list that built this BLAS
-      // This will be used to verify GPU completion before reusing the BLAS
-      entry.buildCommandList = ctx->getCommandList();
-      entry.gpuWorkComplete = false;  // Not yet complete - will be verified on first reuse
+      // CRITICAL GPU SYNCHRONIZATION: Store fence from BLAS build submission
+      // We get the fence from the current command list being recorded
+      // Later, vkGetFenceStatus() checks completion without blocking
+      entry.buildFence = ctx->getCommandList()->fence();
+      entry.gpuWorkComplete = false;  // Will be verified on first reuse
 
       Logger::info(str::format("[RTXMG] Cached cluster BLAS: clusters=", entry.clusterCount,
                               ", size=", entry.blasSizeBytes / 1024, "KB",
-                              ", commandList=", (void*)entry.buildCommandList.ptr(),
-                              " (will verify GPU completion before reuse)"));
+                              ", buildFence=", (void*)entry.buildFence,
+                              " (will verify with vkGetFenceStatus on reuse)"));
     } else {
       entry.hasClusterBLAS = false;
       entry.clusterBLAS = nullptr;
       entry.clusterCount = 0;
       entry.blasSizeBytes = 0;
-      entry.buildCommandList = nullptr;
+      entry.buildFence = VK_NULL_HANDLE;
       entry.gpuWorkComplete = false;
     }
 

@@ -15,67 +15,49 @@ static const uint kThreadsPerGroup = 256;
 
 // Parameters
 struct PatchTlasInstanceParams {
-  uint numPatchEntries;         // Number of (tlasIndex, blasBufferIndex) pairs to patch
-  uint blasAddressesBaseIndex;  // Ring buffer base index for current frame (frameIndex % 4 * maxInstancesPerFrame)
+  uint numInstances;  // Total number of TLAS instances to process
   uint _pad1;
   uint _pad2;
+  uint _pad3;
 };
 
 // Constant buffer (SDK MATCH: binding 0, NOT push constants!)
-[[vk::binding(0)]] ConstantBuffer<PatchTlasInstanceParams> cb;
+[[vk::binding(0, 0)]] ConstantBuffer<PatchTlasInstanceParams> cb;
 
-// Patch entry: maps TLAS instance index to blasPtrsBuffer index
-struct PatchEntry {
-  uint tlasInstanceIndex;      // Index in TLAS instance buffer
-  uint blasBufferIndex;        // Index in blasAddresses buffer
-};
+// Input: BLAS addresses (one per instance, pre-populated with correct addresses)
+// Matching NVIDIA RTXMG sample: blasAddresses[instanceIndex] = correct BLAS address
+[[vk::binding(1, 0)]] StructuredBuffer<uint64_t> blasAddresses;
 
-// Input: Patch entries (TLAS index → blasPtrsBuffer index mapping) - shifted +1
-[[vk::binding(1)]] StructuredBuffer<PatchEntry> patchEntries;
-
-// Input: BLAS addresses from cluster extension (sparse - only cluster BLASes) - shifted +1
-[[vk::binding(2)]] StructuredBuffer<uint64_t> blasAddresses;
-
-// Output: TLAS instance descriptors to patch - shifted +1
+// Output: TLAS instance descriptors to patch
 // VkAccelerationStructureInstanceKHR structure:
 // - float transform[12] (48 bytes)
 // - uint instanceCustomIndex : 24
 // - uint mask : 8
 // - uint instanceShaderBindingTableRecordOffset : 24
 // - uint flags : 8
-// - uint64_t accelerationStructureReference (8 bytes) <-- This is what we patch
-[[vk::binding(3)]] RWByteAddressBuffer instanceDescsBuffer;
+// - uint64_t accelerationStructureReference (8 bytes) <-- This is what we patch at offset 56
+[[vk::binding(2, 0)]] RWByteAddressBuffer instanceDescsBuffer;
 
 // Offset to accelerationStructureReference within VkAccelerationStructureInstanceKHR
-// Structure layout: 48 bytes (transform) + 4 bytes (packed fields) + 4 bytes (packed fields) = 56 bytes offset
 static const uint kBlasAddressOffset = 56;
-
-// Size of VkAccelerationStructureInstanceKHR
 static const uint kInstanceDescSize = 64;
 
 [shader("compute")]
 [numthreads(kThreadsPerGroup, 1, 1)]
 void main(uint3 threadIdx : SV_DispatchThreadID)
 {
-  uint patchIndex = threadIdx.x;
-  if (patchIndex >= cb.numPatchEntries)
+  uint instanceIndex = threadIdx.x;
+  if (instanceIndex >= cb.numInstances)
     return;
 
-  // Read the patch entry
-  PatchEntry entry = patchEntries[patchIndex];
+  // NVIDIA RTXMG Sample Pattern: Simple and direct
+  // Read BLAS address for this instance (pre-populated with correct address)
+  uint64_t blasAddress = blasAddresses[instanceIndex];
 
-  // CRITICAL: Add ring buffer base index to get correct address for current frame
-  // The blasAddresses buffer is ring-buffered (4 copies for multi-frame-in-flight),
-  // so we must add the base index for this frame's slot to read from the correct location.
-  uint actualBlasIndex = cb.blasAddressesBaseIndex + entry.blasBufferIndex;
+  // Patch the accelerationStructureReference field in the instance descriptor
+  uint byteOffset = instanceIndex * kInstanceDescSize + kBlasAddressOffset;
 
-  // Read BLAS address from cluster extension's output buffer (ring-buffered)
-  uint64_t blasAddress = blasAddresses[actualBlasIndex];
-
-  // Patch the accelerationStructureReference field in the TLAS instance descriptor
-  uint byteOffset = entry.tlasInstanceIndex * kInstanceDescSize + kBlasAddressOffset;
-
-  // Write the 64-bit BLAS address as two 32-bit words (Slang RWByteAddressBuffer requirement)
+  // Write the 64-bit BLAS address as two 32-bit words
   uint low = uint(blasAddress & 0xFFFFFFFF);
   uint high = uint(blasAddress >> 32);
 

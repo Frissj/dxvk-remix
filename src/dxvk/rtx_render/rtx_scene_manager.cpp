@@ -1071,72 +1071,52 @@ namespace dxvk {
 
         if (cached && cached->hasClusterBLAS && cached->clusterBLAS.ptr()) {
           uint32_t currentFrame = m_device->getCurrentFrameId();
-          uint32_t cachedFrame = cached->lastUsedFrame;
-          uint32_t framesSinceCache = currentFrame - cachedFrame;
 
-          // ABSOLUTELY SAFE GPU SYNCHRONIZATION: Always verify GPU completion before reuse
-          // NO GUESSWORK - we check the actual fence status every time
-          // Performance optimization: Cache the result so we only check once per BLAS
+          // FAST, NON-BLOCKING GPU SYNCHRONIZATION
+          // Check fence with vkGetFenceStatus() - O(1), no CPU stall
+          // If fence not ready, skip reuse (don't block)
 
           bool isSafeToReuse = false;
 
-          if (cached->gpuWorkComplete) {
-            // Already verified in a previous frame - safe to reuse
-            // This is the FAST PATH after first verification
-            isSafeToReuse = true;
-            Logger::info(str::format("[GPU SYNC] Previously verified complete (frame ", cachedFrame,
-                                    ") - safe to reuse without check"));
-          } else if (cached->buildCommandList.ptr()) {
-            // MUST verify GPU completion - this is REQUIRED for correctness
-            Logger::info(str::format("[GPU SYNC] ========== VERIFYING GPU COMPLETION BEFORE REUSE =========="));
-            Logger::info(str::format("[GPU SYNC] Current frame: ", currentFrame, ", BLAS built at frame: ", cachedFrame,
-                                    " (", framesSinceCache, " frames ago)"));
-            Logger::info(str::format("[GPU SYNC] Hash: 0x", std::hex, drawCallState.clusterBlasGeometryHash, std::dec));
+          Logger::info(str::format("[GPU SYNC] ========== VERIFYING CLUSTER BLAS REUSE =========="));
+          Logger::info(str::format("[GPU SYNC] Current frame: ", currentFrame));
+          Logger::info(str::format("[GPU SYNC] Hash: 0x", std::hex, drawCallState.clusterBlasGeometryHash, std::dec));
 
-            // Step 1: Non-blocking fence check using Vulkan API directly
+          if (cached->gpuWorkComplete) {
+            // Already verified complete in a previous frame
+            // Fast path - no fence check needed
+            isSafeToReuse = true;
+            Logger::info(str::format("[GPU SYNC] Previously verified complete - safe to reuse"));
+          } else if (cached->buildFence != VK_NULL_HANDLE) {
+            // NON-BLOCKING fence check using Vulkan API
+            // This is O(1) and takes microseconds - no CPU blocking
             auto t0 = dxvk::high_resolution_clock::now();
             VkResult fenceStatus = m_device->vkd()->vkGetFenceStatus(m_device->vkd()->device(),
-                                                                      cached->buildCommandList->fence());
+                                                                      cached->buildFence);
+
+            auto t1 = dxvk::high_resolution_clock::now();
+            auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0);
 
             if (fenceStatus == VK_SUCCESS) {
-              // Fence already signaled - GPU work is complete!
+              // Fence signaled - GPU work complete
               cached->gpuWorkComplete = true;
               isSafeToReuse = true;
-              auto t1 = dxvk::high_resolution_clock::now();
-              auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0);
-              Logger::info(str::format("[GPU SYNC] Fence already signaled - GPU complete (checked in ", us.count(), " us)"));
+              Logger::info(str::format("[GPU SYNC] Fence signaled - GPU complete (checked in ", us.count(), " us)"));
             } else if (fenceStatus == VK_NOT_READY) {
-              // Step 2: GPU still working - MUST BLOCK AND WAIT (this ensures correctness)
-              Logger::warn(str::format("[GPU SYNC] ========== GPU STILL WORKING - BLOCKING WAIT =========="));
-              Logger::warn(str::format("[GPU SYNC] This will stall the CPU until GPU completes frame ", cachedFrame));
-
-              // BLOCKING WAIT: This is the cost of absolute safety
-              // Better to stall than to crash or get corruption
-              VkResult syncResult = cached->buildCommandList->synchronize();
-              if (syncResult == VK_SUCCESS) {
-                cached->gpuWorkComplete = true;
-                isSafeToReuse = true;
-
-                auto t1 = dxvk::high_resolution_clock::now();
-                auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0);
-                Logger::warn(str::format("[GPU SYNC] *** PIPELINE STALL *** Blocked for ", us.count(),
-                                        " microseconds waiting for GPU"));
-                Logger::warn(str::format("[GPU SYNC] Consider: Increase ring buffer size, reduce geometry complexity, or optimize GPU work"));
-              } else {
-                Logger::err(str::format("[GPU SYNC] ERROR: synchronize() failed with VkResult ", syncResult));
-                isSafeToReuse = false;
-              }
+              // Fence not ready - GPU still working
+              // Skip reuse THIS FRAME (don't block CPU)
+              // Will retry next frame
+              isSafeToReuse = false;
+              Logger::warn(str::format("[GPU SYNC] Fence not ready - GPU still working (checked in ", us.count(),
+                                      " us, will retry next frame)"));
             } else {
-              // Fence error - something went wrong
+              // Fence error
               Logger::err(str::format("[GPU SYNC] ERROR: Fence check failed with VkResult ", fenceStatus));
-              Logger::err(str::format("[GPU SYNC] Hash: 0x", std::hex, drawCallState.clusterBlasGeometryHash, std::dec));
               isSafeToReuse = false;
             }
           } else {
-            // No fence available - CANNOT verify safety
-            Logger::err(str::format("[GPU SYNC] ERROR: No fence available to verify GPU completion!"));
-            Logger::err(str::format("[GPU SYNC] Hash: 0x", std::hex, drawCallState.clusterBlasGeometryHash, std::dec));
-            Logger::err(str::format("[GPU SYNC] This is a bug - cluster BLAS build should always set buildCommandList"));
+            // No fence available - this shouldn't happen
+            Logger::err(str::format("[GPU SYNC] ERROR: No fence available for BLAS verification"));
             isSafeToReuse = false;
           }
 
@@ -1146,23 +1126,21 @@ namespace dxvk {
             Logger::warn(str::format("[GPU SYNC] Cannot verify GPU completion - will rebuild with regular BLAS path"));
             Logger::warn(str::format("[GPU SYNC] Hash: 0x", std::hex, drawCallState.clusterBlasGeometryHash, std::dec));
           } else {
-            // SAFE TO REUSE: GPU work is verified complete
+            // SAFE TO REUSE: Fence verified complete
             Logger::info(str::format("[CACHE REUSE] ========== SAFELY REUSING CLUSTER BLAS =========="));
-            Logger::info(str::format("[CACHE REUSE] Current frame: ", currentFrame, ", Cached at frame: ", cachedFrame,
-                                    " (", framesSinceCache, " frames ago)"));
+            Logger::info(str::format("[CACHE REUSE] Current frame: ", currentFrame));
             Logger::info(str::format("[CACHE REUSE] Hash: 0x", std::hex, drawCallState.clusterBlasGeometryHash, std::dec));
             Logger::info(str::format("[CACHE REUSE] Cluster BLAS address: 0x", std::hex,
                                     cached->clusterBLAS->getAccelDeviceAddress(), std::dec));
-            Logger::info(str::format("[CACHE REUSE] GPU status: VERIFIED COMPLETE (safe to reuse)"));
+            Logger::info(str::format("[CACHE REUSE] GPU status: VERIFIED COMPLETE (fence checked)"));
 
           // Production: Wrap cluster BLAS in PooledBlas for integration with TLAS building
           Rc<PooledBlas> clusterPooledBlas = new PooledBlas();
           clusterPooledBlas->accelStructure = cached->clusterBLAS;
-          // CRITICAL: Set accelerationStructureReference to 0 for cluster BLASes
-          // GPU patching will write the correct per-geometry BLAS address from blasPtrsBuffer
-          // Using the shared structure address (getAccelDeviceAddress()) is WRONG - all geometries
-          // would reference the same BLAS data, causing GPU crashes
-          clusterPooledBlas->accelerationStructureReference = 0;
+          // CRITICAL: Set accelerationStructureReference to the actual cluster BLAS device address
+          // The cluster BLAS is a prebuilt, shared structure that's reused across all matching geometries
+          // This address is used by GPU patching to fill TLAS instance descriptors
+          clusterPooledBlas->accelerationStructureReference = cached->clusterBLAS->getAccelDeviceAddress();
           clusterPooledBlas->frameLastTouched = currentFrame;
           clusterPooledBlas->isClusterBlas = true;  // Mark as cluster BLAS to prevent rebuilding
           clusterPooledBlas->clusterBlasGeometryHash = drawCallState.clusterBlasGeometryHash;  // Store for GPU patching
@@ -1198,11 +1176,10 @@ namespace dxvk {
                                   std::hex, drawCallState.clusterBlasGeometryHash, std::dec,
                                   ", clusters=", cached->clusterCount,
                                   ", currentFrame=", currentFrame,
-                                  ", cachedAtFrame=", cached->lastUsedFrame,
-                                  ", framesSince=", framesSinceCache,
+                                  ", fence=", (void*)cached->buildFence,
                                   ", totalInjectionsThisFrame=", s_clusterBlasInjectionCount_internal,
                                   ", totalClustersThisFrame=", s_totalClustersUsedThisFrame,
-                                  " (address will be GPU-patched from blasPtrsBuffer)"));
+                                  " (fence-verified GPU completion)"));
           }  // end of: if (!isSafeToReuse) ... else (safe to reuse)
         }  // end of: if (cached && cached->hasClusterBLAS && cached->clusterBLAS.ptr())
       } else {

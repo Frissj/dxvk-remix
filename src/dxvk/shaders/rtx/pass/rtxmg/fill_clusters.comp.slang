@@ -40,28 +40,28 @@ struct FillClustersParams {
 };
 
 // Constant buffer (SDK MATCH: binding 0, NOT push constants!)
-[[vk::binding(0)]] ConstantBuffer<FillClustersParams> cb;
+[[vk::binding(0, 0)]] ConstantBuffer<FillClustersParams> cb;
 
 // Input buffers (shifted +1 to accommodate constant buffer at binding 0)
-[[vk::binding(1)]] StructuredBuffer<float3> inputPositions;
-[[vk::binding(2)]] StructuredBuffer<float3> inputNormals;
+[[vk::binding(1, 0)]] StructuredBuffer<float3> inputPositions;
+[[vk::binding(2, 0)]] StructuredBuffer<float3> inputNormals;
 // Use ByteAddressBuffer for potentially misaligned game buffers (only requires 4-byte alignment)
-[[vk::binding(3)]] ByteAddressBuffer inputTexcoords;
-[[vk::binding(4)]] ByteAddressBuffer inputIndices;
-[[vk::binding(5)]] StructuredBuffer<SurfaceInfo> surfaceInfo;
+[[vk::binding(3, 0)]] ByteAddressBuffer inputTexcoords;
+[[vk::binding(4, 0)]] ByteAddressBuffer inputIndices;
+[[vk::binding(5, 0)]] StructuredBuffer<SurfaceInfo> surfaceInfo;
 
 // Cluster data
-[[vk::binding(6)]] StructuredBuffer<GridSampler> gridSamplers;
-[[vk::binding(7)]] StructuredBuffer<Cluster> clusters;
-[[vk::binding(8)]] StructuredBuffer<ClusterShadingData> clusterShadingData;
+[[vk::binding(6, 0)]] StructuredBuffer<GridSampler> gridSamplers;
+[[vk::binding(7, 0)]] StructuredBuffer<Cluster> clusters;
+[[vk::binding(8, 0)]] StructuredBuffer<ClusterShadingData> clusterShadingData;
 
 // Output buffers
-[[vk::binding(9)]] RWStructuredBuffer<float3> clusterVertexPositionsOut;
-[[vk::binding(10)]] RWStructuredBuffer<float3> clusterVertexNormalsOut;
-[[vk::binding(11)]] RWStructuredBuffer<ClusterShadingData> clusterShadingDataOut;
+[[vk::binding(9, 0)]] RWStructuredBuffer<float3> clusterVertexPositionsOut;
+[[vk::binding(10, 0)]] RWStructuredBuffer<float3> clusterVertexNormalsOut;
+[[vk::binding(11, 0)]] RWStructuredBuffer<ClusterShadingData> clusterShadingDataOut;
 
 // Phase 4: GPU batching support - Instance data buffer (optional)
-[[vk::binding(12)]] StructuredBuffer<InstanceData> instanceDataBuffer;
+[[vk::binding(12, 0)]] StructuredBuffer<InstanceData> instanceDataBuffer;
 
 // Calculate UV position within surface for a cluster vertex
 float2 calculateVertexUV(

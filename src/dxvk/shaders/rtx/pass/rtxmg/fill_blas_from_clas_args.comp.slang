@@ -22,10 +22,10 @@ struct FillBlasFromClasArgsParams {
 };
 
 // Constant buffer (SDK MATCH: binding 0, NOT push constants!)
-[[vk::binding(0)]] ConstantBuffer<FillBlasFromClasArgsParams> cb;
+[[vk::binding(0, 0)]] ConstantBuffer<FillBlasFromClasArgsParams> cb;
 
 // Input: cluster offset/count pairs per instance - shifted +1
-[[vk::binding(1)]] StructuredBuffer<uint2> clusterOffsetCounts;
+[[vk::binding(1, 0)]] StructuredBuffer<uint2> clusterOffsetCounts;
 
 // Output: indirect args for BLAS building - shifted +1
 // Must match VK_NV_cluster_acceleration_structure indirect args layout
@@ -36,7 +36,7 @@ struct BlasFromClasIndirectArg {
   uint _padding;  // Explicit padding to align to 16 bytes
 };
 
-[[vk::binding(2)]] RWStructuredBuffer<BlasFromClasIndirectArg> blasFromClasArgsOut;
+[[vk::binding(2, 0)]] RWStructuredBuffer<BlasFromClasIndirectArg> blasFromClasArgsOut;
 
 [shader("compute")]
 [numthreads(kThreadsPerGroup, 1, 1)]

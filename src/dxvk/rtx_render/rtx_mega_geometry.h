@@ -389,10 +389,12 @@ namespace dxvk {
       VkDeviceAddress clusterBlasAddress = 0;
       uint32_t clusterBlasSize = 0;
 
-      // GPU synchronization: Track command list that built this BLAS
-      // CRITICAL: Must wait for this fence before reusing BLAS addresses
-      Rc<DxvkCommandList> buildCommandList;  // Command list used to build this cluster BLAS
-      bool gpuWorkComplete = false;          // Cached fence status (avoid repeated checks)
+      // GPU synchronization: Track the fence from BLAS build submission
+      // CRITICAL: Store VkFence directly (not command list) to avoid recycled pointer issues
+      // We check fence with vkGetFenceStatus() - O(1), non-blocking, microseconds
+      // If fence not ready, we simply skip reuse (don't block CPU)
+      VkFence buildFence = VK_NULL_HANDLE;   // Fence from GPU submission that built this BLAS
+      bool gpuWorkComplete = false;          // Cached result to avoid repeated checks
     };
 
     // Debug visualization modes

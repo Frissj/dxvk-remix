@@ -160,6 +160,10 @@ private:
   std::vector<VkAccelerationStructureInstanceKHR> m_mergedInstances[Tlas::Count];
   std::vector<Rc<PooledBlas>> m_blasPool;
 
+  // RTXMG GPU PATCHING: Per-instance cluster BLAS data for GPU shader
+  std::vector<uint32_t> m_instanceBlasBufferIndices;  // blasBufferIndex for each TLAS instance
+  Rc<DxvkBuffer> m_instanceBlasBufferIndicesGpu;      // GPU buffer with per-instance blasBufferIndex
+
   Rc<DxvkBuffer> m_vkInstanceBuffer; // Note: Holds Vulkan AS Instances, not RtInstances
   Rc<DxvkBuffer> m_surfaceBuffer;
   Rc<DxvkBuffer> m_surfaceMappingBuffer;

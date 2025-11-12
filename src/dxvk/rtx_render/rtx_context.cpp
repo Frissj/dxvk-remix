@@ -554,48 +554,44 @@ namespace dxvk {
       m_cachedReflexFrameId = cachedReflexFrameId;
 
       // Update all the GPU buffers needed to describe the scene
-      // CRITICAL: Check cluster BLAS injection status BEFORE calling prepareSceneData,
-      // because prepareSceneData resets the flag! We need to capture this early.
-      Logger::info(str::format("[RTX CONTEXT DEBUG] Frame ", m_device->getCurrentFrameId(), " - About to check cluster BLAS status"));
-      uint32_t clusterBlasCount = getSceneManager().getClusterBlasInjectionCount();
-      Logger::info(str::format("[RTX CONTEXT DEBUG] Frame ", m_device->getCurrentFrameId(),
-                              " - Cluster BLAS count BEFORE prepareSceneData: ", clusterBlasCount));
-
       Logger::info(str::format("[RTX CONTEXT DEBUG] Frame ", m_device->getCurrentFrameId(), " - About to call prepareSceneData"));
       getSceneManager().prepareSceneData(this, m_execBarriers);
       Logger::info(str::format("[RTX CONTEXT DEBUG] Frame ", m_device->getCurrentFrameId(), " - prepareSceneData returned"));
 
+      // CRITICAL: Call Mega Geometry update BEFORE checking surfaces
+      // This ensures tessellation/BLAS building happens every frame, even with no surfaces yet
+      // (sample code pattern: BuildAccel is called unconditionally every frame)
+      VkExtent3D downscaledExtent = onFrameBegin(targetImage->info().extent);
+      Resources::RaytracingOutput& rtOutput = getResourceManager().getRaytracingOutput();
+
+      if (common->metaNGXContext().supportsDLFG()) {
+        rtOutput.m_primaryDepthQueue.next();
+        rtOutput.m_primaryScreenSpaceMotionVectorQueue.next();
+      }
+
+      rtOutput.m_primaryDepth = rtOutput.m_primaryDepthQueue.get();
+      rtOutput.m_primaryScreenSpaceMotionVector = rtOutput.m_primaryScreenSpaceMotionVectorQueue.get();
+
       // If we really don't have any RT to do, just bail early (could be UI/menus rendering)
-      // CRITICAL: We MUST call buildTlas if cluster BLASes were injected, even if there's no surface buffer!
-      // Otherwise the TLAS will have invalid BLAS references and cause GPU crashes.
       Logger::info(str::format("[RTX CONTEXT DEBUG] Frame ", m_device->getCurrentFrameId(), " - About to check surface buffer"));
       bool hasSurfaces = (getSceneManager().getSurfaceBuffer() != nullptr);
       Logger::info(str::format("[RTX CONTEXT] Frame ", m_device->getCurrentFrameId(),
-                              " has surfaces: ", hasSurfaces ? "YES" : "NO",
-                              ", cluster BLASes injected: ", clusterBlasCount > 0 ? "YES" : "NO"));
-      if (hasSurfaces || clusterBlasCount > 0) {
+                              " has surfaces: ", hasSurfaces ? "YES" : "NO"));
 
-        VkExtent3D downscaledExtent = onFrameBegin(targetImage->info().extent);
-
-        Resources::RaytracingOutput& rtOutput = getResourceManager().getRaytracingOutput();
-
-        if (common->metaNGXContext().supportsDLFG()) {
-          rtOutput.m_primaryDepthQueue.next();
-          rtOutput.m_primaryScreenSpaceMotionVectorQueue.next();
-        }
-
-        rtOutput.m_primaryDepth = rtOutput.m_primaryDepthQueue.get();
-        rtOutput.m_primaryScreenSpaceMotionVector = rtOutput.m_primaryScreenSpaceMotionVectorQueue.get();
-
-        // Update RTX Mega Geometry per frame (build BLAS, update HiZ)
+      // Update RTX Mega Geometry per frame (build BLAS, update HiZ) - ONLY when we have surfaces
+      // Cannot build cluster BLASes without patching them, and GPU patching requires RTX GPU context
+      if (hasSurfaces) {
+        Logger::info(str::format("[RTX CONTEXT] Frame ", m_device->getCurrentFrameId(), ": Calling updateMegaGeometryPerFrame"));
         updateMegaGeometryPerFrame(this, getSceneManager(), rtOutput.m_primaryDepth.view);
-
-        getCommonObjects()->getTextureManager().prepareSamplerFeedback(this);
-
-        // Build TLAS (cluster BLAS addresses will be patched later on GPU in flushCommandList)
+        Logger::info(str::format("[RTX CONTEXT] Frame ", m_device->getCurrentFrameId(), ": updateMegaGeometryPerFrame returned"));
+        // Build TLAS and patch cluster BLAS addresses
+        // GPU patching compute shader requires GPU context which only exists in RTX pipeline
         Logger::info(str::format("[RTX CONTEXT] About to call buildTlas (frame ", m_device->getCurrentFrameId(), ")"));
         getSceneManager().buildTlas(this);
         Logger::info(str::format("[RTX CONTEXT] buildTlas returned (frame ", m_device->getCurrentFrameId(), ")"));
+        // NOTE: buildTlas() emits its own post-TLAS barrier internally (line 1548-1554 in rtx_accel_manager.cpp)
+        // which properly synchronizes TLAS writes -> ray tracing reads. No additional barrier needed here.
+        getCommonObjects()->getTextureManager().prepareSamplerFeedback(this);
 
         // Generate ray tracing constant buffer
         Logger::info(str::format("[RTX CONTEXT] About to call updateRaytraceArgsConstantBuffer (frame ", m_device->getCurrentFrameId(), ")"));
