@@ -40,10 +40,12 @@ namespace dxvk {
     ~NvrhiDxvkBuffer() {
       // Log destruction of small buffers to help identify the Aftermath "256 B resource DESTROYED"
       if (m_desc.byteSize <= 4096 && m_dxvkBuffer != nullptr) {
+        DxvkBufferSliceHandle slice = m_dxvkBuffer->getSliceHandle();
         Logger::info(str::format("RTX MegaGeo: ~NvrhiDxvkBuffer '",
             m_desc.debugName ? m_desc.debugName : "unnamed",
             "' size=", m_desc.byteSize,
-            " addr=0x", std::hex, m_dxvkBuffer->getDeviceAddress(), std::dec));
+            " deviceAddr=0x", std::hex, m_dxvkBuffer->getDeviceAddress(),
+            " VkBuffer=0x", (uint64_t)slice.handle, std::dec));
       }
     }
 

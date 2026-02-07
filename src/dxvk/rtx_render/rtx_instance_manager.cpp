@@ -939,34 +939,45 @@ namespace dxvk {
   }
 
   void InstanceManager::processInstanceBuffers(const BlasEntry& blas, RtInstance& currentInstance) const {
-    currentInstance.surface.positionBufferIndex = blas.modifiedGeometryData.positionBufferIndex;
-    currentInstance.surface.positionOffset = blas.modifiedGeometryData.positionBuffer.offsetFromSlice();
-    currentInstance.surface.positionStride = blas.modifiedGeometryData.positionBuffer.stride();
-    currentInstance.surface.normalBufferIndex = blas.modifiedGeometryData.normalBufferIndex;
-    currentInstance.surface.normalOffset = blas.modifiedGeometryData.normalBuffer.offsetFromSlice();
-    currentInstance.surface.normalStride = blas.modifiedGeometryData.normalBuffer.stride();
-    currentInstance.surface.normalFormat = blas.modifiedGeometryData.normalBuffer.vertexFormat();
-    currentInstance.surface.color0BufferIndex = blas.modifiedGeometryData.color0BufferIndex;
-    currentInstance.surface.color0Offset = blas.modifiedGeometryData.color0Buffer.offsetFromSlice();
-    currentInstance.surface.color0Stride = blas.modifiedGeometryData.color0Buffer.stride();
-    currentInstance.surface.texcoordBufferIndex = blas.modifiedGeometryData.texcoordBufferIndex;
-    currentInstance.surface.texcoordOffset = blas.modifiedGeometryData.texcoordBuffer.offsetFromSlice();
-    currentInstance.surface.texcoordStride = blas.modifiedGeometryData.texcoordBuffer.stride();
-    currentInstance.surface.previousPositionBufferIndex = blas.modifiedGeometryData.previousPositionBufferIndex;
-    // RTX Mega Geometry: ClusterBlas instances don't use the original index buffer - MegaGeo generates its own cluster geometry.
-    // Setting indexBufferIndex to invalid prevents surface_interaction shader from reading destroyed buffers.
-    // Also mark the surface as a cluster surface so the shader uses the cluster vertex buffers instead.
+    // RTX Mega Geometry: ClusterBlas instances use MegaGeo's own cluster vertex/index buffers,
+    // NOT the original mesh buffers from the bindless buffer table. The buffer indices in
+    // modifiedGeometryData are stale (set on first frame, never updated via updateBufferCache)
+    // because ClusterBlas skips processGeometryInfo on subsequent frames.
+    // Setting all indices to 0 (guaranteed valid dummy descriptor) prevents GPU page faults
+    // from accessing stale descriptors that may point to destroyed VkBuffers.
     if (blas.blasType == BlasEntry::Type::ClusterBlas) {
+      currentInstance.surface.positionBufferIndex = 0;
+      currentInstance.surface.positionOffset = 0;
+      currentInstance.surface.positionStride = 0;
+      currentInstance.surface.normalBufferIndex = 0;
+      currentInstance.surface.normalOffset = 0;
+      currentInstance.surface.normalStride = 0;
+      currentInstance.surface.normalFormat = blas.modifiedGeometryData.normalBuffer.vertexFormat();
+      currentInstance.surface.color0BufferIndex = 0;
+      currentInstance.surface.color0Offset = 0;
+      currentInstance.surface.color0Stride = 0;
+      currentInstance.surface.texcoordBufferIndex = 0;
+      currentInstance.surface.texcoordOffset = 0;
+      currentInstance.surface.texcoordStride = 0;
+      currentInstance.surface.previousPositionBufferIndex = 0;
       currentInstance.surface.indexBufferIndex = kSurfaceInvalidBufferIndex;
       currentInstance.surface.indexStride = 0;
       currentInstance.surface.isClusterSurface = true;
-      // Log cluster surface setup for debugging
-      static uint32_t s_clusterSurfaceCount = 0;
-      if ((s_clusterSurfaceCount++ % 100) == 0) {
-        Logger::info(str::format("RTX MegaGeo: Cluster surface instance created, instanceVectorId=",
-            currentInstance.m_instanceVectorId, " surfaceIndex=", currentInstance.getSurfaceIndex()));
-      }
     } else {
+      currentInstance.surface.positionBufferIndex = blas.modifiedGeometryData.positionBufferIndex;
+      currentInstance.surface.positionOffset = blas.modifiedGeometryData.positionBuffer.offsetFromSlice();
+      currentInstance.surface.positionStride = blas.modifiedGeometryData.positionBuffer.stride();
+      currentInstance.surface.normalBufferIndex = blas.modifiedGeometryData.normalBufferIndex;
+      currentInstance.surface.normalOffset = blas.modifiedGeometryData.normalBuffer.offsetFromSlice();
+      currentInstance.surface.normalStride = blas.modifiedGeometryData.normalBuffer.stride();
+      currentInstance.surface.normalFormat = blas.modifiedGeometryData.normalBuffer.vertexFormat();
+      currentInstance.surface.color0BufferIndex = blas.modifiedGeometryData.color0BufferIndex;
+      currentInstance.surface.color0Offset = blas.modifiedGeometryData.color0Buffer.offsetFromSlice();
+      currentInstance.surface.color0Stride = blas.modifiedGeometryData.color0Buffer.stride();
+      currentInstance.surface.texcoordBufferIndex = blas.modifiedGeometryData.texcoordBufferIndex;
+      currentInstance.surface.texcoordOffset = blas.modifiedGeometryData.texcoordBuffer.offsetFromSlice();
+      currentInstance.surface.texcoordStride = blas.modifiedGeometryData.texcoordBuffer.stride();
+      currentInstance.surface.previousPositionBufferIndex = blas.modifiedGeometryData.previousPositionBufferIndex;
       currentInstance.surface.indexBufferIndex = blas.modifiedGeometryData.indexBufferIndex;
       currentInstance.surface.indexStride = blas.modifiedGeometryData.indexBuffer.stride();
       currentInstance.surface.isClusterSurface = false;

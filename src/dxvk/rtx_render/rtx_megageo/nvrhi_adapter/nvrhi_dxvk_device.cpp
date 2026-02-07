@@ -816,7 +816,9 @@ namespace dxvk {
           bindingSet->addTrackedBuffer(dxvkBuffer);
 
           RTXMG_LOG(str::format("RTX MegaGeo: createBindingSet - buffer binding=", item.slot,
-            " type=", (int)write.descriptorType, " size=", size));
+            " type=", (int)write.descriptorType, " size=", size,
+            " deviceAddr=0x", std::hex, dxvkBuffer->getDeviceAddress(), std::dec,
+            " VkBuffer=0x", std::hex, (uint64_t)sliceHandle.handle, std::dec));
           break;
         }
         case nvrhi::BindingSetItem::Type::Sampler:

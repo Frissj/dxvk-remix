@@ -199,11 +199,34 @@ namespace dxvk {
     // ClusterBlas entries are expensive to recreate (subdivision surface extraction + topology cache).
     // Keep them alive 10x longer than regular BLAS to survive brief offscreen periods.
     const size_t clusterOldestFrame = m_device->getCurrentFrameId() - RtxOptions::numFramesToKeepGeometryData() * 10;
+    const uint32_t currentBufferTableSize = m_bufferCache.getActiveCount();
     auto blasEntryGarbageCollection = [&](auto& iter, auto& entries) -> void {
       if (iter->second.frameLastTouched < oldestFrame) {
         if (iter->second.isClusterBlas() && iter->second.frameLastTouched >= clusterOldestFrame) {
           ++iter;
           return;
+        }
+        // Log buffer indices for GC'd entries to trace stale descriptor access
+        const auto& geo = iter->second.modifiedGeometryData;
+        if (iter->second.isClusterBlas()) {
+          Logger::info(str::format("GC ClusterBlas: posIdx=", geo.positionBufferIndex,
+              " normIdx=", geo.normalBufferIndex,
+              " texIdx=", geo.texcoordBufferIndex,
+              " col0Idx=", geo.color0BufferIndex,
+              " idxIdx=", geo.indexBufferIndex,
+              " prevPosIdx=", geo.previousPositionBufferIndex,
+              " curBufTableSize=", currentBufferTableSize,
+              " frameLastTouched=", iter->second.frameLastTouched,
+              " curFrame=", m_device->getCurrentFrameId(),
+              " histBuf0=0x", std::hex, (geo.historyBuffer[0] != nullptr ? (uint64_t)geo.historyBuffer[0]->getSliceHandle().handle : 0),
+              " idxCacheBuf=0x", (geo.indexCacheBuffer != nullptr ? (uint64_t)geo.indexCacheBuffer->getSliceHandle().handle : 0), std::dec));
+        } else {
+          Logger::info(str::format("GC TriangleBlas: posIdx=", geo.positionBufferIndex,
+              " idxIdx=", geo.indexBufferIndex,
+              " curBufTableSize=", currentBufferTableSize,
+              " frameLastTouched=", iter->second.frameLastTouched,
+              " histBuf0=0x", std::hex, (geo.historyBuffer[0] != nullptr ? (uint64_t)geo.historyBuffer[0]->getSliceHandle().handle : 0),
+              " idxCacheBuf=0x", (geo.indexCacheBuffer != nullptr ? (uint64_t)geo.indexCacheBuffer->getSliceHandle().handle : 0), std::dec));
         }
         onSceneObjectDestroyed(iter->second);
         iter = entries.erase(iter);

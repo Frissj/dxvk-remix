@@ -76,8 +76,14 @@ namespace dxvk {
 
     // Persistent desc pool, our sets can be updated after bind (should be no need to reset this pool)
     Rc<DxvkDescriptorPool> m_globalBindlessPool[kMaxFramesInFlight];
-    
+
     std::unique_ptr<BindlessTable> m_tables[Table::Count][kMaxFramesInFlight];
+
+    // Track descriptor count per table type per rotation slot so we can overwrite
+    // stale descriptors with dummy values when the table shrinks between rotations.
+    // Without this, stale descriptors from a previous rotation may point to destroyed
+    // VkBuffers, causing GPU page faults when shaders access out-of-range indices.
+    uint32_t m_prevDescriptorCount[Table::Count][kMaxFramesInFlight] = {};
 
     uint32_t m_globalBindlessDescSetIdx = 0;
     uint32_t m_frameLastUpdated = UINT_MAX;

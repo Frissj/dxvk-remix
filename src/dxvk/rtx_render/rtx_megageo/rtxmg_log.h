@@ -14,7 +14,7 @@
 #define RTXMG_LOG_NVRHI_SCRATCH_MANAGER    1  // nvrhi_scratch_manager.cpp
 
 // Core
-#define RTXMG_LOG_RTX_MEGAGEO_BUILDER      0  // rtx_megageo_builder.cpp
+#define RTXMG_LOG_RTX_MEGAGEO_BUILDER      1  // rtx_megageo_builder.cpp
 
 // subdivision
 #define RTXMG_LOG_SHAPE                    0  // shape.cpp

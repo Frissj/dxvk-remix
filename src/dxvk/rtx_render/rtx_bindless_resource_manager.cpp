@@ -56,11 +56,25 @@ namespace dxvk {
 
   template<VkDescriptorType Type, typename T, typename U>
   void BindlessResourceManager::createDescriptorSet(const Rc<DxvkContext>& ctx, const std::vector<U>& engineObjects, const T& dummyDescriptor) {
-    const size_t numDescriptors = std::max((size_t) 1, engineObjects.size()); // Must always leave 1 to have a valid binding set
+    const size_t numActiveDescriptors = std::max((size_t) 1, engineObjects.size()); // Must always leave 1 to have a valid binding set
+
+    // Determine table type for stale descriptor tracking
+    Table tableType;
+    if constexpr (Type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) tableType = Table::Textures;
+    else if constexpr (Type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) tableType = Table::Buffers;
+    else tableType = Table::Samplers;
+
+    // When the table shrinks between rotation slots, descriptors beyond the new size
+    // retain stale values from the previous use of this slot (4 frames ago).
+    // Those stale descriptors may reference destroyed VkBuffers, so we must overwrite
+    // them with dummy descriptors to prevent GPU page faults.
+    const size_t prevCount = m_prevDescriptorCount[tableType][currentIdx()];
+    const size_t numDescriptors = std::max(numActiveDescriptors, prevCount);
     assert(numDescriptors <= kMaxBindlessResources);
 
-    std::vector<T> descriptorInfos(numDescriptors);
-    descriptorInfos[0] = dummyDescriptor; // we set the first descriptor to be a dummy (size is always at least 1) and overwrite it if there are valid engine objects
+    // Initialize ALL entries to dummy - entries beyond numActiveDescriptors will safely
+    // point to the dummy resource instead of stale/destroyed buffers
+    std::vector<T> descriptorInfos(numDescriptors, dummyDescriptor);
 
     uint32_t idx = 0;
     for (auto&& engineObject : engineObjects) {
@@ -117,6 +131,10 @@ namespace dxvk {
     default:
       break;
     }
+
+    // Update tracking: store the active count so next rotation of this slot
+    // knows how far it needs to clear
+    m_prevDescriptorCount[tableType][currentIdx()] = numActiveDescriptors;
   }
 
   void BindlessResourceManager::prepareSceneData(const Rc<DxvkContext> ctx, const std::vector<TextureRef>& rtTextures, const std::vector<RaytraceBuffer>& rtBuffers, const std::vector<Rc<DxvkSampler>>& samplers) {

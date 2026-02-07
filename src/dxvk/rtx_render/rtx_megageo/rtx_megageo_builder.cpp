@@ -1723,6 +1723,19 @@ private:
         .setPipeline(m_patchBlasAddressesPSO)
         .addBindingSet(bindingSet);
 
+    // Log GPU virtual addresses of all bound resources for crash investigation
+    {
+      auto* mappingsBuf = static_cast<NvrhiDxvkBuffer*>(m_patchMappingsBuffer.Get());
+      auto* blasPtrsBuf = static_cast<NvrhiDxvkBuffer*>(m_clusterAccels->blasPtrsBuffer.Get());
+      auto* instBuf = static_cast<NvrhiDxvkBuffer*>(instanceBuffer);
+      auto* paramsBuf = static_cast<NvrhiDxvkBuffer*>(m_patchParamsBuffer.Get());
+      Logger::info(str::format("RTX MegaGeo: GPU PATCH BIND ADDRS: mappings=0x", std::hex,
+          mappingsBuf->getDxvkBuffer()->getDeviceAddress(),
+          " blasPtrs=0x", blasPtrsBuf->getDxvkBuffer()->getDeviceAddress(),
+          " instance=0x", instBuf->getDxvkBuffer()->getDeviceAddress(),
+          " params=0x", paramsBuf->getDxvkBuffer()->getDeviceAddress(), std::dec,
+          " paramsSize=", paramsBuf->getDesc().byteSize));
+    }
     RTXMG_LOG(str::format("RTX MegaGeo: patchClusterBlasAddressesGPU - Setting compute state"));
     RTXMG_LOG(str::format("RTX MegaGeo: patchClusterBlasAddressesGPU - blasPtrsBuffer bytes=", m_clusterAccels->blasPtrsBuffer.GetBytes(),
         " numElements=", m_clusterAccels->blasPtrsBuffer.GetNumElements()));
