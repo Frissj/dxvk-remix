@@ -812,7 +812,10 @@ void ClusterAccelBuilder::BuildStructuredCLASes(ClusterAccels& accels, uint32_t 
         .clas =
         {
             .vertexFormat = VK_FORMAT_R32G32B32_SFLOAT,
-            .maxGeometryIndex = maxGeometryCountPerMesh,
+            // The compute_cluster_tiling shader writes clusterIndex into
+            // geometryIndexOffsetPacked (not localGeometryIndex like the sample),
+            // so maxGeometryIndex must cover the full cluster index range.
+            .maxGeometryIndex = m_maxClusters > 0 ? m_maxClusters - 1 : 0,
             .maxUniqueGeometryCount = 1,
             .maxTriangleCount = kClusterMaxTriangles,
             .maxVertexCount = kClusterMaxVertices,
@@ -2131,11 +2134,8 @@ void ClusterAccelBuilder::BuildBlasFromClas(ClusterAccels& accels, const Instanc
     if (blasBufferAddr == 0) Logger::err("RTX MegaGeo: BuildBlasFromClas - blasBufferAddr is NULL!");
     // Note: scratch buffer is now allocated on-demand by the nvrhi adapter if needed
 
-    // CRITICAL: Add barrier after FillBlasFromClasArgs compute shader writes to m_blasFromClasIndirectArgsBuffer
-    // The BLAS build cluster operation reads this buffer for indirect args. Without this barrier,
-    // the cluster operation may read stale/uninitialized data.
-    commandList->bufferBarrier(m_blasFromClasIndirectArgsBuffer, nvrhi::ResourceStates::UnorderedAccess, nvrhi::ResourceStates::ShaderResource);
-    RTXMG_LOG("RTX MegaGeo: BuildBlasFromClas - barrier after FillBlasFromClasArgs");
+    // Barrier for m_blasFromClasIndirectArgsBuffer (UAV → ShaderResource) is handled automatically
+    // by requireBufferState in executeMultiIndirectClusterOperation when it requires inIndirectArgsBuffer as ShaderResource.
 
 #if RTXMG_LOG_CLUSTER_ACCEL_BUILDER
     // Download and log the first few BLAS indirect args to diagnose misaligned address errors (GPU readback - only when logging enabled)
@@ -2596,12 +2596,15 @@ void ClusterAccelBuilder::BuildAccel(const RTXMGScene& scene, const TessellatorC
                              " elementSize=", m_tessellationCountersBuffer.GetElementBytes()));
 
     // Clear tessellation counters for this frame
+    // On first build, zero ALL slots to prevent garbage readback from uninitialized slots
     TessellationCounters tessCounters = {};
-    RTXMG_LOG("RTX MegaGeo: BuildAccel - before UploadElement");
-    m_tessellationCountersBuffer.UploadElement(tessCounters, tessCounterIndex, commandList);
-    RTXMG_LOG(str::format("RTX MegaGeo: Uploaded zeroed counters to index ", tessCounterIndex,
-                             " (clusters=", tessCounters.clusters, " desired=", tessCounters.desiredClusters, ")"));
-    RTXMG_LOG("RTX MegaGeo: BuildAccel - after UploadElement");
+    if (m_buildAccelFrameIndex < kFrameCount) {
+        for (uint32_t i = 0; i < kFrameCount; ++i) {
+            m_tessellationCountersBuffer.UploadElement(tessCounters, i, commandList);
+        }
+    } else {
+        m_tessellationCountersBuffer.UploadElement(tessCounters, tessCounterIndex, commandList);
+    }
 
 #if RTXMG_CHRONO_TIMING
     auto beforeClears = std::chrono::high_resolution_clock::now();
@@ -2733,22 +2736,13 @@ void ClusterAccelBuilder::BuildAccel(const RTXMGScene& scene, const TessellatorC
     // NOTE: enableLogging block removed - Log()/Download() calls close/reopen command list
     // which destroys bound image views and causes VK_ERROR_DEVICE_LOST in DXVK.
 
-    // CRITICAL: Add UAV barriers after compute_cluster_tiling to ensure:
-    // 1. TessellationCounters atomics are visible
-    // 2. IndirectInstantiateTemplateArgs writes are complete
-    // 3. Cluster data is written before CLAS instantiation reads it
-    // 4. ClusterOffsetCounts written by CopyClusterOffset are visible before FillInstanceClusters reads them
-    // 5. FillClustersDispatchIndirect args are ready before dispatchIndirect uses them
+    // UAV barriers after compute_cluster_tiling.
+    // Most buffers are handled by the auto-barrier system (setResourceStatesForBindingSet
+    // and requireBufferState in executeMultiIndirectClusterOperation), but buffers accessed
+    // via device addresses or not tracked by subsequent operations need explicit barriers.
     RTXMG_LOG("RTX MegaGeo: BuildAccel - adding UAV barriers after ComputeClusterTiling");
-    commandList->bufferBarrier(m_tessellationCountersBuffer, nvrhi::ResourceStates::UnorderedAccess, nvrhi::ResourceStates::UnorderedAccess);
-    commandList->bufferBarrier(m_clasIndirectArgDataBuffer, nvrhi::ResourceStates::UnorderedAccess, nvrhi::ResourceStates::UnorderedAccess);
-    commandList->bufferBarrier(m_clustersBuffer, nvrhi::ResourceStates::UnorderedAccess, nvrhi::ResourceStates::UnorderedAccess);
+    // clusterShadingDataBuffer: written here, read later by ray tracing (not tracked by FillInstanceClusters or BuildStructuredCLASes)
     commandList->bufferBarrier(accels.clusterShadingDataBuffer, nvrhi::ResourceStates::UnorderedAccess, nvrhi::ResourceStates::UnorderedAccess);
-    // CRITICAL FIX: These two buffers were missing barriers causing FillInstanceClusters to read stale data
-    // m_clusterOffsetCountsBuffer: Written by CopyClusterOffset as UAV, read by FillInstanceClusters as SRV
-    commandList->bufferBarrier(m_clusterOffsetCountsBuffer, nvrhi::ResourceStates::UnorderedAccess, nvrhi::ResourceStates::ShaderResource);
-    // m_fillClustersDispatchIndirectBuffer: Written by CopyClusterOffset as UAV, used by dispatchIndirect
-    commandList->bufferBarrier(m_fillClustersDispatchIndirectBuffer, nvrhi::ResourceStates::UnorderedAccess, nvrhi::ResourceStates::IndirectArgument);
 
     RTXMG_LOG("RTX MegaGeo: BuildAccel - calling FillInstanceClusters");
     FillInstanceClusters(scene, accels, commandList);
@@ -2827,14 +2821,18 @@ void ClusterAccelBuilder::BuildAccel(const RTXMGScene& scene, const TessellatorC
                                  " desiredClasBlocks=", counterBufferData[i].desiredClasBlocks)));
     }
 
-    // If readIndex has no valid data (0 clusters), find the first index with valid data
-    // This handles early frames where previous frame data doesn't exist yet
+    // If readIndex has no valid data (0 clusters or garbage values exceeding max),
+    // find the first index with valid data.
+    // This handles early frames where previous frame data doesn't exist yet.
+    auto isValidCounter = [this](const TessellationCounters& c) {
+        return c.clusters > 0 && c.clusters <= m_maxClusters;
+    };
     TessellationCounters counters = counterBufferData[readIndex];
-    if (counters.clusters == 0) {
+    if (!isValidCounter(counters)) {
         // Search for any index with valid cluster data, prefer current frame's index
         for (uint32_t i = 0; i < kFrameCount; ++i) {
             uint32_t checkIndex = (tessCounterIndex + kFrameCount - i) % kFrameCount;
-            if (counterBufferData[checkIndex].clusters > 0) {
+            if (isValidCounter(counterBufferData[checkIndex])) {
                 readIndex = checkIndex;
                 counters = counterBufferData[readIndex];
                 RTXMG_LOG(str::format("RTX MegaGeo: Fallback to counter index ", readIndex, " with ", counters.clusters, " clusters"));
@@ -2845,15 +2843,13 @@ void ClusterAccelBuilder::BuildAccel(const RTXMGScene& scene, const TessellatorC
     RTXMG_LOG(str::format("RTX MegaGeo: Using counters from index ", readIndex,
                              ": clusters=", counters.clusters, " desired=", counters.desiredClusters));
 
-    // ALWAYS log counter values - critical for diagnosing zero-triangle issue
-    Logger::info(str::format("RTX MegaGeo COUNTERS[", readIndex, "]: clusters=", counters.clusters,
+    RTXMG_LOG(str::format("RTX MegaGeo COUNTERS[", readIndex, "]: clusters=", counters.clusters,
         " desiredClusters=", counters.desiredClusters,
         " desiredTriangles=", counters.desiredTriangles,
         " desiredVertices=", counters.desiredVertices,
         " desiredClasBlocks=", counters.desiredClasBlocks));
-    // Log ALL frame slots to see if data ended up in wrong slot
     for (uint32_t ci = 0; ci < kFrameCount; ++ci) {
-      Logger::info(str::format("RTX MegaGeo COUNTERS slot[", ci, "]: clusters=", counterBufferData[ci].clusters,
+      RTXMG_LOG(str::format("RTX MegaGeo COUNTERS slot[", ci, "]: clusters=", counterBufferData[ci].clusters,
           " desiredClusters=", counterBufferData[ci].desiredClusters,
           " desiredTris=", counterBufferData[ci].desiredTriangles,
           " desiredVerts=", counterBufferData[ci].desiredVertices));

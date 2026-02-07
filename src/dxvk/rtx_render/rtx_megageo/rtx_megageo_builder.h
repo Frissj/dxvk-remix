@@ -233,6 +233,9 @@ namespace dxvk {
      */
     uint32_t getInstanceIndexForSurface(uint32_t surfaceId) const;
 
+    /** Check if a surface ID still exists in the builder (not pruned). */
+    bool hasSurface(uint32_t surfaceId) const { return m_surfaces.count(surfaceId) > 0; }
+
     /**
      * \brief Patch cluster BLAS addresses in instance buffer (GPU-side)
      *
@@ -480,6 +483,7 @@ namespace dxvk {
       bool isReady = false;
       bool m_hasDisplacementMaterial = false;
       float displacementScale = 1.0f;
+      size_t gpuMemoryBytes = 0;
     };
 
     std::unordered_map<uint32_t, RTXMGSubdivisionSurfaceEntry> m_surfaces;
@@ -507,6 +511,9 @@ namespace dxvk {
 
     // Track last frame each surface had a transform (for stale surface cleanup)
     std::unordered_map<uint32_t, uint32_t> m_surfaceLastSeenFrame;
+
+    // Total GPU memory used by all surfaces in the cache
+    size_t m_surfaceCacheVramBytes = 0;
 
     // Dynamic memory sizing - high-water mark (only grows, never shrinks to avoid reallocation churn)
     uint32_t m_hwmClusters = 0;

@@ -24,6 +24,8 @@
 #include "../rtx_camera.h"
 #include "../../util/log/log.h"
 #include "../../../util/util_error.h"  // For DxvkError exception handling
+#include "../../dxvk_device.h"         // For DxvkDevice, adapter(), memoryProperties()
+#include "../../dxvk_adapter.h"        // For DxvkAdapterMemoryInfo, getMemoryHeapInfo()
 #include <algorithm>
 #include <cmath>
 #include <chrono>
@@ -372,6 +374,13 @@ private:
 
     RTXMGSubdivisionSurfaceEntry& surface = it->second;
 
+    // Decrement tracked VRAM before removing
+    if (m_surfaceCacheVramBytes >= surface.gpuMemoryBytes) {
+      m_surfaceCacheVramBytes -= surface.gpuMemoryBytes;
+    } else {
+      m_surfaceCacheVramBytes = 0;
+    }
+
     // Cleanup BLAS
     if (surface.blas != VK_NULL_HANDLE) {
       // BLAS cleanup handled by DXVK
@@ -417,26 +426,104 @@ private:
       m_surfaceLastSeenFrame[surfaceId] = s_frameCounter;
     }
 
-    // Prune surfaces that haven't had a transform for 120 frames
+    // VRAM budget-based surface cache eviction
+    // Evict oldest surfaces when cache exceeds 10% of total VRAM budget
     {
-      constexpr uint32_t kStaleFrameThreshold = 120;
-      std::vector<uint32_t> staleSurfaceIds;
-      for (const auto& [surfaceId, surface] : m_surfaces) {
-        auto it = m_surfaceLastSeenFrame.find(surfaceId);
-        uint32_t lastSeen = (it != m_surfaceLastSeenFrame.end()) ? it->second : 0;
-        if (s_frameCounter > lastSeen + kStaleFrameThreshold) {
-          staleSurfaceIds.push_back(surfaceId);
+      // Query VRAM budget from the adapter (same pattern as OMM manager)
+      VkDeviceSize totalVramBudget = 0;
+      const VkPhysicalDeviceMemoryProperties memory = m_device->adapter()->memoryProperties();
+      const DxvkAdapterMemoryInfo memHeapInfo = m_device->adapter()->getMemoryHeapInfo();
+      for (uint32_t i = 0; i < memory.memoryHeapCount; i++) {
+        if (memory.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+          totalVramBudget += memHeapInfo.heaps[i].memoryBudget;
         }
       }
-      for (uint32_t surfaceId : staleSurfaceIds) {
-        RTXMG_LOG(str::format("RTX MegaGeo: Pruning stale surface ", surfaceId,
-            " (last seen frame ", m_surfaceLastSeenFrame[surfaceId], ", current ", s_frameCounter, ")"));
-        m_surfaceToMeshIndex.erase(surfaceId);
-        m_surfaceLastSeenFrame.erase(surfaceId);
-        removeSubdivisionSurface(surfaceId);
+
+      // Surface cache budget = 10% of total VRAM
+      const size_t surfaceCacheBudget = static_cast<size_t>(totalVramBudget / 10);
+      const size_t evictionTarget = static_cast<size_t>(surfaceCacheBudget * 8 / 10); // 80% to avoid thrashing
+
+      if (m_surfaceCacheVramBytes > surfaceCacheBudget) {
+        // Collect eviction candidates: surfaces not referenced this frame
+        struct EvictionCandidate {
+          uint32_t surfaceId;
+          uint32_t lastSeenFrame;
+          size_t gpuMemoryBytes;
+        };
+        std::vector<EvictionCandidate> candidates;
+
+        for (const auto& [surfaceId, surface] : m_surfaces) {
+          // Only evict surfaces that don't have a transform this frame
+          if (instanceTransforms.count(surfaceId) > 0)
+            continue;
+          auto it = m_surfaceLastSeenFrame.find(surfaceId);
+          uint32_t lastSeen = (it != m_surfaceLastSeenFrame.end()) ? it->second : 0;
+          candidates.push_back({surfaceId, lastSeen, surface.gpuMemoryBytes});
+        }
+
+        // Sort by last seen frame (oldest first)
+        std::sort(candidates.begin(), candidates.end(),
+          [](const EvictionCandidate& a, const EvictionCandidate& b) {
+            return a.lastSeenFrame < b.lastSeenFrame;
+          });
+
+        // Evict until we're at or below the eviction target (80% of budget)
+        size_t bytesFreed = 0;
+        uint32_t evictedCount = 0;
+        for (const auto& candidate : candidates) {
+          if (m_surfaceCacheVramBytes <= evictionTarget)
+            break;
+          bytesFreed += candidate.gpuMemoryBytes;
+          m_surfaceToMeshIndex.erase(candidate.surfaceId);
+          m_surfaceLastSeenFrame.erase(candidate.surfaceId);
+          removeSubdivisionSurface(candidate.surfaceId);
+          evictedCount++;
+        }
+
+        if (evictedCount > 0) {
+          Logger::info(str::format("RTX MegaGeo: VRAM budget eviction - evicted ", evictedCount,
+              " surfaces, freed ", bytesFreed / (1024 * 1024), " MB, cache now ",
+              m_surfaceCacheVramBytes / (1024 * 1024), " MB / ",
+              surfaceCacheBudget / (1024 * 1024), " MB budget, ",
+              m_surfaces.size(), " surfaces remaining"));
+        }
       }
-      if (!staleSurfaceIds.empty()) {
-        Logger::info(str::format("RTX MegaGeo: Pruned ", staleSurfaceIds.size(), " stale surfaces, ", m_surfaces.size(), " remaining"));
+    }
+
+    // VRAM capacity monitoring — log warnings when approaching total VRAM limits
+    {
+      VkDeviceSize totalVramUsed = 0;
+      VkDeviceSize totalVramBudget = 0;
+      const VkPhysicalDeviceMemoryProperties memory = m_device->adapter()->memoryProperties();
+      const DxvkAdapterMemoryInfo memHeapInfo = m_device->adapter()->getMemoryHeapInfo();
+      for (uint32_t i = 0; i < memory.memoryHeapCount; i++) {
+        if (memory.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+          totalVramUsed += memHeapInfo.heaps[i].memoryAllocated;
+          totalVramBudget += memHeapInfo.heaps[i].memoryBudget;
+        }
+      }
+
+      if (totalVramBudget > 0) {
+        if (totalVramUsed > totalVramBudget * 95 / 100) {
+          Logger::err(str::format("RTX MegaGeo: CRITICAL VRAM usage ",
+              totalVramUsed / (1024 * 1024), " MB / ", totalVramBudget / (1024 * 1024),
+              " MB (", totalVramUsed * 100 / totalVramBudget, "%) - surface cache: ",
+              m_surfaceCacheVramBytes / (1024 * 1024), " MB"));
+        } else if (totalVramUsed > totalVramBudget * 90 / 100) {
+          Logger::warn(str::format("RTX MegaGeo: High VRAM usage ",
+              totalVramUsed / (1024 * 1024), " MB / ", totalVramBudget / (1024 * 1024),
+              " MB (", totalVramUsed * 100 / totalVramBudget, "%) - surface cache: ",
+              m_surfaceCacheVramBytes / (1024 * 1024), " MB"));
+        }
+
+        // Periodic monitoring every 60 frames
+        if (s_frameCounter % 60 == 0) {
+          RTXMG_LOG(str::format("RTX MegaGeo: VRAM ",
+              totalVramUsed / (1024 * 1024), " MB / ", totalVramBudget / (1024 * 1024),
+              " MB (", totalVramUsed * 100 / totalVramBudget, "%) - surface cache: ",
+              m_surfaceCacheVramBytes / (1024 * 1024), " MB, ",
+              m_surfaces.size(), " surfaces"));
+        }
       }
     }
 
@@ -602,8 +689,23 @@ private:
     // PROPER FIX: Rebuild instance list each frame from active transforms
     // This ensures only surfaces with valid transforms this frame are rendered
     // Prevents "sticking to screen" bug from identity transforms on inactive surfaces
-    RTXMG_LOG(str::format("RTX MegaGeo: Rebuilding instances - m_instanceTransforms.size()=", m_instanceTransforms.size(),
-        " m_surfaceToMeshIndex.size()=", m_surfaceToMeshIndex.size()));
+    {
+      uint32_t pendingQueueSize = 0;
+      uint32_t completedQueueSize = 0;
+      {
+        std::lock_guard<std::mutex> lock(m_pendingMutex);
+        pendingQueueSize = static_cast<uint32_t>(m_pendingSurfaces.size());
+      }
+      {
+        std::lock_guard<std::mutex> lock(m_completedMutex);
+        completedQueueSize = static_cast<uint32_t>(m_completedSurfaces.size());
+      }
+      RTXMG_LOG(str::format("RTX MegaGeo: Rebuilding instances - transforms=", m_instanceTransforms.size(),
+          " meshIndex=", m_surfaceToMeshIndex.size(),
+          " surfaces=", m_surfaces.size(),
+          " pendingQueue=", pendingQueueSize,
+          " completedQueue=", completedQueueSize));
+    }
 
     if (m_scene) {
       // Clear instances from previous frame
@@ -632,6 +734,13 @@ private:
         if (meshIt == m_surfaceToMeshIndex.end()) {
           // Mesh not ready yet (async creation in progress)
           meshesNotReady++;
+          // Check if this surface even exists in m_surfaces
+          auto surfIt = m_surfaces.find(surfaceId);
+          bool existsInSurfaces = (surfIt != m_surfaces.end());
+          bool isReady = existsInSurfaces && surfIt->second.isReady;
+          RTXMG_LOG(str::format("RTX MegaGeo: NOT READY surfaceId=", surfaceId,
+              " existsInSurfaces=", existsInSurfaces ? "YES" : "NO",
+              " isReady=", isReady ? "YES" : "NO"));
           continue;
         }
 
@@ -1145,6 +1254,9 @@ private:
 
     {
       std::lock_guard<std::mutex> lock(m_completedMutex);
+      if (!m_completedSurfaces.empty()) {
+        RTXMG_LOG(str::format("RTX MegaGeo: processCompletedSurfaces - draining ", m_completedSurfaces.size(), " completed surfaces"));
+      }
       completed.swap(m_completedSurfaces);
     }
 
@@ -1183,10 +1295,14 @@ private:
 
           surface.isReady = true;
 
+          // Track GPU memory for VRAM budget eviction
+          surface.gpuMemoryBytes = surface.subdivSurface->getGpuMemoryBytes();
+          m_surfaceCacheVramBytes += surface.gpuMemoryBytes;
+
           const Shape* shape = surface.subdivSurface ? surface.subdivSurface->GetShape() : nullptr;
           uint32_t numFaces = shape ? shape->nvertsPerFace.size() : 0;
           RTXMG_LOG(str::format("RTX MegaGeo: Integrated completed surface ", comp.surfaceId,
-                                   " (", numFaces, " faces)"));
+                                   " (", numFaces, " faces, ", surface.gpuMemoryBytes / 1024, " KB GPU mem)"));
         } catch (const std::exception& e) {
           m_commandList->close();
           Logger::err(str::format("RTX MegaGeo: Failed to create SubdivisionSurface for surface ", comp.surfaceId, ": ", e.what()));

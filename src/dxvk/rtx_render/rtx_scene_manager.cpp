@@ -2147,6 +2147,16 @@ namespace dxvk {
     XXH64_hash_t topologyHash = drawCallState.getHash(topologyRule);
     auto cacheIt = m_subdivisionSurfaceCache.find(topologyHash);
 
+    // Invalidate stale cache entries (surface was pruned from builder)
+    if (cacheIt != m_subdivisionSurfaceCache.end()) {
+      RtxMegaGeoBuilder* megaGeoBuilder = m_accelManager.getMegaGeoBuilder();
+      if (megaGeoBuilder && !megaGeoBuilder->hasSurface(cacheIt->second)) {
+        Logger::info(str::format("RTX MegaGeo: Cache hit for pruned surface ", cacheIt->second, ", invalidating"));
+        m_subdivisionSurfaceCache.erase(cacheIt);
+        cacheIt = m_subdivisionSurfaceCache.end(); // treat as cache miss
+      }
+    }
+
     if (cacheIt != m_subdivisionSurfaceCache.end()) {
       // Cache hit! Topology exists, just update control points for animated meshes
       uint32_t cachedSurfaceId = cacheIt->second;

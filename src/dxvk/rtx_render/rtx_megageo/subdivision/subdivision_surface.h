@@ -64,6 +64,8 @@ public:
     bool HasAnimation() const;
     uint32_t NumKeyframes() const;
 
+    size_t getGpuMemoryBytes() const;
+
     void Animate(float animTime, float frameRate);
 
     uint32_t NumVertices() const;

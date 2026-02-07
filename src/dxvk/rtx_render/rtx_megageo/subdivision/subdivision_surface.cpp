@@ -545,6 +545,43 @@ SubdivisionSurface::SubdivisionSurface(TopologyCache& topologyCache,
 
 }
 
+size_t SubdivisionSurface::getGpuMemoryBytes() const
+{
+    size_t total = 0;
+    auto addBuffer = [&total](const nvrhi::BufferHandle& buf) {
+        if (buf)
+            total += buf->getDesc().byteSize;
+    };
+
+    // Vertex surface table data
+    addBuffer(m_vertexDeviceData.surfaceDescriptors);
+    addBuffer(m_vertexDeviceData.controlPointIndices);
+    addBuffer(m_vertexDeviceData.patchPoints);
+    addBuffer(m_vertexDeviceData.patchPointsOffsets);
+
+    // Texcoord surface table data
+    addBuffer(m_texcoordDeviceData.surfaceDescriptors);
+    addBuffer(m_texcoordDeviceData.controlPointIndices);
+    addBuffer(m_texcoordDeviceData.patchPoints);
+    addBuffer(m_texcoordDeviceData.patchPointsOffsets);
+
+    // Position buffers
+    addBuffer(m_positionsBuffer);
+    addBuffer(m_positionsPrevBuffer);
+
+    // Texcoords and per-surface metadata
+    addBuffer(m_texcoordsBuffer);
+    addBuffer(m_surfaceToGeometryIndexBuffer);
+    addBuffer(m_topologyQualityBuffer);
+
+    // Keyframe position buffers
+    for (const auto& buf : m_positionKeyframeBuffers) {
+        addBuffer(buf);
+    }
+
+    return total;
+}
+
 uint32_t SubdivisionSurface::NumVertices() const
 {
     return static_cast<uint32_t>(m_positionsBuffer->getDesc().byteSize / sizeof(Vector3));

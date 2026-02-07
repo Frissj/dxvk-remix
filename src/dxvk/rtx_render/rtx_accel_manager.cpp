@@ -568,25 +568,28 @@ namespace dxvk {
       }
     }
 
+    // RTX MegaGeo: Per-frame geometry pipeline counters
+    uint32_t geoCountTotal = 0;           // Total input instances from the game
+    uint32_t geoCountHidden = 0;          // Skipped: hidden
+    uint32_t geoCountZeroMask = 0;        // Skipped: zero mask
+    uint32_t geoCountClusterSubmitted = 0; // Cluster instances submitted to addBlas
+    uint32_t geoCountClusterNoBuffers = 0; // Cluster instances skipped: buffers not ready
+    uint32_t geoCountStandard = 0;        // Standard BLAS instances
+    // Cluster skip counters from addBlas are tracked via m_frameClusterSkipZeroTris / m_frameClusterSkipNoInstance
+    m_frameClusterSkipZeroTris = 0;
+    m_frameClusterSkipNoInstance = 0;
+
     for (RtInstance* instance : instances) {
-      // RTX MegaGeo: Debug logging for ClusterBlas instances being skipped
-      if (instance && instance->getBlas() && instance->getBlas()->isClusterBlas()) {
-        static bool loggedSkipOnce = false;
-        if (!loggedSkipOnce) {
-          RTXMG_LOG(str::format("RTX MegaGeo mergeInstancesIntoBlas: ClusterBlas instance found! inst=", (void*)instance,
-                                   " isHidden=", instance->isHidden(),
-                                   " mask=", instance->getVkInstance().mask));
-          loggedSkipOnce = true;
-        }
-      }
+      geoCountTotal++;
 
       if (instance->isHidden()) {
+        geoCountHidden++;
         continue;
       }
 
       // If the instance has zero mask, do not build BLAS for it: no ray can intersect this instance.
       if (instance->getVkInstance().mask == 0) {
-        
+        geoCountZeroMask++;
         bool needsOpacityMicromap = instance->isViewModelReference() && opacityMicromapManager;
         bool hasBillboards = instance->getBillboardCount() > 0;
 
@@ -634,6 +637,7 @@ namespace dxvk {
         if (!hasValid) {
           // Skip this cluster instance until buffers are ready
           // The instance will be added in a future frame when buffers are valid
+          geoCountClusterNoBuffers++;
           ONCE(Logger::info("RTX MegaGeo TLAS: SKIPPING cluster instance - buffers not ready"));
           continue;
         }
@@ -647,25 +651,20 @@ namespace dxvk {
         m_reorderedSurfacesFirstIndexOffset.push_back(0);
 
         // Add directly to TLAS - the BLAS address will be patched on GPU later
-        static uint32_t s_clusterAddCount = 0;
         if (instance->surface.instancesToObject == nullptr) {
           addBlas(instance, blasEntry, nullptr);
-          s_clusterAddCount++;
+          geoCountClusterSubmitted++;
         } else {
           for (auto& instanceToObject : *instance->surface.instancesToObject) {
             addBlas(instance, blasEntry, &instanceToObject);
-            s_clusterAddCount++;
+            geoCountClusterSubmitted++;
           }
-        }
-
-        // Log how many cluster instances have been added
-        if ((s_clusterAddCount % 500) == 1) {
-          Logger::info(str::format("RTX MegaGeo TLAS: Added ", s_clusterAddCount, " cluster instances to TLAS"));
         }
 
         continue; // Skip traditional BLAS building (geometry fill, dynamic/merged decision, etc.)
       }
 
+      geoCountStandard++;
       fillGeometryInfoFromBlasEntry(*blasEntry, *instance, opacityMicromapManager);
 
       const uint32_t minPrimsInDynamicBLAS = std::max(RtxOptions::minPrimsInDynamicBLAS(), 100u);
@@ -916,7 +915,24 @@ namespace dxvk {
       totalPrimitiveIDOffset += primitiveCount;
     }
 
-    buildBlases(ctx, execBarriers, cameraManager, opacityMicromapManager, instanceManager, 
+    // RTX MegaGeo: Geometry pipeline summary
+    // Shows how many game geometries survive to the final TLAS output
+    {
+      uint32_t tlasOutput = static_cast<uint32_t>(m_mergedInstances[Tlas::Opaque].size() + m_mergedInstances[Tlas::Unordered].size());
+      uint32_t clusterInTlas = geoCountClusterSubmitted - m_frameClusterSkipZeroTris - m_frameClusterSkipNoInstance;
+      uint32_t totalInvalidated = geoCountHidden + geoCountZeroMask + geoCountClusterNoBuffers + m_frameClusterSkipZeroTris + m_frameClusterSkipNoInstance;
+      static uint32_t s_geoPipelineLogCount = 0;
+      if ((s_geoPipelineLogCount++ % 60) == 0) {
+        Logger::info(str::format("RTX MegaGeo GEO PIPELINE: input=", geoCountTotal,
+            " | output=", tlasOutput, " (standard=", geoCountStandard, " cluster=", clusterInTlas, ")",
+            " | invalidated=", totalInvalidated,
+            " (hidden=", geoCountHidden, " zeroMask=", geoCountZeroMask,
+            " noBuffers=", geoCountClusterNoBuffers,
+            " zeroTris=", m_frameClusterSkipZeroTris, " noInstance=", m_frameClusterSkipNoInstance, ")"));
+      }
+    }
+
+    buildBlases(ctx, execBarriers, cameraManager, opacityMicromapManager, instanceManager,
                 textures, instances, blasBuckets, blasToBuild, blasRangesToBuild, totalScratchMemory);
   }
 
@@ -938,25 +954,14 @@ namespace dxvk {
       // to hit null BLAS pointers → GPU hang (TDR/DEVICE_LOST). Skip ALL cluster entries.
       const auto& tessStats = blasEntry->megaGeoBuilder->getStats();
       if (tessStats.numTriangles == 0) {
-        static uint32_t s_zeroTrisSkipCount = 0;
-        if ((s_zeroTrisSkipCount++ % 100) == 0) {
-          Logger::warn(str::format("RTX MegaGeo AccelManager: Skipping TLAS entry for surface ",
-              blasEntry->megaGeoSurfaceId, " (tessellation produced 0 triangles) [total skipped=", s_zeroTrisSkipCount, "]"));
-        }
+        m_frameClusterSkipZeroTris++;
         return;
       }
 
       // Get the RTXMG instance index for this surface
       uint32_t rtxmgIndex = blasEntry->megaGeoBuilder->getInstanceIndexForSurface(blasEntry->megaGeoSurfaceId);
       if (rtxmgIndex == UINT32_MAX) {
-        // No valid RTXMG instance - skip this surface entirely.
-        // Adding it with accelerationStructureReference=0 causes GPU hang (TDR/DEVICE_LOST)
-        // when ray tracing tries to access BLAS at address 0.
-        static uint32_t s_skipCount = 0;
-        if ((s_skipCount++ % 100) == 0) {
-          Logger::warn(str::format("RTX MegaGeo AccelManager: Skipping TLAS entry for surface ",
-              blasEntry->megaGeoSurfaceId, " (no RTXMG instance, would cause GPU hang) [total skipped=", s_skipCount, "]"));
-        }
+        m_frameClusterSkipNoInstance++;
         return;
       }
 

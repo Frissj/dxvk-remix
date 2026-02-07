@@ -812,7 +812,10 @@ namespace dxvk {
         requireBufferState(desc.inIndirectArgCountBuffer, nvrhi::ResourceStates::ShaderResource);
       }
       if (desc.inOutAddressesBuffer) {
-        requireBufferState(desc.inOutAddressesBuffer, nvrhi::ResourceStates::UnorderedAccess);
+        // The CLAS build reads destination addresses in the ACCELERATION_STRUCTURE_BUILD stage,
+        // not the COMPUTE_SHADER stage. Use AccelStructBuildInput to get the correct barrier
+        // (compute shader UAV write → accel struct build read).
+        requireBufferState(desc.inOutAddressesBuffer, nvrhi::ResourceStates::AccelStructBuildInput);
       }
       if (desc.outSizesBuffer) {
         requireBufferState(desc.outSizesBuffer, nvrhi::ResourceStates::UnorderedAccess);
@@ -983,8 +986,13 @@ namespace dxvk {
       currentState = desc.initialState;
     }
 
-    // If state is different, record a barrier
-    if (currentState != state) {
+    // Record a barrier if state changes, OR if both states include UAV
+    // (UAV → UAV needs an execution+memory barrier to ensure write visibility between dispatches)
+    bool needsBarrier = (currentState != state);
+    if (!needsBarrier && static_cast<uint32_t>(state & nvrhi::ResourceStates::UnorderedAccess) != 0) {
+      needsBarrier = true; // UAV → UAV barrier for write visibility
+    }
+    if (needsBarrier) {
       RTXMG_LOG(str::format("RTX MegaGeo: AUTO BARRIER buffer ", (void*)buffer,
         " from ", (uint32_t)currentState, " to ", (uint32_t)state));
       m_PendingBufferBarriers.push_back({buffer, currentState, state});

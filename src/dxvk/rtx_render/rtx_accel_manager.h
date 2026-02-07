@@ -167,6 +167,10 @@ private:
   };
   std::vector<ClusterInstancePatchInfo> m_clusterInstancePatches;
 
+  // RTX MegaGeo: Per-frame counters for cluster skips in addBlas (reset in mergeInstancesIntoBlas)
+  uint32_t m_frameClusterSkipZeroTris = 0;
+  uint32_t m_frameClusterSkipNoInstance = 0;
+
   // Patch cluster BLAS addresses directly on GPU using a compute shader
   void patchClusterBlasAddresses(Rc<DxvkContext> ctx);
 
