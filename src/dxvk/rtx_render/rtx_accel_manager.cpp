@@ -933,22 +933,43 @@ namespace dxvk {
                                " surfaceId=", blasEntry->megaGeoSurfaceId));
     }
     if (isClusterBlas && blasEntry->megaGeoBuilder) {
-      // Set placeholder - will be patched by patchClusterBlasAddressesGPU()
-      blasInstance.accelerationStructureReference = 0;
+      // If tessellation produced zero triangles, ALL BLAS addresses in blasPtrsBuffer are 0.
+      // GPU patching would copy these zeros into the TLAS instance buffer, causing ray tracing
+      // to hit null BLAS pointers → GPU hang (TDR/DEVICE_LOST). Skip ALL cluster entries.
+      const auto& tessStats = blasEntry->megaGeoBuilder->getStats();
+      if (tessStats.numTriangles == 0) {
+        static uint32_t s_zeroTrisSkipCount = 0;
+        if ((s_zeroTrisSkipCount++ % 100) == 0) {
+          Logger::warn(str::format("RTX MegaGeo AccelManager: Skipping TLAS entry for surface ",
+              blasEntry->megaGeoSurfaceId, " (tessellation produced 0 triangles) [total skipped=", s_zeroTrisSkipCount, "]"));
+        }
+        return;
+      }
 
       // Get the RTXMG instance index for this surface
       uint32_t rtxmgIndex = blasEntry->megaGeoBuilder->getInstanceIndexForSurface(blasEntry->megaGeoSurfaceId);
-      if (rtxmgIndex != UINT32_MAX) {
-        // Determine which TLAS this will go into and calculate the instance index
-        Tlas::Type tlasType = (instance->usesUnorderedApproximations() && RtxOptions::enableSeparateUnorderedApproximations())
-                              ? Tlas::Unordered : Tlas::Opaque;
-        uint32_t remixIndex = static_cast<uint32_t>(m_mergedInstances[tlasType].size());
-
-        // Record the mapping for GPU-side patching
-        m_clusterInstancePatches.push_back({remixIndex, rtxmgIndex, tlasType});
-      } else {
-        Logger::warn(str::format("RTX MegaGeo AccelManager: No RTXMG instance index for surface ", blasEntry->megaGeoSurfaceId));
+      if (rtxmgIndex == UINT32_MAX) {
+        // No valid RTXMG instance - skip this surface entirely.
+        // Adding it with accelerationStructureReference=0 causes GPU hang (TDR/DEVICE_LOST)
+        // when ray tracing tries to access BLAS at address 0.
+        static uint32_t s_skipCount = 0;
+        if ((s_skipCount++ % 100) == 0) {
+          Logger::warn(str::format("RTX MegaGeo AccelManager: Skipping TLAS entry for surface ",
+              blasEntry->megaGeoSurfaceId, " (no RTXMG instance, would cause GPU hang) [total skipped=", s_skipCount, "]"));
+        }
+        return;
       }
+
+      // Set placeholder - will be patched by patchClusterBlasAddressesGPU()
+      blasInstance.accelerationStructureReference = 0;
+
+      // Determine which TLAS this will go into and calculate the instance index
+      Tlas::Type tlasType = (instance->usesUnorderedApproximations() && RtxOptions::enableSeparateUnorderedApproximations())
+                            ? Tlas::Unordered : Tlas::Opaque;
+      uint32_t remixIndex = static_cast<uint32_t>(m_mergedInstances[tlasType].size());
+
+      // Record the mapping for GPU-side patching
+      m_clusterInstancePatches.push_back({remixIndex, rtxmgIndex, tlasType});
     } else {
       // Traditional BLAS - use the address directly
       blasInstance.accelerationStructureReference = blasEntry->getBlasAddress();
@@ -1282,9 +1303,17 @@ namespace dxvk {
         s_patchLogCount++;
       }
 
+      // Barrier: BLAS build wrote blasPtrsBuffer, transfer wrote instance buffer.
+      // GPU PATCH compute shader needs to read blasPtrsBuffer and write instance buffer.
+      ctx->emitMemoryBarrier(0,
+        VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR | VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+
       m_megaGeoBuilder->patchClusterBlasAddressesGPU(instanceBufferWrapper.Get(), 0, mappings);
 
-      // Barrier to ensure patching completes before TLAS build
+      // Barrier: GPU PATCH compute wrote instance buffer, TLAS build needs to read it
       ctx->emitMemoryBarrier(0,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         VK_ACCESS_SHADER_WRITE_BIT,
@@ -1728,11 +1757,15 @@ namespace dxvk {
     RTXMG_LOG("RTX MegaGeo AccelManager: buildTlas - TLAS builds complete");
 
     RTXMG_LOG("RTX MegaGeo AccelManager: buildTlas - emitting final barrier");
+    // Include COMPUTE_SHADER as source: cluster compute shaders wrote to clusterShadingData,
+    // clusterVertexPositions, clusterVertexNormals buffers during BuildAccel.
+    // Include SHADER_READ as dest access: ray tracing closest-hit shader reads these buffers.
+    // Without this, the ray tracing shader may read stale/partial cluster data → GPU crash.
     ctx->emitMemoryBarrier(0,
-      VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
-      VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+      VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR | VK_ACCESS_SHADER_WRITE_BIT,
       VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
-      VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR);
+      VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_SHADER_READ_BIT);
     RTXMG_LOG("RTX MegaGeo AccelManager: buildTlas - final barrier emitted");
 
     // Release the scratch memory so it can be reused by rest of the frame.

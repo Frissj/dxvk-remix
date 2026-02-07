@@ -810,6 +810,11 @@ namespace dxvk {
           write.pBufferInfo = &bufferInfos.back();
           writes.push_back(write);
 
+          // Track the DxvkBuffer so it stays alive until the GPU finishes using this binding set.
+          // Without this, ClusterAccelBuilder's deferred destruction can free buffers while
+          // the GPU still references them via this descriptor set (causing GPU page faults).
+          bindingSet->addTrackedBuffer(dxvkBuffer);
+
           RTXMG_LOG(str::format("RTX MegaGeo: createBindingSet - buffer binding=", item.slot,
             " type=", (int)write.descriptorType, " size=", size));
           break;

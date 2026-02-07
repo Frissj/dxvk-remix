@@ -711,6 +711,18 @@ void SubdivisionSurface::InitDeviceData(nvrhi::ICommandList* commandList)
 
         patchPointsOffsets[iSurface + 1] =
             patchPointsOffsets[iSurface] + static_cast<uint32_t>(plan->GetNumPatchPoints());
+
+#if RTXMG_LOG_SUBDIVISION_SURFACE // DIAGNOSTIC: per-level numPatchPoints
+        if (iSurface < 5 && iSurface >= m_surfaceOffsets[2]) {
+            auto& treeDesc = plan->GetTreeDescriptor();
+            RTXMG_LOG(dxvk::str::format("RTX MegaGeo PATCHPT-LEVELS: surface[", iSurface,
+                "] planIdx=", surface.GetSubdivisionPlanIndex(),
+                " numPP(default)=", plan->GetNumPatchPoints(),
+                " numPP[0]=", treeDesc.GetNumPatchPoints(0),
+                " numPP[6]=", treeDesc.GetNumPatchPoints(6),
+                " numPP[10]=", treeDesc.GetNumPatchPoints(10)));
+        }
+#endif
     }
 
     // Texcoord Patch Points - always computed like the sample

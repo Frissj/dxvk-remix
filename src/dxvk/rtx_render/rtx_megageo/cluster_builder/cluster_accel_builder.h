@@ -304,11 +304,24 @@ protected:
     RTXMGBuffer<nvrhi::rt::cluster::IndirectArgs> m_blasFromClasIndirectArgsBuffer;
     RTXMGBuffer<nvrhi::rt::cluster::IndirectInstantiateTemplateArgs> m_clasIndirectArgDataBuffer;
 
-    uint32_t m_numInstances = 0;
+    uint32_t m_numInstances = 0;        // Actual current instance count (for build operations)
+    uint32_t m_instanceCapacity = 0;    // Allocated buffer capacity (>= m_numInstances)
     uint32_t m_sceneSubdPatches = 0;
+    uint32_t m_gridSamplersCapacity = 0; // Current allocated capacity for gridSamplersBuffer
+    uint32_t m_gridSamplersShrinkCounter = 0;   // Consecutive frames below shrink threshold
+    uint32_t m_gridSamplersResizeCooldown = 0;  // Frames remaining in cooldown after resize
     uint32_t m_maxClusters = 0;
     uint32_t m_maxVertices = 0;
     uint64_t m_maxClasBytes = 0;
+
+    // Smart instance buffer scaling (hysteresis + sustained check + cooldown)
+    // Inspired by dynamic worker pool pattern: grow fast, shrink slow, prevent oscillation
+    static constexpr uint32_t kInstanceGrowHeadroom = 32;       // Extra capacity when growing (prevents micro-reallocations)
+    static constexpr float kInstanceShrinkThreshold = 0.4f;     // Only consider shrinking when using < 40% of capacity
+    static constexpr uint32_t kInstanceShrinkSustainedFrames = 300; // ~5 seconds at 60fps of sustained low usage before shrinking
+    static constexpr uint32_t kInstanceResizeCooldownFrames = 120;  // ~2 seconds cooldown after any resize
+    uint32_t m_instanceShrinkCounter = 0;   // Consecutive frames below shrink threshold
+    uint32_t m_instanceResizeCooldown = 0;  // Frames remaining in cooldown after a resize
 
     struct TemplateBuffers
     {
@@ -334,42 +347,6 @@ protected:
 
     RTXMGBuffer<ShaderDebugElement> m_debugBuffer;
 
-    // Current frame index for deferred destruction tracking
+    // Current frame index tracking
     uint32_t m_currentFrameIndex = 0;
-
-    // Deferred destruction - keep old buffers alive for N frames to avoid use-after-free
-    // This completely avoids calling waitForIdle() which kills performance
-    static constexpr uint32_t kDeferredDestructionFrames = 3;
-    struct DeferredBuffers {
-        uint32_t frameQueued = 0;
-
-        // Instance-related buffers (numInstancesChanged)
-        nvrhi::BufferHandle copyClusterOffsetParams;
-        RTXMGBuffer<uint2> clusterOffsetCounts;
-        RTXMGBuffer<uint3> fillClustersDispatchIndirect;
-        RTXMGBuffer<nvrhi::rt::cluster::IndirectArgs> blasFromClasIndirectArgs;
-        RTXMGBuffer<nvrhi::GpuVirtualAddress> blasPtrs;
-        RTXMGBuffer<uint32_t> blasSizes;
-
-        // Scene patch buffers (sceneSubdPatchesChanged)
-        RTXMGBuffer<GridSampler> gridSamplers;
-
-        // Cluster buffers (numClustersChanged)
-        RTXMGBuffer<Cluster> clusters;
-        RTXMGBuffer<nvrhi::rt::cluster::IndirectInstantiateTemplateArgs> clasIndirectArgData;
-        RTXMGBuffer<ClusterShadingData> clusterShadingData;
-        RTXMGBuffer<nvrhi::GpuVirtualAddress> clasPtrs;
-
-        // CLAS buffer (clasBytesChanged)
-        RTXMGBuffer<uint8_t> clasBuffer;
-
-        // Vertex buffers (maxVerticesChanged or enableVertexNormalsChanged)
-        RTXMGBuffer<float3> clusterVertexPositions;
-        RTXMGBuffer<float3> clusterVertexNormals;
-
-        // BLAS buffer (numClustersChanged || numInstancesChanged)
-        RTXMGBuffer<uint8_t> blasBuffer;
-    };
-    std::vector<DeferredBuffers> m_deferredDestructionQueue;
-    void ProcessDeferredDestruction(uint32_t currentFrame);
 };

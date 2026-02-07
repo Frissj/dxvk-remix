@@ -96,7 +96,7 @@ struct TessellatorConfig
 
     uint2            viewportSize = { 0u, 0u };
     uint4            edgeSegments = { 8, 8, 8, 8 };
-    uint32_t         isolationLevel = 0; // 0 is dynamic, >0 is fixed
+    uint32_t         isolationLevel = kMaxIsolationLevel; // Match sample: use max isolation level (6) for correct patch point evaluation
     ClusterPattern   clusterPattern = ClusterPattern::SLANTED;
     unsigned char    quantNBits = 0;
 

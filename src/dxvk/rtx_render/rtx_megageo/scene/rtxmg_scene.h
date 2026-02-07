@@ -51,6 +51,7 @@ public:
     // Subdivision mesh management
     const std::vector<SubdivisionSurface*>& GetSubdMeshes() const { return m_subdMeshes; }
     void AddSubdMesh(SubdivisionSurface* mesh) { m_subdMeshes.push_back(mesh); }
+    void NullifySubdMesh(uint32_t index) { if (index < m_subdMeshes.size()) m_subdMeshes[index] = nullptr; }
 
     // Instance management
     const std::vector<Instance>& GetSubdMeshInstances() const { return m_instances; }

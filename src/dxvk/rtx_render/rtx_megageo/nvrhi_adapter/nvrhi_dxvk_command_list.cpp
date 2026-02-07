@@ -922,9 +922,41 @@ namespace dxvk {
       return;
     }
 
-    // NO post-barriers - matching sample behavior
-    // NVRHI's automatic barrier system handles subsequent state transitions
-    // DXVK should handle synchronization when BLAS is used in TLAS build
+    // Track all cluster operation buffers on the DXVK command list so they stay alive
+    // until the GPU fence signals completion. This replaces the broken CPU frame-counting
+    // deferred destruction that couldn't account for GPU lag.
+    {
+      Rc<DxvkCommandList> cmdList = m_context->getCommandList();
+      auto trackBuffer = [&](nvrhi::IBuffer* buffer) {
+        if (!buffer) return;
+        auto* nvrhiBuf = static_cast<NvrhiDxvkBuffer*>(buffer);
+        cmdList->trackResource<DxvkAccess::Read>(nvrhiBuf->getDxvkBuffer());
+      };
+      trackBuffer(desc.inIndirectArgsBuffer);
+      trackBuffer(desc.inIndirectArgCountBuffer);
+      trackBuffer(desc.inOutAddressesBuffer);
+      trackBuffer(desc.outSizesBuffer);
+      trackBuffer(desc.outAccelerationStructuresBuffer);
+      // outScratchBuffer is used via raw device address (vkCmds.scratchData) by the
+      // cluster AS build, not through a descriptor set. Must be explicitly tracked
+      // or the buffer can be freed while the GPU is still using it (page fault crash).
+      trackBuffer(desc.outScratchBuffer);
+    }
+
+    // Update buffer states AFTER the cluster operation so the automatic barrier system
+    // uses the correct source pipeline stage (ACCELERATION_STRUCTURE_BUILD_BIT) for
+    // subsequent transitions. Without this, the barrier tracker thinks these buffers
+    // were last written by COMPUTE_SHADER_BIT (from the pre-barrier UnorderedAccess state),
+    // which produces incorrect barriers when a compute shader later reads them.
+    if (desc.inOutAddressesBuffer) {
+      m_BufferStates[desc.inOutAddressesBuffer] = nvrhi::ResourceStates::AccelStructWrite;
+    }
+    if (desc.outSizesBuffer) {
+      m_BufferStates[desc.outSizesBuffer] = nvrhi::ResourceStates::AccelStructWrite;
+    }
+    if (desc.outAccelerationStructuresBuffer) {
+      m_BufferStates[desc.outAccelerationStructuresBuffer] = nvrhi::ResourceStates::AccelStructWrite;
+    }
 
     RTXMG_LOG("RTX MegaGeo: executeMultiIndirectClusterOperation - Complete");
   }

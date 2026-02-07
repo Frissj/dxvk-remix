@@ -47,6 +47,8 @@
 #include "osd_lite/opensubdiv/tmr/topologyMap.h"
 #include "osd_lite/opensubdiv/tmr/surfaceTableFactory.h"
 
+#include "nvrhi_adapter/nvrhi_dxvk_command_list.h"
+
 #include "rtxmg_log.h"
 #undef RTXMG_LOG
 #if RTXMG_LOG_RTX_MEGAGEO_BUILDER
@@ -56,6 +58,17 @@
 #endif
 
 namespace dxvk {
+
+// Wraps a SubdivisionSurface as a DxvkResource so it can be tracked on the
+// DXVK command list. When the GPU fence signals completion, this holder is
+// destroyed, which frees the SubdivisionSurface and all its GPU buffers.
+class DxvkSubdSurfaceHolder : public DxvkResource {
+public:
+  DxvkSubdSurfaceHolder(std::unique_ptr<SubdivisionSurface> surface)
+    : m_surface(std::move(surface)) {}
+private:
+  std::unique_ptr<SubdivisionSurface> m_surface;
+};
 
   // Use OpenSubdiv namespace (from osd_lite, matching the sample)
   // Only use the versioned namespace to avoid ambiguity
@@ -365,8 +378,23 @@ namespace dxvk {
       surface.blas = VK_NULL_HANDLE;
     }
 
-    // Remove from ClusterAccelBuilder
-    // (ClusterAccelBuilder manages its own surface list)
+    // Null out the raw pointer in m_subdMeshes to prevent dangling pointer access.
+    // The m_surfaceToMeshIndex mapping was already erased by the caller, so no new
+    // instances will reference this mesh index. But we null it for safety.
+    auto meshIt = m_surfaceToMeshIndex.find(surfaceId);
+    if (meshIt != m_surfaceToMeshIndex.end() && m_scene) {
+      m_scene->NullifySubdMesh(meshIt->second);
+    }
+
+    // Move SubdivisionSurface to pending list. In buildClusterBlas, these will be
+    // tracked on the DXVK command list so the GPU fence keeps them alive until all
+    // in-flight GPU work completes. This replaces frame-counting which gets out of
+    // sync with the GPU under heavy cluster loads.
+    if (surface.subdivSurface) {
+      m_pendingGpuDestructions.push_back(std::move(surface.subdivSurface));
+      Logger::info(str::format("RTX MegaGeo: Surface ", surfaceId,
+          " queued for GPU fence-based deferred destruction"));
+    }
 
     m_surfaces.erase(it);
     RTXMG_LOG(str::format("Removed subdivision surface ", surfaceId));
@@ -383,6 +411,47 @@ namespace dxvk {
     static uint32_t s_frameCounter = 0;
     s_frameCounter++;
     RTXMG_LOG(str::format("RTX MegaGeo: buildClusterBlas - FRAME ", s_frameCounter, " Entry"));
+
+    // Update last-seen frame for surfaces that have transforms this frame
+    for (const auto& [surfaceId, _] : instanceTransforms) {
+      m_surfaceLastSeenFrame[surfaceId] = s_frameCounter;
+    }
+
+    // Prune surfaces that haven't had a transform for 120 frames
+    {
+      constexpr uint32_t kStaleFrameThreshold = 120;
+      std::vector<uint32_t> staleSurfaceIds;
+      for (const auto& [surfaceId, surface] : m_surfaces) {
+        auto it = m_surfaceLastSeenFrame.find(surfaceId);
+        uint32_t lastSeen = (it != m_surfaceLastSeenFrame.end()) ? it->second : 0;
+        if (s_frameCounter > lastSeen + kStaleFrameThreshold) {
+          staleSurfaceIds.push_back(surfaceId);
+        }
+      }
+      for (uint32_t surfaceId : staleSurfaceIds) {
+        RTXMG_LOG(str::format("RTX MegaGeo: Pruning stale surface ", surfaceId,
+            " (last seen frame ", m_surfaceLastSeenFrame[surfaceId], ", current ", s_frameCounter, ")"));
+        m_surfaceToMeshIndex.erase(surfaceId);
+        m_surfaceLastSeenFrame.erase(surfaceId);
+        removeSubdivisionSurface(surfaceId);
+      }
+      if (!staleSurfaceIds.empty()) {
+        Logger::info(str::format("RTX MegaGeo: Pruned ", staleSurfaceIds.size(), " stale surfaces, ", m_surfaces.size(), " remaining"));
+      }
+    }
+
+    // Track pending SubdivisionSurface destructions on the DXVK command list.
+    // The GPU fence will hold them alive until all in-flight GPU work completes.
+    if (!m_pendingGpuDestructions.empty()) {
+      Rc<DxvkCommandList> cmdList = context->getCommandList();
+      for (auto& surface : m_pendingGpuDestructions) {
+        Rc<DxvkResource> holder = new DxvkSubdSurfaceHolder(std::move(surface));
+        cmdList->trackResource<DxvkAccess::Read>(std::move(holder));
+      }
+      Logger::info(str::format("RTX MegaGeo: Tracked ", m_pendingGpuDestructions.size(),
+          " surfaces on GPU command list for fence-based destruction"));
+      m_pendingGpuDestructions.clear();
+    }
 
     // Reset scratch buffers at start of frame - DXVK ensures GPU is done with previous frame
     if (m_commandList) {
@@ -462,13 +531,52 @@ namespace dxvk {
     config.enableLogging = false;  // DISABLED - causes GPU readback stalls (~1 second per frame)
     config.zbuffer = nullptr;  // Disable HiZ culling to prevent oscillation
     config.camera = &m_tessellationCamera;
-    config.isolationLevel = 0;  // Dynamic isolation level
+    config.isolationLevel = TessellatorConfig::kMaxIsolationLevel;  // Match sample: use max isolation level (6) for correct patch point evaluation
     config.disableSubdivision = false;
 
-    // Match sample defaults from TessellatorConfig
-    config.memorySettings.maxClusters = 1u << 21;  // 2M clusters (sample default)
-    config.memorySettings.vertexBufferBytes = 1024ull << 20;  // 1024MB (sample default)
-    config.memorySettings.clasBufferBytes = 3076ull << 20;  // 3076MB (sample default)
+    // Dynamic memory sizing based on GPU-reported demand from previous frame.
+    //
+    // The GPU shader (compute_cluster_tiling.hlsl) handles overflow gracefully:
+    //   - desiredClusters: unclamped atomic counter tracking ACTUAL demand
+    //   - clusters: clamped counter that stays within maxClusters
+    //   - When desired > max, excess clusters return early (no crash, no OOB)
+    //
+    // Strategy: grow-only high-water mark. We never shrink allocations because:
+    //   1. Shrinking causes constant reallocation churn (buffer destroy/create every frame)
+    //   2. The peak demand for this game is tiny vs the 4GB sample defaults
+    //   3. Reallocation triggers driver overhead and risks use-after-free with deferred destruction
+    {
+      constexpr uint32_t kMaxClusters = 1u << 21;          // 2M (sample default cap)
+      constexpr size_t kMaxVertexBytes = 1024ull << 20;     // 1GB
+      constexpr size_t kMaxClasBytes = 3076ull << 20;       // 3GB
+      constexpr uint32_t kInitialClusters = 1u << 16;       // 64K (conservative first frame)
+      constexpr size_t kInitialVertexBytes = 64ull << 20;    // 64MB
+      constexpr size_t kInitialClasBytes = 128ull << 20;     // 128MB
+      constexpr float kHeadroom = 2.0f;
+
+      // Compute demand-based target from previous frame's stats
+      uint32_t demandClusters = kInitialClusters;
+      size_t demandClasBytes = kInitialClasBytes;
+      size_t demandVertexBytes = kInitialVertexBytes;
+
+      if (m_clusterStats.desired.m_numClusters > 0) {
+        demandClusters = uint32_t(std::min(double(kMaxClusters),
+            double(m_clusterStats.desired.m_numClusters) * kHeadroom));
+        demandClasBytes = size_t(std::min(double(kMaxClasBytes),
+            double(m_clusterStats.desired.m_clasSize) * kHeadroom));
+        demandVertexBytes = size_t(std::min(double(kMaxVertexBytes),
+            double(m_clusterStats.desired.m_vertexBufferSize) * kHeadroom));
+      }
+
+      // Grow-only: high-water mark never shrinks, so buffers are allocated once and reused
+      m_hwmClusters = std::max(m_hwmClusters, demandClusters);
+      m_hwmClasBytes = std::max(m_hwmClasBytes, demandClasBytes);
+      m_hwmVertexBytes = std::max(m_hwmVertexBytes, demandVertexBytes);
+
+      config.memorySettings.maxClusters = std::min(kMaxClusters, m_hwmClusters);
+      config.memorySettings.clasBufferBytes = std::min(kMaxClasBytes, m_hwmClasBytes);
+      config.memorySettings.vertexBufferBytes = std::min(kMaxVertexBytes, m_hwmVertexBytes);
+    }
 
     // Set viewport size from depth buffer - CRITICAL for tessellation rate calculations
     // Without this, viewportSize is {0,0} and edge tessellation rates are all 0, causing clusters=0
@@ -801,7 +909,7 @@ namespace dxvk {
       }
       RTXMG_LOG("=== END RTXMG DIAGNOSTICS ===");
 
-      // CRITICAL DEBUG: Readback BLAS addresses and vertex positions to verify GPU data
+#if RTXMG_LOG_RTX_MEGAGEO_BUILDER // DIAGNOSTIC: BLAS address + vertex position readback (causes GPU stalls)
       {
         static uint32_t s_readbackCount = 0;
         if (s_readbackCount < 3) {
@@ -831,7 +939,6 @@ namespace dxvk {
               if (!std::isnan(y) && !std::isinf(y) && y != kSentinel) { minY = std::min(minY, y); maxY = std::max(maxY, y); }
               if (!std::isnan(z) && !std::isinf(z) && z != kSentinel) { minZ = std::min(minZ, z); maxZ = std::max(maxZ, z); }
             }
-            // sentinel = shader never wrote, zero = shader wrote (0,0,0), other = valid data
             uint32_t realData = totalVerts - zeroVerts - sentinelVerts - nanVerts - infVerts;
             Logger::info(str::format("RTX MegaGeo VERTEX READBACK: ", totalVerts, " total, ",
                 sentinelVerts, " SENTINEL(never written), ", zeroVerts, " zero(shader wrote 0), ",
@@ -850,14 +957,12 @@ namespace dxvk {
             }
             Logger::info(str::format("RTX MegaGeo VERTEX READBACK: firstNonZero=", firstNonZero,
                 " lastNonZero=", lastNonZero, " populated range=", (lastNonZero >= firstNonZero ? lastNonZero - firstNonZero + 1 : 0)));
-            // Log 20 vertices around the first non-zero region
             if (firstNonZero != UINT32_MAX) {
               uint32_t logStart = (firstNonZero > 5) ? firstNonZero - 5 : 0;
               for (uint32_t i = logStart; i < std::min<uint32_t>(logStart + 20, totalVerts); ++i) {
                 Logger::info(str::format("RTX MegaGeo VERTEX[", i, "] = (", vertexPositions[i].x, ",",
                     vertexPositions[i].y, ",", vertexPositions[i].z, ")"));
               }
-              // Also log a few from the middle of the populated range
               uint32_t mid = firstNonZero + (lastNonZero - firstNonZero) / 2;
               Logger::info(str::format("RTX MegaGeo VERTEX READBACK: mid-range samples around ", mid, ":"));
               uint32_t midStart = (mid > 5) ? mid - 5 : 0;
@@ -873,6 +978,7 @@ namespace dxvk {
           s_readbackCount++;
         }
       }
+#endif
 
       // Mark all surfaces as ready - BLAS addresses will be patched on GPU
       for (auto& [id, surface] : m_surfaces) {
@@ -1508,33 +1614,35 @@ namespace dxvk {
       return;
     }
 
-    // Always-on logging for GPU patching
+    // Per-frame diagnostic logging for GPU patching
     static uint32_t s_gpuPatchLogCount = 0;
-    if (s_gpuPatchLogCount < 5) {
-      Logger::info(str::format("RTX MegaGeo GPU PATCH: patching ", mappings.size(), " instances, blasPtrsBuffer=",
-          m_clusterAccels->blasPtrsBuffer.GetBytes(), " bytes (",
-          m_clusterAccels->blasPtrsBuffer.GetNumElements(), " elements)"));
-      Logger::info(str::format("RTX MegaGeo GPU PATCH: instanceBuffer byteSize=", instanceBuffer->getDesc().byteSize,
-          " offset=", instanceBufferOffset,
-          " stride=", sizeof(VkAccelerationStructureInstanceKHR)));
-      // Log first few mappings
-      for (size_t i = 0; i < std::min<size_t>(5, mappings.size()); ++i) {
-        Logger::info(str::format("RTX MegaGeo GPU PATCH mapping[", i, "]: remixIdx=", mappings[i].remixInstanceIndex,
-            "+offset=", instanceBufferOffset,
-            " -> rtxmgIdx=", mappings[i].rtxmgInstanceIndex));
-      }
-      // Check for out-of-bounds rtxmg indices
-      uint32_t maxRtxmgIdx = 0;
-      for (const auto& m : mappings) {
-        if (m.rtxmgInstanceIndex > maxRtxmgIdx) maxRtxmgIdx = m.rtxmgInstanceIndex;
-      }
-      uint32_t blasElements = m_clusterAccels->blasPtrsBuffer.GetNumElements();
-      if (maxRtxmgIdx >= blasElements) {
-        Logger::err(str::format("RTX MegaGeo GPU PATCH: *** OUT OF BOUNDS *** maxRtxmgIdx=", maxRtxmgIdx,
-            " >= blasPtrsBuffer elements=", blasElements));
-      }
-      s_gpuPatchLogCount++;
+    static uint32_t s_prevMappings = 0;
+    static uint32_t s_prevBlasElements = 0;
+
+    uint32_t blasElements = m_clusterAccels->blasPtrsBuffer.GetNumElements();
+    uint32_t maxRtxmgIdx = 0;
+    for (const auto& m : mappings) {
+      if (m.rtxmgInstanceIndex > maxRtxmgIdx) maxRtxmgIdx = m.rtxmgInstanceIndex;
     }
+
+    // Abort on OOB - dispatching with out-of-bounds indices would read garbage
+    // BLAS addresses from blasPtrsBuffer, causing GPU crash during ray tracing
+    if (maxRtxmgIdx >= blasElements) {
+      Logger::err(str::format("RTX MegaGeo GPU PATCH: *** OUT OF BOUNDS *** maxRtxmgIdx=", maxRtxmgIdx,
+          " >= blasPtrsBuffer elements=", blasElements, " mappings=", mappings.size(),
+          " frame=", s_gpuPatchLogCount));
+      return;
+    }
+
+    // Log every frame - compact single line
+    bool countsChanged = (mappings.size() != s_prevMappings || blasElements != s_prevBlasElements);
+    Logger::info(str::format("RTX MegaGeo GPU PATCH[", s_gpuPatchLogCount, "]: mappings=", mappings.size(),
+        " blasPtrsElements=", blasElements, " maxRtxmgIdx=", maxRtxmgIdx,
+        countsChanged ? " ***CHANGED***" : ""));
+
+    s_prevMappings = uint32_t(mappings.size());
+    s_prevBlasElements = blasElements;
+    s_gpuPatchLogCount++;
 
     nvrhi::utils::ScopedMarker marker(m_commandList.Get(), "RtxMegaGeoBuilder::patchClusterBlasAddressesGPU");
 

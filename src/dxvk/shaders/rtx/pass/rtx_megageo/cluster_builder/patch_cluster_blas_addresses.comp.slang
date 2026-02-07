@@ -74,6 +74,15 @@ void main(uint3 threadIdx : SV_DispatchThreadID)
     // Get the BLAS address from the cluster build output
     uint2 blasAddress = InBlasAddresses[mapping.rtxmgInstanceIndex];
 
+    // If BLAS address is 0 (not built yet, overflow, or cleared), make instance invisible
+    // to ray tracing by zeroing the mask. This prevents GPU fault from traversing address 0.
+    if (blasAddress.x == 0 && blasAddress.y == 0)
+    {
+        // Clear mask bits (top 8 bits of instanceCustomIndex_mask) to hide from all ray types
+        InOutInstanceBuffer[mapping.remixInstanceIndex].instanceCustomIndex_mask &= 0x00FFFFFFu;
+        return;
+    }
+
     // Patch the BLAS address in the instance buffer
     InOutInstanceBuffer[mapping.remixInstanceIndex].blasAddress = blasAddress;
 }

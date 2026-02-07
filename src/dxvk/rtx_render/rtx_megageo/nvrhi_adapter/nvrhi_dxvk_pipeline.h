@@ -121,6 +121,14 @@ namespace dxvk {
     VkDescriptorSet getDescriptorSet() const { return m_descriptorSet; }
     bool hasDescriptorSet() const { return m_descriptorSet != VK_NULL_HANDLE; }
 
+    // Track DxvkBuffers used in this binding set's descriptor set.
+    // Ensures buffers stay alive until the GPU finishes using this binding set,
+    // preventing use-after-free when ClusterAccelBuilder's deferred destruction
+    // frees buffers before the GPU is done.
+    void addTrackedBuffer(const Rc<DxvkBuffer>& buffer) {
+      m_trackedBuffers.push_back(buffer);
+    }
+
   private:
     nvrhi::BindingSetDesc m_desc;
     nvrhi::IBindingLayout* m_layout;
@@ -128,6 +136,7 @@ namespace dxvk {
     VkDescriptorSet m_descriptorSet;
     VkDevice m_vkDevice;  // Needed for cleanup
     bool m_ownsPool;      // Whether we own the pool or it's shared
+    std::vector<Rc<DxvkBuffer>> m_trackedBuffers;  // Keep buffers alive for GPU lifetime
   };
 
   // NVRHI IComputePipeline implementation wrapping DXVK compute pipeline

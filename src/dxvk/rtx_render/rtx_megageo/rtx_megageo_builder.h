@@ -485,6 +485,15 @@ namespace dxvk {
     std::unordered_map<uint32_t, RTXMGSubdivisionSurfaceEntry> m_surfaces;
     uint32_t m_nextSurfaceId = 1;
 
+    // Deferred destruction for SubdivisionSurface objects.
+    // When a surface is pruned, its SubdivisionSurface is moved here temporarily.
+    // In buildClusterBlas, these are transferred to the DXVK command list's lifetime
+    // tracker (via DxvkResource wrapping), which holds them until the GPU fence signals
+    // that all in-flight commands have completed. This is the same pattern used for
+    // binding sets (DxvkBindingSetHolder) and cluster operation buffers.
+    // Frame counting doesn't work because GPU can fall behind CPU with heavy cluster loads.
+    std::vector<std::unique_ptr<SubdivisionSurface>> m_pendingGpuDestructions;
+
     // Mapping from surfaceId to instance index in the scene (rebuilt each frame)
     // Used to look up BLAS addresses after cluster build
     std::unordered_map<uint32_t, uint32_t> m_surfaceToInstanceIndex;
@@ -495,6 +504,14 @@ namespace dxvk {
 
     // Instance transforms from RTX Remix (surfaceId -> objectToWorld)
     std::unordered_map<uint32_t, Matrix4> m_instanceTransforms;
+
+    // Track last frame each surface had a transform (for stale surface cleanup)
+    std::unordered_map<uint32_t, uint32_t> m_surfaceLastSeenFrame;
+
+    // Dynamic memory sizing - high-water mark (only grows, never shrinks to avoid reallocation churn)
+    uint32_t m_hwmClusters = 0;
+    size_t m_hwmClasBytes = 0;
+    size_t m_hwmVertexBytes = 0;
 
     // Downloaded BLAS addresses from GPU (populated after BuildAccel)
     std::vector<VkDeviceAddress> m_downloadedBlasAddresses;
