@@ -25,7 +25,7 @@
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 // Enable chrono timing for performance profiling (set to 1 to enable)
-#define RTXMG_CHRONO_TIMING 1
+#define RTXMG_CHRONO_TIMING 0
 
 // Helper to align buffer sizes to 4 bytes (required for Vulkan vkCmdUpdateBuffer)
 inline size_t alignBufferSize(size_t size) {
@@ -571,9 +571,14 @@ void ClusterAccelBuilder::InitStructuredClusterTemplates(uint32_t maxGeometryCou
                              " stored quantNBits=", m_templateBuffers.quantNBits,
                              " config quantNBits=", m_tessellatorConfig.quantNBits));
 
-    // only initialize if maxGeometryCount or quantNBits changes
+    // maxGeometryIndex must match between template creation and CLAS instantiation.
+    // BuildStructuredCLASes uses m_maxClusters-1 because we store clusterIndex in
+    // geometryIndexOffsetPacked for hit shader lookup of per-cluster shading data.
+    uint32_t maxGeometryIndex = m_maxClusters > 0 ? m_maxClusters - 1 : 0;
+
+    // only initialize if maxGeometryIndex or quantNBits changes
     if (m_templateBuffers.dataBuffer.Get() != 0 &&
-        m_templateBuffers.maxGeometryCountPerMesh == maxGeometryCountPerMesh &&
+        m_templateBuffers.maxGeometryCountPerMesh == maxGeometryIndex &&
         m_templateBuffers.quantNBits == m_tessellatorConfig.quantNBits) {
         RTXMG_LOG("RTX MegaGeo: InitStructuredClusterTemplates - early return, templates already initialized");
         return;
@@ -581,7 +586,7 @@ void ClusterAccelBuilder::InitStructuredClusterTemplates(uint32_t maxGeometryCou
     RTXMG_LOG("RTX MegaGeo: InitStructuredClusterTemplates - building new templates");
 
     nvrhi::utils::ScopedMarker marker(commandList, "InitStructuredClusterTemplates");
-    m_templateBuffers.maxGeometryCountPerMesh = maxGeometryCountPerMesh;
+    m_templateBuffers.maxGeometryCountPerMesh = maxGeometryIndex;
     m_templateBuffers.quantNBits = m_tessellatorConfig.quantNBits;
 
     TemplateGrids grids = GenerateTemplateGrids();
@@ -597,7 +602,7 @@ void ClusterAccelBuilder::InitStructuredClusterTemplates(uint32_t maxGeometryCou
         .clas =
         {
             .vertexFormat = VK_FORMAT_R32G32B32_SFLOAT,
-            .maxGeometryIndex = maxGeometryCountPerMesh,
+            .maxGeometryIndex = maxGeometryIndex,
             .maxUniqueGeometryCount = 1,
             .maxTriangleCount = kClusterMaxTriangles,
             .maxVertexCount = kClusterMaxVertices,
@@ -607,7 +612,7 @@ void ClusterAccelBuilder::InitStructuredClusterTemplates(uint32_t maxGeometryCou
         }
     };
     cluster::OperationSizeInfo sizeInfo = m_device->getClusterOperationSizeInfo(operationParams);
-        
+
     nvrhi::BufferHandle clusterTemplateArgsBuffer = GenerateStructuredClusterTemplateArgs(grids, commandList);
     
     // CRITICAL: Use member variable to keep buffer alive - GPU caches address references
@@ -2328,10 +2333,14 @@ void ClusterAccelBuilder::UpdateMemoryAllocations(ClusterAccels& accels, uint32_
     // ==========================================================================
     // RELEASE OLD BUFFERS before creating new ones
     // ==========================================================================
-    // Old NVRHI handles are released here, but the underlying DxvkBuffers stay alive
-    // via Rc<DxvkBuffer> references held by DXVK's command list lifetime tracker
-    // (added in trackPendingBindingSets and executeMultiIndirectClusterOperation).
-    // The GPU fence guarantees buffers survive until the GPU finishes using them.
+    // Cluster AS operations access clasBuffer and clusterVertexPositionsBuffer via
+    // raw device addresses (not through descriptor sets), bypassing DXVK's command
+    // list lifetime tracking. If we release these buffers while the GPU is still
+    // reading from them (e.g., ray tracing traversing CLAS structures from the
+    // previous frame), we get a GPU page fault (VK_ERROR_DEVICE_LOST).
+    // waitForIdle ensures all pending GPU work completes before any buffer is freed.
+    // This only runs when buffers actually need resizing (rare after warmup).
+    m_device->waitForIdle();
 
     if (instanceBuffersNeedResize)
     {

@@ -915,6 +915,90 @@ namespace dxvk {
       totalPrimitiveIDOffset += primitiveCount;
     }
 
+    // RTX MegaGeo: Per-frame cluster instance stability debug
+    // Tracks each cluster instance across frames to detect instability
+    {
+      struct ClusterInstanceInfo {
+        uintptr_t instPtr;       // RtInstance pointer (stable identity)
+        uintptr_t blasPtr;       // BlasEntry pointer
+        uint32_t surfaceId;      // MegaGeo surface ID
+        uint32_t surfaceIndex;   // Surface buffer index this frame
+        XXH64_hash_t geoHash;    // associatedGeometryHash
+        float posX, posY, posZ;  // World position
+      };
+      static std::vector<ClusterInstanceInfo> s_prevFrameInstances;
+      static uint32_t s_debugFrameCount = 0;
+      s_debugFrameCount++;
+
+      std::vector<ClusterInstanceInfo> thisFrameInstances;
+      for (RtInstance* inst : instances) {
+        if (inst->isHidden()) continue;
+        if (inst->getVkInstance().mask == 0) continue;
+        BlasEntry* blas = inst->getBlas();
+        if (!blas || !blas->isClusterBlas()) continue;
+        ClusterInstanceInfo info;
+        info.instPtr = reinterpret_cast<uintptr_t>(inst);
+        info.blasPtr = reinterpret_cast<uintptr_t>(blas);
+        info.surfaceId = blas->megaGeoSurfaceId;
+        info.surfaceIndex = inst->getSurfaceIndex();
+        info.geoHash = inst->surface.associatedGeometryHash;
+        Vector3 wp = inst->getWorldPosition();
+        info.posX = wp.x; info.posY = wp.y; info.posZ = wp.z;
+        thisFrameInstances.push_back(info);
+      }
+
+      // Every frame, diff against previous
+      if (!thisFrameInstances.empty()) {
+        // Build lookup of previous frame by instance pointer
+        std::unordered_map<uintptr_t, ClusterInstanceInfo> prevMap;
+        for (auto& p : s_prevFrameInstances) prevMap[p.instPtr] = p;
+
+        uint32_t unchanged = 0, hashChanged = 0, blasChanged = 0, surfIdChanged = 0, newInst = 0, gone = 0;
+        for (auto& cur : thisFrameInstances) {
+          auto it = prevMap.find(cur.instPtr);
+          if (it == prevMap.end()) {
+            newInst++;
+            continue;
+          }
+          auto& prev = it->second;
+          bool anyChange = false;
+          if (cur.geoHash != prev.geoHash) { hashChanged++; anyChange = true; }
+          if (cur.blasPtr != prev.blasPtr) { blasChanged++; anyChange = true; }
+          if (cur.surfaceId != prev.surfaceId) { surfIdChanged++; anyChange = true; }
+          if (!anyChange) unchanged++;
+          prevMap.erase(it);
+        }
+        gone = static_cast<uint32_t>(prevMap.size());
+
+        Logger::info(str::format("RTX MegaGeo STABILITY[", s_debugFrameCount, "]: ",
+            "count=", thisFrameInstances.size(),
+            " unchanged=", unchanged, " hashChanged=", hashChanged,
+            " blasChanged=", blasChanged, " surfIdChanged=", surfIdChanged,
+            " new=", newInst, " gone=", gone));
+
+        // Log first few instances with hash changes
+        if (hashChanged > 0) {
+          // Rebuild prevMap for detail logging
+          std::unordered_map<uintptr_t, ClusterInstanceInfo> prevMap2;
+          for (auto& p : s_prevFrameInstances) prevMap2[p.instPtr] = p;
+          uint32_t logged = 0;
+          for (auto& cur : thisFrameInstances) {
+            if (logged >= 5) break;
+            auto it = prevMap2.find(cur.instPtr);
+            if (it != prevMap2.end() && cur.geoHash != it->second.geoHash) {
+              Logger::info(str::format("  HASH CHANGE inst=0x", std::hex, cur.instPtr,
+                  " blas=0x", cur.blasPtr, "/0x", it->second.blasPtr,
+                  " surfId=", std::dec, cur.surfaceId, "/", it->second.surfaceId,
+                  " hash=0x", std::hex, cur.geoHash, "/0x", it->second.geoHash,
+                  " pos=(", std::dec, cur.posX, ",", cur.posY, ",", cur.posZ, ")"));
+              logged++;
+            }
+          }
+        }
+      }
+      s_prevFrameInstances = std::move(thisFrameInstances);
+    }
+
     // RTX MegaGeo: Geometry pipeline summary
     // Shows how many game geometries survive to the final TLAS output
     {
@@ -922,6 +1006,15 @@ namespace dxvk {
       uint32_t clusterInTlas = geoCountClusterSubmitted - m_frameClusterSkipZeroTris - m_frameClusterSkipNoInstance;
       uint32_t totalInvalidated = geoCountHidden + geoCountZeroMask + geoCountClusterNoBuffers + m_frameClusterSkipZeroTris + m_frameClusterSkipNoInstance;
       static uint32_t s_geoPipelineLogCount = 0;
+      // Always log when output is 0 but we had cluster input (black frame detection)
+      if (tlasOutput == 0 && geoCountTotal > 0) {
+        Logger::warn(str::format("RTX MegaGeo GEO PIPELINE: BLACK FRAME - input=", geoCountTotal,
+            " | output=0 (standard=", geoCountStandard, " cluster=", clusterInTlas, ")",
+            " | invalidated=", totalInvalidated,
+            " (hidden=", geoCountHidden, " zeroMask=", geoCountZeroMask,
+            " noBuffers=", geoCountClusterNoBuffers,
+            " zeroTris=", m_frameClusterSkipZeroTris, " noInstance=", m_frameClusterSkipNoInstance, ")"));
+      }
       if ((s_geoPipelineLogCount++ % 60) == 0) {
         Logger::info(str::format("RTX MegaGeo GEO PIPELINE: input=", geoCountTotal,
             " | output=", tlasOutput, " (standard=", geoCountStandard, " cluster=", clusterInTlas, ")",

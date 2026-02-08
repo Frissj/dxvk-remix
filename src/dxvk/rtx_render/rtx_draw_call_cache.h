@@ -55,6 +55,7 @@ public:
   ~DrawCallCache();
 
   CacheState get(const DrawCallState& drawCall, BlasEntry** out);
+  void logFrameStats();
 
   MultimapType& getEntries() {return m_entries;}
 
@@ -70,6 +71,10 @@ public:
 
 private:
   MultimapType m_entries;
+  uint32_t m_clusterHits = 0;
+  uint32_t m_clusterMisses = 0;
+  uint32_t m_clusterMultiHits = 0;
+  uint32_t m_nonClusterCalls = 0;
 
   BlasEntry* allocateEntry(XXH64_hash_t hash, const DrawCallState& drawCall);
 };

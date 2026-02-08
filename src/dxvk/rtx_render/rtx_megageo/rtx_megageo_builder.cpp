@@ -29,9 +29,10 @@
 #include <algorithm>
 #include <cmath>
 #include <chrono>
+#include <set>
 
 // Enable chrono timing for performance profiling (set to 1 to enable)
-#define RTXMG_CHRONO_TIMING 1
+#define RTXMG_CHRONO_TIMING 0
 #include "nvrhi_adapter/nvrhi_dxvk_texture.h"
 #include "nvrhi_adapter/nvrhi_dxvk_buffer.h"
 #include "scene/rtxmg_scene.h"
@@ -163,8 +164,8 @@ private:
 
     // Create TopologyCache for each worker thread (thread-safe parallel processing)
     TopologyCache::Options topoCacheOptions{
-      .isoLevelSharp = 3,
-      .isoLevelSmooth = 2,
+      .isoLevelSharp = 1,
+      .isoLevelSmooth = 1,
       .useTerminalNodes = true
     };
     m_topologyCaches.reserve(m_numWorkerThreads);
@@ -618,7 +619,7 @@ private:
     config.enableLogging = false;  // DISABLED - causes GPU readback stalls (~1 second per frame)
     config.zbuffer = nullptr;  // Disable HiZ culling to prevent oscillation
     config.camera = &m_tessellationCamera;
-    config.isolationLevel = TessellatorConfig::kMaxIsolationLevel;  // Match sample: use max isolation level (6) for correct patch point evaluation
+    config.isolationLevel = m_topologyCaches[0]->options.isoLevelSharp;  // Must match TMR plan isolation level
     config.disableSubdivision = false;
 
     // Dynamic memory sizing based on GPU-reported demand from previous frame.
@@ -924,17 +925,9 @@ private:
       RTXMG_LOG(str::format("RTX MegaGeo: numClusters=", m_clusterStats.allocated.m_numClusters,
           " numTriangles=", m_clusterStats.allocated.m_numTriangles));
 
-      // CRITICAL DEBUG: Log desired vs allocated to understand if tessellation is producing geometry
-      Logger::info(str::format("RTX MegaGeo STATS: desired clusters=", m_clusterStats.desired.m_numClusters,
-          " tris=", m_clusterStats.desired.m_numTriangles,
-          " | allocated clusters=", m_clusterStats.allocated.m_numClusters,
-          " tris=", m_clusterStats.allocated.m_numTriangles));
-      Logger::info(str::format("RTX MegaGeo STATS: desired blasSize=", m_clusterStats.desired.m_blasSize,
-          " clasSize=", m_clusterStats.desired.m_clasSize,
-          " vertBufSize=", m_clusterStats.desired.m_vertexBufferSize));
-      Logger::info(str::format("RTX MegaGeo STATS: allocated blasSize=", m_clusterStats.allocated.m_blasSize,
-          " clasSize=", m_clusterStats.allocated.m_clasSize,
-          " vertBufSize=", m_clusterStats.allocated.m_vertexBufferSize));
+      // Log stats periodically (every 120 frames) and always on zero-triangle errors
+      static uint32_t s_statsLogCounter = 0;
+      bool logStats = (s_statsLogCounter++ % 120) == 0;
       if (m_clusterStats.allocated.m_numTriangles == 0) {
         Logger::err("RTX MegaGeo STATS: *** ZERO TRIANGLES PRODUCED! Tessellation is not generating geometry ***");
         Logger::err(str::format("RTX MegaGeo STATS: Config: tessMode=", (int)config.tessMode,
@@ -945,6 +938,19 @@ private:
             " disableSubdiv=", config.disableSubdivision ? "YES" : "NO"));
         Logger::err(str::format("RTX MegaGeo STATS: Scene: meshes=", m_scene ? m_scene->GetSubdMeshes().size() : 0,
             " instances=", m_scene ? m_scene->GetSubdMeshInstances().size() : 0));
+        logStats = true;
+      }
+      if (logStats) {
+        Logger::info(str::format("RTX MegaGeo STATS: desired clusters=", m_clusterStats.desired.m_numClusters,
+            " tris=", m_clusterStats.desired.m_numTriangles,
+            " | allocated clusters=", m_clusterStats.allocated.m_numClusters,
+            " tris=", m_clusterStats.allocated.m_numTriangles));
+        Logger::info(str::format("RTX MegaGeo STATS: desired blasSize=", m_clusterStats.desired.m_blasSize,
+            " clasSize=", m_clusterStats.desired.m_clasSize,
+            " vertBufSize=", m_clusterStats.desired.m_vertexBufferSize));
+        Logger::info(str::format("RTX MegaGeo STATS: allocated blasSize=", m_clusterStats.allocated.m_blasSize,
+            " clasSize=", m_clusterStats.allocated.m_clasSize,
+            " vertBufSize=", m_clusterStats.allocated.m_vertexBufferSize));
       }
 
       // DIAGNOSTIC: Log per-surface info to identify rendering issues
@@ -1401,6 +1407,62 @@ private:
 
     // Map all faces to subshape 0
     shape->faceToSubshapeIndex.resize(desc.numFaces, 0);
+
+    // Mark all edges and vertices as infinitely sharp to prevent Catmull-Clark smoothing.
+    // This keeps subdivision (more triangles for cluster ray tracing) but the limit surface
+    // matches the control cage exactly — angular geometry is preserved.
+    {
+      const float SHARPNESS_INFINITE = 10.0f;
+
+      // Collect all unique edges from face topology
+      std::set<std::pair<int,int>> edgeSet;
+      uint32_t idx = 0;
+      for (uint32_t f = 0; f < desc.numFaces; ++f) {
+        uint32_t nv = desc.faceVertexCounts[f];
+        for (uint32_t j = 0; j < nv; ++j) {
+          int v0 = shape->faceverts[idx + j];
+          int v1 = shape->faceverts[idx + ((j + 1) % nv)];
+          edgeSet.insert(std::make_pair(std::min(v0, v1), std::max(v0, v1)));
+        }
+        idx += nv;
+      }
+
+      // Crease tag: mark all edges as infinitely sharp
+      {
+        Shape::tag creaseTag;
+        creaseTag.name = "crease";
+        creaseTag.intargs.reserve(edgeSet.size() * 2);
+        for (auto const& edge : edgeSet) {
+          creaseTag.intargs.push_back(edge.first);
+          creaseTag.intargs.push_back(edge.second);
+        }
+        creaseTag.floatargs.push_back(SHARPNESS_INFINITE);
+        shape->tags.push_back(std::move(creaseTag));
+      }
+
+      // Corner tag: mark all vertices as infinitely sharp
+      {
+        Shape::tag cornerTag;
+        cornerTag.name = "corner";
+        cornerTag.intargs.reserve(desc.numVertices);
+        for (uint32_t i = 0; i < desc.numVertices; ++i) {
+          cornerTag.intargs.push_back(static_cast<int>(i));
+        }
+        cornerTag.floatargs.push_back(SHARPNESS_INFINITE);
+        shape->tags.push_back(std::move(cornerTag));
+      }
+
+      // Prevent UV smoothing too — FVAR_LINEAR_ALL (value 5)
+      {
+        Shape::tag fvarTag;
+        fvarTag.name = "facevaryinginterpolateboundary";
+        fvarTag.intargs.push_back(5);
+        shape->tags.push_back(std::move(fvarTag));
+      }
+
+      RTXMG_LOG(str::format("RTX MegaGeo: Added infinite sharpness tags: ",
+          edgeSet.size(), " crease edges, ", desc.numVertices, " corner vertices"));
+    }
 
     // Compute bounding box
     if (desc.numVertices > 0 && desc.controlPoints != nullptr) {

@@ -538,6 +538,8 @@ namespace dxvk {
       m_opacityMicromapManager->onFrameEnd();
     }
     
+    m_drawCallCache.logFrameStats();
+
     m_activePOMCount = 0;
     m_startInMediumMaterialIndex = BINDING_INDEX_INVALID;
     m_startInMediumMaterialIndex_inCache = UINT32_MAX;
@@ -1093,7 +1095,7 @@ namespace dxvk {
 
     // DEBUG: Set to true to hide ALL non-MegaGeo geometry (only ClusterBlas surfaces visible)
     // Waits until ClusterBlas instances exist before hiding, to avoid empty TLAS crash
-    static const bool s_megaGeoOnly = true;
+    static const bool s_megaGeoOnly = false;
     static bool s_hasSeenClusterBlas = false;
     if (pBlas->isClusterBlas()) {
       s_hasSeenClusterBlas = true;

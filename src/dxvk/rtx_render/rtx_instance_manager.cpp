@@ -1096,7 +1096,15 @@ namespace dxvk {
         currentInstance.surface.tFactor = drawCall.getMaterialData().tFactor;
         currentInstance.surface.alphaState = alphaState;
         currentInstance.surface.isAnimatedWater = currentInstance.testCategoryFlags(InstanceCategories::AnimatedWater);
-        currentInstance.surface.associatedGeometryHash = drawCall.getHash(RtxOptions::geometryAssetHashRule());
+        // ClusterBlas: use TopologicalHash (Indices + GeometryDescriptor) instead of geometryAssetHashRule
+        // (which includes positions). For D3D9 dynamic VBs, position hashes change every frame,
+        // causing the debug view hash colors to flicker. TopologicalHash is stable.
+        if (blas.isClusterBlas()) {
+          currentInstance.surface.associatedGeometryHash =
+            drawCall.getGeometryData().getHashForRule<rules::TopologicalHash>() ^ drawCall.getMaterialData().getHash();
+        } else {
+          currentInstance.surface.associatedGeometryHash = drawCall.getHash(RtxOptions::geometryAssetHashRule());
+        }
         currentInstance.surface.isTextureFactorBlend = drawCall.getMaterialData().isTextureFactorBlend;
         currentInstance.surface.isVertexColorBakedLighting = drawCall.getMaterialData().isVertexColorBakedLighting;
         currentInstance.surface.isMotionBlurMaskOut = currentInstance.testCategoryFlags(InstanceCategories::IgnoreMotionBlur);
