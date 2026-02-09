@@ -474,17 +474,8 @@ namespace dxvk {
     // This ensures surfaceId->instanceIndex mapping is populated before addBlas() is called
     // CRITICAL: buildClusterBlas must run BEFORE addBlas so getInstanceIndexForSurface works
 
-    // DIAGNOSTIC: Log builder state at entry to mergeInstancesIntoBlas
-    static uint32_t s_mergeCallCount = 0;
-    s_mergeCallCount++;
-    if ((s_mergeCallCount % 100) == 1) {  // Log first call and every 100th call
-      Logger::info(str::format("RTX MegaGeo mergeInstances: call#", s_mergeCallCount,
-          " m_megaGeoBuilder=", (void*)m_megaGeoBuilder.ptr(),
-          " this(AccelManager)=", (void*)this,
-          " instances.size()=", instances.size()));
-    }
-
     if (m_megaGeoBuilder != nullptr) {
+      Logger::warn("CHECKPOINT: mergeInstances pre-processCompletedSurfaces");
       m_megaGeoBuilder->processCompletedSurfaces();
 
       // Collect transforms for all cluster BLAS instances FIRST
@@ -492,6 +483,7 @@ namespace dxvk {
       // because MegaGeo's affineToColumnMajor expects row-major input
       std::unordered_map<uint32_t, Matrix4> surfaceTransforms;
       uint32_t clusterInstCount = 0;
+      Logger::warn(str::format("CHECKPOINT: mergeInstances collecting transforms, instances=", instances.size()));
       for (RtInstance* inst : instances) {
         if (inst && inst->getBlas() && inst->getBlas()->isClusterBlas()) {
           uint32_t surfaceId = inst->getBlas()->megaGeoSurfaceId;
@@ -499,32 +491,13 @@ namespace dxvk {
           // This matches what affineToColumnMajor expects
           Matrix4 worldTransform = Matrix4(inst->getVkInstance().transform);
           surfaceTransforms[surfaceId] = worldTransform;
-          // Log first few to debug transform values (DXVK Matrix4: translation is in column 3, i.e., data[i][3])
-          if (clusterInstCount < 3) {
-            Vector3 worldPos = inst->getWorldPosition();
-            // VkTransformMatrixKHR has 3 rows of 4 floats: transform.matrix[row][col]
-            Logger::info(str::format("RTX MegaGeo: Collecting transform surfaceId=", surfaceId,
-                " worldPos=(", worldPos.x, ",", worldPos.y, ",", worldPos.z, ")"));
-            Logger::info(str::format("  VkTransform row0=(", inst->getVkInstance().transform.matrix[0][0], ",", inst->getVkInstance().transform.matrix[0][1], ",", inst->getVkInstance().transform.matrix[0][2], ",", inst->getVkInstance().transform.matrix[0][3], ")"));
-            Logger::info(str::format("  VkTransform row1=(", inst->getVkInstance().transform.matrix[1][0], ",", inst->getVkInstance().transform.matrix[1][1], ",", inst->getVkInstance().transform.matrix[1][2], ",", inst->getVkInstance().transform.matrix[1][3], ")"));
-            Logger::info(str::format("  VkTransform row2=(", inst->getVkInstance().transform.matrix[2][0], ",", inst->getVkInstance().transform.matrix[2][1], ",", inst->getVkInstance().transform.matrix[2][2], ",", inst->getVkInstance().transform.matrix[2][3], ")"));
-            // Check if VK transform is identity
-            bool vkIsIdentity = (inst->getVkInstance().transform.matrix[0][0] == 1.0f &&
-                                 inst->getVkInstance().transform.matrix[1][1] == 1.0f &&
-                                 inst->getVkInstance().transform.matrix[2][2] == 1.0f) &&
-                                (inst->getVkInstance().transform.matrix[0][3] == 0.0f &&
-                                 inst->getVkInstance().transform.matrix[1][3] == 0.0f &&
-                                 inst->getVkInstance().transform.matrix[2][3] == 0.0f);
-            Logger::info(str::format("  VkTransform isIdentity=", vkIsIdentity ? "YES" : "NO"));
-          }
           clusterInstCount++;
         }
       }
+      Logger::warn(str::format("CHECKPOINT: mergeInstances transforms collected, cluster=", clusterInstCount, " surfaces=", surfaceTransforms.size()));
 
       // No transform preservation: ClusterBlas fast-path in DrawCallCache keeps entries alive,
       // and 10x GC lifetime protects them. Preserved transforms waste cluster budget on invisible surfaces.
-
-      Logger::info(str::format("RTX MegaGeo: Collected ", clusterInstCount, " cluster instance transforms, unique=", surfaceTransforms.size()));
 
       // Build cluster BLAS if we have any transforms
       if (!surfaceTransforms.empty()) {
@@ -543,7 +516,7 @@ namespace dxvk {
 
           // Build cluster BLAS - this rebuilds instances from surfaceTransforms
           // After this call, getInstanceIndexForSurface will return valid indices
-          ONCE(Logger::info("RTX MegaGeo AccelManager: Calling buildClusterBlas (early, before instance loop)"));
+          Logger::warn(str::format("CHECKPOINT: pre-buildClusterBlas surfaces=", surfaceTransforms.size()));
           m_megaGeoBuilder->buildClusterBlas(rtxCtx, depthBuffer, camera, surfaceTransforms);
 
           // Barrier: RTXMG compute writes → ray tracing shader reads
@@ -557,16 +530,9 @@ namespace dxvk {
             VK_ACCESS_SHADER_READ_BIT);
         }
       }
-    } else {
-      // DIAGNOSTIC: Builder is null - this means no surfaces have been created yet
-      // or initialization failed. Log periodically to track state.
-      static uint32_t s_nullBuilderCount = 0;
-      s_nullBuilderCount++;
-      if ((s_nullBuilderCount % 100) == 1) {
-        Logger::info(str::format("RTX MegaGeo mergeInstances: builder is NULL (count=", s_nullBuilderCount,
-            ") - no surfaces created yet or init failed. instances.size()=", instances.size()));
-      }
     }
+
+    Logger::warn("CHECKPOINT: post-buildClusterBlas");
 
     // RTX MegaGeo: Per-frame geometry pipeline counters
     uint32_t geoCountTotal = 0;           // Total input instances from the game
@@ -627,18 +593,8 @@ namespace dxvk {
         RtxMegaGeoBuilder* megaGeo = getMegaGeoBuilder();
         bool hasValid = megaGeo && megaGeo->hasValidBuffers();
 
-        // Log every 100 frames
-        static uint32_t s_clusterCheckFrame = 0;
-        if ((s_clusterCheckFrame++ % 100) == 0) {
-          Logger::info(str::format("RTX MegaGeo TLAS: isCluster=1 megaGeo=", megaGeo ? "valid" : "null",
-                                   " hasValidBuffers=", hasValid, " surfaceId=", blasEntry->megaGeoSurfaceId));
-        }
-
         if (!hasValid) {
-          // Skip this cluster instance until buffers are ready
-          // The instance will be added in a future frame when buffers are valid
           geoCountClusterNoBuffers++;
-          ONCE(Logger::info("RTX MegaGeo TLAS: SKIPPING cluster instance - buffers not ready"));
           continue;
         }
 
@@ -970,34 +926,16 @@ namespace dxvk {
         }
         gone = static_cast<uint32_t>(prevMap.size());
 
-        Logger::info(str::format("RTX MegaGeo STABILITY[", s_debugFrameCount, "]: ",
+        RTXMG_LOG(str::format("RTX MegaGeo STABILITY[", s_debugFrameCount, "]: ",
             "count=", thisFrameInstances.size(),
             " unchanged=", unchanged, " hashChanged=", hashChanged,
             " blasChanged=", blasChanged, " surfIdChanged=", surfIdChanged,
             " new=", newInst, " gone=", gone));
-
-        // Log first few instances with hash changes
-        if (hashChanged > 0) {
-          // Rebuild prevMap for detail logging
-          std::unordered_map<uintptr_t, ClusterInstanceInfo> prevMap2;
-          for (auto& p : s_prevFrameInstances) prevMap2[p.instPtr] = p;
-          uint32_t logged = 0;
-          for (auto& cur : thisFrameInstances) {
-            if (logged >= 5) break;
-            auto it = prevMap2.find(cur.instPtr);
-            if (it != prevMap2.end() && cur.geoHash != it->second.geoHash) {
-              Logger::info(str::format("  HASH CHANGE inst=0x", std::hex, cur.instPtr,
-                  " blas=0x", cur.blasPtr, "/0x", it->second.blasPtr,
-                  " surfId=", std::dec, cur.surfaceId, "/", it->second.surfaceId,
-                  " hash=0x", std::hex, cur.geoHash, "/0x", it->second.geoHash,
-                  " pos=(", std::dec, cur.posX, ",", cur.posY, ",", cur.posZ, ")"));
-              logged++;
-            }
-          }
-        }
       }
       s_prevFrameInstances = std::move(thisFrameInstances);
     }
+
+    Logger::warn(str::format("CHECKPOINT: post-instanceLoop total=", geoCountTotal, " cluster=", geoCountClusterSubmitted, " std=", geoCountStandard));
 
     // RTX MegaGeo: Geometry pipeline summary
     // Shows how many game geometries survive to the final TLAS output
@@ -1016,7 +954,7 @@ namespace dxvk {
             " zeroTris=", m_frameClusterSkipZeroTris, " noInstance=", m_frameClusterSkipNoInstance, ")"));
       }
       if ((s_geoPipelineLogCount++ % 60) == 0) {
-        Logger::info(str::format("RTX MegaGeo GEO PIPELINE: input=", geoCountTotal,
+        RTXMG_LOG(str::format("RTX MegaGeo GEO PIPELINE: input=", geoCountTotal,
             " | output=", tlasOutput, " (standard=", geoCountStandard, " cluster=", clusterInTlas, ")",
             " | invalidated=", totalInvalidated,
             " (hidden=", geoCountHidden, " zeroMask=", geoCountZeroMask,
@@ -1088,31 +1026,6 @@ namespace dxvk {
       // The TLAS instance transform (inherited from the RtInstance) transforms rays to local space.
       // The shader must transform vertex positions by surface.objectToWorld when reading them.
 
-      // Comprehensive logging for cluster instance debugging
-      static uint32_t s_clusterAddBlasLog = 0;
-      if (s_clusterAddBlasLog < 10) {
-        const auto& xform = blasInstance.transform;
-        Logger::info(str::format("RTX MegaGeo addBlas[", s_clusterAddBlasLog, "]: ",
-            " customIndex=0x", std::hex, blasInstance.instanceCustomIndex, std::dec,
-            " surfaceIdx=", surfaceIndexForCustomIndex,
-            " mask=", blasInstance.mask,
-            " sbtOffset=", blasInstance.instanceShaderBindingTableRecordOffset,
-            " flags=", blasInstance.flags,
-            " blasAddr=", blasInstance.accelerationStructureReference));
-        Logger::info(str::format("  transform row0=(", xform.matrix[0][0], ",", xform.matrix[0][1], ",", xform.matrix[0][2], ",", xform.matrix[0][3], ")"));
-        Logger::info(str::format("  transform row1=(", xform.matrix[1][0], ",", xform.matrix[1][1], ",", xform.matrix[1][2], ",", xform.matrix[1][3], ")"));
-        Logger::info(str::format("  transform row2=(", xform.matrix[2][0], ",", xform.matrix[2][1], ",", xform.matrix[2][2], ",", xform.matrix[2][3], ")"));
-        // Log the objectToWorld matrix for comparison
-        const auto& m = instance->surface.objectToWorld;
-        Logger::info(str::format("  objectToWorld row0=(", m.data[0][0], ",", m.data[0][1], ",", m.data[0][2], ",", m.data[0][3], ")"));
-        Logger::info(str::format("  objectToWorld row1=(", m.data[1][0], ",", m.data[1][1], ",", m.data[1][2], ",", m.data[1][3], ")"));
-        Logger::info(str::format("  objectToWorld row2=(", m.data[2][0], ",", m.data[2][1], ",", m.data[2][2], ",", m.data[2][3], ")"));
-        Logger::info(str::format("  objectToWorld row3=(", m.data[3][0], ",", m.data[3][1], ",", m.data[3][2], ",", m.data[3][3], ")"));
-        Logger::info(str::format("  isClusterSurface=", instance->surface.isClusterSurface,
-            " indexBufferIndex=", instance->surface.indexBufferIndex,
-            " positionBufferIndex=", instance->surface.positionBufferIndex));
-        s_clusterAddBlasLog++;
-      }
     }
 
     if (instanceToObject) {
@@ -1388,19 +1301,6 @@ namespace dxvk {
         uniqueRtxmgIndices.insert(patch.rtxmgInstanceIndex);
       }
 
-      // CRITICAL DEBUG: Check if multiple TLAS instances map to different RTXMG BLASes
-      ONCE(Logger::info(str::format("RTX MegaGeo PATCH: ", mappings.size(), " mappings, ",
-          uniqueRtxmgIndices.size(), " unique RTXMG indices, opaqueCount=", opaqueCount)));
-      // Log first 10 mappings to see the pattern
-      static uint32_t s_patchLogCount = 0;
-      if (s_patchLogCount < 3) {
-        for (size_t i = 0; i < std::min<size_t>(10, mappings.size()); ++i) {
-          Logger::info(str::format("RTX MegaGeo PATCH[", i, "]: remixIdx=", mappings[i].remixInstanceIndex,
-              " -> rtxmgIdx=", mappings[i].rtxmgInstanceIndex));
-        }
-        s_patchLogCount++;
-      }
-
       // Barrier: BLAS build wrote blasPtrsBuffer, transfer wrote instance buffer.
       // GPU PATCH compute shader needs to read blasPtrsBuffer and write instance buffer.
       ctx->emitMemoryBarrier(0,
@@ -1409,7 +1309,9 @@ namespace dxvk {
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
 
+      Logger::warn(str::format("CHECKPOINT: pre-patchGPU mappings=", mappings.size()));
       m_megaGeoBuilder->patchClusterBlasAddressesGPU(instanceBufferWrapper.Get(), 0, mappings);
+      Logger::warn("CHECKPOINT: post-patchGPU");
 
       // Barrier: GPU PATCH compute wrote instance buffer, TLAS build needs to read it
       ctx->emitMemoryBarrier(0,
@@ -1550,21 +1452,6 @@ namespace dxvk {
       // Log cluster surface data being uploaded
       if (currentSurface.isClusterSurface) {
         static uint32_t s_clusterSurfUploadLog = 0;
-        if (s_clusterSurfUploadLog < 10) {
-          const auto& m = currentSurface.objectToWorld;
-          Logger::info(str::format("RTX MegaGeo uploadSurface[", i, "]: isCluster=", currentSurface.isClusterSurface,
-              " posBuffIdx=", currentSurface.positionBufferIndex,
-              " posOffset=", currentSurface.positionOffset,
-              " prevPosBuffIdx=", currentSurface.previousPositionBufferIndex,
-              " normalBuffIdx=", currentSurface.normalBufferIndex,
-              " color0BuffIdx=", currentSurface.color0BufferIndex,
-              " idxBuffIdx=", currentSurface.indexBufferIndex,
-              " idxStride=", currentSurface.indexStride,
-              " firstIdx=", currentSurface.firstIndex));
-          Logger::info(str::format("  objectToWorld row0=(", m.data[0][0], ",", m.data[0][1], ",", m.data[0][2], ",", m.data[0][3], ")"));
-          Logger::info(str::format("  objectToWorld row3=(", m.data[3][0], ",", m.data[3][1], ",", m.data[3][2], ",", m.data[3][3], ")"));
-          s_clusterSurfUploadLog++;
-        }
       }
 
       // Split instance geometry need to have their first index offset set in their corresponding surface instances
@@ -1662,8 +1549,10 @@ namespace dxvk {
                                  std::vector<VkAccelerationStructureBuildRangeInfoKHR*>& blasRangesToBuild,
                                  size_t& totalScratchMemory) {
     ScopedGpuProfileZone(ctx, "buildBLAS");
+    Logger::warn("CHECKPOINT: buildBlases-enter");
     // Upload surfaces before opacity micromap generation which reads the surface data on the GPU
     uploadSurfaceData(ctx);
+    Logger::warn("CHECKPOINT: post-uploadSurfaceData");
 
     // Build and bind opacity micromaps
     if (opacityMicromapManager && opacityMicromapManager->isActive()) {
@@ -1752,14 +1641,14 @@ namespace dxvk {
     // Log statistics every 60 frames to help debug timing issues
     static uint32_t statsLogCounter = 0;
     if ((statsLogCounter++ % 60) == 0) {
-      Logger::info(str::format("RTX MegaGeo buildBlases: instances=", instances.size(),
+      RTXMG_LOG(str::format("RTX MegaGeo buildBlases: instances=", instances.size(),
                                " validBlas=", validBlasCount, " nullBlas=", nullBlasCount,
                                " clusterBlas=", clusterBlasCount));
     }
 
     static bool loggedOnce = false;
     if (hasClusterBlas && !loggedOnce) {
-      Logger::info(str::format("RTX MegaGeo AccelManager: Found ", clusterBlasCount, " ClusterBlas instances"));
+      ONCE(Logger::info(str::format("RTX MegaGeo: Found ", clusterBlasCount, " ClusterBlas instances")));
       loggedOnce = true;
     }
 
@@ -1767,13 +1656,10 @@ namespace dxvk {
       // Lazy initialization of RtxMegaGeoBuilder (if not initialized earlier)
       Rc<RtxContext> rtxCtx = dynamic_cast<RtxContext*>(ctx.ptr());
       if (rtxCtx != nullptr && m_megaGeoBuilder == nullptr) {
-        Logger::info("RTX Mega Geometry: Initializing RtxMegaGeoBuilder in AccelManager (late init)");
         m_megaGeoBuilder = new RtxMegaGeoBuilder(m_device, rtxCtx);
         if (!m_megaGeoBuilder->initialize()) {
-          Logger::err("RTX Mega Geometry: Failed to initialize RtxMegaGeoBuilder");
+          Logger::err("RTX MegaGeo: Failed to initialize RtxMegaGeoBuilder (late init)");
           m_megaGeoBuilder = nullptr;
-        } else {
-          Logger::info("RTX MegaGeo AccelManager: Builder initialized successfully");
         }
       }
 
@@ -1789,7 +1675,6 @@ namespace dxvk {
     } else {
       static bool infoLogged = false;
       if (!infoLogged && clusterBlasCount == 0 && instances.size() > 0) {
-        Logger::info(str::format("RTX MegaGeo AccelManager: Using standard BLAS for all ", instances.size(), " instances (no MegaGeometry candidates)"));
         infoLogged = true;
       }
     }
@@ -1808,19 +1693,17 @@ namespace dxvk {
       return false;
     }
 
-    Logger::info("RTX MegaGeo: Initializing RtxMegaGeoBuilder (on-demand from first candidate)");
     m_megaGeoBuilder = new RtxMegaGeoBuilder(m_device, rtxCtx);
     if (!m_megaGeoBuilder->initialize()) {
       Logger::err("RTX MegaGeo: Failed to initialize RtxMegaGeoBuilder");
       m_megaGeoBuilder = nullptr;
       return false;
     }
-
-    Logger::info("RTX MegaGeo: RtxMegaGeoBuilder initialized successfully");
     return true;
   }
 
   void AccelManager::buildTlas(Rc<DxvkContext> ctx) {
+    Logger::warn("CHECKPOINT: buildTlas-enter");
     RTXMG_LOG("RTX MegaGeo AccelManager: buildTlas entering");
     if (m_vkInstanceBuffer == nullptr) {
       RTXMG_LOG("RTX MegaGeo AccelManager: buildTlas - no instance buffer, returning");
@@ -1841,18 +1724,18 @@ namespace dxvk {
       VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR);
     RTXMG_LOG("RTX MegaGeo AccelManager: buildTlas - memory barrier done");
 
-    RTXMG_LOG(str::format("RTX MegaGeo AccelManager: buildTlas - tracking ", m_blasPool.size(), " BLASes"));
+    Logger::warn(str::format("CHECKPOINT: buildTlas-trackBlas pool=", m_blasPool.size()));
     for (auto&& blas : m_blasPool) {
       ctx->getCommandList()->trackResource<DxvkAccess::Read>(blas->accelStructure);
     }
-    RTXMG_LOG("RTX MegaGeo AccelManager: buildTlas - BLAS tracking done");
+    Logger::warn("CHECKPOINT: buildTlas-trackDone");
 
     size_t totalScratchSize = 0;
-    RTXMG_LOG("RTX MegaGeo AccelManager: buildTlas - building opaque TLAS");
+    Logger::warn(str::format("CHECKPOINT: buildTlas-opaque instances=", m_mergedInstances[Tlas::Opaque].size()));
     internalBuildTlas<Tlas::Opaque>(ctx, totalScratchSize);
-    RTXMG_LOG("RTX MegaGeo AccelManager: buildTlas - building unordered TLAS");
+    Logger::warn(str::format("CHECKPOINT: buildTlas-unordered instances=", m_mergedInstances[Tlas::Unordered].size()));
     internalBuildTlas<Tlas::Unordered>(ctx, totalScratchSize);
-    RTXMG_LOG("RTX MegaGeo AccelManager: buildTlas - TLAS builds complete");
+    Logger::warn("CHECKPOINT: buildTlas-complete");
 
     RTXMG_LOG("RTX MegaGeo AccelManager: buildTlas - emitting final barrier");
     // Include COMPUTE_SHADER as source: cluster compute shaders wrote to clusterShadingData,
@@ -1911,8 +1794,10 @@ namespace dxvk {
     buildInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
 
     const uint32_t numInstances = uint32_t(m_mergedInstances[type].size());
+    Logger::warn(str::format("CHECKPOINT: internalBuildTlas type=", type, " numInstances=", numInstances));
     VkAccelerationStructureBuildSizesInfoKHR sizeInfo { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR };
     vkd->vkGetAccelerationStructureBuildSizesKHR(vkd->device(), VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &buildInfo, &numInstances, &sizeInfo);
+    Logger::warn(str::format("CHECKPOINT: internalBuildTlas getSizes done asSize=", sizeInfo.accelerationStructureSize, " scratchSize=", sizeInfo.buildScratchSize));
 
     // Create TLAS
     Tlas& tlas = m_device->getCommon()->getResources().getTLAS(type);
@@ -1936,7 +1821,10 @@ namespace dxvk {
 
     // Allocate the scratch memory, we share the same buffer between all TLAS types, so just ensure we handle the offsetting correctly here.
     const size_t requiredScratchAllocSize = align(sizeInfo.buildScratchSize + m_scratchAlignment, m_scratchAlignment);
-    buildInfo.scratchData.deviceAddress = getScratchMemory(totalScratchSize + requiredScratchAllocSize)->getDeviceAddress() + totalScratchSize;
+    Logger::warn(str::format("CHECKPOINT: internalBuildTlas scratch totalSoFar=", totalScratchSize, " required=", requiredScratchAllocSize));
+    auto scratchMem = getScratchMemory(totalScratchSize + requiredScratchAllocSize);
+    Logger::warn(str::format("CHECKPOINT: internalBuildTlas scratch allocated=", (scratchMem != nullptr)));
+    buildInfo.scratchData.deviceAddress = scratchMem->getDeviceAddress() + totalScratchSize;
     totalScratchSize += requiredScratchAllocSize;
 
     // Update build information
@@ -1950,10 +1838,13 @@ namespace dxvk {
     const VkAccelerationStructureBuildRangeInfoKHR* pBuildOffsetInfo = &buildOffsetInfo;
 
     // Build the TLAS
+    Logger::warn(str::format("CHECKPOINT: internalBuildTlas pre-vkBuild dstAS=", (buildInfo.dstAccelerationStructure != VK_NULL_HANDLE)));
     ctx->getCommandList()->vkCmdBuildAccelerationStructuresKHR(1, &buildInfo, &pBuildOffsetInfo);
+    Logger::warn("CHECKPOINT: internalBuildTlas post-vkBuild");
 
     ctx->getCommandList()->trackResource<DxvkAccess::Write>(tlas.accelStructure);
     ctx->getCommandList()->trackResource<DxvkAccess::Write>(m_scratchBuffer);
+    Logger::warn("CHECKPOINT: internalBuildTlas DONE");
   }
 
   // Check if the existing build geometry info for this blas is compatible with the new one for the purpose of updating rather than rebuilding

@@ -28,6 +28,8 @@
 #include <cmath>
 #include <mutex>
 #include <numeric>
+#include "../../../util/log/log.h"
+#include "../../../util/util_string.h"
 
 namespace OpenSubdiv {
 namespace OPENSUBDIV_VERSION {
@@ -129,14 +131,30 @@ TopologyMap::resizeAddressSpace(size_t size) {
     _hashTable.clear();
     _hashTable.resize(size, kOpenAddress);
 
+    dxvk::Logger::warn(dxvk::str::format("OSD TopologyMap: resizeAddressSpace rehashing ", _plansTable.size(), " plans into ", size, " slots"));
+
     for (Index planIndex = 0; planIndex < (Index)_plansTable.size(); ) {
+
+        if (_plansTable[planIndex].get() == nullptr) {
+            dxvk::Logger::warn(dxvk::str::format("OSD TopologyMap: resizeAddressSpace planIndex=", planIndex, " is NULL, skipping"));
+            ++planIndex;
+            continue;
+        }
 
         insertHashKeys(planIndex);
 
         SubdivisionPlan const& plan = *_plansTable[planIndex];
 
-        planIndex += plan.IsRegularFace() ? 1 : plan.GetFaceSize();
+        int advance = plan.IsRegularFace() ? 1 : plan.GetFaceSize();
+        if (advance <= 0) {
+            dxvk::Logger::err(dxvk::str::format("OSD TopologyMap: resizeAddressSpace planIndex=", planIndex,
+                " advance=", advance, " IsRegularFace=", plan.IsRegularFace(), " GetFaceSize=", plan.GetFaceSize(),
+                " - would loop forever, breaking"));
+            break;
+        }
+        planIndex += advance;
     }
+    dxvk::Logger::warn(dxvk::str::format("OSD TopologyMap: resizeAddressSpace done, hashCount=", _hashCount));
 }
 
 inline float 
@@ -149,14 +167,20 @@ TopologyMap::appendPlan(SubdivisionPlan* plan, bool indexZero) {
 
     assert(_plansTable.size() < std::numeric_limits<Index>::max());
 
-    if (loadFactor() > _options.loadFactorThreshold) {
-        
+    float lf = loadFactor();
+    if (lf > _options.loadFactorThreshold) {
+
         size_t size = _hashTable.size() * kExpansionFactor;
-        
+
+        dxvk::Logger::warn(dxvk::str::format("OSD TopologyMap: appendPlan resizing hashTable ",
+            _hashTable.size(), "->", size, " loadFactor=", lf, " hashCount=", _hashCount,
+            " plansCount=", _plansTable.size()));
+
         if (size > _options.maxAddressSpace)
             return INDEX_INVALID;
 
         resizeAddressSpace(size);
+        dxvk::Logger::warn("OSD TopologyMap: appendPlan resize complete");
     }
 
     plan->_topologyMap = this;

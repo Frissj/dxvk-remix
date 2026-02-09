@@ -528,11 +528,6 @@ DxvkMemory::DxvkMemory() { }
     const bool isRTAccelStruct = (category == DxvkMemoryStats::Category::RTXAccelerationStructure);
     const VkMemoryPropertyFlags hvvFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
 
-    if (isRTAccelStruct) {
-      Logger::info(str::format("DxvkMemoryAllocator: Allocating RTX AS buffer, size=", req->size,
-                               ", will skip HVV heap"));
-    }
-
     for (uint32_t i = 0; i < m_memProps.memoryTypeCount && !result; i++) {
       const bool supported = (req->memoryTypeBits & (1u << i)) != 0;
       const bool adequate  = (m_memTypes[i].memType.propertyFlags & flags) == flags;
@@ -541,18 +536,9 @@ DxvkMemory::DxvkMemory() { }
       const bool isHvv = (m_memTypes[i].memType.propertyFlags & hvvFlags) == hvvFlags;
       const bool skipHvv = isRTAccelStruct && isHvv;
 
-      if (isRTAccelStruct && isHvv && supported && adequate) {
-        Logger::info(str::format("DxvkMemoryAllocator: Skipping HVV heap (type ", i, ") for RTX AS"));
-      }
-
       if (supported && adequate && !skipHvv) {
         result = this->tryAllocFromType(&m_memTypes[i],
                                         flags, req->size, req->alignment, hints, dedAllocInfo, category);
-        if (result && isRTAccelStruct) {
-          Logger::info(str::format("DxvkMemoryAllocator: RTX AS allocated from memory type ", i,
-                                   " flags=0x", std::hex, m_memTypes[i].memType.propertyFlags, std::dec,
-                                   " heap=", m_memTypes[i].heapId));
-        }
       }
     }
 

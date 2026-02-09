@@ -202,7 +202,8 @@ namespace dxvk {
     const uint32_t currentBufferTableSize = m_bufferCache.getActiveCount();
     auto blasEntryGarbageCollection = [&](auto& iter, auto& entries) -> void {
       if (iter->second.frameLastTouched < oldestFrame) {
-        if (iter->second.isClusterBlas() && iter->second.frameLastTouched >= clusterOldestFrame) {
+        if (iter->second.isClusterBlas()) {
+          // TEMP: Never GC cluster BLASes to test if GC is causing crash
           ++iter;
           return;
         }
@@ -582,10 +583,13 @@ namespace dxvk {
     static uint32_t lastFrameProcessed = 0;
     uint32_t currentFrame = m_device->getCurrentFrameId();
     if (currentFrame != lastFrameProcessed) {
+      Logger::warn(str::format("CHECKPOINT: submitDrawState NEW FRAME ", currentFrame));
       lastFrameProcessed = currentFrame;
       RtxMegaGeoBuilder* megaGeoBuilder = m_accelManager.getMegaGeoBuilder();
       if (megaGeoBuilder) {
+        Logger::warn("CHECKPOINT: pre-processCompletedSurfaces");
         megaGeoBuilder->processCompletedSurfaces();
+        Logger::warn("CHECKPOINT: post-processCompletedSurfaces");
       }
     }
 
@@ -949,14 +953,8 @@ namespace dxvk {
     
     const bool isMegaGeoCandidate = tryCreateSubdivisionSurface(ctx, drawCallState, pBlas);
     
-    if (isMegaGeoCandidate) {
-      Logger::info(str::format("RTX MegaGeo: onSceneObjectAdded - subdivision surface created! pBlas=", (void*)pBlas,
-                               " isClusterBlas=", pBlas->isClusterBlas(),
-                               " hash=", std::hex, drawCallState.getHash(RtxOptions::geometryAssetHashRule())));
-    } else if (s_debugRejectNonCandidates) {
+    if (!isMegaGeoCandidate && s_debugRejectNonCandidates) {
       // Debug mode: Mark this BLAS as rejected so we can hide its instance later
-      Logger::info(str::format("RTX MegaGeo DEBUG: Rejecting non-candidate mesh. hash=",
-                               std::hex, drawCallState.getHash(RtxOptions::geometryAssetHashRule())));
       pBlas->isMegaGeoDebugRejected = true;
     }
 
@@ -1107,22 +1105,6 @@ namespace dxvk {
     // DEBUG FEATURE: Hide instances for meshes rejected by MegaGeo debug mode
     if (instance && pBlas->isMegaGeoDebugRejected) {
       instance->setHidden(true);
-      Logger::info(str::format("RTX MegaGeo DEBUG: Hiding rejected instance ", (void*)instance,
-                               " for hash=", std::hex, drawCallState.getHash(RtxOptions::geometryAssetHashRule())));
-    }
-
-    // RTX MegaGeo: Log instance-BLAS linking for ClusterBlas debugging
-    if (pBlas->isClusterBlas() && instance) {
-      static bool loggedLinkOnce = false;
-      if (!loggedLinkOnce) {
-        Logger::info(str::format("RTX MegaGeo: processDrawCallState - ClusterBlas instance created! pBlas=", (void*)pBlas,
-                                 " instance=", (void*)instance,
-                                 " instance->getBlas()=", (void*)instance->getBlas(),
-                                 " isClusterBlas=", instance->getBlas()->isClusterBlas(),
-                                 " isHidden=", instance->isHidden(),
-                                 " mask=", instance->getVkInstance().mask));
-        loggedLinkOnce = true;
-      }
     }
 
     // Check if a light should be created for this Material
@@ -1600,6 +1582,7 @@ namespace dxvk {
   }
 
   void SceneManager::prepareSceneData(Rc<RtxContext> ctx, DxvkBarrierSet& execBarriers) {
+    Logger::warn("CHECKPOINT: prepareSceneData ENTER");
     ScopedGpuProfileZone(ctx, "Build Scene");
 
   #ifdef REMIX_DEVELOPMENT
@@ -1610,16 +1593,22 @@ namespace dxvk {
   #endif
 
     // Needs to happen before garbageCollection to avoid destroying dynamic lights
+    Logger::warn("CHECKPOINT: pre-dynamicLightMatching");
     m_lightManager.dynamicLightMatching();
 
+    Logger::warn("CHECKPOINT: pre-garbageCollection");
     garbageCollection();
+    Logger::warn("CHECKPOINT: post-garbageCollection");
 
     m_graphManager.applySceneOverrides(ctx);
+    Logger::warn("CHECKPOINT: post-applySceneOverrides");
 
     m_terrainBaker->prepareSceneData(ctx);
+    Logger::warn("CHECKPOINT: post-terrainBaker");
 
     auto& textureManager = m_device->getCommon()->getTextureManager();
     m_bindlessResourceManager.prepareSceneData(ctx, textureManager.getTextureTable(), getBufferTable(), getSamplerTable());
+    Logger::warn("CHECKPOINT: post-bindlessResourceManager");
 
     // If there are no instances, we should do nothing!
     if (m_instanceManager.getActiveCount() == 0) {
@@ -1670,16 +1659,19 @@ namespace dxvk {
     m_instanceManager.createViewModelInstances(ctx, m_cameraManager, m_rayPortalManager);
     m_instanceManager.createPlayerModelVirtualInstances(ctx, m_cameraManager, m_rayPortalManager);
 
+    Logger::warn("CHECKPOINT: pre-mergeInstancesIntoBlas");
     m_accelManager.mergeInstancesIntoBlas(ctx, execBarriers, textureManager.getTextureTable(), m_cameraManager, m_instanceManager, m_opacityMicromapManager.get());
+    Logger::warn("CHECKPOINT: post-mergeInstancesIntoBlas");
 
     // Call on the other managers to prepare their GPU data for the current scene
+    Logger::warn("CHECKPOINT: pre-accelManager-prepareSceneData");
     m_accelManager.prepareSceneData(ctx, execBarriers, m_instanceManager);
+    Logger::warn("CHECKPOINT: post-accelManager-prepareSceneData");
     m_lightManager.prepareSceneData(ctx, m_cameraManager);
 
     // Build the TLAS
-    Logger::info("RTX MegaGeo SceneManager: About to call buildTlas");
     m_accelManager.buildTlas(ctx);
-    Logger::info("RTX MegaGeo SceneManager: buildTlas returned, continuing with material updates");
+    Logger::warn("CHECKPOINT: post-buildTlas in prepareSceneData");
 
     // Todo: These updates require a lot of temporary buffer allocations and memcopies, ideally we should memcpy directly into a mapped pointer provided by Vulkan,
     // but we have to create a buffer to pass to DXVK's updateBuffer for now.
@@ -1693,6 +1685,7 @@ namespace dxvk {
       // Surface Material buffer
       if (m_surfaceMaterialCache.getTotalCount() > 0) {
         ScopedGpuProfileZone(ctx, "updateSurfaceMaterials");
+        Logger::warn(str::format("CHECKPOINT: updateSurfaceMaterials surfaceCount=", m_accelManager.getSurfaceCount(), " matCacheCount=", m_surfaceMaterialCache.getTotalCount()));
         // Note: We duplicate the materials in the buffer so we don't have to do pointer chasing on the GPU (i.e. rather than BLAS->Surface->Material, do, BLAS->Surface, BLAS->Material)
         size_t surfaceMaterialsGPUSize = m_accelManager.getSurfaceCount() * kSurfaceMaterialGPUSize;
         if (m_startInMediumMaterialIndex_inCache != UINT32_MAX) {
@@ -1708,11 +1701,21 @@ namespace dxvk {
         std::size_t dataOffset = 0;
         uint16_t surfaceIndex = 0;
         std::vector<unsigned char> surfaceMaterialsGPUData(surfaceMaterialsGPUSize);
-        for (auto&& pInstance : m_accelManager.getOrderedInstances()) {
-          auto&& surfaceMaterial = m_surfaceMaterialCache.getObjectTable()[pInstance->surface.surfaceMaterialIndex];
+        const auto& orderedInstances = m_accelManager.getOrderedInstances();
+        const auto& matTable = m_surfaceMaterialCache.getObjectTable();
+        Logger::warn(str::format("CHECKPOINT: matLoop orderedInstances=", orderedInstances.size(), " matTableSize=", matTable.size(), " gpuSize=", surfaceMaterialsGPUSize));
+        for (auto&& pInstance : orderedInstances) {
+          uint32_t matIdx = pInstance->surface.surfaceMaterialIndex;
+          if (matIdx >= matTable.size()) {
+            Logger::err(str::format("CRASH: surfaceMaterialIndex=", matIdx, " >= matTableSize=", matTable.size(), " at surfaceIndex=", surfaceIndex, " isCluster=", pInstance->getBlas() ? pInstance->getBlas()->isClusterBlas() : false));
+            surfaceIndex++;
+            continue;
+          }
+          auto&& surfaceMaterial = matTable[matIdx];
           surfaceMaterial.writeGPUData(surfaceMaterialsGPUData.data(), dataOffset, surfaceIndex);
           surfaceIndex++;
         }
+        Logger::warn(str::format("CHECKPOINT: matLoop done surfaceIndex=", surfaceIndex));
 
         if (m_startInMediumMaterialIndex_inCache != UINT32_MAX) {
           auto&& surfaceMaterial = m_surfaceMaterialCache.getObjectTable()[m_startInMediumMaterialIndex_inCache];
@@ -1725,6 +1728,7 @@ namespace dxvk {
         assert(surfaceMaterialsGPUData.size() == surfaceMaterialsGPUSize);
 
         ctx->writeToBuffer(m_surfaceMaterialBuffer, 0, surfaceMaterialsGPUData.size(), surfaceMaterialsGPUData.data());
+        Logger::warn("CHECKPOINT: surfaceMaterial writeToBuffer done");
       }
 
       // Surface Material Extension Buffer
@@ -1752,6 +1756,7 @@ namespace dxvk {
 
         ctx->writeToBuffer(m_surfaceMaterialExtensionBuffer, 0, surfaceMaterialExtensionsGPUData.size(), surfaceMaterialExtensionsGPUData.data());
       }
+      Logger::warn("CHECKPOINT: post-materialExtensions");
 
       // Volume Material buffer
       if (m_volumeMaterialCache.getTotalCount() > 0) {
@@ -1777,6 +1782,7 @@ namespace dxvk {
         ctx->writeToBuffer(m_volumeMaterialBuffer, 0, volumeMaterialsGPUData.size(), volumeMaterialsGPUData.data());
       }
     }
+    Logger::warn("CHECKPOINT: post-allMaterialUploads");
 
     ctx->emitMemoryBarrier(0,
       VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -1800,6 +1806,7 @@ namespace dxvk {
       capturer->triggerNewCapture();
     }
     capturer->step(ctx, ctx->getCommonObjects()->getLastKnownWindowHandle());
+    Logger::warn("CHECKPOINT: prepareSceneData COMPLETE");
 
     // Clear the ray portal data before the next frame
     m_rayPortalManager.clear();
@@ -1974,17 +1981,10 @@ namespace dxvk {
   bool SceneManager::isSubdivisionSurfaceCandidate(const RaytraceGeometry& convertedGeom, const DrawCallState& drawCallState) const {
     // Use the CONVERTED geometry data (triangle strips already converted to triangle lists by processGeometryInfo)
 
-    static uint32_t logCounter = 0;
-    static uint32_t candidateCount = 0;
-    const bool shouldLog = (logCounter++ % 100) == 0; // Log every 100th call for testing
-
     // Early rejection: Must have vertex and index data
     // Note: We check indexCount > 0 instead of usesIndices() because the temporary geometry
     // passed from tryCreateSubdivisionSurface doesn't have an actual index buffer set
     if (convertedGeom.indexCount == 0 || convertedGeom.vertexCount == 0) {
-      if (shouldLog) {
-        Logger::info(str::format("RTX MegaGeo: Rejected - no indices (indexCount=", convertedGeom.indexCount, ", vertexCount=", convertedGeom.vertexCount, ")"));
-      }
       return false;
     }
 
@@ -1995,9 +1995,6 @@ namespace dxvk {
     // In DX9/legacy games, quads are typically submitted as 2 triangles per quad
     // Check if index count is divisible by 6 (2 triangles * 3 indices per quad)
     if (convertedGeom.indexCount % 6 != 0) {
-      if (shouldLog) {
-        Logger::info(str::format("RTX MegaGeo: Rejected - indexCount not divisible by 6 (indexCount=", convertedGeom.indexCount, ")"));
-      }
       return false;
     }
 
@@ -2005,9 +2002,6 @@ namespace dxvk {
 
     // Sanity check: Must have at least 1 quad
     if (potentialQuadCount == 0) {
-      if (shouldLog) {
-        Logger::info("RTX MegaGeo: Rejected - zero quads");
-      }
       return false;
     }
 
@@ -2037,9 +2031,6 @@ namespace dxvk {
                                          (potentialQuadCount >= 4 && potentialQuadCount <= 16384);
 
     if (!hasReasonableComplexity) {
-      if (shouldLog) {
-        Logger::info(str::format("RTX MegaGeo: Rejected - unreasonable complexity (verts=", convertedGeom.vertexCount, ", quads=", potentialQuadCount, ")"));
-      }
       return false;
     }
 
@@ -2063,19 +2054,6 @@ namespace dxvk {
     // TODO: Re-enable conservative check once mega geometry is proven working
     bool result = hasReasonableComplexity;  // Changed from isTrackedReplacementMesh
 
-    if (result) {
-      candidateCount++;
-      Logger::info(str::format("RTX MegaGeo: CANDIDATE FOUND (#", candidateCount, ") - verts=", convertedGeom.vertexCount,
-                                ", quads=", potentialQuadCount,
-                                ", hash=", std::hex, meshHash,
-                                ", isTracked=", isTrackedReplacementMesh ? "YES" : "NO"));
-    } else if (shouldLog) {
-      Logger::info(str::format("RTX MegaGeo: Candidate check - verts=", convertedGeom.vertexCount,
-                                ", quads=", potentialQuadCount,
-                                ", hash=", std::hex, meshHash,
-                                ", isTracked=", isTrackedReplacementMesh ? "YES" : "NO"));
-    }
-
     // Conservative approach: Only enable for tracked replacement meshes with quad topology
     // This can be relaxed with additional configuration options
     return result;
@@ -2092,12 +2070,6 @@ namespace dxvk {
     // IMPORTANT: This function is now called BEFORE processGeometryInfo to access
     // the original vertex buffer data before GPU upload makes it inaccessible.
     // We use the ORIGINAL geometry from drawCallState, not converted geometry.
-
-    ONCE(Logger::info("RTX Mega Geometry: tryCreateSubdivisionSurface called for first time"));
-    static uint32_t callCount = 0;
-    if ((callCount++ % 100) == 0) {
-      Logger::info(str::format("RTX Mega Geometry: tryCreateSubdivisionSurface call #", callCount));
-    }
 
     // Use the ORIGINAL geometry from drawCallState (before GPU upload)
     // This is called before processGeometryInfo so pBlas->modifiedGeometryData isn't ready yet
@@ -2121,28 +2093,6 @@ namespace dxvk {
       return false;
     }
 
-    // DIAGNOSTIC: Log the draw call's objectToWorld transform
-    // This is the transform that SHOULD be applied to the cluster geometry in TLAS
-    {
-      const Matrix4& objToWorld = drawCallState.getTransformData().objectToWorld;
-      static uint32_t transformLogCount = 0;
-      if (transformLogCount < 10) {
-        Logger::info(str::format("RTXMG CREATE: Draw call objectToWorld transform #", transformLogCount));
-        Logger::info(str::format("  row0=(", objToWorld.data[0][0], ",", objToWorld.data[0][1], ",", objToWorld.data[0][2], ",", objToWorld.data[0][3], ")"));
-        Logger::info(str::format("  row1=(", objToWorld.data[1][0], ",", objToWorld.data[1][1], ",", objToWorld.data[1][2], ",", objToWorld.data[1][3], ")"));
-        Logger::info(str::format("  row2=(", objToWorld.data[2][0], ",", objToWorld.data[2][1], ",", objToWorld.data[2][2], ",", objToWorld.data[2][3], ")"));
-        Logger::info(str::format("  row3=(", objToWorld.data[3][0], ",", objToWorld.data[3][1], ",", objToWorld.data[3][2], ",", objToWorld.data[3][3], ")"));
-        // Check for identity
-        bool isIdentity = (objToWorld.data[0][0] == 1.0f && objToWorld.data[1][1] == 1.0f && objToWorld.data[2][2] == 1.0f && objToWorld.data[3][3] == 1.0f) &&
-                          (objToWorld.data[0][1] == 0.0f && objToWorld.data[0][2] == 0.0f && objToWorld.data[0][3] == 0.0f) &&
-                          (objToWorld.data[1][0] == 0.0f && objToWorld.data[1][2] == 0.0f && objToWorld.data[1][3] == 0.0f) &&
-                          (objToWorld.data[2][0] == 0.0f && objToWorld.data[2][1] == 0.0f && objToWorld.data[2][3] == 0.0f) &&
-                          (objToWorld.data[3][0] == 0.0f && objToWorld.data[3][1] == 0.0f && objToWorld.data[3][2] == 0.0f);
-        Logger::info(str::format("  isIdentity=", isIdentity ? "YES (vertices already in world space)" : "NO (need transform)"));
-        transformLogCount++;
-      }
-    }
-
     // Cache by TOPOLOGY only (not vertex positions) for animated meshes!
     // Topology = indices + geometry descriptor (no positions)
     HashRule topologyRule = rules::TopologicalHash;
@@ -2153,7 +2103,6 @@ namespace dxvk {
     if (cacheIt != m_subdivisionSurfaceCache.end()) {
       RtxMegaGeoBuilder* megaGeoBuilder = m_accelManager.getMegaGeoBuilder();
       if (megaGeoBuilder && !megaGeoBuilder->hasSurface(cacheIt->second)) {
-        Logger::info(str::format("RTX MegaGeo: Cache hit for pruned surface ", cacheIt->second, ", invalidating"));
         m_subdivisionSurfaceCache.erase(cacheIt);
         cacheIt = m_subdivisionSurfaceCache.end(); // treat as cache miss
       }
@@ -2187,15 +2136,9 @@ namespace dxvk {
         controlPoints[v] = bufferData.getPosition(v);
       }
 
-      // Debug: Log first vertex to verify data
-      if (vertexCount > 0) {
-        Logger::info(str::format("RTX MegaGeo: Cache hit v0=(", controlPoints[0].x, ",", controlPoints[0].y, ",", controlPoints[0].z, ")"));
-      }
-
       // For topology cache hits, reuse the existing surface
       // Topology hasn't changed, so we can use the cached surface directly
       // TODO: In the future, implement proper animation support by updating only control point buffers
-      Logger::info(str::format("RTX MegaGeo: Cache hit, reusing surface ", cachedSurfaceId));
 
       pBlas->blasType = BlasEntry::Type::ClusterBlas;
       pBlas->megaGeoBuilder = megaGeoBuilder;
@@ -2203,12 +2146,9 @@ namespace dxvk {
       return true;
     }
 
-    Logger::info(str::format("RTX MegaGeo: Cache miss for topology hash ", std::hex, topologyHash, ", creating new subdivision surface"));
-
     // Get or initialize RtxMegaGeoBuilder from AccelManager
     RtxMegaGeoBuilder* megaGeoBuilder = m_accelManager.getMegaGeoBuilder();
     if (!megaGeoBuilder) {
-      Logger::info("RTX MegaGeo: Builder not initialized yet, initializing now...");
       if (!m_accelManager.initializeMegaGeoBuilder(ctx)) {
         Logger::err("RTX MegaGeo: Failed to initialize builder");
         return false;
@@ -2217,16 +2157,6 @@ namespace dxvk {
       if (!megaGeoBuilder) {
         Logger::err("RTX MegaGeo: Builder is still null after initialization");
         return false;
-      }
-      Logger::info(str::format("RTX MegaGeo: Builder initialized successfully, ptr=", (void*)megaGeoBuilder,
-          " via AccelManager=", (void*)&m_accelManager));
-    } else {
-      // Builder already exists - log that we're reusing it
-      static uint32_t s_reuseCount = 0;
-      s_reuseCount++;
-      if ((s_reuseCount % 100) == 1) {
-        Logger::info(str::format("RTX MegaGeo: Reusing existing builder ptr=", (void*)megaGeoBuilder,
-            " (reuse count=", s_reuseCount, ")"));
       }
     }
 
@@ -2256,7 +2186,6 @@ namespace dxvk {
       if (origPtr != nullptr) {
         positionDataPtr = (float*)origPtr;
         positionStrideFloats = originalGeom.originalPositionBuffer.stride() / sizeof(float);
-        Logger::info("RTX MegaGeo: Using originalPositionBuffer for vertex data");
       }
     }
 
@@ -2272,25 +2201,11 @@ namespace dxvk {
       controlPoints[v] = Vector3(vertPtr[0], vertPtr[1], vertPtr[2]);
     }
 
-    // Debug: Log first vertex position to verify data is valid
-    if (vertexCount > 0) {
-      Logger::info(str::format("RTX MegaGeo: v0=(", controlPoints[0].x, ",", controlPoints[0].y, ",", controlPoints[0].z, ")"));
-    }
-
     // Extract texture coordinates from ORIGINAL buffer
     if (bufferData.texcoordData != nullptr) {
       texcoords.resize(vertexCount);
       for (uint32_t v = 0; v < vertexCount; ++v) {
         texcoords[v] = bufferData.getTexCoord(v);
-      }
-      // Log first few texcoords for debugging
-      static uint32_t s_texcoordLogCount = 0;
-      if (s_texcoordLogCount < 5) {
-        uint32_t numToLog = std::min(vertexCount, 4u);
-        for (uint32_t v = 0; v < numToLog; ++v) {
-          Logger::info(str::format("RTX MegaGeo TEXCOORD[", s_texcoordLogCount, "] v", v, "=(", texcoords[v].x, ",", texcoords[v].y, ")"));
-        }
-        s_texcoordLogCount++;
       }
     } else {
       Logger::warn("RTX MegaGeo: texcoordData is NULL - no texcoords for subdivision surface!");
@@ -2304,24 +2219,12 @@ namespace dxvk {
         const float* normPtr = bufferData.normalData + v * bufferData.normalStride;
         normals[v] = Vector3(normPtr[0], normPtr[1], normPtr[2]);
       }
-      // Log first few normals for debugging
-      static uint32_t s_normalLogCount = 0;
-      if (s_normalLogCount < 5) {
-        uint32_t numToLog = std::min(originalGeom.vertexCount, 4u);
-        for (uint32_t v = 0; v < numToLog; ++v) {
-          Logger::info(str::format("RTX MegaGeo NORMAL[", s_normalLogCount, "] v", v, "=(", normals[v].x, ",", normals[v].y, ",", normals[v].z, ")"));
-        }
-        s_normalLogCount++;
-      }
     } else {
       Logger::warn("RTX MegaGeo: normalData is NULL - no normals for subdivision surface!");
     }
 
     // Extract quad topology - copy index data to CPU for async processing
     // We need to copy NOW before GPU upload completes asynchronously
-
-    Logger::info(str::format("RTX MegaGeo: Index counts - converted=", tempConvertedGeom.indexCount, ", original=", originalGeom.indexCount));
-    Logger::info(str::format("RTX MegaGeo: Vertex counts - converted=", tempConvertedGeom.vertexCount, ", original=", originalGeom.vertexCount));
 
     const uint32_t numQuads = tempConvertedGeom.indexCount / 6;
     if (numQuads == 0 || (tempConvertedGeom.indexCount % 6) != 0) {
@@ -2387,7 +2290,6 @@ namespace dxvk {
           convertedIndices.push_back(i1);
         }
       }
-      Logger::info(str::format("RTX MegaGeo: Converted triangle strip (", originalGeom.indexCount, " → ", convertedIndices.size(), " indices)"));
     } else {
       Logger::warn(str::format("RTX MegaGeo: Unsupported topology type ", (uint32_t)originalGeom.topology));
       return false;
@@ -2396,117 +2298,141 @@ namespace dxvk {
     const void* indexBufferPtr = convertedIndices.data();
     const uint32_t convertedIndexCount = convertedIndices.size();
 
-    // Re-check quad count with converted indices
-    const uint32_t finalNumQuads = convertedIndexCount / 6;
-    if (finalNumQuads == 0 || (convertedIndexCount % 6) != 0) {
-      Logger::warn(str::format("RTX MegaGeo: After conversion, index count ", convertedIndexCount, " not divisible by 6"));
+    // Edge-adjacency quad detection: build adjacency from non-degenerate triangles,
+    // pair triangles sharing an edge into quads, emit remaining as triangle faces.
+    // This avoids losing valid triangles to degenerate strip-separator neighbors.
+    const uint32_t finalTriCount = convertedIndexCount / 3;
+    if (finalTriCount == 0) {
+      Logger::warn(str::format("RTX MegaGeo: After conversion, no valid triangles (indexCount=", convertedIndexCount, ")"));
       return false;
     }
 
-    Logger::info(str::format("RTX MegaGeo: Ready to process ", finalNumQuads, " potential quads"));
-
-    faceVertexIndices.reserve(finalNumQuads * 4);
-    faceVertexCounts.reserve(finalNumQuads); // Reserve space, but don't pre-size
-
-    // Log first few quads for debugging
-    uint32_t numQuadsToLog = std::min(finalNumQuads, 3u);
-    uint32_t validQuadCount = 0; // Track actual valid quads
-    uint32_t degenerateQuadCount = 0; // Track degenerate quads
-
-    // Indices are now always uint32_t after conversion
     const uint32_t* indices32 = (const uint32_t*)indexBufferPtr;
 
-    for (uint32_t q = 0; q < finalNumQuads; ++q) {
-      const uint32_t baseIdx = q * 6; // Each quad = 2 triangles = 6 indices
+    // Step 1: Collect non-degenerate triangles
+    struct Tri { uint32_t v[3]; };
+    std::vector<Tri> validTris;
+    validTris.reserve(finalTriCount);
+    uint32_t degenerateTriCount = 0;
 
-      // Read ALL 6 indices for this quad (2 triangles)
-      uint32_t tri1[3], tri2[3];
-      tri1[0] = indices32[baseIdx + 0];
-      tri1[1] = indices32[baseIdx + 1];
-      tri1[2] = indices32[baseIdx + 2];
-      tri2[0] = indices32[baseIdx + 3];
-      tri2[1] = indices32[baseIdx + 4];
-      tri2[2] = indices32[baseIdx + 5];
-
-      // Log first few quads to understand the pattern
-      if (q < numQuadsToLog) {
-        Logger::info(str::format("RTX MegaGeo: Quad ", q, " triangles: [",
-                                tri1[0], ",", tri1[1], ",", tri1[2], "] [",
-                                tri2[0], ",", tri2[1], ",", tri2[2], "]"));
-      }
-
-      // Detect quad pattern by finding shared vertices
-      // Common patterns:
-      // 1. [v0,v1,v2] [v0,v2,v3] - shares edge v0-v2
-      // 2. [v0,v1,v2] [v2,v3,v0] - shares edge v0-v2 (rotated)
-      // 3. [v0,v1,v2] [v1,v2,v3] - shares edge v1-v2
-      // 4. [v0,v1,v2] [v1,v3,v2] - shares edge v1-v2 (reversed)
-
-      uint32_t v0, v1, v2, v3;
-      bool validQuad = false;
-
-      // Pattern 1: [v0,v1,v2] [v0,v2,v3] - most common
-      if (tri1[0] == tri2[0] && tri1[2] == tri2[1]) {
-        v0 = tri1[0]; v1 = tri1[1]; v2 = tri1[2]; v3 = tri2[2];
-        validQuad = true;
-      }
-      // Pattern 2: [v0,v1,v2] [v2,v3,v0] - rotated
-      else if (tri1[2] == tri2[0] && tri1[0] == tri2[2]) {
-        v0 = tri1[0]; v1 = tri1[1]; v2 = tri1[2]; v3 = tri2[1];
-        validQuad = true;
-      }
-      // Pattern 3: [v0,v1,v2] [v1,v2,v3]
-      else if (tri1[1] == tri2[0] && tri1[2] == tri2[1]) {
-        v0 = tri1[0]; v1 = tri1[1]; v2 = tri1[2]; v3 = tri2[2];
-        validQuad = true;
-      }
-      // Pattern 4: [v0,v1,v2] [v1,v3,v2] - shares edge v1-v2 (same order)
-      else if (tri1[1] == tri2[0] && tri1[2] == tri2[2]) {
-        v0 = tri1[0]; v1 = tri1[1]; v2 = tri2[1]; v3 = tri1[2];
-        validQuad = true;
-      }
-
-      if (!validQuad) {
-        Logger::err(str::format("RTX MegaGeo: Cannot detect quad pattern at quad ", q,
-                                " - triangles don't share an edge properly"));
-        Logger::err(str::format("  Triangle 1: [", tri1[0], ",", tri1[1], ",", tri1[2], "]"));
-        Logger::err(str::format("  Triangle 2: [", tri2[0], ",", tri2[1], ",", tri2[2], "]"));
+    for (uint32_t t = 0; t < finalTriCount; ++t) {
+      uint32_t i0 = indices32[t * 3];
+      uint32_t i1 = indices32[t * 3 + 1];
+      uint32_t i2 = indices32[t * 3 + 2];
+      if (i0 >= vertexCount || i1 >= vertexCount || i2 >= vertexCount) {
+        Logger::err(str::format("RTX MegaGeo: Invalid vertex index at triangle ", t));
         return false;
       }
-
-      // Validate all 4 unique vertices
-      if (v0 >= vertexCount || v1 >= vertexCount || v2 >= vertexCount || v3 >= vertexCount) {
-        Logger::err(str::format("RTX MegaGeo: Invalid vertex indices in quad ", q,
-                                " - v0=", v0, " v1=", v1, " v2=", v2, " v3=", v3,
-                                " (vertexCount=", vertexCount, ")"));
-        return false;
-      }
-
-      // Check for degenerate quad (duplicate vertices)
-      if (v0 == v1 || v0 == v2 || v0 == v3 || v1 == v2 || v1 == v3 || v2 == v3) {
-        // Count and skip degenerate quads instead of logging each one
-        degenerateQuadCount++;
+      if (i0 == i1 || i0 == i2 || i1 == i2) {
+        degenerateTriCount++;
         continue;
       }
-
-      // Add quad vertices in CCW order: [v0, v1, v2, v3]
-      faceVertexIndices.push_back(v0);
-      faceVertexIndices.push_back(v1);
-      faceVertexIndices.push_back(v2);
-      faceVertexIndices.push_back(v3);
-      faceVertexCounts.push_back(4); // This face has 4 vertices
-      validQuadCount++;
+      validTris.push_back({i0, i1, i2});
     }
 
-    // Check if we have any valid quads after filtering
-    if (validQuadCount == 0) {
-      Logger::err("RTX MegaGeo: No valid quads found after filtering degenerate faces");
+    if (validTris.empty()) {
+      Logger::err("RTX MegaGeo: No valid triangles after filtering degenerates");
       return false;
     }
 
-    Logger::info(str::format("RTX MegaGeo: Found ", validQuadCount, " valid quads out of ", numQuads, " total"));
-    if (degenerateQuadCount > 0) {
-      Logger::warn(str::format("RTX MegaGeo: Skipped ", degenerateQuadCount, " degenerate quads with duplicate vertices"));
+    // Step 2: Build edge adjacency map (edge → triangle indices)
+    auto edgeKey = [](uint32_t a, uint32_t b) -> uint64_t {
+      if (a > b) std::swap(a, b);
+      return ((uint64_t)a << 32) | (uint64_t)b;
+    };
+
+    std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> edgeToTris;
+    // Value: (tri0, tri1) where tri1 == UINT32_MAX means only 1 triangle on this edge
+
+    for (uint32_t ti = 0; ti < (uint32_t)validTris.size(); ++ti) {
+      const auto& tri = validTris[ti];
+      for (int e = 0; e < 3; ++e) {
+        uint64_t ek = edgeKey(tri.v[e], tri.v[(e + 1) % 3]);
+        auto it = edgeToTris.find(ek);
+        if (it == edgeToTris.end()) {
+          edgeToTris[ek] = {ti, UINT32_MAX};
+        } else if (it->second.second == UINT32_MAX) {
+          it->second.second = ti; // second triangle on this edge
+        }
+        // If >2 triangles share an edge (non-manifold), ignore extras
+      }
+    }
+
+    // Step 3: Greedily pair triangles into quads via shared edges
+    std::vector<bool> used(validTris.size(), false);
+    uint32_t validQuadCount = 0;
+    uint32_t validTriCount = 0;
+
+    faceVertexIndices.reserve(validTris.size() * 3);
+    faceVertexCounts.reserve(validTris.size());
+
+    for (auto& [ek, triPair] : edgeToTris) {
+      uint32_t ti0 = triPair.first;
+      uint32_t ti1 = triPair.second;
+      if (ti1 == UINT32_MAX) continue; // boundary edge
+      if (used[ti0] || used[ti1]) continue;
+
+      const auto& t0 = validTris[ti0];
+      const auto& t1 = validTris[ti1];
+
+      // Shared edge vertices from the key
+      uint32_t s0 = (uint32_t)(ek >> 32);
+      uint32_t s1 = (uint32_t)(ek & 0xFFFFFFFF);
+
+      // Find opposite vertices
+      uint32_t opp0 = UINT32_MAX, opp1 = UINT32_MAX;
+      for (int i = 0; i < 3; ++i) {
+        if (t0.v[i] != s0 && t0.v[i] != s1) opp0 = t0.v[i];
+        if (t1.v[i] != s0 && t1.v[i] != s1) opp1 = t1.v[i];
+      }
+      if (opp0 == UINT32_MAX || opp1 == UINT32_MAX) continue;
+      if (opp0 == opp1) continue; // degenerate — both triangles same
+
+      // Find shared edge direction in tri0's winding to produce consistent quad winding
+      // tri0 has edges: v[0]→v[1], v[1]→v[2], v[2]→v[0]
+      // Find which edge matches (s0,s1) or (s1,s0)
+      uint32_t ea = s0, eb = s1; // default
+      for (int i = 0; i < 3; ++i) {
+        uint32_t vi = t0.v[i];
+        uint32_t vj = t0.v[(i + 1) % 3];
+        if ((vi == s0 && vj == s1) || (vi == s1 && vj == s0)) {
+          ea = vi; eb = vj;
+          break;
+        }
+      }
+
+      // Quad perimeter: ea → opp0 → eb → opp1
+      faceVertexIndices.push_back(ea);
+      faceVertexIndices.push_back(opp0);
+      faceVertexIndices.push_back(eb);
+      faceVertexIndices.push_back(opp1);
+      faceVertexCounts.push_back(4);
+      validQuadCount++;
+
+      used[ti0] = true;
+      used[ti1] = true;
+    }
+
+    // Step 4: Emit remaining unpaired triangles as 3-vertex faces
+    // Catmull-Clark handles non-quad faces as "irregular" — they get subdivided
+    // with stencil matrices. This is slightly more expensive per-face than quads
+    // but avoids losing geometry (holes in the mesh).
+    for (uint32_t ti = 0; ti < (uint32_t)validTris.size(); ++ti) {
+      if (!used[ti]) {
+        const auto& tri = validTris[ti];
+        faceVertexIndices.push_back(tri.v[0]);
+        faceVertexIndices.push_back(tri.v[1]);
+        faceVertexIndices.push_back(tri.v[2]);
+        faceVertexCounts.push_back(3);
+        validTriCount++;
+      }
+    }
+
+    uint32_t totalFaces = validQuadCount + validTriCount;
+
+    if (totalFaces == 0) {
+      Logger::err("RTX MegaGeo: No valid faces found after edge-adjacency pairing");
+      return false;
     }
 
     // Populate SubdivisionSurfaceDesc
@@ -2515,7 +2441,7 @@ namespace dxvk {
     std::string debugName = str::format("SubdivSurface_", std::hex, topologyHash);
     desc.debugName = debugName.c_str();
 
-    desc.numFaces = validQuadCount; // Use actual valid quad count, not potential count
+    desc.numFaces = totalFaces; // Quads + unpaired triangles
     desc.numVertices = vertexCount; // Use converted vertex count (matches converted indices)
     desc.faceVertexCounts = faceVertexCounts.data();
     desc.faceVertexIndices = faceVertexIndices.data();
@@ -2535,59 +2461,6 @@ namespace dxvk {
     desc.displacementTextureIndex = 0;
     desc.displacementScale = 0.0f;
 
-    Logger::info(str::format("RTX MegaGeo: Extracting subdivision surface - ",
-                             validQuadCount, " valid quads, ", vertexCount, " vertices"));
-
-    // DIAGNOSTIC: Log input mesh data for debugging geometry corruption
-    {
-      // Compute input AABB
-      Vector3 inputMin = controlPoints[0];
-      Vector3 inputMax = controlPoints[0];
-      for (uint32_t i = 1; i < vertexCount; ++i) {
-        const Vector3& v = controlPoints[i];
-        inputMin.x = std::min(inputMin.x, v.x);
-        inputMin.y = std::min(inputMin.y, v.y);
-        inputMin.z = std::min(inputMin.z, v.z);
-        inputMax.x = std::max(inputMax.x, v.x);
-        inputMax.y = std::max(inputMax.y, v.y);
-        inputMax.z = std::max(inputMax.z, v.z);
-      }
-      Vector3 extent(inputMax.x - inputMin.x, inputMax.y - inputMin.y, inputMax.z - inputMin.z);
-      Vector3 center((inputMin.x + inputMax.x) * 0.5f, (inputMin.y + inputMax.y) * 0.5f, (inputMin.z + inputMax.z) * 0.5f);
-
-      Logger::info(str::format("RTXMG INPUT DIAG: AABB min=(", inputMin.x, ",", inputMin.y, ",", inputMin.z,
-          ") max=(", inputMax.x, ",", inputMax.y, ",", inputMax.z, ")"));
-      Logger::info(str::format("RTXMG INPUT DIAG: extent=(", extent.x, ",", extent.y, ",", extent.z,
-          ") center=(", center.x, ",", center.y, ",", center.z, ")"));
-
-      // Log first few vertices
-      uint32_t numToLog = std::min(vertexCount, 5u);
-      for (uint32_t i = 0; i < numToLog; ++i) {
-        Logger::info(str::format("RTXMG INPUT DIAG: v[", i, "]=(", controlPoints[i].x, ",", controlPoints[i].y, ",", controlPoints[i].z, ")"));
-      }
-
-      // Log first few face indices
-      uint32_t facesToLog = std::min(validQuadCount, 3u);
-      for (uint32_t f = 0; f < facesToLog; ++f) {
-        uint32_t baseIdx = f * 4;
-        Logger::info(str::format("RTXMG INPUT DIAG: face[", f, "] indices=[",
-            faceVertexIndices[baseIdx], ",", faceVertexIndices[baseIdx+1], ",",
-            faceVertexIndices[baseIdx+2], ",", faceVertexIndices[baseIdx+3], "]"));
-      }
-
-      // Check for suspicious values
-      uint32_t nanCount = 0, infCount = 0, zeroCount = 0;
-      for (uint32_t i = 0; i < vertexCount; ++i) {
-        const Vector3& v = controlPoints[i];
-        if (std::isnan(v.x) || std::isnan(v.y) || std::isnan(v.z)) nanCount++;
-        if (std::isinf(v.x) || std::isinf(v.y) || std::isinf(v.z)) infCount++;
-        if (v.x == 0.0f && v.y == 0.0f && v.z == 0.0f) zeroCount++;
-      }
-      if (nanCount > 0) Logger::err(str::format("RTXMG INPUT DIAG: ", nanCount, " vertices have NaN!"));
-      if (infCount > 0) Logger::err(str::format("RTXMG INPUT DIAG: ", infCount, " vertices have Inf!"));
-      if (zeroCount > vertexCount / 2) Logger::warn(str::format("RTXMG INPUT DIAG: ", zeroCount, "/", vertexCount, " vertices are at origin (suspicious)"));
-    }
-
     // Create subdivision surface in RtxMegaGeoBuilder
     uint32_t surfaceId = 0;
     if (!megaGeoBuilder->createSubdivisionSurface(desc, surfaceId)) {
@@ -2603,8 +2476,6 @@ namespace dxvk {
     // Cache the subdivision surface ID by topology for future reuse
     m_subdivisionSurfaceCache[topologyHash] = surfaceId;
 
-    Logger::info(str::format("RTX MegaGeo: Created subdivision surface with ID ", surfaceId,
-                             ", cached for topology hash ", std::hex, topologyHash));
     return true;
   }
 

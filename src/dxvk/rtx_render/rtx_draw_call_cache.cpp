@@ -176,17 +176,6 @@ DrawCallCache::CacheState DrawCallCache::get(const DrawCallState& drawCall, Blas
 }
 
 void DrawCallCache::logFrameStats() {
-  // Per-frame cache hit/miss stats for ClusterBlas entries
-  static uint32_t s_frameCount = 0;
-  s_frameCount++;
-  if (m_clusterHits + m_clusterMisses + m_clusterMultiHits > 0) {
-    Logger::info(str::format("RTX MegaGeo CACHE[", s_frameCount, "]: ",
-        "clusterHits=", m_clusterHits,
-        " clusterMultiHits=", m_clusterMultiHits,
-        " clusterMisses=", m_clusterMisses,
-        " nonCluster=", m_nonClusterCalls,
-        " totalEntries=", m_entries.size()));
-  }
   m_clusterHits = 0;
   m_clusterMisses = 0;
   m_clusterMultiHits = 0;

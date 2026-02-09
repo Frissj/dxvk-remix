@@ -34,6 +34,9 @@
 #include "../vtr/level.h"
 
 #include <limits>
+#include <chrono>
+#include "../../../util/log/log.h"
+#include "../../../util/util_string.h"
 
 namespace OpenSubdiv {
 namespace OPENSUBDIV_VERSION {
@@ -171,6 +174,8 @@ SurfaceTableFactory::Create(TopologyRefiner const& refiner,
     surfaceTable->descriptors.resize(numSurfaces);
     surfaceTable->controlPointIndices.reserve(numFaces * 20);
 
+    auto loopStart = std::chrono::high_resolution_clock::now();
+
     for (Index faceIndex = 0, surfIndex = 0; faceIndex < numFaces; ++faceIndex) {
 
         int n = level.getNumFaceVertices(faceIndex);
@@ -180,7 +185,12 @@ SurfaceTableFactory::Create(TopologyRefiner const& refiner,
             surfIndex += n == regFaceSize ? 1 : n;
             continue;
         }
-        
+
+        // Log every face to find the exact freeze point
+        dxvk::Logger::warn(dxvk::str::format("OSD SurfaceTableFactory: face ", faceIndex, "/", numFaces, " n=", n));
+
+        auto faceStart = std::chrono::high_resolution_clock::now();
+
         Neighborhood const* neighborhood = populateNeighborhoodData(faceIndex);
 
         if (!neighborhood) {
@@ -198,8 +208,10 @@ SurfaceTableFactory::Create(TopologyRefiner const& refiner,
 
             auto buildPlan = [&](LocalIndex subfaceIndex = 0) -> SubdivisionPlan* {
 
+                dxvk::Logger::warn(dxvk::str::format("OSD SurfaceTableFactory: face ", faceIndex, " buildPlan subface=", (int)subfaceIndex));
                 std::unique_ptr<SubdivisionPlan> plan = _planBuilder.Create(
                     schemeType, schemeOptions, options.planBuilderOptions, *neighborhood, subfaceIndex);
+                dxvk::Logger::warn(dxvk::str::format("OSD SurfaceTableFactory: face ", faceIndex, " plan created"));
 
                 plan->reserveNeighborhoods(n);
 
@@ -207,11 +219,12 @@ SurfaceTableFactory::Create(TopologyRefiner const& refiner,
                     auto neighborhoodData = createNeighborhoodData(faceIndex, subfaceIndex);
                     plan->addNeighborhood(std::move(neighborhoodData), subfaceIndex);
                 }
+                dxvk::Logger::warn(dxvk::str::format("OSD SurfaceTableFactory: face ", faceIndex, " neighborhoods added"));
                 return plan.release();
             };
 
             if (n == regFaceSize) {
-                
+
                 planIndex = topologyMap.InsertRegularFace<thread_safe>(buildPlan());
 
             } else {
@@ -228,12 +241,24 @@ SurfaceTableFactory::Create(TopologyRefiner const& refiner,
             if (startingEdge > 0) {
                 // rotated variant of the SubdivisionPlan: rebuild the 1-ring of control points, but with
                 // ordering starting from the matching vertex/edge
-                //_neighborhoodBuilder.Populate(neighborhoodData, level, faceIndex, startingEdge);      
+                //_neighborhoodBuilder.Populate(neighborhoodData, level, faceIndex, startingEdge);
                 neighborhood = populateNeighborhoodData(faceIndex, startingEdge);
             }
         }
 
-        assert(neighborhood->GetNumControlPoints() == topologyMap.GetSubdivisionPlan(planIndex)->GetNumControlPoints());
+        dxvk::Logger::warn(dxvk::str::format("OSD SurfaceTableFactory: face ", faceIndex, " plan done planIndex=", planIndex));
+
+        auto faceEnd = std::chrono::high_resolution_clock::now();
+        float faceMs = std::chrono::duration_cast<std::chrono::microseconds>(faceEnd - faceStart).count() * 0.001f;
+        if (faceMs > 100.0f) {
+            dxvk::Logger::warn(dxvk::str::format("OSD SurfaceTableFactory: face ", faceIndex, " took ", faceMs, "ms (SLOW) n=", n, " planIndex=", planIndex));
+        }
+
+        int nbrCP = neighborhood->GetNumControlPoints();
+        int planCP = topologyMap.GetSubdivisionPlan(planIndex)->GetNumControlPoints();
+        if (nbrCP != planCP) {
+            dxvk::Logger::err(dxvk::str::format("OSD SurfaceTableFactory: MISMATCH face ", faceIndex, " nbrCP=", nbrCP, " planCP=", planCP));
+        }
 
         // populate the SurfaceTable
  

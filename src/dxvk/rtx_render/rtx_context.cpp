@@ -419,6 +419,7 @@ namespace dxvk {
 
   // Hooked into D3D9 presentImage (same place HUD rendering is)
   void RtxContext::injectRTX(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targetImage) {
+    Logger::warn("CHECKPOINT-CTX: injectRTX-ENTER");
     ScopedCpuProfileZone();
 #ifdef REMIX_DEVELOPMENT
     m_currentPassStage = RtxFramePassStage::FrameBegin;
@@ -454,6 +455,7 @@ namespace dxvk {
 #endif
 
     commitGraphicsState<true, false>();
+    Logger::warn("CHECKPOINT-CTX: post-commitGraphicsState");
 
     auto common = getCommonObjects();
     const auto isRaytracingEnabled = RtxOptions::enableRaytracing();
@@ -550,15 +552,20 @@ namespace dxvk {
         takeScreenshot("orgImage", targetImage);
       }
 
+      Logger::warn("CHECKPOINT-CTX: pre-particles");
       RtxParticleSystemManager& particles = m_device->getCommon()->metaParticleSystem();
       particles.submitDrawState(this);
 
+      Logger::warn("CHECKPOINT-CTX: pre-spillRenderPass");
       this->spillRenderPass(false);
 
+      Logger::warn("CHECKPOINT-CTX: pre-submitTextures");
       getCommonObjects()->getTextureManager().submitTexturesToDeviceLocal(this, m_execBarriers, m_execAcquires);
 
+      Logger::warn("CHECKPOINT-CTX: pre-recordBarriers");
       m_execBarriers.recordCommands(m_cmd);
 
+      Logger::warn("CHECKPOINT-CTX: pre-prepareSceneData");
       ScopedGpuProfileZone(this, "InjectRTX");
 
       // Signal Reflex rendering start
@@ -573,11 +580,13 @@ namespace dxvk {
 
       // Update all the GPU buffers needed to describe the scene
       getSceneManager().prepareSceneData(this, m_execBarriers);
+      Logger::warn("CHECKPOINT-CTX: post-prepareSceneData");
 
       // If we really don't have any RT to do, just bail early (could be UI/menus rendering)
       if (getSceneManager().getSurfaceBuffer() != nullptr) {
 
         VkExtent3D downscaledExtent = onFrameBegin(targetImage->info().extent);
+        Logger::warn("CHECKPOINT-CTX: post-onFrameBegin");
 
         Resources::RaytracingOutput& rtOutput = getResourceManager().getRaytracingOutput();
 
@@ -593,12 +602,15 @@ namespace dxvk {
 
         // Generate ray tracing constant buffer
         updateRaytraceArgsConstantBuffer(rtOutput, downscaledExtent, targetImage->info().extent);
+        Logger::warn("CHECKPOINT-CTX: post-updateRTArgs");
 
         // Volumetric Lighting
         dispatchVolumetrics(rtOutput);
+        Logger::warn("CHECKPOINT-CTX: post-volumetrics");
 
         // Path Tracing
         dispatchPathTracing(rtOutput);
+        Logger::warn("CHECKPOINT-CTX: post-pathTracing");
 
         // Neural Radiance Cache
         m_common->metaNeuralRadianceCache().dispatchTrainingAndResolve(*this, rtOutput);
@@ -625,6 +637,7 @@ namespace dxvk {
         }
 
         // Denoising
+        Logger::warn("CHECKPOINT-CTX: pre-denoise");
         dispatchDenoise(rtOutput);
 
         // Note: Primary direct diffuse/specular radiance textures denoised but in a still demodulated state after denoising step.
@@ -633,11 +646,15 @@ namespace dxvk {
           takeScreenshot("denoisedSpecular", rtOutput.m_primaryDirectSpecularRadiance.image(Resources::AccessType::Read));
         }
 
+        Logger::warn("CHECKPOINT-CTX: post-denoise");
         // Composition
         dispatchComposite(rtOutput);
+        Logger::warn("CHECKPOINT-CTX: post-composite");
 
+        Logger::warn("CHECKPOINT-CTX: pre-replaceDebugView");
         // Post composite Debug View that may overwrite Composite output
         dispatchReplaceCompositeWithDebugView(rtOutput);
+        Logger::warn("CHECKPOINT-CTX: post-replaceDebugView");
         
         if (captureScreenImage && captureDebugImage) {
           takeScreenshot("rtxImagePostComposite", rtOutput.m_compositeOutput.resource(Resources::AccessType::Read).image);
@@ -677,8 +694,10 @@ namespace dxvk {
         RtxDustParticles& dust = m_common->metaDustParticles();
         dust.simulateAndDraw(this, m_state, rtOutput);
 
+        Logger::warn("CHECKPOINT-CTX: pre-upscale-done");
         dispatchBloom(rtOutput);
         dispatchPostFx(rtOutput);
+        Logger::warn("CHECKPOINT-CTX: post-postfx");
 
         // Tone mapping
         // WAR for TREX-553 - disable sRGB conversion as NVTT implicitly applies it during dds->png
@@ -699,6 +718,7 @@ namespace dxvk {
           }
         }
 
+        Logger::warn("CHECKPOINT-CTX: post-tonemap");
         // Set up output src
         Rc<DxvkImage> srcImage = rtOutput.m_finalOutput.resource(Resources::AccessType::Read).image;
 
@@ -707,6 +727,7 @@ namespace dxvk {
 
         dispatchDLFG();
 
+        Logger::warn("CHECKPOINT-CTX: pre-blit");
         // Blit to the game target
         {
           ScopedGpuProfileZone(this, "Blit to Game");
@@ -716,6 +737,7 @@ namespace dxvk {
           assert(srcImage->info().extent == targetImage->info().extent);
           blitImageHelper(this, srcImage, targetImage, VkFilter::VK_FILTER_NEAREST);
         }
+        Logger::warn("CHECKPOINT-CTX: post-blit");
 
         // Log stats when an image is taken
         if (captureScreenImage) {
@@ -726,9 +748,11 @@ namespace dxvk {
         getSceneManager().onFrameEnd(this);
 
         rtOutput.onFrameEnd();
+        Logger::warn("CHECKPOINT-CTX: frame-complete");
       }
 
       m_previousInjectRtxHadScene = true;
+      Logger::warn("CHECKPOINT-CTX: post-frame-complete-tail");
     } else {
       // If raytracing is only disabled because we don't have shaders available, we don't want to clear the scene.
       // This frequently happens for a single frame when a cached shader is being fetched, and causes the Logic 
@@ -745,18 +769,23 @@ namespace dxvk {
 
     // Reset the fog state to get it re-discovered on the next frame
     getSceneManager().clearFogState();
+    Logger::warn("CHECKPOINT-CTX: post-clearFogState");
 
     // apply changes to RtxOptions after the frame has ended
     RtxOptionManager::applyPendingValuesOptionLayers();
     RtxOptionManager::applyPendingValues(m_device.ptr(), /* forceOnChange */ false);
+    Logger::warn("CHECKPOINT-CTX: post-RtxOptions");
 
     // Update stats
     updateMetrics(gpuIdleTimeMilliseconds);
+    Logger::warn("CHECKPOINT-CTX: post-updateMetrics");
 
     m_resetHistory = false;
+    Logger::warn("CHECKPOINT-CTX: injectRTX-EXIT");
   }
 
   void RtxContext::endFrame(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targetImage, bool callInjectRtx) {
+    Logger::warn("CHECKPOINT-CTX: endFrame-ENTER");
 
     if (callInjectRtx) {
       // Fallback inject (is a no-op if already injected this frame, or no valid RT scene)
@@ -771,10 +800,12 @@ namespace dxvk {
 
     // Update time on the frame end so all other systems can benefit from a global time
     GlobalTime::get().update();
+    Logger::warn("CHECKPOINT-CTX: endFrame-EXIT");
   }
 
   // Called right before D3D9 present
   void RtxContext::onPresent(Rc<DxvkImage> targetImage) {
+    Logger::warn("CHECKPOINT-CTX: onPresent-ENTER");
     // If injectRTX couldn't screenshot a final image or a pre-present screenshot is requested,
     // take a screenshot of a present image (with UI and others)
     {
@@ -807,6 +838,7 @@ namespace dxvk {
 
     // This needs to happen at the end of frame, after ImGUI rendering
     GpuMemoryTracker::onFrameEnd();
+    Logger::warn("CHECKPOINT-CTX: onPresent-EXIT");
   }
 
   void RtxContext::updateMetrics(const float gpuIdleTimeMilliseconds) const {
@@ -1363,12 +1395,6 @@ namespace dxvk {
 
     if (megaGeoBuilder) {
       s_validCount++;
-      // Check if buffers are actually valid
-      nvrhi::BufferHandle shadingBuf = megaGeoBuilder->getClusterShadingDataBuffer();
-      if (logDiag) {
-        Logger::info(str::format("RTX MegaGeo bindCommon: megaGeoBuilder valid, shadingBuffer=",
-          (void*)shadingBuf.Get(), " validCount=", s_validCount, " nullCount=", s_nullCount));
-      }
       // Cluster shading data buffer
       nvrhi::BufferHandle clusterShadingDataBufferHandle = megaGeoBuilder->getClusterShadingDataBuffer();
       if (clusterShadingDataBufferHandle) {
@@ -1439,12 +1465,6 @@ namespace dxvk {
       bindResourceBuffer(BINDING_CLUSTER_VERTEX_NORMALS_BUFFER, DxvkBufferSlice(surfaceBuffer, 0, surfaceBuffer->info().size));
     }
 
-    // Log binding status for debugging
-    static uint32_t s_frameCount = 0;
-    if ((s_frameCount++ % 100) == 0) { // Log every 100 frames to avoid spam
-      Logger::info(str::format("RTX MegaGeo Bindings: shadingData=", clusterShadingDataBound,
-          " vertexPos=", clusterVertexPositionsBound, " vertexNormals=", clusterVertexNormalsBound));
-    }
   }
 
   void RtxContext::bindResourceView(const uint32_t slot, const Rc<DxvkImageView>& imageView, const Rc<DxvkBufferView>& bufferView)

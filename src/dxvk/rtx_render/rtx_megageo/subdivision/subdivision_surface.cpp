@@ -45,6 +45,7 @@
 #include <ranges>
 
 #include "../rtxmg_log.h"
+#undef RTXMG_LOG
 #if RTXMG_LOG_SUBDIVISION_SURFACE
 #define RTXMG_LOG(msg) dxvk::Logger::info(msg)
 #else
@@ -430,6 +431,22 @@ SubdivisionSurface::SubdivisionSurface(TopologyCache& topologyCache,
         *m_shape,
         Far::TopologyRefinerFactory<Shape>::Options(schemeType, schemeOptions)));
 
+    if (!refiner) {
+        dxvk::Logger::err(dxvk::str::format("SubdivSurface: TopologyRefiner creation FAILED for shape with ",
+            m_shape->verts.size(), " verts, ", m_shape->nvertsPerFace.size(), " faces"));
+        throw std::runtime_error("TopologyRefiner creation failed");
+    }
+
+    // Log shape topology details for crash diagnosis
+    dxvk::Logger::warn(dxvk::str::format("SubdivSurface: TopologyRefiner created - numLevels=", refiner->GetNumLevels(),
+        " numVerts=", refiner->GetLevel(0).GetNumVertices(),
+        " numFaces=", refiner->GetLevel(0).GetNumFaces(),
+        " numEdges=", refiner->GetLevel(0).GetNumEdges(),
+        " numFVarChannels=", refiner->GetNumFVarChannels(),
+        " shapeVerts=", m_shape->verts.size(),
+        " shapeFaces=", m_shape->nvertsPerFace.size(),
+        " shapeIndices=", m_shape->faceverts.size()));
+
     RTXMG_LOG("SubdivSurface: Creating SurfaceTable");
     Tmr::SurfaceTableFactory tableFactory;
 
@@ -444,8 +461,10 @@ SubdivisionSurface::SubdivisionSurface(TopologyCache& topologyCache,
     options.planBuilderOptions.orderStencilMatrixByLevel = true;
     options.planBuilderOptions.generateLegacySharpCornerPatches = false;
 
+    dxvk::Logger::warn("SubdivSurface: Calling SurfaceTableFactory::Create");
     m_surface_table =
         tableFactory.Create(*refiner, topologyMap, options);
+    dxvk::Logger::warn("SubdivSurface: SurfaceTableFactory::Create returned");
 
     RTXMG_LOG("SubdivSurface: Gathering statistics");
     std::vector<uint16_t> topologyQuality;

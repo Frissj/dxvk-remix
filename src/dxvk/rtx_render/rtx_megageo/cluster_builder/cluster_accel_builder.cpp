@@ -905,63 +905,6 @@ void ClusterAccelBuilder::FillInstanceClusters(const RTXMGScene& scene, ClusterA
     nvrhi::utils::ScopedMarker marker(commandList, "FillInstanceClusters");
     stats::clusterAccelSamplers.fillClustersTime.Start(commandList);
 
-#if RTXMG_LOG_CLUSTER_ACCEL_BUILDER // DIAGNOSTIC: vertex sentinel fill + fill readback (causes GPU stalls)
-    // DIAGNOSTIC: Fill vertex buffer with sentinel value (10000.0f = 0x461C4000) to distinguish
-    // "shader wrote zero" from "shader never wrote". Only for first 3 frames.
-    {
-        static uint32_t sentinelFrame = 0;
-        if (sentinelFrame < 3) {
-            Logger::info(str::format("RTX MegaGeo SENTINEL: Filling vertex buffer with 10000.0f (frame ", sentinelFrame, ")"));
-            commandList->clearBufferUInt(accels.clusterVertexPositionsBuffer.Get(), 0x461C4000u);
-            sentinelFrame++;
-        }
-    }
-
-    // Diagnostic: read back the indirect dispatch args and cluster offset-counts
-    {
-        static uint32_t fillDiagFrame = 0;
-        if (fillDiagFrame < 3) {
-            auto indirectArgs = m_fillClustersDispatchIndirectBuffer.Download(commandList);
-            auto offsetCounts = m_clusterOffsetCountsBuffer.Download(commandList);
-            uint32_t numInstances = std::min(uint32_t(instances.size()), m_numInstances);
-            uint32_t maxLog = std::min(numInstances, 5u);
-            Logger::info(dxvk::str::format("RTX MegaGeo FILL DIAG frame=", fillDiagFrame,
-                " indirectArgs.size()=", indirectArgs.size(), " offsetCounts.size()=", offsetCounts.size(),
-                " numInstances=", numInstances));
-            for (uint32_t i = 0; i < maxLog; ++i) {
-                uint32_t base = i * ClusterDispatchType::NumTypes;
-                uint32_t limitIdx = base + ClusterDispatchType::Limit;
-                uint32_t allIdx = base + ClusterDispatchType::AllTypes;
-                if (allIdx < indirectArgs.size() && allIdx < offsetCounts.size()) {
-                    Logger::info(dxvk::str::format("RTX MegaGeo FILL DIAG inst[", i, "]: "
-                        "Limit dispatch=(", indirectArgs[limitIdx].x, ",", indirectArgs[limitIdx].y, ",", indirectArgs[limitIdx].z, ") "
-                        "All dispatch=(", indirectArgs[allIdx].x, ",", indirectArgs[allIdx].y, ",", indirectArgs[allIdx].z, ") "
-                        "Limit OC=(off=", offsetCounts[limitIdx].x, ",cnt=", offsetCounts[limitIdx].y, ") "
-                        "All OC=(off=", offsetCounts[allIdx].x, ",cnt=", offsetCounts[allIdx].y, ")"));
-                }
-            }
-            auto clusters = m_clustersBuffer.Download(commandList);
-            Logger::info(dxvk::str::format("RTX MegaGeo FILL DIAG: clusters buffer has ", clusters.size(), " entries"));
-            uint32_t clusterLog = std::min(uint32_t(clusters.size()), 10u);
-            for (uint32_t i = 0; i < clusterLog; ++i) {
-                Logger::info(dxvk::str::format("RTX MegaGeo CLUSTER[", i, "]: iSurface=", clusters[i].iSurface,
-                    " nVertexOffset=", clusters[i].nVertexOffset,
-                    " offset=(", clusters[i].offset.x, ",", clusters[i].offset.y, ")"
-                    " sizeX=", clusters[i].sizeX, " sizeY=", clusters[i].sizeY));
-            }
-            if (clusters.size() > 20) {
-                uint32_t mid = uint32_t(clusters.size()) / 2;
-                for (uint32_t i = mid; i < std::min(mid + 5u, uint32_t(clusters.size())); ++i) {
-                    Logger::info(dxvk::str::format("RTX MegaGeo CLUSTER[", i, "]: iSurface=", clusters[i].iSurface,
-                        " nVertexOffset=", clusters[i].nVertexOffset,
-                        " offset=(", clusters[i].offset.x, ",", clusters[i].offset.y, ")"
-                        " sizeX=", clusters[i].sizeX, " sizeY=", clusters[i].sizeY));
-                }
-            }
-            fillDiagFrame++;
-        }
-    }
-#endif
 
 #if RTXMG_CHRONO_TIMING
     auto fillStart = std::chrono::high_resolution_clock::now();
@@ -1250,102 +1193,6 @@ void ClusterAccelBuilder::FillInstanceClusters(const RTXMGScene& scene, ClusterA
             vectorlog::Log(debugOutput, ShaderDebugElement::OutputLambda, vectorlog::FormatOptions{ .wrap = false, .header = false, .elementIndex = false, .startIndex = 1, .count = numElements });
         }
 
-#if RTXMG_LOG_CLUSTER_ACCEL_BUILDER // DIAGNOSTIC: shader debug buffer + input data readback (causes GPU stalls)
-        {
-            static uint32_t debugFrameCount = 0;
-            if (instanceIndex == 0 && debugFrameCount < 3) {
-                auto debugOutput = m_debugBuffer.Download(commandList);
-                Logger::info("=== SHADER DEBUG: Fill Clusters Vertex Positions (instance 0) ===");
-                uint32_t validEntries = 0;
-                for (int i = 1; i < 16 && i < (int)debugOutput.size(); i++) {
-                    const auto& d = debugOutput[i];
-                    Logger::info(str::format("  [", i, "] pos=(", d.floatData.x, ",", d.floatData.y, ",", d.floatData.z,
-                        ") surf=", d.uintData.x, " cluster=", d.uintData.y, " pt=", d.uintData.z, " payloadType=", d.payloadType));
-                    if (d.payloadType != 0) validEntries++;
-                }
-                Logger::info(str::format("  validEntries=", validEntries));
-
-                const auto& subd = *subdMeshes[instances[0].meshID];
-                {
-                    nvrhi::IBuffer* posBuf = subd.m_positionsBuffer.Get();
-                    size_t posBytes = posBuf ? posBuf->getDesc().byteSize : 0;
-                    uint32_t cpTotal = posBytes > 0 ? static_cast<uint32_t>(posBytes / sizeof(float3)) : 0;
-                    Logger::info(str::format("RTX MegaGeo INPUT DATA: mesh[", instances[0].meshID, "] positionsBuffer bytes=", posBytes, " elements=", cpTotal));
-                    if (posBytes > 0) {
-                        auto readbackDesc = GetReadbackDesc(posBuf->getDesc());
-                        auto staging = m_device->createBuffer(readbackDesc);
-                        std::vector<float3> controlPoints((posBytes + sizeof(float3) - 1) / sizeof(float3));
-                        DownloadBuffer(posBuf, (void*)controlPoints.data(), staging.Get(), false, commandList);
-                        uint32_t cpZero = 0;
-                        for (uint32_t i = 0; i < cpTotal; ++i) {
-                            if (controlPoints[i].x == 0.0f && controlPoints[i].y == 0.0f && controlPoints[i].z == 0.0f) cpZero++;
-                        }
-                        Logger::info(str::format("RTX MegaGeo INPUT DATA: controlPoints total=", cpTotal, " zero=", cpZero, " nonZero=", (cpTotal - cpZero)));
-                        for (uint32_t i = 0; i < std::min(cpTotal, 10u); ++i) {
-                            Logger::info(str::format("  CP[", i, "] = (", controlPoints[i].x, ",", controlPoints[i].y, ",", controlPoints[i].z, ")"));
-                        }
-                    }
-                }
-                {
-                    nvrhi::IBuffer* ppBuf = subd.m_vertexDeviceData.patchPoints.Get();
-                    size_t ppBytes = ppBuf ? ppBuf->getDesc().byteSize : 0;
-                    uint32_t ppTotal = ppBytes > 0 ? static_cast<uint32_t>(ppBytes / sizeof(float3)) : 0;
-                    Logger::info(str::format("RTX MegaGeo INPUT DATA: mesh[", instances[0].meshID, "] patchPoints bytes=", ppBytes, " elements=", ppTotal));
-                    if (ppBytes > 0) {
-                        auto readbackDesc = GetReadbackDesc(ppBuf->getDesc());
-                        auto staging = m_device->createBuffer(readbackDesc);
-                        std::vector<float3> patchPoints((ppBytes + sizeof(float3) - 1) / sizeof(float3));
-                        DownloadBuffer(ppBuf, (void*)patchPoints.data(), staging.Get(), false, commandList);
-                        uint32_t ppZero = 0, ppSentinel = 0, ppNaN = 0, ppReal = 0;
-                        const float kSentinel = 10000.0f;
-                        for (uint32_t i = 0; i < ppTotal; ++i) {
-                            float x = patchPoints[i].x, y = patchPoints[i].y, z = patchPoints[i].z;
-                            if (x == 0.0f && y == 0.0f && z == 0.0f) ppZero++;
-                            else if (x == kSentinel && y == kSentinel && z == kSentinel) ppSentinel++;
-                            else if (std::isnan(x) || std::isnan(y) || std::isnan(z)) ppNaN++;
-                            else ppReal++;
-                        }
-                        Logger::info(str::format("RTX MegaGeo INPUT DATA: patchPoints total=", ppTotal,
-                            " SENTINEL(never written)=", ppSentinel,
-                            " zero(shader wrote 0)=", ppZero,
-                            " real=", ppReal,
-                            " NaN=", ppNaN));
-                        for (uint32_t i = 0; i < std::min(ppTotal, 10u); ++i) {
-                            Logger::info(str::format("  PP[", i, "] = (", patchPoints[i].x, ",", patchPoints[i].y, ",", patchPoints[i].z, ")"));
-                        }
-                    }
-                }
-                {
-                    auto* topoMap = subd.GetTopologyMap();
-                    nvrhi::IBuffer* stencilBuf = topoMap ? topoMap->stencilMatrixArraysBuffer.Get() : nullptr;
-                    size_t stencilBytes = stencilBuf ? stencilBuf->getDesc().byteSize : 0;
-                    uint32_t stencilTotal = stencilBytes > 0 ? static_cast<uint32_t>(stencilBytes / sizeof(float)) : 0;
-                    Logger::info(str::format("RTX MegaGeo INPUT DATA: stencilMatrix bytes=", stencilBytes, " elements=", stencilTotal));
-                    if (stencilBytes > 0 && stencilTotal > 0) {
-                        auto readbackDesc = GetReadbackDesc(stencilBuf->getDesc());
-                        auto staging = m_device->createBuffer(readbackDesc);
-                        std::vector<float> stencilData((stencilBytes + sizeof(float) - 1) / sizeof(float));
-                        DownloadBuffer(stencilBuf, (void*)stencilData.data(), staging.Get(), false, commandList);
-                        uint32_t sZero = 0, sNaN = 0;
-                        float sMin = std::numeric_limits<float>::max(), sMax = std::numeric_limits<float>::lowest();
-                        for (uint32_t i = 0; i < stencilTotal; ++i) {
-                            if (stencilData[i] == 0.0f) sZero++;
-                            else if (std::isnan(stencilData[i])) sNaN++;
-                            else { sMin = std::min(sMin, stencilData[i]); sMax = std::max(sMax, stencilData[i]); }
-                        }
-                        Logger::info(str::format("RTX MegaGeo INPUT DATA: stencilMatrix total=", stencilTotal,
-                            " zero=", sZero, " NaN=", sNaN,
-                            " nonZero=", (stencilTotal - sZero - sNaN),
-                            " range=[", sMin, ",", sMax, "]"));
-                        for (uint32_t i = 0; i < std::min(stencilTotal, 20u); ++i) {
-                            Logger::info(str::format("  stencil[", i, "] = ", stencilData[i]));
-                        }
-                    }
-                }
-                debugFrameCount++;
-            }
-        }
-#endif
 #if RTXMG_CHRONO_TIMING
         auto instEnd = std::chrono::high_resolution_clock::now();
         dispatchTimeMs += std::chrono::duration_cast<std::chrono::microseconds>(instEnd - afterBinding).count() * 0.001f;
@@ -1556,31 +1403,6 @@ void ClusterAccelBuilder::ComputeInstanceClusterTiling(ClusterAccels& accels,
     params.clusterVertexPositionsBaseAddress = accels.clusterVertexPositionsBuffer.GetGpuVirtualAddress();
     params.clasDataBaseAddress = accels.clasBuffer.GetGpuVirtualAddress();
     params.disableSubdivision = m_tessellatorConfig.disableSubdivision ? 1 : 0;
-
-    // STRUCT ALIGNMENT DEBUG - always log via Logger::info to diagnose shader mismatch
-    ONCE(Logger::info(str::format("RTX MegaGeo: STRUCT DEBUG sizeof(ComputeClusterTilingParams)=", sizeof(ComputeClusterTilingParams))));
-    ONCE(Logger::info(str::format("RTX MegaGeo: STRUCT DEBUG offset(surfaceStart)=", offsetof(ComputeClusterTilingParams, surfaceStart),
-        " offset(surfaceEnd)=", offsetof(ComputeClusterTilingParams, surfaceEnd),
-        " offset(matWorldToClip)=", offsetof(ComputeClusterTilingParams, matWorldToClip),
-        " offset(localToWorld)=", offsetof(ComputeClusterTilingParams, localToWorld))));
-    ONCE(Logger::info(str::format("RTX MegaGeo: STRUCT DEBUG offset(cameraPos)=", offsetof(ComputeClusterTilingParams, cameraPos),
-        " offset(aabb)=", offsetof(ComputeClusterTilingParams, aabb),
-        " offset(viewportSize)=", offsetof(ComputeClusterTilingParams, viewportSize))));
-    ONCE(Logger::info(str::format("RTX MegaGeo: STRUCT DEBUG offset(disableSubdivision)=", offsetof(ComputeClusterTilingParams, disableSubdivision),
-        " offset(clasDataBaseAddress)=", offsetof(ComputeClusterTilingParams, clasDataBaseAddress),
-        " offset(clusterVertexPositionsBaseAddress)=", offsetof(ComputeClusterTilingParams, clusterVertexPositionsBaseAddress))));
-    ONCE(Logger::info(str::format("RTX MegaGeo: STRUCT DEBUG offset(fineTessellationRate)=", offsetof(ComputeClusterTilingParams, fineTessellationRate),
-        " offset(coarseTessellationRate)=", offsetof(ComputeClusterTilingParams, coarseTessellationRate),
-        " offset(maxClusters)=", offsetof(ComputeClusterTilingParams, maxClusters),
-        " offset(maxVertices)=", offsetof(ComputeClusterTilingParams, maxVertices),
-        " offset(maxClasBlocks)=", offsetof(ComputeClusterTilingParams, maxClasBlocks))));
-    ONCE(Logger::info(str::format("RTX MegaGeo: STRUCT DEBUG disableSubdivision VALUE=", params.disableSubdivision,
-        " (config=", m_tessellatorConfig.disableSubdivision ? "true" : "false", ")")));
-    // Log key param values
-    ONCE(Logger::info(str::format("RTX MegaGeo: TILING PARAMS viewport=(", params.viewportSize.x, ",", params.viewportSize.y,
-        ") fineTessRate=", params.fineTessellationRate, " coarseTessRate=", params.coarseTessellationRate,
-        " isolation=", params.isolationLevel, " maxClusters=", params.maxClusters,
-        " frustumVis=", params.enableFrustumVisibility, " backfaceVis=", params.enableBackfaceVisibility)));
 
     // Safety check: if clasDataBaseAddress is 0, all CLAS addresses will be invalid
     if (params.clasDataBaseAddress == 0) {
@@ -1884,28 +1706,10 @@ void ClusterAccelBuilder::ComputeInstanceClusterTiling(ClusterAccels& accels,
             : subdivisionSurface.m_surfaceOffsets[uint32_t(SubdivisionSurface::SurfaceType::NoLimit)];
         uint32_t dispatchCount = params.surfaceEnd - params.surfaceStart;
 
-        // Always log this info to help debug zero-triangle issue
-        {
-            uint32_t surfaceCount = subdivisionSurface.m_surfaceCount;
+        if (dispatchCount == 0) {
             uint32_t noLimitOffset = subdivisionSurface.m_surfaceOffsets[uint32_t(SubdivisionSurface::SurfaceType::NoLimit)];
-            uint32_t off0 = subdivisionSurface.m_surfaceOffsets[0];
-            uint32_t off1 = subdivisionSurface.m_surfaceOffsets[1];
-            uint32_t off2 = subdivisionSurface.m_surfaceOffsets[2];
-            uint32_t off3 = subdivisionSurface.m_surfaceOffsets[3];
-            bool disableSub = m_tessellatorConfig.disableSubdivision;
-            uint32_t sStart = params.surfaceStart;
-            uint32_t sEnd = params.surfaceEnd;
-            // ALWAYS log - this is the critical value that determines if any surfaces get processed
-            ONCE(Logger::info(str::format("RTX MegaGeo DISPATCH: disableSubdivision=", disableSub ? "YES" : "NO",
-                " surfaceStart=", sStart, " surfaceEnd=", sEnd,
-                " dispatchCount=", dispatchCount,
-                " surfaceCount=", surfaceCount, " NoLimitOffset=", noLimitOffset)));
-            ONCE(Logger::info(str::format("RTX MegaGeo DISPATCH: surfaceOffsets=[",
-                off0, ",", off1, ",", off2, ",", off3, "]")));
-            if (dispatchCount == 0) {
-                Logger::err(str::format("RTX MegaGeo DISPATCH: *** ZERO DISPATCH! surfaceEnd=", sEnd,
-                    " NoLimitOffset=", noLimitOffset, " - no surfaces will be tessellated ***"));
-            }
+            Logger::err(str::format("RTX MegaGeo DISPATCH: *** ZERO DISPATCH! surfaceEnd=", params.surfaceEnd,
+                " NoLimitOffset=", noLimitOffset, " - no surfaces will be tessellated ***"));
         }
 
         RTXMG_LOG(str::format("RTX MegaGeo: Monolithic - surfaceStart=", params.surfaceStart,
@@ -1923,19 +1727,6 @@ void ClusterAccelBuilder::ComputeInstanceClusterTiling(ClusterAccels& accels,
         RTXMG_LOG("RTX MegaGeo: Monolithic - setComputeState");
         commandList->setComputeState(state);
 
-#if RTXMG_LOG_CLUSTER_ACCEL_BUILDER // DIAGNOSTIC: Sentinel fill patch points buffer
-        {
-            static uint32_t ppSentinelFrame = 0;
-            if (ppSentinelFrame < 3 && instanceIndex == 0) {
-                nvrhi::IBuffer* ppBuf = subdivisionSurface.m_vertexDeviceData.patchPoints.Get();
-                if (ppBuf) {
-                    Logger::info(str::format("RTX MegaGeo PP-SENTINEL: Filling patch points buffer (frame ", ppSentinelFrame, ", bytes=", ppBuf->getDesc().byteSize, ")"));
-                    commandList->clearBufferUInt(ppBuf, 0x461C4000u);
-                }
-                ppSentinelFrame++;
-            }
-        }
-#endif
 
         RTXMG_LOG("RTX MegaGeo: Monolithic - dispatch");
         commandList->dispatch(div_ceil(dispatchCount, kComputeClusterTilingWaves), 1, 1);
@@ -2118,6 +1909,20 @@ void ClusterAccelBuilder::BuildBlasFromClas(ClusterAccels& accels, const Instanc
 
     FillBlasFromClasArgs(m_blasFromClasIndirectArgsBuffer, m_clusterOffsetCountsBuffer, clasPtrsBaseAddress, numInstances, commandList);
 
+    // CRITICAL BARRIER: FillBlasFromClasArgs dispatches a compute shader that writes to
+    // m_blasFromClasIndirectArgsBuffer as UAV. The subsequent BLAS build (via
+    // executeMultiIndirectClusterOperation) reads this buffer as ShaderResource. However,
+    // the NVRHI adapter's m_BufferStates has stale state (CopyDest from the clear earlier),
+    // because the compute dispatch went through DXVK which doesn't update m_BufferStates.
+    // This causes commitBarriers to emit a TRANSFER→COMPUTE barrier instead of the required
+    // COMPUTE→COMPUTE barrier, missing the compute shader's write entirely.
+    // This global memory barrier ensures compute shader writes are visible to the BLAS build.
+    Logger::warn("CHECKPOINT: BuildBlasFromClas pre-indirectArgs-barrier");
+    commandList->bufferBarrier(m_blasFromClasIndirectArgsBuffer,
+        nvrhi::ResourceStates::UnorderedAccess,
+        nvrhi::ResourceStates::ShaderResource);
+    Logger::warn("CHECKPOINT: BuildBlasFromClas post-indirectArgs-barrier");
+
 #if RTXMG_LOG_CLUSTER_ACCEL_BUILDER
     m_blasFromClasIndirectArgsBuffer.Log(commandList, [](std::ostream& ss, const cluster::IndirectArgs& e)
         {
@@ -2137,10 +1942,6 @@ void ClusterAccelBuilder::BuildBlasFromClas(ClusterAccels& accels, const Instanc
 
     if (blasPtrsAddr == 0) Logger::err("RTX MegaGeo: BuildBlasFromClas - blasPtrsAddr is NULL!");
     if (blasBufferAddr == 0) Logger::err("RTX MegaGeo: BuildBlasFromClas - blasBufferAddr is NULL!");
-    // Note: scratch buffer is now allocated on-demand by the nvrhi adapter if needed
-
-    // Barrier for m_blasFromClasIndirectArgsBuffer (UAV → ShaderResource) is handled automatically
-    // by requireBufferState in executeMultiIndirectClusterOperation when it requires inIndirectArgsBuffer as ShaderResource.
 
 #if RTXMG_LOG_CLUSTER_ACCEL_BUILDER
     // Download and log the first few BLAS indirect args to diagnose misaligned address errors (GPU readback - only when logging enabled)
@@ -2161,11 +1962,22 @@ void ClusterAccelBuilder::BuildBlasFromClas(ClusterAccels& accels, const Instanc
 #endif
 
     //// Build Operation
-    // Use actual numInstances for maxArgCount (not m_instanceCapacity which is the buffer sizing upper bound)
-    // The buffers are sized for capacity, but the build should only process actual instances
+    // =================================================================================
+    // maxArgCount override: use numInstances, NOT m_instanceCapacity
+    // =================================================================================
+    // m_createBlasParams.maxArgCount is set to m_instanceCapacity in UpdateMemoryAllocations
+    // (line ~2257) because that's what's used for GetSizes to compute scratch/result buffer
+    // sizes. But for the actual BUILD call, we must pass the real instance count.
+    //
+    // The sample does this in UpdateMemoryAllocations:
+    //   m_createBlasParams.maxArgCount = m_numInstances  (exact count, not capacity)
+    // We can't do that because our m_createBlasParams is also used for GetSizes which needs
+    // the capacity. So we override here at build time.
+    //
+    // Scratch was sized for m_instanceCapacity >= numInstances, so always large enough.
+    // =================================================================================
     cluster::OperationParams buildParams = m_createBlasParams;
     buildParams.maxArgCount = numInstances;
-
     cluster::OperationDesc createBlasDesc =
     {
         .params = buildParams,
@@ -2180,11 +1992,11 @@ void ClusterAccelBuilder::BuildBlasFromClas(ClusterAccels& accels, const Instanc
         .outSizesOffsetInBytes = 0,
         .outAccelerationStructuresBuffer = accels.blasBuffer,
         .outAccelerationStructuresOffsetInBytes = 0,
-        // Note: outScratchBuffer not set - matching sample code behavior
     };
 
     RTXMG_LOG("RTX MegaGeo: BuildBlasFromClas - calling executeMultiIndirectClusterOperation");
     Logger::warn(str::format("RTX MegaGeo: BuildBlasFromClas - numInstances=", numInstances,
+        " maxArgCount=", buildParams.maxArgCount,
         " blasPtrsAddr=0x", std::hex, blasPtrsAddr,
         " blasBufferAddr=0x", blasBufferAddr, std::dec,
         " blasPtrsElements=", accels.blasPtrsBuffer.GetNumElements(),
@@ -2333,14 +2145,18 @@ void ClusterAccelBuilder::UpdateMemoryAllocations(ClusterAccels& accels, uint32_
     // ==========================================================================
     // RELEASE OLD BUFFERS before creating new ones
     // ==========================================================================
-    // Cluster AS operations access clasBuffer and clusterVertexPositionsBuffer via
-    // raw device addresses (not through descriptor sets), bypassing DXVK's command
-    // list lifetime tracking. If we release these buffers while the GPU is still
-    // reading from them (e.g., ray tracing traversing CLAS structures from the
-    // previous frame), we get a GPU page fault (VK_ERROR_DEVICE_LOST).
-    // waitForIdle ensures all pending GPU work completes before any buffer is freed.
-    // This only runs when buffers actually need resizing (rare after warmup).
-    m_device->waitForIdle();
+    // Only flush+wait when buffers are actually being released. Without this guard,
+    // subdPatches changes (which only resize gridSamplers) would call waitForIdle()
+    // every frame, serializing CPU/GPU and causing the game to freeze.
+    bool needBufferRelease = instanceBuffersNeedResize || numClustersChanged || clasBytesChanged || maxVerticesChanged || enableVertexNormalsChanged || gridSamplersNeedResize;
+    if (needBufferRelease)
+    {
+        // Cluster AS operations access buffers via raw device addresses, bypassing
+        // DXVK's command list lifetime tracking. Must flush+wait before releasing.
+        Logger::warn("RTX MegaGeo: UpdateMemoryAllocations - flushing command list before waitForIdle");
+        m_rtxContext->flushCommandList();
+        m_device->waitForIdle();
+    }
 
     if (instanceBuffersNeedResize)
     {
@@ -2426,14 +2242,9 @@ void ClusterAccelBuilder::UpdateMemoryAllocations(ClusterAccels& accels, uint32_
 
     if (gridSamplersNeedResize)
     {
-        uint32_t oldCapacityGS = m_gridSamplersCapacity;
         uint32_t newCapacity = sceneSubdPatches + (sceneSubdPatches / 4) + 256; // 25% headroom + minimum
         m_gridSamplersCapacity = newCapacity;
         m_gridSamplersBuffer.Create(newCapacity, "GridSamplers", m_device.Get());
-        const char* action = (newCapacity > oldCapacityGS) ? "GROW" : "SHRINK";
-        Logger::info(dxvk::str::format("RTX MegaGeo: GridSamplers ", action,
-            " - needed=", sceneSubdPatches,
-            " newCapacity=", newCapacity, " oldCapacity=", oldCapacityGS));
     }
 
     if (numClustersChanged)
@@ -2572,6 +2383,7 @@ void ClusterAccelBuilder::BuildAccel(const RTXMGScene& scene, const TessellatorC
 #if RTXMG_CHRONO_TIMING
     auto setupStart = std::chrono::high_resolution_clock::now();
 #endif
+    Logger::warn(str::format("CHECKPOINT: BuildAccel pre-UpdateMemoryAllocations inst=", instances.size(), " patches=", totalSubdPatches));
     UpdateMemoryAllocations(accels, uint32_t(instances.size()), totalSubdPatches);
 #if RTXMG_CHRONO_TIMING
     auto afterMemAlloc = std::chrono::high_resolution_clock::now();
@@ -2580,7 +2392,7 @@ void ClusterAccelBuilder::BuildAccel(const RTXMGScene& scene, const TessellatorC
         RTXMG_LOG(str::format(">>> RTXMG CHRONO: UpdateMemoryAllocations=", memAllocMs, "ms (SLOW - likely waitForIdle)"));
     }
 #endif
-    RTXMG_LOG("RTX MegaGeo: BuildAccel - after UpdateMemoryAllocations");
+    Logger::warn("CHECKPOINT: BuildAccel post-UpdateMemoryAllocations");
 
     const uint32_t maxGeometryCountPerMesh = uint32_t(scene.GetSceneGraph()->GetMaxGeometryCountPerMesh());
     InitStructuredClusterTemplates(maxGeometryCountPerMesh, commandList);
@@ -2618,19 +2430,62 @@ void ClusterAccelBuilder::BuildAccel(const RTXMGScene& scene, const TessellatorC
 #if RTXMG_CHRONO_TIMING
     auto beforeClears = std::chrono::high_resolution_clock::now();
 #endif
+    // =====================================================================================
+    // Per-frame buffer clears
+    // =====================================================================================
+    // All these clears go through our NVRHI adapter's clearBufferUInt(), which:
+    //   1. Calls requireBufferState(buffer, CopyDest) → transitions to VK_PIPELINE_STAGE_TRANSFER_BIT
+    //   2. Calls commitBarriers() → emits VkBufferMemoryBarrier
+    //   3. Calls DXVK's m_context->clearBuffer() → vkCmdFillBuffer (TRANSFER operation)
+    //
+    // IMPORTANT: DXVK's clearBuffer() also does its OWN internal barrier tracking via
+    // m_execBarriers.accessBuffer() at TRANSFER stage. This creates DUAL barrier tracking
+    // (our NVRHI m_BufferStates + DXVK's m_execBarriers). For most buffers this is harmless
+    // because the extra DXVK barrier is just redundant. But for blasBuffer specifically,
+    // the dual tracking matters - see the blasBuffer clear comment below.
+    // =====================================================================================
     RTXMG_LOG("RTX MegaGeo: BuildAccel - before clearBufferUInt 1");
     commandList->clearBufferUInt(m_clusterOffsetCountsBuffer.Get(), 0);
     RTXMG_LOG("RTX MegaGeo: BuildAccel - before clearBufferUInt 2");
     commandList->clearBufferUInt(m_fillClustersDispatchIndirectBuffer.Get(), 0);
     RTXMG_LOG("RTX MegaGeo: BuildAccel - before clearBufferUInt 3");
-    // Clear BLAS indirect args to ensure any unprocessed instances have clusterCount = 0
     commandList->clearBufferUInt(m_blasFromClasIndirectArgsBuffer.Get(), 0);
-    // Clear BLAS address buffer to zero - prevents garbage/stale addresses from being patched
-    // into TLAS instances. After reallocation, new entries contain uninitialized data.
-    // Instances without BLAS (overflow, culled) would keep stale addresses from previous frames.
-    // Zero = no BLAS, which the patch shader safely writes as accelerationStructureReference=0.
+
+    // blasPtrsBuffer: zero prevents garbage/stale BLAS addresses from being patched into TLAS.
+    // After reallocation, new entries are uninitialized. Instances without BLAS (overflow,
+    // culled) would keep stale addresses. Zero = no BLAS → patch shader writes
+    // accelerationStructureReference=0 safely.
     commandList->clearBufferUInt(accels.blasPtrsBuffer.Get(), 0);
     commandList->clearBufferUInt(accels.blasSizesBuffer.Get(), 0);
+
+    // =====================================================================================
+    // blasBuffer clear - DO NOT REMOVE
+    // =====================================================================================
+    // This clear is REQUIRED for correctness in ImplicitDestinations mode.
+    //
+    // WHY IT'S NEEDED:
+    //   When the blasBuffer is resized (new VkBuffer allocated), its contents are undefined.
+    //   The NVIDIA driver in ImplicitDestinations mode reads from the output buffer during
+    //   BLAS builds (presumably to manage internal allocation state). Undefined/garbage data
+    //   causes the driver to access invalid memory → GPU page fault → VK_ERROR_DEVICE_LOST
+    //   (TDR after ~2-4 seconds).
+    //
+    // WHY THE SAMPLE DOESN'T NEED IT:
+    //   The sample (donut NVRHI) uses a different Vulkan backend where buffer creation may
+    //   zero-initialize, or the sample's usage patterns avoid the stale data issue.
+    //   Our DXVK backend does NOT zero-initialize buffers.
+    //
+    // TESTED: Removing this clear causes GPU hangs on the frame after instance buffer resize.
+    //   With the clear present + heavy barrier, resizes survive reliably.
+    //
+    // BARRIER IMPLICATIONS:
+    //   This clear puts the blasBuffer in CopyDest state (TRANSFER stage) in our NVRHI
+    //   tracking. The pre-BLAS-build barrier in executeMultiIndirectClusterOperation then
+    //   transitions it from CopyDest → UnorderedAccess|AccelStructWrite. The heavy barrier
+    //   (ALL_COMMANDS→ALL_COMMANDS) inserted before the BLAS build provides additional
+    //   synchronization that covers any gaps in the dual barrier tracking.
+    // =====================================================================================
+    commandList->clearBufferUInt(accels.blasBuffer.Get(), 0);
 #if RTXMG_CHRONO_TIMING
     auto afterClears = std::chrono::high_resolution_clock::now();
     float clearsMs = std::chrono::duration_cast<std::chrono::microseconds>(afterClears - beforeClears).count() * 0.001f;
@@ -2638,7 +2493,7 @@ void ClusterAccelBuilder::BuildAccel(const RTXMGScene& scene, const TessellatorC
         RTXMG_LOG(str::format(">>> RTXMG CHRONO: BufferClears=", clearsMs, "ms (SLOW)"));
     }
 #endif
-    RTXMG_LOG("RTX MegaGeo: BuildAccel - after clearBufferUInt");
+    Logger::warn("CHECKPOINT: BuildAccel post-clears");
 
     // Transition dummy HiZ textures to ShaderResource on first use only
     // Use RtxContext's initImage to initialize the textures from UNDEFINED to their stable layout
@@ -2687,7 +2542,7 @@ void ClusterAccelBuilder::BuildAccel(const RTXMGScene& scene, const TessellatorC
         uint32_t surfaceOffset = 0;
         // Limit to m_numInstances to avoid buffer overflows
         uint32_t maxInstances = std::min(uint32_t(instances.size()), m_numInstances);
-        RTXMG_LOG(str::format("RTX MegaGeo: BuildAccel - ComputeClusterTiling loop, maxInstances=", maxInstances));
+        Logger::warn(str::format("CHECKPOINT: BuildAccel pre-tiling-loop maxInstances=", maxInstances));
 #if RTXMG_CHRONO_TIMING
         float totalInstanceMs = 0.0f;
         uint32_t totalSurfaces = 0;
@@ -2729,7 +2584,7 @@ void ClusterAccelBuilder::BuildAccel(const RTXMGScene& scene, const TessellatorC
             }
 #endif
         }
-        RTXMG_LOG("RTX MegaGeo: BuildAccel - ComputeClusterTiling loop complete");
+        Logger::warn("CHECKPOINT: BuildAccel post-tiling-loop");
         stats::clusterAccelSamplers.clusterTilingTime.Stop();
 #if RTXMG_CHRONO_TIMING
         auto chronoNow = std::chrono::high_resolution_clock::now();
@@ -2753,9 +2608,9 @@ void ClusterAccelBuilder::BuildAccel(const RTXMGScene& scene, const TessellatorC
     // clusterShadingDataBuffer: written here, read later by ray tracing (not tracked by FillInstanceClusters or BuildStructuredCLASes)
     commandList->bufferBarrier(accels.clusterShadingDataBuffer, nvrhi::ResourceStates::UnorderedAccess, nvrhi::ResourceStates::UnorderedAccess);
 
-    RTXMG_LOG("RTX MegaGeo: BuildAccel - calling FillInstanceClusters");
+    Logger::warn("CHECKPOINT: BuildAccel pre-FillInstanceClusters");
     FillInstanceClusters(scene, accels, commandList);
-    RTXMG_LOG("RTX MegaGeo: BuildAccel - FillInstanceClusters complete");
+    Logger::warn("CHECKPOINT: BuildAccel post-FillInstanceClusters");
 #if RTXMG_CHRONO_TIMING
     {
         auto chronoNow = std::chrono::high_resolution_clock::now();
@@ -2774,11 +2629,11 @@ void ClusterAccelBuilder::BuildAccel(const RTXMGScene& scene, const TessellatorC
     commandList->bufferBarrier(accels.clusterVertexPositionsBuffer, nvrhi::ResourceStates::UnorderedAccess, nvrhi::ResourceStates::AccelStructBuildInput);
 
     // Build CLASes for all instances at once
-    RTXMG_LOG("RTX MegaGeo: BuildAccel - calling BuildStructuredCLASes");
+    Logger::warn("CHECKPOINT: BuildAccel pre-BuildStructuredCLASes");
     stats::clusterAccelSamplers.buildClasTime.Start(commandList);
     BuildStructuredCLASes(accels, maxGeometryCountPerMesh, tessCounterRange, commandList);
     stats::clusterAccelSamplers.buildClasTime.Stop();
-    RTXMG_LOG("RTX MegaGeo: BuildAccel - BuildStructuredCLASes complete");
+    Logger::warn("CHECKPOINT: BuildAccel post-BuildStructuredCLASes");
 #if RTXMG_CHRONO_TIMING
     {
         auto chronoNow = std::chrono::high_resolution_clock::now();
@@ -2788,13 +2643,28 @@ void ClusterAccelBuilder::BuildAccel(const RTXMGScene& scene, const TessellatorC
     }
 #endif
 
+    // CRITICAL BARRIER: The CLAS build (BuildStructuredCLASes) writes to clasPtrsBuffer and
+    // clasBuffer via vkCmdBuildClusterAccelerationStructureIndirectNV, which bypasses DXVK's
+    // barrier tracking entirely. The subsequent FillBlasFromClasArgs compute shader reads
+    // clasPtrsBuffer via raw device address, and the BLAS build reads clasBuffer data via
+    // device addresses in the indirect args. Without this barrier, the GPU may read
+    // incomplete/stale CLAS data, causing TDR on resize frames when all commands execute
+    // in a single submission after flush+waitForIdle.
+    // Combined ShaderResource|AccelStructBuildInput covers both SHADER_READ and
+    // ACCELERATION_STRUCTURE_READ access, ensuring visibility for both the compute shader
+    // (FillBlasFromClasArgs) and the BLAS build's AS-level reads of CLAS data.
+    Logger::warn("CHECKPOINT: BuildAccel pre-CLAS-barrier");
+    commandList->bufferBarrier(accels.clasPtrsBuffer, nvrhi::ResourceStates::AccelStructWrite,
+        nvrhi::ResourceStates::ShaderResource | nvrhi::ResourceStates::AccelStructBuildInput);
+    Logger::warn("CHECKPOINT: BuildAccel post-CLAS-barrier");
+
     // Build BLAS unconditionally (matching sample behavior)
     // NOTE: Removed sync Download check for clusters > 0 because Download closes/reopens
     // command list which destroys bound image views in DXVK
-    RTXMG_LOG("RTX MegaGeo: BuildAccel - calling BuildBlasFromClas");
+    Logger::warn(str::format("CHECKPOINT: BuildAccel pre-BuildBlasFromClas count=", std::min(uint32_t(instances.size()), m_numInstances)));
     uint32_t blasInstanceCount = std::min(uint32_t(instances.size()), m_numInstances);
     BuildBlasFromClas(accels, instances.data(), blasInstanceCount, commandList);
-    RTXMG_LOG("RTX MegaGeo: BuildAccel - BuildBlasFromClas complete");
+    Logger::warn("CHECKPOINT: BuildAccel post-BuildBlasFromClas");
 #if RTXMG_CHRONO_TIMING
     {
         auto chronoNow = std::chrono::high_resolution_clock::now();
@@ -2809,9 +2679,9 @@ void ClusterAccelBuilder::BuildAccel(const RTXMGScene& scene, const TessellatorC
     uint32_t readIndex = (tessCounterIndex + 1) % kFrameCount;
     RTXMG_LOG(str::format("RTX MegaGeo: About to download counters - writeIndex=", tessCounterIndex,
                              " readIndex=", readIndex, " frame=", m_buildAccelFrameIndex));
-    RTXMG_LOG("RTX MegaGeo: BuildAccel - downloading counters");
+    Logger::warn("CHECKPOINT: BuildAccel pre-Download-counters");
     auto counterBufferData = m_tessellationCountersBuffer.Download(commandList, true);
-    RTXMG_LOG("RTX MegaGeo: BuildAccel - counters downloaded");
+    Logger::warn("CHECKPOINT: BuildAccel post-Download-counters");
 #if RTXMG_CHRONO_TIMING
     {
         auto chronoNow = std::chrono::high_resolution_clock::now();

@@ -66,7 +66,10 @@
 
 // Group atomics is significantly faster by reducing pressure on the global atomic
 // This reduces the global atomic by a factor of 4 (kComputeClusterTilingWavesPerSurface)
-#define ENABLE_GROUP_ATOMICS 1
+// DISABLED: GroupMemoryBarrierWithGroupSync() inside divergent if(iLane==0) is UB
+// in Vulkan SPIR-V (requires ALL workgroup threads to reach barrier). The SDK uses
+// D3D12 where NVIDIA handles this pattern, but Slang->SPIR-V on Vulkan deadlocks/fails.
+#define ENABLE_GROUP_ATOMICS 0
 
 // Wave intrinsics do not appear to make any difference in performance
 // This is most likely since we use the same number of registers (otherwise we pay for local data stores/reads)

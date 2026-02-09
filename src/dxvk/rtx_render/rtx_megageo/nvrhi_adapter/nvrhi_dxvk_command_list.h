@@ -49,9 +49,6 @@ namespace dxvk {
     DxvkBindingSetHolder(nvrhi::BindingSetHandle bindingSet)
       : m_bindingSet(std::move(bindingSet)) {}
     ~DxvkBindingSetHolder() {
-      if (m_bindingSet) {
-        Logger::info("RTX MegaGeo: ~DxvkBindingSetHolder - releasing binding set (GPU fence signaled)");
-      }
     }
   private:
     nvrhi::BindingSetHandle m_bindingSet;

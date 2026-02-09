@@ -95,27 +95,6 @@ namespace dxvk {
     }
     // NV-DXVK end
 
-    // RTX MegaGeo: Log destruction of buffers whose INITIAL VkBuffer could be 256 bytes
-    // (Aftermath "256 B resource DESTROYED"). Use logical size since physSliceCount
-    // grows via allocSlice/renaming, making physSize unreliable for filtering.
-    // A logicalSize <= 256 buffer starts as a 256-byte VkBuffer (uniform alignment).
-    // The old 256-byte VkBuffer stays in m_buffers when the buffer grows.
-    if (m_info.size <= 4096) {
-      VkDeviceSize physSize = m_physSliceCount * m_physSliceStride;
-      Logger::info(str::format("RTX MegaGeo: ~DxvkBuffer logicalSize=", m_info.size,
-        " physSize=", physSize,
-        " sliceStride=", m_physSliceStride,
-        " sliceCount=", m_physSliceCount,
-        " usage=0x", std::hex, m_info.usage,
-        " deviceAddr=0x", m_deviceAddress,
-        " VkBuffer=0x", (uint64_t)m_buffer.buffer, std::dec,
-        " oldBufs=", m_buffers.size()));
-      for (size_t i = 0; i < m_buffers.size(); i++) {
-        Logger::info(str::format("RTX MegaGeo:   oldVkBuffer[", i, "]=0x",
-          std::hex, (uint64_t)m_buffers[i].buffer, std::dec));
-      }
-    }
-
     const auto& vkd = m_device->vkd();
 
     for (const auto& buffer : m_buffers)
@@ -434,13 +413,6 @@ namespace dxvk {
 
   DxvkAccelStructure::~DxvkAccelStructure() {
     if (accelStructureRef != VK_NULL_HANDLE) {
-      // RTX MegaGeo: Log AS destruction to match with Aftermath "256 B resource DESTROYED"
-      // Aftermath may report the VkAccelerationStructureKHR handle, not the backing VkBuffer
-      Logger::info(str::format("RTX MegaGeo: ~DxvkAccelStructure AS=0x",
-        std::hex, (uint64_t)accelStructureRef,
-        " backingSize=", std::dec, m_info.size,
-        " deviceAddr=0x", std::hex, m_deviceAddress,
-        " VkBuffer=0x", (uint64_t)m_buffer.buffer, std::dec));
       const auto& vkd = m_device->vkd();
       vkd->vkDestroyAccelerationStructureKHR(m_device->handle(), accelStructureRef, nullptr);
     }

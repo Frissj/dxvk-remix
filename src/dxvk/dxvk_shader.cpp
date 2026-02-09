@@ -63,7 +63,6 @@ namespace dxvk {
     const SpirvCodeBuffer&      code)
   : m_vkd(vkd), m_stage() {
     ScopedCpuProfileZone();
-    Logger::info(str::format("DxvkShaderModule ctor: stage=0x", std::hex, shader->stage(), " codeSize=", std::dec, code.size()));
     m_stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     m_stage.pNext = nullptr;
     m_stage.flags = 0;
@@ -79,9 +78,7 @@ namespace dxvk {
     info.codeSize = code.size();
     info.pCode    = code.data();
 
-    Logger::info(str::format("DxvkShaderModule ctor: Calling vkCreateShaderModule for stage=0x", std::hex, shader->stage()));
     VkResult result = m_vkd->vkCreateShaderModule(m_vkd->device(), &info, nullptr, &m_stage.module);
-    Logger::info(str::format("DxvkShaderModule ctor: vkCreateShaderModule returned ", result, " for stage=0x", std::hex, shader->stage()));
     if (result != VK_SUCCESS)
       throw DxvkError("DxvkComputePipeline::DxvkComputePipeline: Failed to create shader module");
   }
@@ -166,14 +163,9 @@ namespace dxvk {
     if (stage == VK_SHADER_STAGE_FLAG_BITS_MAX_ENUM)
       stage = m_stage;
 
-    Logger::info(str::format("DxvkShader::defineResourceSlots - adding ", m_slots.size(), " slots for stage=0x", std::hex, stage));
-
     for (const auto& slot : m_slots) {
-      Logger::info(str::format("  defineResourceSlots: slot=", slot.slot, " type=", slot.type));
       mapping.defineSlot(stage, slot);
     }
-
-    Logger::info(str::format("DxvkShader::defineResourceSlots - mapping now has ", mapping.bindingCount(), " bindings"));
 
     if (m_interface.pushConstSize) {
       mapping.definePushConstRange(stage,
@@ -187,18 +179,10 @@ namespace dxvk {
     const Rc<vk::DeviceFn>&          vkd,
     const DxvkDescriptorSlotMapping& mapping,
     const DxvkShaderModuleCreateInfo& info) {
-    Logger::info(str::format("DxvkShader::createShaderModule: Decompressing SPIRV for stage=0x", std::hex, m_stage));
     SpirvCodeBuffer spirvCode = m_code.decompress();
     uint32_t* code = spirvCode.data();
-    Logger::info(str::format("DxvkShader::createShaderModule: Decompressed, size=", spirvCode.size(), " bytes"));
 
     // Remap resource binding IDs
-    Logger::info(str::format("DxvkShader::createShaderModule: Remapping ", m_idOffsets.size(), " bindings, mapping has ", mapping.bindingCount(), " entries"));
-    // Log what slots are in the mapping
-    for (uint32_t i = 0; i < mapping.bindingCount(); i++) {
-      const auto& b = mapping.bindingInfos()[i];
-      Logger::info(str::format("  mapping[", i, "]: slot=", b.slot, " type=", b.type));
-    }
     for (uint32_t ofs : m_idOffsets) {
       if (code[ofs] < MaxNumResourceSlots) {
         uint32_t newBinding = mapping.getBindingId(code[ofs]);
@@ -216,11 +200,9 @@ namespace dxvk {
       std::swap(code[m_o1IdxOffset], code[m_o1LocOffset]);
 
     // Replace undefined input variables with zero
-    Logger::info(str::format("DxvkShader::createShaderModule: Processing undefined inputs"));
     for (uint32_t u : bit::BitMask(info.undefinedInputs))
       eliminateInput(spirvCode, u);
 
-    Logger::info(str::format("DxvkShader::createShaderModule: Calling DxvkShaderModule ctor"));
     return DxvkShaderModule(vkd, this, spirvCode);
   }
   

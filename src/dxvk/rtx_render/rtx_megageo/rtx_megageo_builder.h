@@ -68,9 +68,9 @@ namespace dxvk {
    */
   struct SubdivisionSurfaceDesc {
     // Topology
-    uint32_t numFaces = 0;                    // Number of quadrilateral faces
+    uint32_t numFaces = 0;                    // Number of faces (quads and/or triangles)
     uint32_t numVertices = 0;                 // Number of control vertices
-    const uint32_t* faceVertexCounts = nullptr; // Vertices per face (always 4 for quads)
+    const uint32_t* faceVertexCounts = nullptr; // Vertices per face (4 for quads, 3 for triangles)
     const uint32_t* faceVertexIndices = nullptr; // Flattened vertex indices
 
     // Control point data

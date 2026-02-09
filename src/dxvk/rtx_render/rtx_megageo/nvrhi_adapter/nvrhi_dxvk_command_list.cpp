@@ -226,15 +226,42 @@ namespace dxvk {
       return;
     }
 
-    // Automatic barrier: buffer is being written (CopyDest)
+    // Automatic barrier: transition buffer to CopyDest (TRANSFER stage) before clearing.
+    // This updates our NVRHI m_BufferStates tracking ONLY.
     if (m_EnableAutomaticBarriers) {
       requireBufferState(buffer, nvrhi::ResourceStates::CopyDest);
       commitBarriers();
     }
 
-    // Clear buffer with uint32 value
+    // =================================================================================
+    // BYPASSING DXVK's clearBuffer - calling vkCmdFillBuffer directly
+    // =================================================================================
+    // We intentionally do NOT call m_context->clearBuffer() here because it would add
+    // DXVK's own barrier tracking (m_execBarriers.accessBuffer at TRANSFER stage) on TOP
+    // of our NVRHI m_BufferStates tracking above. That dual tracking was the root cause of
+    // GPU hangs after instance buffer resize:
+    //
+    //   - Our NVRHI tracking: buffer is at CopyDest (TRANSFER) after this clear
+    //   - DXVK tracking:      buffer is at TRANSFER (independently tracked)
+    //   - Later barriers from our NVRHI adapter wouldn't clear DXVK's stale state
+    //   - DXVK would later emit a spurious TRANSFER→X barrier at an unexpected time
+    //
+    // By calling vkCmdFillBuffer directly through the DxvkCommandList, we:
+    //   1. Still get the actual GPU clear operation (vkCmdFillBuffer)
+    //   2. Still track the resource lifetime (trackResource for fence-based destruction)
+    //   3. Do NOT pollute DXVK's m_execBarriers with TRANSFER state
+    //   4. Our NVRHI m_BufferStates is the SOLE barrier tracker for this buffer
+    //
+    // This eliminates the need for the heavy barrier workaround for the dual-tracking issue,
+    // though the heavy barrier may still be needed for other synchronization gaps.
+    // =================================================================================
     const nvrhi::BufferDesc& desc = nvrhiBuffer->getDesc();
-    m_context->clearBuffer(dxvkBuffer, 0, desc.byteSize, value);
+    auto slice = dxvkBuffer->getSliceHandle(0, desc.byteSize);
+    // vkCmdFillBuffer requires size aligned to 4 bytes
+    VkDeviceSize fillLength = (slice.length + 3) & ~VkDeviceSize(3);
+    Rc<DxvkCommandList> cmdList = m_context->getCommandList();
+    cmdList->cmdFillBuffer(slice.handle, slice.offset, fillLength, value);
+    cmdList->trackResource<DxvkAccess::Write>(dxvkBuffer);
   }
 
   void NvrhiDxvkCommandList::copyBuffer(
@@ -812,16 +839,25 @@ namespace dxvk {
         requireBufferState(desc.inIndirectArgCountBuffer, nvrhi::ResourceStates::ShaderResource);
       }
       if (desc.inOutAddressesBuffer) {
-        // The CLAS build reads destination addresses in the ACCELERATION_STRUCTURE_BUILD stage,
-        // not the COMPUTE_SHADER stage. Use AccelStructBuildInput to get the correct barrier
-        // (compute shader UAV write → accel struct build read).
-        requireBufferState(desc.inOutAddressesBuffer, nvrhi::ResourceStates::AccelStructBuildInput);
+        // Match sample: use UnorderedAccess (COMPUTE_SHADER stage + SHADER_READ|WRITE access).
+        // The driver's vkCmdBuildClusterAccelerationStructureIndirectNV internally dispatches a
+        // compute shader that reads AND writes the addresses buffer. Using AccelStructBuildInput
+        // (ACCEL_STRUCT_BUILD stage) does NOT synchronize with the internal compute dispatch,
+        // causing stale data reads on reallocated buffers (page fault on freed VA).
+        requireBufferState(desc.inOutAddressesBuffer, nvrhi::ResourceStates::UnorderedAccess);
       }
       if (desc.outSizesBuffer) {
         requireBufferState(desc.outSizesBuffer, nvrhi::ResourceStates::UnorderedAccess);
       }
       if (desc.outAccelerationStructuresBuffer) {
-        requireBufferState(desc.outAccelerationStructuresBuffer, nvrhi::ResourceStates::AccelStructWrite);
+        // Match sample: AccelStructWrite only.
+        // clearBufferUInt now bypasses DXVK's barrier tracking (calls vkCmdFillBuffer directly),
+        // so our m_BufferStates is the sole tracker. The state chain is:
+        //   AccelStructWrite (post-build) → CopyDest (clear) → AccelStructWrite (pre-build)
+        // No dual-tracking conflict, no need for the combined UnorderedAccess|AccelStructWrite
+        // workaround that was previously required.
+        requireBufferState(desc.outAccelerationStructuresBuffer,
+            nvrhi::ResourceStates::AccelStructWrite);
       }
       commitBarriers();
     }
@@ -917,6 +953,40 @@ namespace dxvk {
                                (void*)vkCmds.input.opInput.pTriangleClusters,
                                " pClustersBottomLevel=", (void*)vkCmds.input.opInput.pClustersBottomLevel,
                                " pMoveObjects=", (void*)vkCmds.input.opInput.pMoveObjects));
+      // Always-visible logging of operation type for crash diagnosis
+      const char* opTypeStr = "Unknown";
+      switch ((uint32_t)vkCmds.input.opType) {
+        case 0: opTypeStr = "TriangleCluster"; break;
+        case 1: opTypeStr = "TriangleClusterGetSizes"; break;
+        case 2: opTypeStr = "BlasBuild"; break;
+        case 3: opTypeStr = "BlasGetSizes"; break;
+        case 4: opTypeStr = "InstantiateTemplate"; break;
+        case 5: opTypeStr = "InstantiateTemplateGetSizes"; break;
+        case 6: opTypeStr = "MoveObjects"; break;
+      }
+      Logger::warn(str::format("CHECKPOINT: vkCmdBuildClusterAS opType=", opTypeStr,
+          " maxAccelStructCount=", vkCmds.input.maxAccelerationStructureCount,
+          " dstImplicit=0x", std::hex, vkCmds.dstImplicitData,
+          " scratch=0x", vkCmds.scratchData, std::dec));
+
+      // Heavy barrier DISABLED - clearBufferUInt now bypasses DXVK's barrier tracking
+      // (calls vkCmdFillBuffer directly), eliminating the dual-tracking conflict that
+      // required this workaround. If GPU hangs return on resize frames, re-enable this
+      // to confirm whether the dual-tracking fix is complete.
+      //
+      // if (vkCmds.input.opType == VK_CLUSTER_ACCELERATION_STRUCTURE_OP_TYPE_BUILD_CLUSTERS_BOTTOM_LEVEL_NV) {
+      //   Logger::warn("CHECKPOINT: Inserting HEAVY barrier before BLAS build");
+      //   VkMemoryBarrier heavyBarrier = {};
+      //   heavyBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+      //   heavyBarrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT;
+      //   heavyBarrier.dstAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT;
+      //   m_device->getDxvkDevice()->vkd()->vkCmdPipelineBarrier(
+      //     cmdBuffer,
+      //     VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+      //     VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+      //     0, 1, &heavyBarrier, 0, nullptr, 0, nullptr);
+      // }
+
       RTXMG_LOG("RTX MegaGeo: Calling vkCmdBuildClusterAccelerationStructureIndirectNV");
       vkCmdBuildClusterAS(cmdBuffer, &vkCmds);
       RTXMG_LOG("RTX MegaGeo: vkCmdBuildClusterAccelerationStructureIndirectNV completed");
@@ -946,11 +1016,9 @@ namespace dxvk {
       trackBuffer(desc.outScratchBuffer);
     }
 
-    // Update buffer states AFTER the cluster operation so the automatic barrier system
-    // uses the correct source pipeline stage (ACCELERATION_STRUCTURE_BUILD_BIT) for
-    // subsequent transitions. Without this, the barrier tracker thinks these buffers
-    // were last written by COMPUTE_SHADER_BIT (from the pre-barrier UnorderedAccess state),
-    // which produces incorrect barriers when a compute shader later reads them.
+    // Update buffer states AFTER the cluster operation. The AS build command formally
+    // operates at VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR per Vulkan spec.
+    // Post-build tracking ensures subsequent barriers use the correct source stage.
     if (desc.inOutAddressesBuffer) {
       m_BufferStates[desc.inOutAddressesBuffer] = nvrhi::ResourceStates::AccelStructWrite;
     }
@@ -958,7 +1026,10 @@ namespace dxvk {
       m_BufferStates[desc.outSizesBuffer] = nvrhi::ResourceStates::AccelStructWrite;
     }
     if (desc.outAccelerationStructuresBuffer) {
-      m_BufferStates[desc.outAccelerationStructuresBuffer] = nvrhi::ResourceStates::AccelStructWrite;
+      // Post-build: AccelStructWrite (matches pre-build barrier and sample).
+      // Next frame's clearBufferUInt will transition AccelStructWrite → CopyDest.
+      m_BufferStates[desc.outAccelerationStructuresBuffer] =
+          nvrhi::ResourceStates::AccelStructWrite;
     }
 
     RTXMG_LOG("RTX MegaGeo: executeMultiIndirectClusterOperation - Complete");
@@ -1969,6 +2040,53 @@ namespace dxvk {
       RTXMG_LOG(str::format("RTX MegaGeo: suballocated scratch buffer, addr=", std::hex, vkCmds.scratchData,
                                " offset=", std::dec, scratchOffset,
                                " (requested=", desc.scratchSizeInBytes, ")"));
+
+      // Clear scratch buffer to zero to prevent the driver's internal compute shader
+      // from reading stale pointers. The scratch manager reuses memory between frames
+      // (resetWritePointers only resets the allocation offset, not the data). After a
+      // buffer resize, stale scratch data can contain GPU VAs pointing to freed buffers.
+      {
+        VkCommandBuffer cmdBuf = m_context->getCmdBuffer(DxvkCmdBuffer::ExecBuffer);
+        auto scratchSlice = scratchBuffer->getSliceHandle(scratchOffset, desc.scratchSizeInBytes);
+
+        // Barrier: previous scratch usage → transfer write
+        VkBufferMemoryBarrier preClear = {};
+        preClear.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        preClear.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                                 VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+        preClear.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        preClear.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        preClear.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        preClear.buffer = scratchSlice.handle;
+        preClear.offset = scratchSlice.offset;
+        preClear.size = scratchSlice.length;
+        m_device->getDxvkDevice()->vkd()->vkCmdPipelineBarrier(
+          cmdBuf,
+          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+          VK_PIPELINE_STAGE_TRANSFER_BIT,
+          0, 0, nullptr, 1, &preClear, 0, nullptr);
+
+        // Fill scratch with zeros
+        m_device->getDxvkDevice()->vkd()->vkCmdFillBuffer(
+          cmdBuf, scratchSlice.handle, scratchSlice.offset, scratchSlice.length, 0);
+
+        // Barrier: transfer write → compute/AS build read/write
+        VkBufferMemoryBarrier postClear = {};
+        postClear.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        postClear.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        postClear.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                                  VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+        postClear.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        postClear.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        postClear.buffer = scratchSlice.handle;
+        postClear.offset = scratchSlice.offset;
+        postClear.size = scratchSlice.length;
+        m_device->getDxvkDevice()->vkd()->vkCmdPipelineBarrier(
+          cmdBuf,
+          VK_PIPELINE_STAGE_TRANSFER_BIT,
+          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+          0, 0, nullptr, 1, &postClear, 0, nullptr);
+      }
 
       // Track the buffer for command list lifetime
       m_context->getCommandList()->trackResource<DxvkAccess::Write>(scratchBuffer);
