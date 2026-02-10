@@ -1008,22 +1008,33 @@ private:
       }
       RTXMG_LOG("=== END RTXMG DIAGNOSTICS ===");
 
-#if RTXMG_LOG_RTX_MEGAGEO_BUILDER // DIAGNOSTIC: BLAS address + vertex position readback (causes GPU stalls)
+      // DIAGNOSTIC: Download BLAS addresses to verify they're valid
+      // Only count frames that actually have cluster data (>1 address), log up to 10 such frames
       {
         static uint32_t s_readbackCount = 0;
-        if (s_readbackCount < 3) {
-          // BLAS address readback
+        static uint32_t s_frameNumber = 0;
+        s_frameNumber++;
+        if (s_readbackCount < 10) {
           downloadBlasAddresses();
-
-          // Vertex position readback - check if GPU vertex data is valid
-          if (m_clusterAccels->clusterVertexPositionsBuffer.GetBytes() == 0) {
-            Logger::warn("RTX MegaGeo VERTEX READBACK: clusterVertexPositionsBuffer is empty!");
+          if (!m_downloadedBlasAddresses.empty() && m_downloadedBlasAddresses.size() > 1) {
+            uint32_t zeroCount = 0, nonZeroCount = 0;
+            for (size_t i = 0; i < m_downloadedBlasAddresses.size(); i++) {
+              if (m_downloadedBlasAddresses[i] == 0) zeroCount++;
+              else nonZeroCount++;
+            }
+            Logger::warn(str::format("CHECKPOINT: BLAS address readback[", s_readbackCount, "] frame=", s_frameNumber,
+                ": total=", m_downloadedBlasAddresses.size(),
+                " nonZero=", nonZeroCount, " zero=", zeroCount));
+            // Log first 10 addresses
+            for (size_t i = 0; i < std::min<size_t>(10, m_downloadedBlasAddresses.size()); i++) {
+              Logger::warn(str::format("CHECKPOINT: BLAS[", i, "] = 0x", std::hex, m_downloadedBlasAddresses[i]));
+            }
+            s_readbackCount++;
+          } else if (!m_downloadedBlasAddresses.empty()) {
+            Logger::warn(str::format("CHECKPOINT: BLAS readback frame=", s_frameNumber, ": only ", m_downloadedBlasAddresses.size(), " address(es), skipping count"));
           }
-
-          s_readbackCount++;
         }
       }
-#endif
 
       // Mark all surfaces as ready - BLAS addresses will be patched on GPU
       for (auto& [id, surface] : m_surfaces) {
@@ -1744,6 +1755,21 @@ private:
     uint32_t maxRtxmgIdx = 0;
     for (const auto& m : mappings) {
       if (m.rtxmgInstanceIndex > maxRtxmgIdx) maxRtxmgIdx = m.rtxmgInstanceIndex;
+    }
+
+    Logger::warn(str::format("CHECKPOINT: patchGPU blasPtrsElements=", blasElements,
+        " maxRtxmgIdx=", maxRtxmgIdx, " mappings=", mappings.size(),
+        " blasPtrsBytes=", m_clusterAccels->blasPtrsBuffer.GetBytes()));
+
+    // Check if we have downloaded BLAS addresses for verification
+    if (!m_downloadedBlasAddresses.empty()) {
+      uint32_t zeroAddrs = 0, nonZeroAddrs = 0;
+      for (size_t i = 0; i < std::min(m_downloadedBlasAddresses.size(), (size_t)blasElements); i++) {
+        if (m_downloadedBlasAddresses[i] == 0) zeroAddrs++;
+        else nonZeroAddrs++;
+      }
+      Logger::warn(str::format("CHECKPOINT: patchGPU downloadedBlasAddrs: zero=", zeroAddrs, " nonZero=", nonZeroAddrs,
+          " total=", m_downloadedBlasAddresses.size()));
     }
 
     // Abort on OOB - dispatching with out-of-bounds indices would read garbage

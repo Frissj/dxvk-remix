@@ -969,23 +969,11 @@ namespace dxvk {
           " dstImplicit=0x", std::hex, vkCmds.dstImplicitData,
           " scratch=0x", vkCmds.scratchData, std::dec));
 
-      // Heavy barrier DISABLED - clearBufferUInt now bypasses DXVK's barrier tracking
-      // (calls vkCmdFillBuffer directly), eliminating the dual-tracking conflict that
-      // required this workaround. If GPU hangs return on resize frames, re-enable this
-      // to confirm whether the dual-tracking fix is complete.
-      //
-      // if (vkCmds.input.opType == VK_CLUSTER_ACCELERATION_STRUCTURE_OP_TYPE_BUILD_CLUSTERS_BOTTOM_LEVEL_NV) {
-      //   Logger::warn("CHECKPOINT: Inserting HEAVY barrier before BLAS build");
-      //   VkMemoryBarrier heavyBarrier = {};
-      //   heavyBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-      //   heavyBarrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT;
-      //   heavyBarrier.dstAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT;
-      //   m_device->getDxvkDevice()->vkd()->vkCmdPipelineBarrier(
-      //     cmdBuffer,
-      //     VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-      //     VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-      //     0, 1, &heavyBarrier, 0, nullptr, 0, nullptr);
-      // }
+      // Heavy barrier no longer needed. The root cause was bufferBarrier() not updating
+      // m_BufferStates, causing requireBufferState() to emit wrong barriers (e.g. TRANSFER→X
+      // instead of the correct post-barrier state→X). Now that bufferBarrier() updates
+      // m_BufferStates and emits buffer-specific VkBufferMemoryBarrier, the automatic
+      // barrier system in executeMultiIndirectClusterOperation sees correct states.
 
       RTXMG_LOG("RTX MegaGeo: Calling vkCmdBuildClusterAccelerationStructureIndirectNV");
       vkCmdBuildClusterAS(cmdBuffer, &vkCmds);
@@ -1181,6 +1169,14 @@ namespace dxvk {
         vkBarrier.dstAccessMask |= VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
         dstStages |= VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT;
       }
+      if (static_cast<uint32_t>(barrier.stateAfter & nvrhi::ResourceStates::CopySource) != 0) {
+        vkBarrier.dstAccessMask |= VK_ACCESS_TRANSFER_READ_BIT;
+        dstStages |= VK_PIPELINE_STAGE_TRANSFER_BIT;
+      }
+      if (static_cast<uint32_t>(barrier.stateAfter & nvrhi::ResourceStates::CopyDest) != 0) {
+        vkBarrier.dstAccessMask |= VK_ACCESS_TRANSFER_WRITE_BIT;
+        dstStages |= VK_PIPELINE_STAGE_TRANSFER_BIT;
+      }
       if (static_cast<uint32_t>(barrier.stateAfter & nvrhi::ResourceStates::AccelStructBuildInput) != 0) {
         vkBarrier.dstAccessMask |= VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
         dstStages |= VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
@@ -1335,8 +1331,36 @@ namespace dxvk {
     if (srcStages == 0) srcStages = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
     if (dstStages == 0) dstStages = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
 
-    // Emit memory barrier with proper VkAccessFlags
-    m_context->emitMemoryBarrier(0, srcStages, srcAccess, dstStages, dstAccess);
+    // Emit buffer-specific barrier (not global memory barrier) for precise synchronization.
+    // This matches what commitBarriers() does for automatic barriers.
+    VkCommandBuffer cmdBuffer = m_context->getCmdBuffer(DxvkCmdBuffer::ExecBuffer);
+    auto slice = dxvkBuffer->getSliceHandle();
+
+    VkBufferMemoryBarrier vkBarrier = {};
+    vkBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    vkBarrier.srcAccessMask = srcAccess;
+    vkBarrier.dstAccessMask = dstAccess;
+    vkBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    vkBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    vkBarrier.buffer = slice.handle;
+    vkBarrier.offset = 0;
+    vkBarrier.size = VK_WHOLE_SIZE;
+
+    m_device->getDxvkDevice()->vkd()->vkCmdPipelineBarrier(
+      cmdBuffer,
+      srcStages,
+      dstStages,
+      0,  // dependencyFlags
+      0, nullptr,  // memory barriers
+      1, &vkBarrier,  // buffer barriers
+      0, nullptr);  // image barriers
+
+    // CRITICAL: Update m_BufferStates so subsequent requireBufferState() calls see the
+    // correct post-barrier state. Without this, the automatic barrier system uses stale
+    // state from before the explicit barrier, emitting wrong transitions (e.g. TRANSFER→X
+    // instead of the correct post-barrier state→X). This was the root cause of Issue A:
+    // dual barrier tracking between explicit bufferBarrier calls and the automatic system.
+    m_BufferStates[buffer] = stateAfter;
   }
 
   void NvrhiDxvkCommandList::textureBarrier(

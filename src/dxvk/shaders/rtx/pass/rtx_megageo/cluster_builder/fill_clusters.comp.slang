@@ -236,16 +236,24 @@ void FillClustersMain(uint3 threadIdx, uint3 groupIdx)
 
             GathererWriteLimit(limit, rCluster, pointIndex);
 
-            // DEBUG: Log first few vertex positions to debug buffer
-            // ShaderDebugElement has: float4 floatData, uint4 uintData, uint payloadType, uint lineNumber
-            if (clusterIndex < 2 && pointIndex < 4) {
-                uint32_t debugIdx = clusterIndex * 4 + pointIndex + 1; // +1 to skip slot 0 (counter)
-                if (debugIdx < 16) {
-                    u_Debug[debugIdx].floatData = float4(limit.p.x, limit.p.y, limit.p.z, uv.x);
-                    u_Debug[debugIdx].uintData = uint4(iSurface, clusterIndex, pointIndex, asuint(uv.y));
-                    u_Debug[debugIdx].payloadType = 1; // Mark as valid
-                    u_Debug[debugIdx].lineNumber = 0;
-                }
+            // DEBUG: Log cluster metadata + vertex positions to debug buffer (instance 0 only)
+            // Slots 0-7: reserved for compute_cluster_tiling debug (payloadType=3)
+            // Slots 8: offsetCount for this fill_clusters dispatch
+            // Slots 9-15: cluster metadata (iSurface, nVertexOffset, etc.) for first 7 clusters
+            if (g_TessParams.instanceIndex == 0 && groupClusterIndex == 0 && pointIndex == 0) {
+                // Slot 8: store offsetCount for this instance
+                u_Debug[8].uintData = uint4(offsetCount.x, offsetCount.y, g_TessParams.instanceIndex, kDispatchTypeIndex);
+                u_Debug[8].floatData = float4(limit.p.x, limit.p.y, limit.p.z, 0);
+                u_Debug[8].payloadType = 2; // Mark as offset data
+                u_Debug[8].lineNumber = 0;
+            }
+            if (g_TessParams.instanceIndex == 0 && pointIndex == 0 && groupClusterIndex < 7) {
+                uint32_t debugIdx = 9 + groupClusterIndex;
+                // Log cluster metadata: iSurface, nVertexOffset, sizeX, sizeY, offset, clusterIndex
+                u_Debug[debugIdx].uintData = uint4(iSurface, rCluster.nVertexOffset, rCluster.sizeX | (rCluster.sizeY << 16), clusterIndex);
+                u_Debug[debugIdx].floatData = float4(limit.p.x, limit.p.y, limit.p.z, asfloat(rCluster.offset.x | (rCluster.offset.y << 16)));
+                u_Debug[debugIdx].payloadType = 4; // Mark as fill_clusters cluster metadata
+                u_Debug[debugIdx].lineNumber = 0;
             }
 
 #if VERTEX_NORMALS

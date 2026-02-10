@@ -100,6 +100,9 @@ using namespace dxvk;
 using namespace donut;
 using namespace nvrhi::rt;
 
+// Global debug flag shared between BuildAccel (clear) and FillInstanceClusters (readback)
+bool g_megageoDbgGotData = false;
+
 constexpr uint32_t kNumTemplates = kMaxClusterEdgeSegments * kMaxClusterEdgeSegments;
 constexpr uint32_t kClusterMaxTriangles = kMaxClusterEdgeSegments * kMaxClusterEdgeSegments * 2;
 constexpr uint32_t kClusterMaxVertices = (kMaxClusterEdgeSegments + 1) * (kMaxClusterEdgeSegments + 1);
@@ -943,6 +946,20 @@ void ClusterAccelBuilder::FillInstanceClusters(const RTXMGScene& scene, ClusterA
 
         const uint32_t surfaceCount = subd.SurfaceCount();
 
+        // DEBUG: Log instance 0's mesh AABB and positions buffer size
+        {
+            static bool s_loggedInst0 = false;
+            if (!s_loggedInst0 && instanceIndex == 0) {
+                const auto& aabb = subd.m_aabb;
+                uint32_t posBufBytes = subd.m_positionsBuffer ? (uint32_t)subd.m_positionsBuffer->getDesc().byteSize : 0;
+                Logger::warn(str::format("CHECKPOINT: Instance 0 mesh: meshID=", instance.meshID,
+                    " posBufBytes=", posBufBytes, " surfaceCount=", surfaceCount,
+                    " AABB min=(", aabb.m_mins[0], ",", aabb.m_mins[1], ",", aabb.m_mins[2],
+                    ") max=(", aabb.m_maxs[0], ",", aabb.m_maxs[1], ",", aabb.m_maxs[2], ")"));
+                s_loggedInst0 = true;
+            }
+        }
+
         // DEBUG: Validate all buffers before binding
         {
             bool hasNullBuffer = false;
@@ -986,6 +1003,8 @@ void ClusterAccelBuilder::FillInstanceClusters(const RTXMGScene& scene, ClusterA
         {
             commandList->clearBufferUInt(m_debugBuffer.Get(), 0);
         }
+
+        // Debug buffer cleared before tiling loop in BuildAccel - no need to clear here
 
         FillClustersParams params = {};
         params.instanceIndex = instanceIndex;
@@ -1191,6 +1210,80 @@ void ClusterAccelBuilder::FillInstanceClusters(const RTXMGScene& scene, ClusterA
             auto debugOutput = m_debugBuffer.Download(commandList);
             uint numElements = debugOutput.front().payloadType;
             vectorlog::Log(debugOutput, ShaderDebugElement::OutputLambda, vectorlog::FormatOptions{ .wrap = false, .header = false, .elementIndex = false, .startIndex = 1, .count = numElements });
+        }
+
+        // Unconditional debug readback: tiling debug (slots 0-7) + fill debug (slots 8-15)
+        {
+            static uint32_t s_fillDbgAttempts = 0;
+            if (!g_megageoDbgGotData && instanceIndex == 0) {
+                auto debugOutput = m_debugBuffer.Download(commandList);
+                s_fillDbgAttempts++;
+                bool hasData = false;
+                if (debugOutput.size() > 9) {
+                    // Check for our SPECIFIC payloadType markers (not just any non-zero)
+                    // payloadType=3: compute_cluster_tiling wrote it
+                    // payloadType=2: fill_clusters offsetCount
+                    // payloadType=4: fill_clusters cluster metadata
+                    for (uint32_t i = 0; i < 8 && i < debugOutput.size(); ++i) {
+                        if (debugOutput[i].payloadType == 3) { hasData = true; break; }
+                    }
+                    for (uint32_t i = 8; i <= 15 && i < debugOutput.size(); ++i) {
+                        if (debugOutput[i].payloadType == 2 || debugOutput[i].payloadType == 4) { hasData = true; break; }
+                    }
+                }
+                if (hasData) {
+                    g_megageoDbgGotData = true;
+                    Logger::warn(str::format("CHECKPOINT: debug readback (attempt=", s_fillDbgAttempts, ")"));
+
+                    // Slots 0-7: compute_cluster_tiling debug (payloadType=3)
+                    Logger::warn("  === compute_cluster_tiling (what was WRITTEN to clusters buffer) ===");
+                    for (uint32_t i = 0; i < 8 && i < debugOutput.size(); ++i) {
+                        const auto& e = debugOutput[i];
+                        if (e.payloadType == 3) {
+                            uint32_t tilingClusterOff;
+                            uint32_t surfStart, surfEnd;
+                            memcpy(&tilingClusterOff, &e.floatData.x, 4);
+                            memcpy(&surfStart, &e.floatData.y, 4);
+                            memcpy(&surfEnd, &e.floatData.z, 4);
+                            Logger::warn(str::format("  tiling[", i, "] iSurface=", e.uintData.x,
+                                " clusterIdx=", e.uintData.y, " atomicOffset=", e.uintData.z,
+                                " clusterCount=", e.uintData.w, " tilingOff=", tilingClusterOff,
+                                " surfRange=[", surfStart, ",", surfEnd, ")"));
+                        } else if (e.payloadType != 0) {
+                            Logger::warn(str::format("  tiling[", i, "] payloadType=", e.payloadType));
+                        } else {
+                            Logger::warn(str::format("  tiling[", i, "] EMPTY"));
+                        }
+                    }
+
+                    // Slot 8: fill_clusters offsetCount (payloadType=2)
+                    Logger::warn("  === fill_clusters (what was READ from clusters buffer) ===");
+                    if (debugOutput.size() > 8 && debugOutput[8].payloadType == 2) {
+                        const auto& e = debugOutput[8];
+                        Logger::warn(str::format("  fill[8] offsetCount: offset=", e.uintData.x, " count=", e.uintData.y,
+                            " instanceIndex=", e.uintData.z, " dispatchType=", e.uintData.w,
+                            " firstPos=(", e.floatData.x, ",", e.floatData.y, ",", e.floatData.z, ")"));
+                    }
+
+                    // Slots 9-15: fill_clusters cluster metadata (payloadType=4)
+                    for (uint32_t i = 9; i <= 15 && i < debugOutput.size(); ++i) {
+                        const auto& e = debugOutput[i];
+                        if (e.payloadType == 4) {
+                            uint32_t sizeX = e.uintData.z & 0xFFFF;
+                            uint32_t sizeY = (e.uintData.z >> 16) & 0xFFFF;
+                            Logger::warn(str::format("  fill[", i, "] cluster[", e.uintData.w, "] iSurface=", e.uintData.x,
+                                " vtxOff=", e.uintData.y, " size=", sizeX, "x", sizeY,
+                                " pos=(", e.floatData.x, ",", e.floatData.y, ",", e.floatData.z, ")"));
+                        } else if (e.payloadType != 0) {
+                            Logger::warn(str::format("  fill[", i, "] payloadType=", e.payloadType));
+                        } else {
+                            Logger::warn(str::format("  fill[", i, "] EMPTY"));
+                        }
+                    }
+                } else if (s_fillDbgAttempts % 50 == 0) {
+                    Logger::warn(str::format("CHECKPOINT: debug readback attempt ", s_fillDbgAttempts, " - still empty"));
+                }
+            }
         }
 
 #if RTXMG_CHRONO_TIMING
@@ -1403,6 +1496,7 @@ void ClusterAccelBuilder::ComputeInstanceClusterTiling(ClusterAccels& accels,
     params.clusterVertexPositionsBaseAddress = accels.clusterVertexPositionsBuffer.GetGpuVirtualAddress();
     params.clasDataBaseAddress = accels.clasBuffer.GetGpuVirtualAddress();
     params.disableSubdivision = m_tessellatorConfig.disableSubdivision ? 1 : 0;
+    params.instanceIndex = instanceIndex;
 
     // Safety check: if clasDataBaseAddress is 0, all CLAS addresses will be invalid
     if (params.clasDataBaseAddress == 0) {
@@ -2533,6 +2627,12 @@ void ClusterAccelBuilder::BuildAccel(const RTXMGScene& scene, const TessellatorC
 
         m_dummyHiZTexturesInitialized = true;
         RTXMG_LOG("RTX MegaGeo: Dummy HiZ texture initialization complete");
+    }
+
+    // Clear debug buffer before tiling loop so compute_cluster_tiling can write to slots 0-7
+    // and fill_clusters can write to slots 8-15. Only do it until we get data.
+    if (!g_megageoDbgGotData) {
+        commandList->clearBufferUInt(m_debugBuffer.Get(), 0);
     }
 
     {

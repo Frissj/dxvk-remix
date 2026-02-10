@@ -814,6 +814,14 @@ void WriteSurfaceWave(uint32_t iWave, uint32_t iLane, uint32_t iSurface, GridSam
             uint32_t clusterIndex = tilingClusterOffset + iCluster;
             u_Clusters[clusterIndex] = cluster;
 
+            // DEBUG: Log what compute_cluster_tiling writes to clusters buffer for instance 0
+            if (g_Params.instanceIndex == 0 && clusterIndex < 8) {
+                u_Debug[clusterIndex].uintData = uint4(iSurface, clusterIndex, surfaceClusterOffset, clusterCount);
+                u_Debug[clusterIndex].floatData = float4(asfloat(tilingClusterOffset), asfloat(g_Params.surfaceStart), asfloat(g_Params.surfaceEnd), 0);
+                u_Debug[clusterIndex].payloadType = 3; // Mark as tiling debug
+                u_Debug[clusterIndex].lineNumber = 0;
+            }
+
             GathererWriteCluster(cluster, clusterIndex, rSampler, localGeometryIndex, templateAddress);
 
             u_ClasAddresses[clusterIndex] = tilingClusterBaseAddress + clasBytes * iCluster;

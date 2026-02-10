@@ -68,7 +68,7 @@ struct ComputeClusterTilingParams
     uint maxClasBlocks;
 
     uint disableSubdivision;  // 1 = bypass stencil evaluation, use bilinear interpolation
-    uint pad3;
+    uint instanceIndex;  // Instance index for debug logging (was pad3)
     uint pad4;
     uint pad5;
 

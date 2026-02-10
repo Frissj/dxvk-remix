@@ -2449,6 +2449,29 @@ namespace dxvk {
     desc.texcoords = texcoords.empty() ? nullptr : texcoords.data();
     desc.normals = normals.empty() ? nullptr : normals.data();
 
+    // Log control point AABB for every surface so we can match with tessellated output
+    {
+      static uint32_t s_cpSurfIdx = 0;
+      static bool s_cpLogDone = false;
+      if (!s_cpLogDone) {
+        Vector3 cpMin(FLT_MAX, FLT_MAX, FLT_MAX);
+        Vector3 cpMax(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+        for (uint32_t i = 0; i < vertexCount; ++i) {
+          cpMin.x = std::min(cpMin.x, controlPoints[i].x);
+          cpMin.y = std::min(cpMin.y, controlPoints[i].y);
+          cpMin.z = std::min(cpMin.z, controlPoints[i].z);
+          cpMax.x = std::max(cpMax.x, controlPoints[i].x);
+          cpMax.y = std::max(cpMax.y, controlPoints[i].y);
+          cpMax.z = std::max(cpMax.z, controlPoints[i].z);
+        }
+        Logger::warn(str::format("CHECKPOINT: SubdivSurface[", s_cpSurfIdx, "] ", vertexCount, "v ", totalFaces, "f (",
+            validQuadCount, "q+", validTriCount, "t) AABB min=(", cpMin.x, ",", cpMin.y, ",", cpMin.z,
+            ") max=(", cpMax.x, ",", cpMax.y, ",", cpMax.z, ")"));
+        s_cpSurfIdx++;
+        if (s_cpSurfIdx >= 50) s_cpLogDone = true; // Stop after 50 surfaces
+      }
+    }
+
     // Material index - use 0 as placeholder
     desc.materialIndex = 0;
 

@@ -495,6 +495,20 @@ namespace dxvk {
         }
       }
       Logger::warn(str::format("CHECKPOINT: mergeInstances transforms collected, cluster=", clusterInstCount, " surfaces=", surfaceTransforms.size()));
+      // Log first transform to verify it's a valid world transform (not identity or projection)
+      {
+        static uint32_t s_transformLogCount = 0;
+        if (s_transformLogCount < 5 && !surfaceTransforms.empty()) {
+          auto it = surfaceTransforms.begin();
+          const Matrix4& m = it->second;
+          Logger::warn(str::format("CHECKPOINT: RTXMG localToWorld surfaceId=", it->first, " (Matrix4 from VkTransformMatrixKHR):"));
+          Logger::warn(str::format("  data[0]=(", m.data[0][0], ", ", m.data[0][1], ", ", m.data[0][2], ", ", m.data[0][3], ")"));
+          Logger::warn(str::format("  data[1]=(", m.data[1][0], ", ", m.data[1][1], ", ", m.data[1][2], ", ", m.data[1][3], ")"));
+          Logger::warn(str::format("  data[2]=(", m.data[2][0], ", ", m.data[2][1], ", ", m.data[2][2], ", ", m.data[2][3], ")"));
+          Logger::warn(str::format("  data[3]=(", m.data[3][0], ", ", m.data[3][1], ", ", m.data[3][2], ", ", m.data[3][3], ")"));
+          s_transformLogCount++;
+        }
+      }
 
       // No transform preservation: ClusterBlas fast-path in DrawCallCache keeps entries alive,
       // and 10x GC lifetime protects them. Preserved transforms waste cluster budget on invisible surfaces.
@@ -935,41 +949,66 @@ namespace dxvk {
       s_prevFrameInstances = std::move(thisFrameInstances);
     }
 
-    Logger::warn(str::format("CHECKPOINT: post-instanceLoop total=", geoCountTotal, " cluster=", geoCountClusterSubmitted, " std=", geoCountStandard));
+    Logger::warn(str::format("CHECKPOINT: post-instanceLoop total=", geoCountTotal, " cluster=", geoCountClusterSubmitted, " std=", geoCountStandard,
+        " hidden=", geoCountHidden, " zeroMask=", geoCountZeroMask, " noBuffers=", geoCountClusterNoBuffers,
+        " skipZeroTris=", m_frameClusterSkipZeroTris, " skipNoInst=", m_frameClusterSkipNoInstance));
 
-    // RTX MegaGeo: Geometry pipeline summary
-    // Shows how many game geometries survive to the final TLAS output
-    {
-      uint32_t tlasOutput = static_cast<uint32_t>(m_mergedInstances[Tlas::Opaque].size() + m_mergedInstances[Tlas::Unordered].size());
-      uint32_t clusterInTlas = geoCountClusterSubmitted - m_frameClusterSkipZeroTris - m_frameClusterSkipNoInstance;
-      uint32_t totalInvalidated = geoCountHidden + geoCountZeroMask + geoCountClusterNoBuffers + m_frameClusterSkipZeroTris + m_frameClusterSkipNoInstance;
-      static uint32_t s_geoPipelineLogCount = 0;
-      // Always log when output is 0 but we had cluster input (black frame detection)
-      if (tlasOutput == 0 && geoCountTotal > 0) {
-        Logger::warn(str::format("RTX MegaGeo GEO PIPELINE: BLACK FRAME - input=", geoCountTotal,
-            " | output=0 (standard=", geoCountStandard, " cluster=", clusterInTlas, ")",
-            " | invalidated=", totalInvalidated,
-            " (hidden=", geoCountHidden, " zeroMask=", geoCountZeroMask,
-            " noBuffers=", geoCountClusterNoBuffers,
-            " zeroTris=", m_frameClusterSkipZeroTris, " noInstance=", m_frameClusterSkipNoInstance, ")"));
-      }
-      if ((s_geoPipelineLogCount++ % 60) == 0) {
-        RTXMG_LOG(str::format("RTX MegaGeo GEO PIPELINE: input=", geoCountTotal,
-            " | output=", tlasOutput, " (standard=", geoCountStandard, " cluster=", clusterInTlas, ")",
-            " | invalidated=", totalInvalidated,
-            " (hidden=", geoCountHidden, " zeroMask=", geoCountZeroMask,
-            " noBuffers=", geoCountClusterNoBuffers,
-            " zeroTris=", m_frameClusterSkipZeroTris, " noInstance=", m_frameClusterSkipNoInstance, ")"));
-      }
-    }
+    // Log cluster instance patches before buildBlases
+    Logger::warn(str::format("CHECKPOINT: pre-buildBlases clusterPatches=", m_clusterInstancePatches.size()));
 
     buildBlases(ctx, execBarriers, cameraManager, opacityMicromapManager, instanceManager,
                 textures, instances, blasBuckets, blasToBuild, blasRangesToBuild, totalScratchMemory);
+
+    // RTX MegaGeo: Geometry pipeline summary - AFTER buildBlases so m_mergedInstances is populated
+    {
+      uint32_t tlasOpaque = static_cast<uint32_t>(m_mergedInstances[Tlas::Opaque].size());
+      uint32_t tlasUnordered = static_cast<uint32_t>(m_mergedInstances[Tlas::Unordered].size());
+      uint32_t tlasOutput = tlasOpaque + tlasUnordered;
+      uint32_t clusterInTlas = geoCountClusterSubmitted - m_frameClusterSkipZeroTris - m_frameClusterSkipNoInstance;
+      uint32_t totalInvalidated = geoCountHidden + geoCountZeroMask + geoCountClusterNoBuffers + m_frameClusterSkipZeroTris + m_frameClusterSkipNoInstance;
+
+      // Count how many TLAS instances have null BLAS addresses (should only be cluster instances pre-patch)
+      uint32_t nullAddrCount = 0;
+      uint32_t nonNullAddrCount = 0;
+      for (const auto& inst : m_mergedInstances[Tlas::Opaque]) {
+        if (inst.accelerationStructureReference == 0) nullAddrCount++;
+        else nonNullAddrCount++;
+      }
+      for (const auto& inst : m_mergedInstances[Tlas::Unordered]) {
+        if (inst.accelerationStructureReference == 0) nullAddrCount++;
+        else nonNullAddrCount++;
+      }
+
+      Logger::warn(str::format("RTX MegaGeo GEO PIPELINE: input=", geoCountTotal,
+          " | tlasOutput=", tlasOutput, " (opaque=", tlasOpaque, " unordered=", tlasUnordered, ")",
+          " | cluster=", clusterInTlas, " std=", geoCountStandard,
+          " | invalidated=", totalInvalidated,
+          " | blasAddr: null=", nullAddrCount, " valid=", nonNullAddrCount,
+          " | patches=", m_clusterInstancePatches.size()));
+    }
   }
 
   void AccelManager::addBlas(RtInstance* instance, BlasEntry* blasEntry, const Matrix4* instanceToObject) {
     // Create an instance for this BLAS
     VkAccelerationStructureInstanceKHR blasInstance = instance->getVkInstance();
+
+    // Log transforms for first few standard instances (for comparison with cluster identity issue)
+    {
+      static uint32_t s_stdLogCount = 0;
+      static uint32_t s_stdLogFrame = UINT32_MAX;
+      uint32_t curFrame = m_device->getCurrentFrameId();
+      if (curFrame != s_stdLogFrame) { s_stdLogFrame = curFrame; s_stdLogCount = 0; }
+      if (s_stdLogCount < 2 && !blasEntry->isClusterBlas()) {
+        auto& t = blasInstance.transform.matrix;
+        const Matrix4& o2w = instance->surface.objectToWorld;
+        Logger::warn(str::format("CHECKPOINT: addBlas STANDARD[", s_stdLogCount, "] instanceToObject=", (instanceToObject ? "YES" : "null")));
+        Logger::warn(str::format("  VkTransform row0=(", t[0][0], ", ", t[0][1], ", ", t[0][2], ", ", t[0][3], ")"));
+        Logger::warn(str::format("  VkTransform row1=(", t[1][0], ", ", t[1][1], ", ", t[1][2], ", ", t[1][3], ")"));
+        Logger::warn(str::format("  VkTransform row2=(", t[2][0], ", ", t[2][1], ", ", t[2][2], ", ", t[2][3], ")"));
+        Logger::warn(str::format("  objectToWorld[3]=(", o2w.data[3][0], ", ", o2w.data[3][1], ", ", o2w.data[3][2], ", ", o2w.data[3][3], ")"));
+        s_stdLogCount++;
+      }
+    }
 
     // RTX Mega Geometry: For cluster BLASes, the address will be patched on GPU
     // Set to 0 here and record mapping for later GPU-side patching
@@ -1022,10 +1061,28 @@ namespace dxvk {
     // RTX MegaGeo: Set cluster surface flag so shader knows not to add geometryIndex to surfaceIndex
     if (isClusterBlas) {
       blasInstance.instanceCustomIndex |= CUSTOM_INDEX_IS_CLUSTER_SURFACE;
-      // Note: Cluster vertices are stored in LOCAL space by fill_clusters.
-      // The TLAS instance transform (inherited from the RtInstance) transforms rays to local space.
-      // The shader must transform vertex positions by surface.objectToWorld when reading them.
 
+      // Log first few cluster instances per frame for debugging
+      static uint32_t s_clusterAddBlasFrame = UINT32_MAX;
+      static uint32_t s_clusterAddBlasCount = 0;
+      uint32_t curFrame = m_device->getCurrentFrameId();
+      if (curFrame != s_clusterAddBlasFrame) {
+        s_clusterAddBlasFrame = curFrame;
+        s_clusterAddBlasCount = 0;
+      }
+      if (s_clusterAddBlasCount < 3) {
+        Logger::warn(str::format("CHECKPOINT: addBlas cluster[", s_clusterAddBlasCount, "]: surfaceIdx=", surfaceIndexForCustomIndex,
+            " customIdx=0x", std::hex, blasInstance.instanceCustomIndex, std::dec,
+            " mask=0x", std::hex, blasInstance.mask, std::dec,
+            " remixIdx=", static_cast<uint32_t>(m_mergedInstances[Tlas::Opaque].size())));
+        // Log TLAS instance transform to diagnose "flat on screen" geometry
+        auto& t = blasInstance.transform.matrix;
+        Logger::warn(str::format("CHECKPOINT: addBlas cluster[", s_clusterAddBlasCount, "] TLAS transform:"));
+        Logger::warn(str::format("  row0=(", t[0][0], ", ", t[0][1], ", ", t[0][2], ", ", t[0][3], ")"));
+        Logger::warn(str::format("  row1=(", t[1][0], ", ", t[1][1], ", ", t[1][2], ", ", t[1][3], ")"));
+        Logger::warn(str::format("  row2=(", t[2][0], ", ", t[2][1], ", ", t[2][2], ", ", t[2][3], ")"));
+      }
+      s_clusterAddBlasCount++;
     }
 
     if (instanceToObject) {
@@ -1309,7 +1366,14 @@ namespace dxvk {
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
 
-      Logger::warn(str::format("CHECKPOINT: pre-patchGPU mappings=", mappings.size()));
+      // Log mapping details for first few
+      for (size_t i = 0; i < std::min(mappings.size(), (size_t)3); i++) {
+        Logger::warn(str::format("CHECKPOINT: patchGPU mapping[", i, "]: remixIdx=", mappings[i].remixInstanceIndex,
+            " rtxmgIdx=", mappings[i].rtxmgInstanceIndex));
+      }
+      Logger::warn(str::format("CHECKPOINT: pre-patchGPU mappings=", mappings.size(),
+          " uniqueRtxmgIndices=", uniqueRtxmgIndices.size(),
+          " opaqueCount=", opaqueCount));
       m_megaGeoBuilder->patchClusterBlasAddressesGPU(instanceBufferWrapper.Get(), 0, mappings);
       Logger::warn("CHECKPOINT: post-patchGPU");
 
@@ -1445,13 +1509,16 @@ namespace dxvk {
     std::size_t dataOffset = 0;
     surfacesGPUData.resize(surfacesGPUSize);
 
+    uint32_t clusterSurfaceCount = 0;
+    uint32_t standardSurfaceCount = 0;
     for (uint32_t i = 0; i < m_reorderedSurfaces.size(); ++i) {
       const auto& currentInstance = *m_reorderedSurfaces[i];
       RtSurface& currentSurface = m_reorderedSurfaces[i]->surface;
 
-      // Log cluster surface data being uploaded
       if (currentSurface.isClusterSurface) {
-        static uint32_t s_clusterSurfUploadLog = 0;
+        clusterSurfaceCount++;
+      } else {
+        standardSurfaceCount++;
       }
 
       // Split instance geometry need to have their first index offset set in their corresponding surface instances
@@ -1466,6 +1533,9 @@ namespace dxvk {
         maxPreviousSurfaceIndex = std::max(maxPreviousSurfaceIndex, currentInstance.getPreviousSurfaceIndex());
       }
     }
+
+    Logger::warn(str::format("CHECKPOINT: uploadSurfaceData reorderedSurfaces=", m_reorderedSurfaces.size(),
+        " clusterSurfaces=", clusterSurfaceCount, " standardSurfaces=", standardSurfaceCount));
 
     assert(dataOffset == surfacesGPUSize);
     assert(surfacesGPUData.size() == surfacesGPUSize);
