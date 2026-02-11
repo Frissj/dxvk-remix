@@ -219,6 +219,11 @@ public:
     // when the sync Downloads in template init close/reopen the command list
     void EnsureTemplatesInitialized(uint32_t maxGeometryCountPerMesh, nvrhi::ICommandList* commandList);
 
+    // Diagnostic: dump all key buffer contents to log for debugging garbled geometry
+    // WARNING: This does sync GPU readbacks (close/reopen command list). Only call
+    // when no image views are bound (same restriction as template init).
+    void DumpDiagnosticData(ClusterAccels& accels, nvrhi::ICommandList* commandList);
+
 protected:
     void UpdateMemoryAllocations(ClusterAccels& accels, uint32_t numInstances, uint32_t sceneSubdPatches);
 

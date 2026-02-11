@@ -783,9 +783,9 @@ namespace dxvk {
       write.descriptorCount = 1;
 
       switch (item.type) {
+        case nvrhi::BindingSetItem::Type::ConstantBuffer:
         case nvrhi::BindingSetItem::Type::StructuredBuffer_SRV:
         case nvrhi::BindingSetItem::Type::StructuredBuffer_UAV:
-        case nvrhi::BindingSetItem::Type::ConstantBuffer:
         {
           auto* nvrhiBuffer = static_cast<NvrhiDxvkBuffer*>(item.resourceHandle);
           Rc<DxvkBuffer> dxvkBuffer = nvrhiBuffer->getDxvkBuffer();
@@ -804,15 +804,13 @@ namespace dxvk {
           bufferInfo.range = size;
           bufferInfos.push_back(bufferInfo);
 
+          // CB → UNIFORM_BUFFER; SRV/UAV → STORAGE_BUFFER (must match createBindingLayout)
           write.descriptorType = (item.type == nvrhi::BindingSetItem::Type::ConstantBuffer)
             ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
             : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
           write.pBufferInfo = &bufferInfos.back();
           writes.push_back(write);
 
-          // Track the DxvkBuffer so it stays alive until the GPU finishes using this binding set.
-          // Without this, ClusterAccelBuilder's deferred destruction can free buffers while
-          // the GPU still references them via this descriptor set (causing GPU page faults).
           bindingSet->addTrackedBuffer(dxvkBuffer);
 
           RTXMG_LOG(str::format("RTX MegaGeo: createBindingSet - buffer binding=", item.slot,

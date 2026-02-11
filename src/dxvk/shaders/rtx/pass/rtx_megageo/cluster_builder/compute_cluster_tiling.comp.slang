@@ -814,12 +814,15 @@ void WriteSurfaceWave(uint32_t iWave, uint32_t iLane, uint32_t iSurface, GridSam
             uint32_t clusterIndex = tilingClusterOffset + iCluster;
             u_Clusters[clusterIndex] = cluster;
 
-            // DEBUG: Log what compute_cluster_tiling writes to clusters buffer for instance 0
-            if (g_Params.instanceIndex == 0 && clusterIndex < 8) {
-                u_Debug[clusterIndex].uintData = uint4(iSurface, clusterIndex, surfaceClusterOffset, clusterCount);
-                u_Debug[clusterIndex].floatData = float4(asfloat(tilingClusterOffset), asfloat(g_Params.surfaceStart), asfloat(g_Params.surfaceEnd), 0);
-                u_Debug[clusterIndex].payloadType = 3; // Mark as tiling debug
-                u_Debug[clusterIndex].lineNumber = 0;
+            // DEBUG: Log what compute_cluster_tiling writes for instance 0
+            if (g_Params.instanceIndex == 0 && clusterIndex < 7) {
+                // slot 1..7: per-cluster data (slot 0 reserved for entry point marker)
+                uint debugSlot = clusterIndex + 1;
+                nvrhi::GpuVirtualAddress vtxAddr = g_Params.clusterVertexPositionsBaseAddress + nvrhi::GpuVirtualAddress(cluster.nVertexOffset * sizeof(float3));
+                u_Debug[debugSlot].uintData = uint4(iSurface, cluster.nVertexOffset, uint(vtxAddr & 0xFFFFFFFF), uint(vtxAddr >> 32));
+                u_Debug[debugSlot].floatData = float4(asfloat(clusterIndex), asfloat(templateAddress & 0xFFFFFFFF), asfloat(templateAddress >> 32), asfloat(sizeof(float3)));
+                u_Debug[debugSlot].payloadType = 103;
+                u_Debug[debugSlot].lineNumber = 0;
             }
 
             GathererWriteCluster(cluster, clusterIndex, rSampler, localGeometryIndex, templateAddress);
@@ -842,6 +845,13 @@ void main(uint3 threadIdx : SV_GroupThreadID, uint3 groupIdx : SV_GroupID)
 
     SHADER_DEBUG_INIT(u_Debug, uint2(g_Params.debugSurfaceIndex, g_Params.debugLaneIndex), uint2(iSurface, iLane));
 
+    // DEBUG: Verify tiling shader runs for instance 0 - write to slot 0 from first thread
+    if (g_Params.instanceIndex == 0 && threadIdx.x == 0 && groupIdx.x == 0) {
+        u_Debug[0].uintData = uint4(999, g_Params.surfaceStart, g_Params.surfaceEnd, g_Params.instanceIndex);
+        u_Debug[0].floatData = float4(0, 0, 0, 0);
+        u_Debug[0].payloadType = 103;
+        u_Debug[0].lineNumber = 1; // lineNumber=1 means entry point marker
+    }
 
 #if ENABLE_GROUP_ATOMICS
     if (iLane == 0 && iWave == 0)

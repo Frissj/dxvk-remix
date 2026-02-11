@@ -166,7 +166,7 @@ private:
     TopologyCache::Options topoCacheOptions{
       .isoLevelSharp = 1,
       .isoLevelSmooth = 1,
-      .useTerminalNodes = true
+      .useTerminalNodes = false
     };
     m_topologyCaches.reserve(m_numWorkerThreads);
     for (uint32_t i = 0; i < m_numWorkerThreads; ++i) {
@@ -615,7 +615,7 @@ private:
     config.zbuffer = nullptr;  // Disable HiZ culling to prevent oscillation
     config.camera = &m_tessellationCamera;
     config.isolationLevel = m_topologyCaches[0]->options.isoLevelSharp;  // Must match TMR plan isolation level
-    config.disableSubdivision = false;
+    config.disableSubdivision = false;  // Use proper subdivision evaluation
 
     // Dynamic memory sizing based on GPU-reported demand from previous frame.
     //
@@ -1008,6 +1008,9 @@ private:
       }
       RTXMG_LOG("=== END RTXMG DIAGNOSTICS ===");
 
+      // DIAGNOSTIC: Dump full pipeline data (cluster offsets, vertex positions, shading data, etc.)
+      m_clusterBuilder->DumpDiagnosticData(*m_clusterAccels, m_commandList.Get());
+
       // DIAGNOSTIC: Download BLAS addresses to verify they're valid
       // Only count frames that actually have cluster data (>1 address), log up to 10 such frames
       {
@@ -1041,7 +1044,7 @@ private:
         if (surface.isDirty && surface.subdivSurface) {
           surface.isDirty = false;
           surface.isReady = true;
-          // Note: blasAddress is left as 0 - patching happens on GPU via patchClusterBlasAddresses()
+          // BLAS addresses available via getDownloadedBlasAddress() for AccelManager
           RTXMG_LOG(str::format("RTX MegaGeo: Surface ", id, " marked ready"));
         }
       }

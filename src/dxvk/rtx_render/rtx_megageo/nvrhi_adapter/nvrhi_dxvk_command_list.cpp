@@ -130,77 +130,37 @@ namespace dxvk {
       return;
     }
 
+    // Cache data for small constant buffers (used for push constants)
+    if (offset == 0 && size <= 128) {
+      nvrhiBuffer->setCachedData(data, size);
+    }
+
     // Automatic barrier for non-volatile buffers
     if (m_EnableAutomaticBarriers) {
       requireBufferState(buffer, nvrhi::ResourceStates::CopyDest);
       commitBarriers();
     }
 
-    // Cache data for small constant buffers (used for push constants)
-    if (offset == 0 && size <= 128) {
-      nvrhiBuffer->setCachedData(data, size);
-    }
-
     // Vulkan requires vkCmdUpdateBuffer size to be a multiple of 4
-    // If size is not aligned, we need to pad with zeros
     size_t alignedSize = (size + 3) & ~3;
-    size_t copySize = size;  // How many bytes to actually copy from source
+    size_t copySize = size;
 
-    // But we can't write past buffer end, so clamp
+    // Clamp if rounding up would overflow buffer
     if (offset + alignedSize > bufferSize) {
-      // Round down instead if rounding up would overflow
       alignedSize = size & ~3;
-      copySize = alignedSize;  // CRITICAL: Only copy what fits in the aligned buffer!
+      copySize = alignedSize;
       if (alignedSize == 0 && size > 0) {
-        // Size is 1-3 bytes, can't align - skip this write
         Logger::warn(str::format("RTX MegaGeo: writeBuffer - size ", size, " too small to align to 4 bytes"));
         return;
       }
     }
 
-    // Vulkan limits vkCmdUpdateBuffer to 65536 bytes - split large updates into chunks
-    constexpr size_t maxChunkSize = 65536;
-
-    RTXMG_LOG(str::format("RTX MegaGeo: writeBuffer - alignedSize=", alignedSize, " copySize=", copySize));
-
-    if (alignedSize <= maxChunkSize) {
-      // Small update - send as single chunk
-      if (alignedSize != size) {
-        // Need to pad - create temporary buffer
-        std::vector<uint8_t> alignedData(alignedSize, 0);
-        std::memcpy(alignedData.data(), data, copySize);  // Use copySize, not size!
-        m_context->updateBuffer(dxvkBuffer, offset, alignedSize, alignedData.data());
-      } else {
-        m_context->updateBuffer(dxvkBuffer, offset, size, data);
-      }
+    if (alignedSize != size) {
+      std::vector<uint8_t> alignedData(alignedSize, 0);
+      std::memcpy(alignedData.data(), data, copySize);
+      m_context->updateBuffer(dxvkBuffer, offset, alignedSize, alignedData.data());
     } else {
-      // Large update - split into chunks
-      const uint8_t* dataPtr = static_cast<const uint8_t*>(data);
-      size_t remaining = size;
-      uint64_t currentOffset = offset;
-
-      while (remaining > 0) {
-        size_t chunkSize = std::min(remaining, maxChunkSize);
-        size_t alignedChunkSize = (chunkSize + 3) & ~3;
-
-        // Don't exceed buffer
-        if (currentOffset + alignedChunkSize > bufferSize) {
-          alignedChunkSize = chunkSize & ~3;
-        }
-        if (alignedChunkSize == 0) break;
-
-        if (alignedChunkSize != chunkSize) {
-          std::vector<uint8_t> alignedChunk(alignedChunkSize, 0);
-          std::memcpy(alignedChunk.data(), dataPtr, std::min(chunkSize, alignedChunkSize));
-          m_context->updateBuffer(dxvkBuffer, currentOffset, alignedChunkSize, alignedChunk.data());
-        } else {
-          m_context->updateBuffer(dxvkBuffer, currentOffset, chunkSize, dataPtr);
-        }
-
-        dataPtr += chunkSize;
-        currentOffset += chunkSize;
-        remaining -= chunkSize;
-      }
+      m_context->updateBuffer(dxvkBuffer, offset, size, data);
     }
   }
 
@@ -746,6 +706,7 @@ namespace dxvk {
       }
 
       // Bind pre-built descriptor sets with vkCmdBindDescriptorSets
+      // Also handle push constants for constant buffers (matching dispatch() behavior)
       if (!m_pendingDescriptorSets.empty()) {
         for (const auto& pending : m_pendingDescriptorSets) {
           VkPipelineLayout layoutToUse = pending.pipelineLayout != VK_NULL_HANDLE
@@ -764,6 +725,30 @@ namespace dxvk {
             &pending.descriptorSet,
             0,
             nullptr);
+
+          // Push constants for constant buffers in this binding set
+          if (pending.bindingSetRef) {
+            auto* nvrhiBindingSet = static_cast<NvrhiDxvkBindingSet*>(pending.bindingSetRef.Get());
+            if (nvrhiBindingSet) {
+              const auto& desc = nvrhiBindingSet->getDesc();
+              for (const auto& item : desc.bindings) {
+                if (item.type == nvrhi::BindingSetItem::Type::ConstantBuffer && item.resourceHandle) {
+                  auto* nvrhiBuffer = static_cast<NvrhiDxvkBuffer*>(item.resourceHandle);
+                  if (nvrhiBuffer->hasCachedData()) {
+                    uint32_t pushSize = static_cast<uint32_t>(nvrhiBuffer->getCachedDataSize());
+                    RTXMG_LOG(str::format("RTX MegaGeo: dispatchIndirect vkCmdPushConstants size=", pushSize, " (b", item.slot, ")"));
+                    m_device->getDxvkDevice()->vkd()->vkCmdPushConstants(
+                      cmdBuffer,
+                      layoutToUse,
+                      VK_SHADER_STAGE_COMPUTE_BIT,
+                      0,
+                      pushSize,
+                      nvrhiBuffer->getCachedData());
+                  }
+                }
+              }
+            }
+          }
 
           m_pendingBindingSetsForTracking.push_back(pending.bindingSetRef);
         }
@@ -956,13 +941,11 @@ namespace dxvk {
       // Always-visible logging of operation type for crash diagnosis
       const char* opTypeStr = "Unknown";
       switch ((uint32_t)vkCmds.input.opType) {
-        case 0: opTypeStr = "TriangleCluster"; break;
-        case 1: opTypeStr = "TriangleClusterGetSizes"; break;
-        case 2: opTypeStr = "BlasBuild"; break;
-        case 3: opTypeStr = "BlasGetSizes"; break;
-        case 4: opTypeStr = "InstantiateTemplate"; break;
-        case 5: opTypeStr = "InstantiateTemplateGetSizes"; break;
-        case 6: opTypeStr = "MoveObjects"; break;
+        case 0: opTypeStr = "MoveObjects"; break;
+        case 1: opTypeStr = "BuildClustersBottomLevel"; break;
+        case 2: opTypeStr = "BuildTriangleCluster"; break;
+        case 3: opTypeStr = "BuildTriangleClusterTemplate"; break;
+        case 4: opTypeStr = "InstantiateTriangleCluster"; break;
       }
       Logger::warn(str::format("CHECKPOINT: vkCmdBuildClusterAS opType=", opTypeStr,
           " maxAccelStructCount=", vkCmds.input.maxAccelerationStructureCount,
@@ -1978,15 +1961,23 @@ namespace dxvk {
     }
 
     // Set up srcInfosArray (indirect args buffer)
+    // CRITICAL: size must be maxArgCount * stride, NOT the full buffer byteSize.
+    // Our buffers are capacity-sized (with headroom), but the driver uses
+    // srcInfosArray.size/stride to determine how many entries to process.
+    // If size = capacity * stride but maxArgCount = numInstances, the driver
+    // processes entries beyond what we filled, reading garbage/zeroes → TDR.
+    // The sample's buffers are exactly numInstances-sized, so this is never an issue there.
+    uint32_t maxArgCount = input.maxAccelerationStructureCount;
     if (desc.inIndirectArgsBuffer) {
       NvrhiDxvkBuffer* argsBuffer = static_cast<NvrhiDxvkBuffer*>(desc.inIndirectArgsBuffer);
       vkCmds.srcInfosArray.deviceAddress = argsBuffer->getGpuVirtualAddress() + desc.inIndirectArgsOffsetInBytes;
       vkCmds.srcInfosArray.stride = argsBuffer->getDesc().structStride;
-      vkCmds.srcInfosArray.size = argsBuffer->getDesc().byteSize - desc.inIndirectArgsOffsetInBytes;
+      vkCmds.srcInfosArray.size = uint64_t(maxArgCount) * vkCmds.srcInfosArray.stride;
       // Always log for crash debugging
       RTXMG_LOG(str::format("RTX MegaGeo: ", opTypeName, " srcInfosArray addr=0x", std::hex, vkCmds.srcInfosArray.deviceAddress,
                                " stride=", std::dec, vkCmds.srcInfosArray.stride, " size=", vkCmds.srcInfosArray.size,
-                               " (numElements=", vkCmds.srcInfosArray.stride > 0 ? vkCmds.srcInfosArray.size / vkCmds.srcInfosArray.stride : 0, ")"));
+                               " (numElements=", maxArgCount, " bufferCapacity=",
+                               vkCmds.srcInfosArray.stride > 0 ? (argsBuffer->getDesc().byteSize / vkCmds.srcInfosArray.stride) : 0, ")"));
     } else {
       Logger::warn("RTX MegaGeo: inIndirectArgsBuffer is NULL");
     }
@@ -1996,9 +1987,8 @@ namespace dxvk {
     if (desc.inOutAddressesBuffer) {
       NvrhiDxvkBuffer* addressesBuffer = static_cast<NvrhiDxvkBuffer*>(desc.inOutAddressesBuffer);
       vkCmds.dstAddressesArray.deviceAddress = addressesBuffer->getGpuVirtualAddress() + desc.inOutAddressesOffsetInBytes;
-      // Use buffer's structStride instead of hardcoding sizeof(VkDeviceAddress)
       vkCmds.dstAddressesArray.stride = addressesBuffer->getDesc().structStride;
-      vkCmds.dstAddressesArray.size = addressesBuffer->getDesc().byteSize - desc.inOutAddressesOffsetInBytes;
+      vkCmds.dstAddressesArray.size = uint64_t(maxArgCount) * vkCmds.dstAddressesArray.stride;
       // Always log for crash debugging
       RTXMG_LOG(str::format("RTX MegaGeo: ", opTypeName, " dstAddressesArray addr=0x", std::hex, vkCmds.dstAddressesArray.deviceAddress,
                                " stride=", std::dec, vkCmds.dstAddressesArray.stride, " size=", vkCmds.dstAddressesArray.size));
@@ -2028,12 +2018,11 @@ namespace dxvk {
     if (desc.outSizesBuffer) {
       NvrhiDxvkBuffer* sizesBuffer = static_cast<NvrhiDxvkBuffer*>(desc.outSizesBuffer);
       vkCmds.dstSizesArray.deviceAddress = sizesBuffer->getGpuVirtualAddress() + desc.outSizesOffsetInBytes;
-      // Use buffer's structStride instead of hardcoding sizeof(uint32_t)
       vkCmds.dstSizesArray.stride = sizesBuffer->getDesc().structStride;
-      vkCmds.dstSizesArray.size = sizesBuffer->getDesc().byteSize - desc.outSizesOffsetInBytes;
+      vkCmds.dstSizesArray.size = uint64_t(maxArgCount) * vkCmds.dstSizesArray.stride;
       RTXMG_LOG(str::format("RTX MegaGeo: dstSizesArray addr=", vkCmds.dstSizesArray.deviceAddress,
                                " stride=", vkCmds.dstSizesArray.stride, " size=", vkCmds.dstSizesArray.size,
-                               " (numElements=", vkCmds.dstSizesArray.size / vkCmds.dstSizesArray.stride, ")"));
+                               " (numElements=", maxArgCount, ")"));
     } else if (!desc.outAccelerationStructuresBuffer && !desc.inOutAddressesBuffer) {
       // GetSizes mode but no sizes output - this is unexpected
       Logger::warn("RTX MegaGeo: outSizesBuffer is NULL in GetSizes mode");

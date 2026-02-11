@@ -244,7 +244,7 @@ void FillClustersMain(uint3 threadIdx, uint3 groupIdx)
                 // Slot 8: store offsetCount for this instance
                 u_Debug[8].uintData = uint4(offsetCount.x, offsetCount.y, g_TessParams.instanceIndex, kDispatchTypeIndex);
                 u_Debug[8].floatData = float4(limit.p.x, limit.p.y, limit.p.z, 0);
-                u_Debug[8].payloadType = 2; // Mark as offset data
+                u_Debug[8].payloadType = 102; // Mark as offset data (102 to avoid conflict with ShaderDebug PayloadType_Uint2=2)
                 u_Debug[8].lineNumber = 0;
             }
             if (g_TessParams.instanceIndex == 0 && pointIndex == 0 && groupClusterIndex < 7) {
@@ -252,7 +252,7 @@ void FillClustersMain(uint3 threadIdx, uint3 groupIdx)
                 // Log cluster metadata: iSurface, nVertexOffset, sizeX, sizeY, offset, clusterIndex
                 u_Debug[debugIdx].uintData = uint4(iSurface, rCluster.nVertexOffset, rCluster.sizeX | (rCluster.sizeY << 16), clusterIndex);
                 u_Debug[debugIdx].floatData = float4(limit.p.x, limit.p.y, limit.p.z, asfloat(rCluster.offset.x | (rCluster.offset.y << 16)));
-                u_Debug[debugIdx].payloadType = 4; // Mark as fill_clusters cluster metadata
+                u_Debug[debugIdx].payloadType = 104; // Mark as fill_clusters cluster metadata (104 to avoid conflict with ShaderDebug PayloadType_Uint4=4)
                 u_Debug[debugIdx].lineNumber = 0;
             }
 

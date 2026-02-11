@@ -27,7 +27,11 @@
 #ifndef SHADER_DEBUG_SLANG_H
 #define SHADER_DEBUG_SLANG_H
 
-#define ENABLE_SHADER_DEBUG 1
+#define ENABLE_SHADER_DEBUG 0
+
+// Slots 0..SHADER_DEBUG_RESERVED_SLOTS-1 are reserved for custom debug writes.
+// ShaderDebug_AllocateSlot() starts allocating from this offset.
+#define SHADER_DEBUG_RESERVED_SLOTS 16
 
 // PayloadType constants (standalone for Slang compatibility)
 static const uint PayloadType_None = 0;
@@ -63,11 +67,13 @@ uint ShaderDebug_AllocateSlot(RWStructuredBuffer<ShaderDebugElement> output)
 {
     uint bufferSize, bufferStride;
     output.GetDimensions(bufferSize, bufferStride);
-    uint maxSize = bufferSize - 1;
+    // Reserve first SHADER_DEBUG_RESERVED_SLOTS slots for custom debug writes.
+    // ShaderDebug allocates in the remaining range [SHADER_DEBUG_RESERVED_SLOTS, bufferSize-1].
+    uint availableSlots = bufferSize - SHADER_DEBUG_RESERVED_SLOTS;
 
     uint result;
     InterlockedAdd(output[0].payloadType, 1, result);
-    return (result % maxSize) + 1;
+    return (result % availableSlots) + SHADER_DEBUG_RESERVED_SLOTS;
 }
 
 void ShaderDebug_WriteFloat4(RWStructuredBuffer<ShaderDebugElement> output, float4 value, uint lineNumber, uint payloadType, bool checkPredicate)

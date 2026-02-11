@@ -484,24 +484,48 @@ namespace dxvk {
       std::unordered_map<uint32_t, Matrix4> surfaceTransforms;
       uint32_t clusterInstCount = 0;
       Logger::warn(str::format("CHECKPOINT: mergeInstances collecting transforms, instances=", instances.size()));
+      uint32_t identityO2W = 0, nonIdentityO2W = 0;
+      uint32_t hasI2O = 0, noI2O = 0;
       for (RtInstance* inst : instances) {
         if (inst && inst->getBlas() && inst->getBlas()->isClusterBlas()) {
           uint32_t surfaceId = inst->getBlas()->megaGeoSurfaceId;
-          // Build Matrix4 directly from VkTransformMatrixKHR (row-major) without transposing
-          // This matches what affineToColumnMajor expects
-          Matrix4 worldTransform = Matrix4(inst->getVkInstance().transform);
-          surfaceTransforms[surfaceId] = worldTransform;
+          // Compute the full transform: objectToWorld * instanceToObject (if available)
+          // This matches what addBlas does for standard instances at line 1117
+          Matrix4 fullTransform;
+          if (inst->surface.instancesToObject != nullptr && !inst->surface.instancesToObject->empty()) {
+            fullTransform = inst->surface.objectToWorld * (*inst->surface.instancesToObject)[0];
+            hasI2O++;
+          } else {
+            fullTransform = inst->surface.objectToWorld;
+            noI2O++;
+          }
+          surfaceTransforms[surfaceId] = fullTransform;
+          bool isIdentity = (fullTransform.data[0][0] == 1.f && fullTransform.data[1][1] == 1.f && fullTransform.data[2][2] == 1.f &&
+                             fullTransform.data[0][1] == 0.f && fullTransform.data[0][2] == 0.f && fullTransform.data[0][3] == 0.f &&
+                             fullTransform.data[1][0] == 0.f && fullTransform.data[1][2] == 0.f && fullTransform.data[1][3] == 0.f &&
+                             fullTransform.data[2][0] == 0.f && fullTransform.data[2][1] == 0.f && fullTransform.data[2][3] == 0.f);
+          if (isIdentity) identityO2W++; else nonIdentityO2W++;
           clusterInstCount++;
         }
       }
-      Logger::warn(str::format("CHECKPOINT: mergeInstances transforms collected, cluster=", clusterInstCount, " surfaces=", surfaceTransforms.size()));
-      // Log first transform to verify it's a valid world transform (not identity or projection)
+      Logger::warn(str::format("CHECKPOINT: mergeInstances transforms collected, cluster=", clusterInstCount,
+          " surfaces=", surfaceTransforms.size(),
+          " fullXform(identity=", identityO2W, " nonIdentity=", nonIdentityO2W,
+          ") i2o(has=", hasI2O, " none=", noI2O, ")"));
+      // Log first non-identity transform (or first transform if all identity)
       {
         static uint32_t s_transformLogCount = 0;
         if (s_transformLogCount < 5 && !surfaceTransforms.empty()) {
+          // Prefer logging a non-identity transform
           auto it = surfaceTransforms.begin();
+          for (auto jt = surfaceTransforms.begin(); jt != surfaceTransforms.end(); ++jt) {
+            const Matrix4& m = jt->second;
+            if (m.data[0][0] != 1.f || m.data[0][3] != 0.f || m.data[1][3] != 0.f || m.data[2][3] != 0.f) {
+              it = jt; break;
+            }
+          }
           const Matrix4& m = it->second;
-          Logger::warn(str::format("CHECKPOINT: RTXMG localToWorld surfaceId=", it->first, " (Matrix4 from VkTransformMatrixKHR):"));
+          Logger::warn(str::format("CHECKPOINT: RTXMG localToWorld surfaceId=", it->first, " (from surface.objectToWorld):"));
           Logger::warn(str::format("  data[0]=(", m.data[0][0], ", ", m.data[0][1], ", ", m.data[0][2], ", ", m.data[0][3], ")"));
           Logger::warn(str::format("  data[1]=(", m.data[1][0], ", ", m.data[1][1], ", ", m.data[1][2], ", ", m.data[1][3], ")"));
           Logger::warn(str::format("  data[2]=(", m.data[2][0], ", ", m.data[2][1], ", ", m.data[2][2], ", ", m.data[2][3], ")"));
@@ -979,12 +1003,34 @@ namespace dxvk {
         else nonNullAddrCount++;
       }
 
+      // Count identity vs non-identity transforms for cluster and standard TLAS instances
+      uint32_t clusterIdentity = 0, clusterNonIdentity = 0;
+      uint32_t stdIdentity = 0, stdNonIdentity = 0;
+      auto countTransforms = [&](const std::vector<VkAccelerationStructureInstanceKHR>& instances) {
+        for (const auto& inst : instances) {
+          auto& t = inst.transform.matrix;
+          bool isIdentity = (t[0][0] == 1.f && t[0][1] == 0.f && t[0][2] == 0.f && t[0][3] == 0.f &&
+                             t[1][0] == 0.f && t[1][1] == 1.f && t[1][2] == 0.f && t[1][3] == 0.f &&
+                             t[2][0] == 0.f && t[2][1] == 0.f && t[2][2] == 1.f && t[2][3] == 0.f);
+          bool isCluster = (inst.instanceCustomIndex & CUSTOM_INDEX_IS_CLUSTER_SURFACE) != 0;
+          if (isCluster) {
+            if (isIdentity) clusterIdentity++; else clusterNonIdentity++;
+          } else {
+            if (isIdentity) stdIdentity++; else stdNonIdentity++;
+          }
+        }
+      };
+      countTransforms(m_mergedInstances[Tlas::Opaque]);
+      countTransforms(m_mergedInstances[Tlas::Unordered]);
+
       Logger::warn(str::format("RTX MegaGeo GEO PIPELINE: input=", geoCountTotal,
           " | tlasOutput=", tlasOutput, " (opaque=", tlasOpaque, " unordered=", tlasUnordered, ")",
           " | cluster=", clusterInTlas, " std=", geoCountStandard,
           " | invalidated=", totalInvalidated,
           " | blasAddr: null=", nullAddrCount, " valid=", nonNullAddrCount,
           " | patches=", m_clusterInstancePatches.size()));
+      Logger::warn(str::format("RTX MegaGeo TRANSFORMS: cluster(identity=", clusterIdentity, " nonIdentity=", clusterNonIdentity,
+          ") std(identity=", stdIdentity, " nonIdentity=", stdNonIdentity, ")"));
     }
   }
 
@@ -1070,17 +1116,43 @@ namespace dxvk {
         s_clusterAddBlasFrame = curFrame;
         s_clusterAddBlasCount = 0;
       }
-      if (s_clusterAddBlasCount < 3) {
-        Logger::warn(str::format("CHECKPOINT: addBlas cluster[", s_clusterAddBlasCount, "]: surfaceIdx=", surfaceIndexForCustomIndex,
-            " customIdx=0x", std::hex, blasInstance.instanceCustomIndex, std::dec,
-            " mask=0x", std::hex, blasInstance.mask, std::dec,
-            " remixIdx=", static_cast<uint32_t>(m_mergedInstances[Tlas::Opaque].size())));
-        // Log TLAS instance transform to diagnose "flat on screen" geometry
+      // Log ALL cluster instances (not just first 3) for first 3 frames, then first 5 per frame
+      {
         auto& t = blasInstance.transform.matrix;
-        Logger::warn(str::format("CHECKPOINT: addBlas cluster[", s_clusterAddBlasCount, "] TLAS transform:"));
-        Logger::warn(str::format("  row0=(", t[0][0], ", ", t[0][1], ", ", t[0][2], ", ", t[0][3], ")"));
-        Logger::warn(str::format("  row1=(", t[1][0], ", ", t[1][1], ", ", t[1][2], ", ", t[1][3], ")"));
-        Logger::warn(str::format("  row2=(", t[2][0], ", ", t[2][1], ", ", t[2][2], ", ", t[2][3], ")"));
+        bool isIdentity = (t[0][0] == 1.f && t[0][1] == 0.f && t[0][2] == 0.f && t[0][3] == 0.f &&
+                           t[1][0] == 0.f && t[1][1] == 1.f && t[1][2] == 0.f && t[1][3] == 0.f &&
+                           t[2][0] == 0.f && t[2][1] == 0.f && t[2][2] == 1.f && t[2][3] == 0.f);
+        static uint32_t s_fullLogFrames = 0;
+        bool doFullLog = (s_fullLogFrames < 3);  // Log all instances for first 3 frames
+        bool doPartialLog = (s_clusterAddBlasCount < 5);  // Then just first 5
+
+        if (doFullLog || doPartialLog) {
+          Logger::warn(str::format("CHECKPOINT: addBlas cluster[", s_clusterAddBlasCount, "]: surfaceIdx=", surfaceIndexForCustomIndex,
+              " customIdx=0x", std::hex, blasInstance.instanceCustomIndex, std::dec,
+              " mask=0x", std::hex, blasInstance.mask, std::dec,
+              " remixIdx=", static_cast<uint32_t>(m_mergedInstances[Tlas::Opaque].size()),
+              " transform=", isIdentity ? "IDENTITY" : "NON-IDENTITY",
+              " rtxmgIdx=", (isClusterBlas && blasEntry->megaGeoBuilder) ?
+                  blasEntry->megaGeoBuilder->getInstanceIndexForSurface(blasEntry->megaGeoSurfaceId) : UINT32_MAX));
+          if (!isIdentity) {
+            Logger::warn(str::format("  row0=(", t[0][0], ", ", t[0][1], ", ", t[0][2], ", ", t[0][3], ")"));
+            Logger::warn(str::format("  row1=(", t[1][0], ", ", t[1][1], ", ", t[1][2], ", ", t[1][3], ")"));
+            Logger::warn(str::format("  row2=(", t[2][0], ", ", t[2][1], ", ", t[2][2], ", ", t[2][3], ")"));
+          }
+          // Also log the surface's objectToWorld
+          const Matrix4& o2w = instance->surface.objectToWorld;
+          bool o2wIsIdentity = (o2w.data[0][0] == 1.f && o2w.data[1][1] == 1.f && o2w.data[2][2] == 1.f &&
+                                o2w.data[3][3] == 1.f && o2w.data[0][1] == 0.f && o2w.data[0][2] == 0.f);
+          if (!o2wIsIdentity) {
+            Logger::warn(str::format("  objectToWorld: NON-IDENTITY col3=(", o2w.data[3][0], ",", o2w.data[3][1], ",", o2w.data[3][2], ")"));
+          }
+        }
+        // Track if we did full logging this frame
+        static uint32_t s_prevFullFrame = UINT32_MAX;
+        if (curFrame != s_prevFullFrame && doFullLog) {
+          s_prevFullFrame = curFrame;
+          s_fullLogFrames++;
+        }
       }
       s_clusterAddBlasCount++;
     }
@@ -1377,10 +1449,15 @@ namespace dxvk {
       m_megaGeoBuilder->patchClusterBlasAddressesGPU(instanceBufferWrapper.Get(), 0, mappings);
       Logger::warn("CHECKPOINT: post-patchGPU");
 
-      // Barrier: GPU PATCH compute wrote instance buffer, TLAS build needs to read it
+      // Barrier: TLAS build needs to read both:
+      //  1. Instance buffer (written by patch compute shader → SHADER_WRITE)
+      //  2. BLAS data in blasBuffer (written by cluster BLAS build → AS_WRITE)
+      // Barrier 1 above made AS_WRITE visible to SHADER_READ (for the patch shader),
+      // but NOT to AS_READ. We must include AS_WRITE here so the TLAS build can
+      // read the BLAS data through the addresses patched into the instance buffer.
       ctx->emitMemoryBarrier(0,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_ACCESS_SHADER_WRITE_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+        VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
         VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
         VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR);
     }
