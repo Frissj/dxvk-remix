@@ -796,6 +796,15 @@ namespace dxvk {
             ? std::min(item.range.byteSize, bufferSize - offset)
             : bufferSize - offset;
 
+          // Volatile constant buffers: use the current version's offset and size.
+          // writeVolatile() writes to a ring buffer at version-specific offsets, but the
+          // default descriptor covers the full buffer from offset 0 (stale/zero data).
+          // We must point the descriptor to the actual version that was just written.
+          if (item.type == nvrhi::BindingSetItem::Type::ConstantBuffer && nvrhiBuffer->isVolatile()) {
+            offset = nvrhiBuffer->getCurrentVersionOffset();
+            size = nvrhiBuffer->getPerVersionSize();
+          }
+
           DxvkBufferSliceHandle sliceHandle = dxvkBuffer->getSliceHandle();
 
           VkDescriptorBufferInfo bufferInfo = {};
@@ -950,6 +959,7 @@ namespace dxvk {
     // Store in binding set (owns pool - pool is destroyed when binding set is destroyed, thread-safe)
     bindingSet->setDescriptorSet(descriptorPool, descriptorSet, m_vkDevice, true);
 
+    // Always log VkDescriptorSet handle for tracing
     RTXMG_LOG(str::format("RTX MegaGeo: createBindingSet - created pre-built descriptor set with ",
       writes.size(), " descriptors for space ", layoutDesc.registerSpace));
 

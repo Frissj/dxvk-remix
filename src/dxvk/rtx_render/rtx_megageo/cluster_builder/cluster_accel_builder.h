@@ -40,6 +40,7 @@
 #include "../utils/shader_debug.h"
 #include "../hiz/hiz_buffer_constants.h"
 
+#include <deque>
 #include <memory>
 #include <vector>
 // clang-format on
@@ -327,6 +328,16 @@ protected:
     static constexpr uint32_t kInstanceResizeCooldownFrames = 120;  // ~2 seconds cooldown after any resize
     uint32_t m_instanceShrinkCounter = 0;   // Consecutive frames below shrink threshold
     uint32_t m_instanceResizeCooldown = 0;  // Frames remaining in cooldown after a resize
+
+    // Deferred buffer release: old buffers kept alive for N frames after resize
+    // so in-flight GPU work can finish before memory is freed.
+    // This replaces flushCommandList+waitForIdle, avoiding mid-frame command buffer splits.
+    static constexpr uint32_t kDeferredReleaseFrames = 4;
+    struct DeferredBufferRelease {
+        uint32_t frameIndex;
+        std::vector<nvrhi::BufferHandle> buffers;
+    };
+    std::deque<DeferredBufferRelease> m_deferredReleases;
 
     struct TemplateBuffers
     {

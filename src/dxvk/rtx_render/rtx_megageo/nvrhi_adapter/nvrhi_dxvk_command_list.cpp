@@ -269,6 +269,21 @@ namespace dxvk {
     Rc<DxvkBuffer> dxvkDst = nvrhiDst->getDxvkBuffer();
     Rc<DxvkBuffer> dxvkSrc = nvrhiSrc->getDxvkBuffer();
 
+    // DIAG: Log VkBuffer handles for source buffer to compare with descriptor set binding
+    {
+      static uint32_t s_copyDiagCount = 0;
+      if (s_copyDiagCount < 20 && srcName && strstr(srcName, "vertex pos")) {
+        DxvkBufferSliceHandle srcSlice = dxvkSrc->getSliceHandle();
+        Logger::warn(str::format("DIAG COPYBUF: src='", srcName,
+          "' nvrhiBuf=", (void*)src,
+          " VkBuffer=0x", std::hex, (uint64_t)srcSlice.handle, std::dec,
+          " sliceOffset=", srcSlice.offset,
+          " deviceAddr=0x", std::hex, dxvkSrc->getDeviceAddress(), std::dec,
+          " copyOffset=", srcOffset, " copySize=", size));
+        s_copyDiagCount++;
+      }
+    }
+
     // When the special dispatch path is used (pre-built descriptor sets / raw Vulkan dispatch),
     // DXVK doesn't track compute shader UAV writes. We must insert an explicit barrier
     // to ensure compute writes are visible before the transfer read.
@@ -716,6 +731,7 @@ namespace dxvk {
           RTXMG_LOG(str::format("RTX MegaGeo: binding pre-built descriptor set at index ", pending.setIndex,
             " with pipelineLayout=", (void*)layoutToUse));
 
+          // Always log VkDescriptorSet handle being bound (dispatchIndirect path)
           m_device->getDxvkDevice()->vkd()->vkCmdBindDescriptorSets(
             cmdBuffer,
             VK_PIPELINE_BIND_POINT_COMPUTE,

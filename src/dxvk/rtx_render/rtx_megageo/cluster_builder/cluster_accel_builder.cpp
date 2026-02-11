@@ -2101,6 +2101,83 @@ void ClusterAccelBuilder::BuildBlasFromClas(ClusterAccels& accels, const Instanc
     if (blasPtrsAddr == 0) Logger::err("RTX MegaGeo: BuildBlasFromClas - blasPtrsAddr is NULL!");
     if (blasBufferAddr == 0) Logger::err("RTX MegaGeo: BuildBlasFromClas - blasBufferAddr is NULL!");
 
+    // DIAGNOSTIC: Download and inspect BLAS indirect args + CLAS pointers to find why most BLAS addresses are zero
+    {
+        static uint32_t s_diagCount = 0;
+        if (s_diagCount < 3) {
+            s_diagCount++;
+
+            // 1. Download BLAS indirect args
+            auto blasIndirectArgs = m_blasFromClasIndirectArgsBuffer.Download(commandList);
+            uint32_t zeroCountArgs = 0, zeroAddrArgs = 0, validArgs = 0;
+            uint32_t totalClusterCount = 0;
+            for (uint32_t i = 0; i < std::min(uint32_t(blasIndirectArgs.size()), numInstances); ++i) {
+                const auto& arg = blasIndirectArgs[i];
+                if (arg.clusterCount == 0) zeroCountArgs++;
+                if (arg.clusterAddresses == 0) zeroAddrArgs++;
+                if (arg.clusterCount > 0 && arg.clusterAddresses != 0) validArgs++;
+                totalClusterCount += arg.clusterCount;
+            }
+            Logger::warn(str::format("DIAG BLAS-ARGS: numInstances=", numInstances,
+                " validArgs=", validArgs, " zeroCount=", zeroCountArgs, " zeroAddr=", zeroAddrArgs,
+                " totalClusters=", totalClusterCount));
+
+            // Log first 10 and any problematic entries
+            for (uint32_t i = 0; i < std::min(uint32_t(blasIndirectArgs.size()), numInstances); ++i) {
+                const auto& arg = blasIndirectArgs[i];
+                if (i < 10 || arg.clusterCount == 0 || arg.clusterAddresses == 0) {
+                    Logger::warn(str::format("DIAG BLAS-ARGS[", i, "]: clusterCount=", arg.clusterCount,
+                        " addr=0x", std::hex, arg.clusterAddresses, std::dec,
+                        " stride=", arg.clusterReferencesStride));
+                    if (i == 10) Logger::warn("  ... (showing only problematic entries after this)");
+                }
+            }
+
+            // 2. Download clusterOffsetCounts to see per-instance offsets
+            auto offsetCounts = m_clusterOffsetCountsBuffer.Download(commandList);
+            Logger::warn(str::format("DIAG OFFSET-COUNTS: buffer elements=", offsetCounts.size()));
+            uint32_t zeroOffsetCount = 0;
+            for (uint32_t i = 0; i < std::min(uint32_t(offsetCounts.size()), numInstances); ++i) {
+                // Index: instanceIndex * NumTypes + All = i * 4 + 3
+                uint32_t idx = i * 4 + 3; // ClusterDispatchType::All = 3, NumTypes = 4
+                if (idx < offsetCounts.size()) {
+                    uint32_t offset = offsetCounts[idx].x;
+                    uint32_t count = offsetCounts[idx].y;
+                    if (count == 0) zeroOffsetCount++;
+                    if (i < 10 || count == 0) {
+                        Logger::warn(str::format("DIAG OFFSET-COUNTS[inst", i, " idx", idx, "]: offset=", offset, " count=", count));
+                    }
+                }
+            }
+            Logger::warn(str::format("DIAG OFFSET-COUNTS: zeroCountInstances=", zeroOffsetCount, " of ", numInstances));
+
+            // 3. Download CLAS pointers to check if they're valid
+            auto clasPtrs = accels.clasPtrsBuffer.Download(commandList);
+            uint32_t zeroClas = 0, nonZeroClas = 0;
+            for (size_t i = 0; i < clasPtrs.size(); ++i) {
+                if (clasPtrs[i] == 0) zeroClas++;
+                else nonZeroClas++;
+            }
+            Logger::warn(str::format("DIAG CLAS-PTRS: total=", clasPtrs.size(), " nonZero=", nonZeroClas, " zero=", zeroClas));
+
+            // Sample CLAS ptrs for first few instances based on their offsets
+            for (uint32_t i = 0; i < std::min(5u, numInstances); ++i) {
+                uint32_t idx = i * 4 + 3;
+                if (idx < offsetCounts.size()) {
+                    uint32_t offset = offsetCounts[idx].x;
+                    uint32_t count = offsetCounts[idx].y;
+                    uint32_t instNonZero = 0;
+                    for (uint32_t c = 0; c < std::min(count, uint32_t(clasPtrs.size()) - offset); ++c) {
+                        if (clasPtrs[offset + c] != 0) instNonZero++;
+                    }
+                    Logger::warn(str::format("DIAG CLAS-PTRS inst[", i, "]: offset=", offset,
+                        " count=", count, " nonZeroClas=", instNonZero,
+                        " first=0x", std::hex, (offset < clasPtrs.size() ? clasPtrs[offset] : 0), std::dec));
+                }
+            }
+        }
+    }
+
 #if RTXMG_LOG_CLUSTER_ACCEL_BUILDER
     // Download and log the first few BLAS indirect args to diagnose misaligned address errors (GPU readback - only when logging enabled)
     {
@@ -2310,61 +2387,69 @@ void ClusterAccelBuilder::UpdateMemoryAllocations(ClusterAccels& accels, uint32_
         RTXMG_LOG(str::format("  maxVertices: ", oldMaxVertices, " -> ", maxVertices));
 
     // ==========================================================================
-    // RELEASE OLD BUFFERS before creating new ones
+    // DEFERRED RELEASE: Save old buffer handles before creating replacements.
+    // Old buffers are kept alive for kDeferredReleaseFrames frames so in-flight
+    // GPU work (which may reference them via raw device addresses) can finish
+    // before the memory is freed. This avoids the expensive flushCommandList +
+    // waitForIdle that would stall the CPU and split the command buffer mid-frame.
     // ==========================================================================
-    // Only flush+wait when buffers are actually being released. Without this guard,
-    // subdPatches changes (which only resize gridSamplers) would call waitForIdle()
-    // every frame, serializing CPU/GPU and causing the game to freeze.
-    bool needBufferRelease = instanceBuffersNeedResize || numClustersChanged || clasBytesChanged || maxVerticesChanged || enableVertexNormalsChanged || gridSamplersNeedResize;
-    if (needBufferRelease)
-    {
-        // Cluster AS operations access buffers via raw device addresses, bypassing
-        // DXVK's command list lifetime tracking. Must flush+wait before releasing.
-        Logger::warn("RTX MegaGeo: UpdateMemoryAllocations - flushing command list before waitForIdle");
-        m_rtxContext->flushCommandList();
-        m_device->waitForIdle();
-    }
+    DeferredBufferRelease deferred;
+    deferred.frameIndex = m_currentFrameIndex;
+
+    auto deferBuffer = [&deferred](auto& rtxmgBuffer) {
+        if (auto buf = rtxmgBuffer.GetBuffer()) {
+            deferred.buffers.push_back(buf);
+        }
+        rtxmgBuffer.Release();
+    };
 
     if (instanceBuffersNeedResize)
     {
-        m_clusterOffsetCountsBuffer.Release();
-        m_fillClustersDispatchIndirectBuffer.Release();
-        m_blasFromClasIndirectArgsBuffer.Release();
-        accels.blasPtrsBuffer.Release();
-        accels.blasSizesBuffer.Release();
+        deferBuffer(m_clusterOffsetCountsBuffer);
+        deferBuffer(m_fillClustersDispatchIndirectBuffer);
+        deferBuffer(m_blasFromClasIndirectArgsBuffer);
+        deferBuffer(accels.blasPtrsBuffer);
+        deferBuffer(accels.blasSizesBuffer);
     }
 
     if (gridSamplersNeedResize)
     {
-        m_gridSamplersBuffer.Release();
+        deferBuffer(m_gridSamplersBuffer);
     }
 
     if (numClustersChanged)
     {
-        m_clustersBuffer.Release();
-        m_clasIndirectArgDataBuffer.Release();
-        accels.clusterShadingDataBuffer.Release();
-        accels.clasPtrsBuffer.Release();
+        deferBuffer(m_clustersBuffer);
+        deferBuffer(m_clasIndirectArgDataBuffer);
+        deferBuffer(accels.clusterShadingDataBuffer);
+        deferBuffer(accels.clasPtrsBuffer);
     }
 
     if (numClustersChanged || instanceBuffersNeedResize)
     {
-        accels.blasBuffer.Release();
+        deferBuffer(accels.blasBuffer);
     }
 
     if (clasBytesChanged)
     {
-        accels.clasBuffer.Release();
+        deferBuffer(accels.clasBuffer);
     }
 
     if (maxVerticesChanged)
     {
-        accels.clusterVertexPositionsBuffer.Release();
+        deferBuffer(accels.clusterVertexPositionsBuffer);
     }
 
     if (maxVerticesChanged || enableVertexNormalsChanged)
     {
-        accels.clusterVertexNormalsBuffer.Release();
+        deferBuffer(accels.clusterVertexNormalsBuffer);
+    }
+
+    if (!deferred.buffers.empty()) {
+        Logger::warn(str::format("RTX MegaGeo: UpdateMemoryAllocations - deferred ",
+            deferred.buffers.size(), " old buffers for release in ",
+            kDeferredReleaseFrames, " frames"));
+        m_deferredReleases.push_back(std::move(deferred));
     }
 
     // ==========================================================================
@@ -2533,6 +2618,12 @@ void ClusterAccelBuilder::BuildAccel(const RTXMGScene& scene, const TessellatorC
     ClusterAccels& accels, ClusterStatistics& stats, uint32_t frameIndex, nvrhi::ICommandList* commandList)
 {
     m_currentFrameIndex = frameIndex;
+
+    // Release deferred buffers that are old enough (GPU has finished using them)
+    while (!m_deferredReleases.empty() &&
+           m_currentFrameIndex >= m_deferredReleases.front().frameIndex + kDeferredReleaseFrames) {
+        m_deferredReleases.pop_front();
+    }
 
 #if RTXMG_CHRONO_TIMING
     auto chronoStart = std::chrono::high_resolution_clock::now();

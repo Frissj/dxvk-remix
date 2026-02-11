@@ -812,56 +812,10 @@ private:
       RTXMG_LOG("RTX MegaGeo: Scene is null, cannot rebuild instances");
     }
 
-    // Dirty tracking: skip expensive BuildAccel if nothing changed
+    // Always rebuild - skipping BuildAccel when camera is stationary causes
+    // GPU hangs because the TLAS is rebuilt with stale BLAS references.
+    // TODO: Investigate proper dirty tracking that keeps BLAS/TLAS consistent.
     {
-      bool needsRebuild = m_forceRebuild;
-
-      if (!needsRebuild) {
-        const float cameraPosThreshold = 0.01f;
-        const float cameraFwdThreshold = 0.001f;
-        const float fovThreshold = 0.001f;
-
-        float posDelta = length(actualCameraPos - m_prevCameraPosition);
-        float fwdDelta = length(forward - m_prevCameraForward);
-
-        if (posDelta > cameraPosThreshold ||
-            fwdDelta > cameraFwdThreshold ||
-            std::abs(fovY - m_prevFovY) > fovThreshold) {
-          needsRebuild = true;
-        }
-      }
-
-      if (!needsRebuild) {
-        if (m_instanceTransforms.size() != m_prevBuildTransforms.size()) {
-          needsRebuild = true;
-        } else {
-          for (const auto& [surfaceId, transform] : m_instanceTransforms) {
-            auto it = m_prevBuildTransforms.find(surfaceId);
-            if (it == m_prevBuildTransforms.end()) {
-              needsRebuild = true;
-              break;
-            }
-            const auto& prev = it->second;
-            bool same = true;
-            for (int r = 0; r < 4 && same; r++)
-              for (int c = 0; c < 4 && same; c++)
-                if (std::abs(transform.data[r][c] - prev.data[r][c]) > 1e-6f)
-                  same = false;
-            if (!same) { needsRebuild = true; break; }
-          }
-        }
-      }
-
-      m_prevCameraPosition = actualCameraPos;
-      m_prevCameraForward = forward;
-      m_prevFovY = fovY;
-      m_prevBuildTransforms = m_instanceTransforms;
-      m_forceRebuild = false;
-
-      if (!needsRebuild) {
-        RTXMG_LOG("RTX MegaGeo: Skipping BuildAccel - nothing changed");
-        return true;
-      }
     }
 
     // Chrono timing for BuildAccel
