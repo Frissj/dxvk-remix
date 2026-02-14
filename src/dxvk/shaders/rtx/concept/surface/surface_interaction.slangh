@@ -395,7 +395,7 @@ SurfaceInteraction surfaceInteractionCreateCluster<let GenerateTangents : bool>(
   }
 
   // DEBUG: Bright red vertex color for cluster surfaces to visually identify them
-  surfaceInteraction.vertexColor = f16vec4(1.0, 0.0, 0.0, 1.0);
+  //surfaceInteraction.vertexColor = f16vec4(1.0, 0.0, 0.0, 1.0);
 
   return surfaceInteraction;
 }

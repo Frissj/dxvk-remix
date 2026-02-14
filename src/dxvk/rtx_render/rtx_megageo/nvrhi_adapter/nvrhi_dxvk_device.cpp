@@ -765,8 +765,16 @@ namespace dxvk {
     writes.reserve(desc.bindings.size());
     imageViews.reserve(desc.bindings.size());
 
+    uint32_t skippedNullCount = 0;
     for (const auto& item : desc.bindings) {
-      if (item.resourceHandle == nullptr) continue;
+      if (item.resourceHandle == nullptr) {
+        uint32_t wouldBeBinding = layoutDesc.registerSpaceIsDescriptorSet
+          ? item.slot : getBindingOffsetForSetType(item.type) + item.slot;
+        Logger::warn(str::format("RTX MegaGeo: createBindingSet - SKIPPING binding ", wouldBeBinding,
+          " (slot=", item.slot, " type=", (int)item.type, ") due to NULL resourceHandle!"));
+        skippedNullCount++;
+        continue;
+      }
 
       VkWriteDescriptorSet write = {};
       write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -953,6 +961,31 @@ namespace dxvk {
 
     // Update descriptor set with all writes
     if (!writes.empty()) {
+      // One-shot diagnostic: if any write targets binding 208 (UAV slot 8), dump all writes
+      static bool s_dumpedUav8 = false;
+      if (!s_dumpedUav8) {
+        for (const auto& w : writes) {
+          if (w.dstBinding == 208) {
+            s_dumpedUav8 = true;
+            Logger::warn(str::format("TILING_DBG: createBindingSet descriptor writes (", writes.size(), " total) for set with UAV(8):"));
+            for (size_t wi = 0; wi < writes.size(); ++wi) {
+              const auto& wd = writes[wi];
+              if (wd.pBufferInfo) {
+                Logger::warn(str::format("  write[", wi, "] binding=", wd.dstBinding, " type=", (int)wd.descriptorType,
+                  " buf=0x", std::hex, (uint64_t)wd.pBufferInfo->buffer, std::dec,
+                  " offset=", wd.pBufferInfo->offset, " range=", wd.pBufferInfo->range));
+              } else if (wd.pImageInfo) {
+                Logger::warn(str::format("  write[", wi, "] binding=", wd.dstBinding, " type=", (int)wd.descriptorType,
+                  " imageView=0x", std::hex, (uint64_t)wd.pImageInfo->imageView, std::dec,
+                  " arrayElem=", wd.dstArrayElement));
+              } else {
+                Logger::warn(str::format("  write[", wi, "] binding=", wd.dstBinding, " type=", (int)wd.descriptorType, " (no info)"));
+              }
+            }
+            break;
+          }
+        }
+      }
       vkUpdateDescriptorSets(m_vkDevice, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
     }
 
@@ -960,6 +993,10 @@ namespace dxvk {
     bindingSet->setDescriptorSet(descriptorPool, descriptorSet, m_vkDevice, true);
 
     // Always log VkDescriptorSet handle for tracing
+    if (skippedNullCount > 0) {
+      Logger::warn(str::format("RTX MegaGeo: createBindingSet - WARNING: ", skippedNullCount,
+        " bindings SKIPPED due to NULL resourceHandle! (", writes.size(), " writes, space=", layoutDesc.registerSpace, ")"));
+    }
     RTXMG_LOG(str::format("RTX MegaGeo: createBindingSet - created pre-built descriptor set with ",
       writes.size(), " descriptors for space ", layoutDesc.registerSpace));
 

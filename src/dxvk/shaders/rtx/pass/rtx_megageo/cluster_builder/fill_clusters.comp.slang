@@ -256,6 +256,184 @@ void FillClustersMain(uint3 threadIdx, uint3 groupIdx)
                 u_Debug[debugIdx].lineNumber = 0;
             }
 
+            // DIAG: Dump control point data chain for first cluster, first vertex of instance 0
+            // Slots 16-23: control point diagnostic data (payloadType=105)
+            if (g_TessParams.instanceIndex == 0 && groupClusterIndex == 0 && pointIndex == 0) {
+                SurfaceDescriptor desc = t_VertexSurfaceDescriptors[iSurface];
+
+                // Slot 16: surface descriptor raw data
+                u_Debug[16].uintData = uint4(iSurface, desc.field0, desc.firstControlPoint, 0);
+                u_Debug[16].floatData = float4(0, 0, 0, 0);
+                u_Debug[16].payloadType = 105;
+                u_Debug[16].lineNumber = 1;
+
+                // Slot 17: control point indices [0..3]
+                uint cpi0 = t_VertexControlPointIndices[desc.firstControlPoint + 0];
+                uint cpi1 = t_VertexControlPointIndices[desc.firstControlPoint + 1];
+                uint cpi2 = t_VertexControlPointIndices[desc.firstControlPoint + 2];
+                uint cpi3 = t_VertexControlPointIndices[desc.firstControlPoint + 3];
+                u_Debug[17].uintData = uint4(cpi0, cpi1, cpi2, cpi3);
+                u_Debug[17].floatData = float4(asfloat(desc.firstControlPoint), 0, 0, 0);
+                u_Debug[17].payloadType = 105;
+                u_Debug[17].lineNumber = 2;
+
+                // Slot 18: control point position p00 = positions[cpi0]
+                float3 p00 = t_VertexControlPoints[cpi0];
+                u_Debug[18].floatData = float4(p00.x, p00.y, p00.z, 0);
+                u_Debug[18].uintData = uint4(cpi0, 0, 0, 0);
+                u_Debug[18].payloadType = 105;
+                u_Debug[18].lineNumber = 3;
+
+                // Slot 19: control point position p10 = positions[cpi1]
+                float3 p10 = t_VertexControlPoints[cpi1];
+                u_Debug[19].floatData = float4(p10.x, p10.y, p10.z, 0);
+                u_Debug[19].uintData = uint4(cpi1, 0, 0, 0);
+                u_Debug[19].payloadType = 105;
+                u_Debug[19].lineNumber = 4;
+
+                // Slot 20: control point position p11 = positions[cpi2]
+                float3 p11 = t_VertexControlPoints[cpi2];
+                u_Debug[20].floatData = float4(p11.x, p11.y, p11.z, 0);
+                u_Debug[20].uintData = uint4(cpi2, 0, 0, 0);
+                u_Debug[20].payloadType = 105;
+                u_Debug[20].lineNumber = 5;
+
+                // Slot 21: control point position p01 = positions[cpi3]
+                float3 p01 = t_VertexControlPoints[cpi3];
+                u_Debug[21].floatData = float4(p01.x, p01.y, p01.z, 0);
+                u_Debug[21].uintData = uint4(cpi3, 0, 0, 0);
+                u_Debug[21].payloadType = 105;
+                u_Debug[21].lineNumber = 6;
+
+                // Slot 22: buffer dimension info
+                uint numDescriptors, descStride;
+                t_VertexSurfaceDescriptors.GetDimensions(numDescriptors, descStride);
+                uint numCPIndices, cpiStride;
+                t_VertexControlPointIndices.GetDimensions(numCPIndices, cpiStride);
+                uint numPositions, posStride;
+                t_VertexControlPoints.GetDimensions(numPositions, posStride);
+                u_Debug[22].uintData = uint4(numDescriptors, numCPIndices, numPositions, descStride);
+                u_Debug[22].floatData = float4(asfloat(cpiStride), asfloat(posStride), 0, 0);
+                u_Debug[22].payloadType = 105;
+                u_Debug[22].lineNumber = 7;
+
+                // Slot 23: evaluated limit position at uv=(0,0) for comparison
+                u_Debug[23].floatData = float4(limit.p.x, limit.p.y, limit.p.z, 0);
+                u_Debug[23].uintData = uint4(asuint(uv.x), asuint(uv.y), 0, 0);
+                u_Debug[23].payloadType = 105;
+                u_Debug[23].lineNumber = 8;
+
+                // Slots 24-30: Compare bilinear vs Evaluate() at multiple UV values
+                {
+                    SubdivisionEvaluatorHLSL cmpEval;
+                    cmpEval.m_surfaceIndex = iSurface;
+                    cmpEval.m_isolationLevel = g_TessParams.isolationLevel;
+                    cmpEval.m_surfaceDescriptors = t_VertexSurfaceDescriptors;
+                    cmpEval.m_plans = t_Plans;
+                    cmpEval.m_subpatchTrees = t_SubpatchTrees;
+                    cmpEval.m_vertexPatchPointIndices = t_PatchPointIndices;
+                    cmpEval.m_stencilMatrix = t_StencilMatrix;
+                    cmpEval.m_vertexControlPointIndices = t_VertexControlPointIndices;
+                    cmpEval.m_vertexControlPoints = t_VertexControlPoints;
+                    cmpEval.m_vertexPatchPointsOffsets = t_VertexPatchPointsOffsets;
+                    cmpEval.m_vertexPatchPoints = t_VertexPatchPoints;
+
+                    SurfaceDescriptor cmpDesc = t_VertexSurfaceDescriptors[iSurface];
+                    uint planIdx = cmpDesc.GetSubdivisionPlanIndex();
+                    bool isPure = (planIdx == 0);
+                    bool isBSp = !isPure && cmpEval.IsBSplinePatch();
+                    uint evalPath = isPure ? 0 : (isBSp ? 1 : 2);
+
+                    // Slot 24: path info + bilinear vs Evaluate at UV=(0.5, 0.5)
+                    LimitFrame bilin05 = cmpEval.EvaluateBilinear(float2(0.5, 0.5));
+                    LimitFrame subd05 = cmpEval.Evaluate(float2(0.5, 0.5));
+                    u_Debug[24].floatData = float4(bilin05.p.x, bilin05.p.y, bilin05.p.z, 0);
+                    u_Debug[24].uintData = uint4(evalPath, planIdx, asuint(subd05.p.x - bilin05.p.x), asuint(subd05.p.y - bilin05.p.y));
+                    u_Debug[24].payloadType = 106;
+                    u_Debug[24].lineNumber = 1;
+
+                    // Slot 25: Evaluate result at UV=(0.5, 0.5)
+                    u_Debug[25].floatData = float4(subd05.p.x, subd05.p.y, subd05.p.z, 0);
+                    u_Debug[25].uintData = uint4(asuint(subd05.p.z - bilin05.p.z), 0, 0, 0);
+                    u_Debug[25].payloadType = 106;
+                    u_Debug[25].lineNumber = 2;
+
+                    // Slot 26: bilinear vs Evaluate at UV=(0.25, 0.75)
+                    LimitFrame bilin2575 = cmpEval.EvaluateBilinear(float2(0.25, 0.75));
+                    LimitFrame subd2575 = cmpEval.Evaluate(float2(0.25, 0.75));
+                    u_Debug[26].floatData = float4(bilin2575.p.x, bilin2575.p.y, bilin2575.p.z, 0);
+                    u_Debug[26].uintData = uint4(asuint(subd2575.p.x - bilin2575.p.x), asuint(subd2575.p.y - bilin2575.p.y), asuint(subd2575.p.z - bilin2575.p.z), 0);
+                    u_Debug[26].payloadType = 106;
+                    u_Debug[26].lineNumber = 3;
+
+                    // Slot 27: Evaluate at UV=(0.25, 0.75)
+                    u_Debug[27].floatData = float4(subd2575.p.x, subd2575.p.y, subd2575.p.z, 0);
+                    u_Debug[27].uintData = uint4(0, 0, 0, 0);
+                    u_Debug[27].payloadType = 106;
+                    u_Debug[27].lineNumber = 4;
+
+                    // Slot 28: Check a DIFFERENT surface (surface 0) - bilinear vs Evaluate
+                    {
+                        SubdivisionEvaluatorHLSL cmpEval0;
+                        cmpEval0.m_surfaceIndex = 0;
+                        cmpEval0.m_isolationLevel = g_TessParams.isolationLevel;
+                        cmpEval0.m_surfaceDescriptors = t_VertexSurfaceDescriptors;
+                        cmpEval0.m_plans = t_Plans;
+                        cmpEval0.m_subpatchTrees = t_SubpatchTrees;
+                        cmpEval0.m_vertexPatchPointIndices = t_PatchPointIndices;
+                        cmpEval0.m_stencilMatrix = t_StencilMatrix;
+                        cmpEval0.m_vertexControlPointIndices = t_VertexControlPointIndices;
+                        cmpEval0.m_vertexControlPoints = t_VertexControlPoints;
+                        cmpEval0.m_vertexPatchPointsOffsets = t_VertexPatchPointsOffsets;
+                        cmpEval0.m_vertexPatchPoints = t_VertexPatchPoints;
+
+                        SurfaceDescriptor desc0 = t_VertexSurfaceDescriptors[0];
+                        uint planIdx0 = desc0.GetSubdivisionPlanIndex();
+                        bool isPure0 = (planIdx0 == 0);
+                        bool isBSp0 = !isPure0 && cmpEval0.IsBSplinePatch();
+                        uint path0 = isPure0 ? 0 : (isBSp0 ? 1 : 2);
+
+                        LimitFrame bilin0 = cmpEval0.EvaluateBilinear(float2(0.5, 0.5));
+                        LimitFrame subd0 = cmpEval0.Evaluate(float2(0.5, 0.5));
+                        u_Debug[28].floatData = float4(bilin0.p.x - subd0.p.x, bilin0.p.y - subd0.p.y, bilin0.p.z - subd0.p.z, 0);
+                        u_Debug[28].uintData = uint4(path0, planIdx0, desc0.firstControlPoint, 0);
+                        u_Debug[28].payloadType = 106;
+                        u_Debug[28].lineNumber = 5;
+                    }
+
+                    // Slot 29: numCP for current plan, HasSharpness, actual sharpness from node
+                    {
+                        SubdivisionPlanContext dbgPlan = cmpEval.GetPlan();
+                        SubdivisionNode rootNode = dbgPlan.GetRootNode();
+                        NodeDescriptor nDesc = rootNode.GetDesc();
+                        bool hasSharp = nDesc.HasSharpness();
+                        float sharp = hasSharp ? rootNode.GetSharpness() : 0.0f;
+                        float computedSharp = computeSingleCreaseSharpness(rootNode, nDesc, (uint16_t)nDesc.GetDepth(), g_TessParams.isolationLevel);
+                        u_Debug[29].floatData = float4(sharp, computedSharp, 0, 0);
+                        u_Debug[29].uintData = uint4(hasSharp ? 1 : 0, nDesc.GetBoundaryMask(), dbgPlan.m_data.numControlPoints, evalPath);
+                        u_Debug[29].payloadType = 106;
+                        u_Debug[29].lineNumber = 6;
+                    }
+
+                    // Slot 30: BSpline weights at UV=(0.5,0.5) - show positions 5,6,9,10 weights
+                    {
+                        SubdivisionPlanContext dbgPlan = cmpEval.GetPlan();
+                        float wP[16], wDs[16], wDt[16];
+                        uint16_t quadrant = 0;
+                        SubdivisionNode node = dbgPlan.EvaluateBasis(float2(0.5, 0.5), wP, wDs, wDt, quadrant, g_TessParams.isolationLevel);
+                        // Show weights at the 4 inner positions (5,6,9,10) and sum of outer ring
+                        float outerSum = 0;
+                        for (int i = 0; i < 16; i++) {
+                            if (i != 5 && i != 6 && i != 9 && i != 10) outerSum += wP[i];
+                        }
+                        u_Debug[30].floatData = float4(wP[5], wP[6], wP[9], wP[10]);
+                        u_Debug[30].uintData = uint4(asuint(outerSum), asuint(wP[0]), asuint(wP[3]), asuint(wP[15]));
+                        u_Debug[30].payloadType = 106;
+                        u_Debug[30].lineNumber = 7;
+                    }
+                }
+            }
+
 #if VERTEX_NORMALS
             GathererWriteNormal(limit, rCluster, pointIndex, subd);
 #endif

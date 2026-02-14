@@ -94,23 +94,52 @@ void Camera::ComputeBasis(Vector3& u, Vector3& v, Vector3& w) const {
 }
 
 Matrix4 Camera::GetViewMatrix() const {
-    Vector3 u, v, w;
-    ComputeBasis(u, v, w);
+    // Column-vector convention matching sample: mul(V, pos) = V * pos
+    // Row-major storage: data[row][col], translation in column 3
+    // W = normalize(lookat - eye) = forward direction
+    // View Z stores -W (camera looks along -Z in view space, OpenGL convention)
+    Vector3 W = Vector3(m_lookat.x - m_eye.x, m_lookat.y - m_eye.y, m_lookat.z - m_eye.z);
+    float wLen = std::sqrt(W.x * W.x + W.y * W.y + W.z * W.z);
+    if (wLen > 0.0f) { W.x /= wLen; W.y /= wLen; W.z /= wLen; }
 
-    // Create view matrix (lookAt)
+    // U = normalize(cross(W, up)) — right direction
+    Vector3 U = Vector3(
+        W.y * m_up.z - W.z * m_up.y,
+        W.z * m_up.x - W.x * m_up.z,
+        W.x * m_up.y - W.y * m_up.x
+    );
+    float uLen = std::sqrt(U.x * U.x + U.y * U.y + U.z * U.z);
+    if (uLen > 0.0f) { U.x /= uLen; U.y /= uLen; U.z /= uLen; }
+
+    // V = normalize(cross(U, W)) — true up
+    Vector3 V = Vector3(
+        U.y * W.z - U.z * W.y,
+        U.z * W.x - U.x * W.z,
+        U.x * W.y - U.y * W.x
+    );
+    float vLen = std::sqrt(V.x * V.x + V.y * V.y + V.z * V.z);
+    if (vLen > 0.0f) { V.x /= vLen; V.y /= vLen; V.z /= vLen; }
+
+    float dotUeye = U.x * m_eye.x + U.y * m_eye.y + U.z * m_eye.z;
+    float dotVeye = V.x * m_eye.x + V.y * m_eye.y + V.z * m_eye.z;
+    float dotWeye = W.x * m_eye.x + W.y * m_eye.y + W.z * m_eye.z;
+
     Matrix4 mat;
-    mat.data[0][0] = u.x; mat.data[0][1] = v.x; mat.data[0][2] = w.x; mat.data[0][3] = 0.0f;
-    mat.data[1][0] = u.y; mat.data[1][1] = v.y; mat.data[1][2] = w.y; mat.data[1][3] = 0.0f;
-    mat.data[2][0] = u.z; mat.data[2][1] = v.z; mat.data[2][2] = w.z; mat.data[2][3] = 0.0f;
-    mat.data[3][0] = -(u.x * m_eye.x + u.y * m_eye.y + u.z * m_eye.z);
-    mat.data[3][1] = -(v.x * m_eye.x + v.y * m_eye.y + v.z * m_eye.z);
-    mat.data[3][2] = -(w.x * m_eye.x + w.y * m_eye.y + w.z * m_eye.z);
-    mat.data[3][3] = 1.0f;
+    // Row 0: U (right)
+    mat.data[0][0] = U.x;  mat.data[0][1] = U.y;  mat.data[0][2] = U.z;  mat.data[0][3] = -dotUeye;
+    // Row 1: V (up)
+    mat.data[1][0] = V.x;  mat.data[1][1] = V.y;  mat.data[1][2] = V.z;  mat.data[1][3] = -dotVeye;
+    // Row 2: -W (negate forward → camera looks along -Z in view space)
+    mat.data[2][0] = -W.x; mat.data[2][1] = -W.y; mat.data[2][2] = -W.z; mat.data[2][3] = dotWeye;
+    // Row 3: homogeneous
+    mat.data[3][0] = 0.0f; mat.data[3][1] = 0.0f; mat.data[3][2] = 0.0f; mat.data[3][3] = 1.0f;
 
     return mat;
 }
 
 Matrix4 Camera::GetProjectionMatrix() const {
+    // Column-vector convention matching sample: mul(P, v) = P * v
+    // OpenGL-style: depth range [-1, 1], clip.w = -pz (visible objects have w > 0)
     float tanHalfFovy = std::tan(m_fovY * 0.5f * 3.14159265f / 180.0f);
 
     Matrix4 mat;
@@ -120,9 +149,9 @@ Matrix4 Camera::GetProjectionMatrix() const {
 
     mat.data[0][0] = 1.0f / (m_aspectRatio * tanHalfFovy);
     mat.data[1][1] = 1.0f / tanHalfFovy;
-    mat.data[2][2] = m_zFar / (m_zFar - m_zNear);
-    mat.data[2][3] = 1.0f;
-    mat.data[3][2] = -(m_zFar * m_zNear) / (m_zFar - m_zNear);
+    mat.data[2][2] = (m_zFar + m_zNear) / (m_zNear - m_zFar);
+    mat.data[2][3] = 2.0f * m_zFar * m_zNear / (m_zNear - m_zFar);
+    mat.data[3][2] = -1.0f;
 
     return mat;
 }

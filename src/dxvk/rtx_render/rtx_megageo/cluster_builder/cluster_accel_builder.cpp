@@ -142,26 +142,40 @@ ClusterAccelBuilder::ClusterAccelBuilder(
     m_fillInstantiateTemplateArgsParamsBuffer = m_device->createBuffer(nvrhi::utils::CreateVolatileConstantBufferDesc(
         sizeof(FillInstantiateTemplateArgsParams), "FillInstantiateTemplateArgsParams", engine::c_MaxRenderPassConstantBufferVersions));
 
-    m_computeClusterTilingParamsBuffer = m_device->createBuffer(nvrhi::utils::CreateVolatileConstantBufferDesc(
-        sizeof(ComputeClusterTilingParams), "ComputeClusterTilingParams", engine::c_MaxRenderPassConstantBufferVersions));
-
-    m_fillClustersParamsBuffer = m_device->createBuffer(nvrhi::utils::CreateVolatileConstantBufferDesc(
-        sizeof(FillClustersParams), "FillClustersParams", engine::c_MaxRenderPassConstantBufferVersions));
+    // Per-instance CBs: NON-volatile with vkCmdUpdateBuffer.
+    // The sample's NVRHI Vulkan backend uses VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC for volatile CBs,
+    // with per-slot version tracking and fence-based slot recycling. Our DXVK adapter's volatile path
+    // uses a simple ring buffer (host memcpy, no GPU commands) that wraps after maxVersions writes.
+    // With 200+ instances per frame, the 16-slot ring buffer wraps and the GPU reads overwritten data.
+    // Non-volatile CBs use vkCmdUpdateBuffer (GPU command) which is properly serialized in the
+    // command buffer — each dispatch reads the correct data regardless of instance count.
+    {
+        nvrhi::BufferDesc desc;
+        desc.byteSize = sizeof(ComputeClusterTilingParams);
+        desc.debugName = "ComputeClusterTilingParams";
+        desc.isConstantBuffer = true;
+        desc.isVolatile = false;
+        desc.initialState = nvrhi::ResourceStates::ConstantBuffer;
+        desc.keepInitialState = true;
+        m_computeClusterTilingParamsBuffer = m_device->createBuffer(desc);
+    }
+    {
+        nvrhi::BufferDesc desc;
+        desc.byteSize = sizeof(FillClustersParams);
+        desc.debugName = "FillClustersParams";
+        desc.isConstantBuffer = true;
+        desc.isVolatile = false;
+        desc.initialState = nvrhi::ResourceStates::ConstantBuffer;
+        desc.keepInitialState = true;
+        m_fillClustersParamsBuffer = m_device->createBuffer(desc);
+    }
 
     m_fillBlasFromClasArgsParamsBuffer = m_device->createBuffer(nvrhi::utils::CreateVolatileConstantBufferDesc(
         sizeof(FillBlasFromClasArgsParams), "FillBlasFromClasArgsParams", engine::c_MaxRenderPassConstantBufferVersions));
 
-    // CopyClusterOffsetParams is always 256 bytes regardless of numInstances.
-    // Create it once here and reuse forever - no need to destroy/recreate on reallocation.
-    {
-        nvrhi::BufferDesc cbDesc;
-        cbDesc.byteSize = 256; // CopyClusterOffsetParams is 16 bytes, align to 256 for constant buffer
-        cbDesc.debugName = "CopyClusterOffsetParams";
-        cbDesc.isConstantBuffer = true;
-        cbDesc.initialState = nvrhi::ResourceStates::ConstantBuffer;
-        cbDesc.keepInitialState = true;
-        m_copyClusterOffsetParamsBuffer = m_device->createBuffer(cbDesc);
-    }
+    // m_copyClusterOffsetParamsBuffer: created as volatile in UpdateMemoryAllocations (matching sample).
+    // Volatile CB uses a ring buffer so each CopyClusterOffset dispatch per instance gets its own version,
+    // preventing data races when the same buffer is written+read across multiple dispatches per frame.
 
     //////////////////////////////////////////////////
     // Create common bindless binding layout and descriptor table
@@ -1019,6 +1033,160 @@ void ClusterAccelBuilder::FillInstanceClusters(const RTXMGScene& scene, ClusterA
         params.debugLaneIndex = uint32_t(m_tessellatorConfig.debugLaneIndex);
         commandList->writeBuffer(m_fillClustersParamsBuffer, &params, sizeof(FillClustersParams));
 
+        // DIAGNOSTIC: Log FillClustersParams and all per-mesh buffer metadata for first instance
+        {
+            static bool s_loggedFillDiag = false;
+            if (!s_loggedFillDiag && instanceIndex == 0) {
+                s_loggedFillDiag = true;
+                auto bufInfo = [](const char* name, nvrhi::IBuffer* buf) {
+                    if (!buf) return dxvk::str::format("  ", name, ": NULL");
+                    auto& d = buf->getDesc();
+                    return dxvk::str::format("  ", name, ": byteSize=", d.byteSize,
+                        " structStride=", d.structStride, " elems=", d.structStride ? d.byteSize / d.structStride : 0);
+                };
+                Logger::warn("=== FillInstanceClusters DIAGNOSTIC (instance 0) ===");
+                Logger::warn(str::format("  FillClustersParams: instanceIndex=", params.instanceIndex,
+                    " quantNBits=", params.quantNBits, " isolationLevel=", params.isolationLevel,
+                    " firstGeomIdx=", params.firstGeometryIndex));
+                Logger::warn(str::format("  FillClustersParams: displacementScale=", params.globalDisplacementScale,
+                    " clusterPattern=", params.clusterPattern,
+                    " disableSubdivision=", params.disableSubdivision));
+                Logger::warn(str::format("  sizeof(FillClustersParams)=", sizeof(FillClustersParams),
+                    " sizeof(SurfaceDescriptor)=", sizeof(OpenSubdiv::Tmr::SurfaceDescriptor)));
+                Logger::warn(str::format("  surfaceOffset=", surfaceOffset, " surfaceCount=", surfaceCount));
+                Logger::warn(bufInfo("t3:positionsBuffer", subd.m_positionsBuffer.Get()));
+                Logger::warn(bufInfo("t4:surfaceDescriptors", subd.m_vertexDeviceData.surfaceDescriptors.Get()));
+                Logger::warn(bufInfo("t5:controlPointIndices", subd.m_vertexDeviceData.controlPointIndices.Get()));
+                Logger::warn(bufInfo("t6:patchPointsOffsets", subd.m_vertexDeviceData.patchPointsOffsets.Get()));
+                Logger::warn(bufInfo("t7:plansBuffer", subd.GetTopologyMap()->plansBuffer.Get()));
+                Logger::warn(bufInfo("t8:subpatchTreesArrays", subd.GetTopologyMap()->subpatchTreesArraysBuffer.Get()));
+                Logger::warn(bufInfo("t9:patchPointIndicesArrays", subd.GetTopologyMap()->patchPointIndicesArraysBuffer.Get()));
+                Logger::warn(bufInfo("t10:stencilMatrixArrays", subd.GetTopologyMap()->stencilMatrixArraysBuffer.Get()));
+                Logger::warn(bufInfo("t11:patchPoints", subd.m_vertexDeviceData.patchPoints.Get()));
+                Logger::warn(bufInfo("t14:surfaceToGeomIdx", subd.m_surfaceToGeometryIndexBuffer.Get()));
+                Logger::warn(bufInfo("u0:clusterVertexPositions", accels.clusterVertexPositionsBuffer.Get()));
+                Logger::warn(bufInfo("CB:fillClustersParams", m_fillClustersParamsBuffer.Get()));
+                // Surface offsets (PureBSpline/RegularBSpline/Limit/NoLimit)
+                Logger::warn(str::format("  surfaceOffsets: PureBSpline=", subd.m_surfaceOffsets[0],
+                    " RegularBSpline=", subd.m_surfaceOffsets[1],
+                    " Limit=", subd.m_surfaceOffsets[2], " NoLimit=", subd.m_surfaceOffsets[3]));
+                Logger::warn("=== END FillInstanceClusters DIAGNOSTIC ===");
+
+                // CPU-side readback of surfaceDescriptors and controlPointIndices
+                {
+                    Logger::warn("=== GPU Buffer Readback (instance 0) ===");
+
+                    // Download all three buffers in one batch
+                    auto descBuf = subd.m_vertexDeviceData.surfaceDescriptors;
+                    auto cpiBuf = subd.m_vertexDeviceData.controlPointIndices;
+                    auto posBuf = subd.m_positionsBuffer;
+                    uint32_t descBytes = (uint32_t)descBuf->getDesc().byteSize;
+                    uint32_t cpiBytes = (uint32_t)cpiBuf->getDesc().byteSize;
+                    uint32_t posBytes = (uint32_t)posBuf->getDesc().byteSize;
+                    uint32_t numDescs = descBytes / 8;
+                    uint32_t numCPIs = cpiBytes / 4;
+                    uint32_t numPos = posBytes / 12;
+
+                    auto descReadback = commandList->getDevice()->createBuffer(nvrhi::BufferDesc{
+                        .byteSize = descBytes, .debugName = "descReadback",
+                        .cpuAccess = nvrhi::CpuAccessMode::Read,
+                        .initialState = nvrhi::ResourceStates::CopyDest, .keepInitialState = true });
+                    auto cpiReadback = commandList->getDevice()->createBuffer(nvrhi::BufferDesc{
+                        .byteSize = cpiBytes, .debugName = "cpiReadback",
+                        .cpuAccess = nvrhi::CpuAccessMode::Read,
+                        .initialState = nvrhi::ResourceStates::CopyDest, .keepInitialState = true });
+                    auto posReadback = commandList->getDevice()->createBuffer(nvrhi::BufferDesc{
+                        .byteSize = posBytes, .debugName = "posReadback",
+                        .cpuAccess = nvrhi::CpuAccessMode::Read,
+                        .initialState = nvrhi::ResourceStates::CopyDest, .keepInitialState = true });
+                    commandList->copyBuffer(descReadback.Get(), 0, descBuf.Get(), 0, descBytes);
+                    commandList->copyBuffer(cpiReadback.Get(), 0, cpiBuf.Get(), 0, cpiBytes);
+                    commandList->copyBuffer(posReadback.Get(), 0, posBuf.Get(), 0, posBytes);
+                    commandList->close();
+                    commandList->getDevice()->executeCommandList(commandList);
+                    commandList->getDevice()->waitForIdle();
+
+                    uint32_t* descData = (uint32_t*)commandList->getDevice()->mapBuffer(descReadback.Get(), nvrhi::CpuAccessMode::Read);
+                    int32_t* cpiData = (int32_t*)commandList->getDevice()->mapBuffer(cpiReadback.Get(), nvrhi::CpuAccessMode::Read);
+                    float* posData = (float*)commandList->getDevice()->mapBuffer(posReadback.Get(), nvrhi::CpuAccessMode::Read);
+
+                    // --- Surface descriptor bounds check ---
+                    if (descData) {
+                        uint32_t descOOB = 0, cpiOOBcount = 0;
+                        uint32_t minFirstCP = UINT32_MAX, maxFirstCP = 0;
+                        // Log first 10 and last 5 descriptors, plus any OOB
+                        for (uint32_t i = 0; i < numDescs; i++) {
+                            uint32_t field0 = descData[i * 2];
+                            uint32_t firstCP = descData[i * 2 + 1];
+                            uint32_t planIdx = (field0 >> 12) & 0xFFFFF;
+                            minFirstCP = std::min(minFirstCP, firstCP);
+                            maxFirstCP = std::max(maxFirstCP, firstCP);
+
+                            // Compute CPI range for this surface
+                            uint32_t nextFirstCP = (i + 1 < numDescs) ? descData[(i + 1) * 2 + 1] : numCPIs;
+                            uint32_t numCPForSurf = (nextFirstCP > firstCP) ? (nextFirstCP - firstCP) : 0;
+                            bool firstCPOOB = (firstCP >= numCPIs);
+                            bool rangeOOB = (firstCP + numCPForSurf > numCPIs);
+
+                            if (firstCPOOB || rangeOOB) descOOB++;
+
+                            // Log first 10, last 5, and any OOB
+                            if (i < 10 || i >= numDescs - 5 || firstCPOOB || rangeOOB) {
+                                Logger::warn(str::format("  desc[", i, "] field0=0x", std::hex, field0, std::dec,
+                                    " firstCP=", firstCP, " numCPForSurf=", numCPForSurf,
+                                    " planIdx=", planIdx, " hasLimit=", (field0 & 1),
+                                    firstCPOOB ? " **FIRSTCP_OOB**" : "",
+                                    rangeOOB ? " **RANGE_OOB**" : ""));
+                            }
+                            if (i == 10 && numDescs > 15) {
+                                Logger::warn(str::format("  ... (", numDescs - 15, " more descriptors) ..."));
+                            }
+
+                            // Check CPI values within this surface's range for position OOB
+                            if (cpiData && !firstCPOOB && firstCP + numCPForSurf <= numCPIs) {
+                                for (uint32_t j = firstCP; j < firstCP + numCPForSurf; j++) {
+                                    if (cpiData[j] < 0 || (uint32_t)cpiData[j] >= numPos) {
+                                        if (cpiOOBcount < 20) {
+                                            Logger::warn(str::format("  **CPI_OOB**: desc[", i, "] CPI[", j, "]=", cpiData[j],
+                                                " >= numPos=", numPos));
+                                        }
+                                        cpiOOBcount++;
+                                    }
+                                }
+                            }
+                        }
+                        Logger::warn(str::format("  BOUNDS SUMMARY: numDescs=", numDescs, " numCPIs=", numCPIs, " numPos=", numPos,
+                            " firstCP range=[", minFirstCP, "..", maxFirstCP, "]",
+                            " descOOB=", descOOB, " cpiOOB=", cpiOOBcount));
+                    }
+
+                    // --- Position sample ---
+                    if (posData) {
+                        uint32_t logCount = std::min(numPos, 10u);
+                        for (uint32_t i = 0; i < logCount; i++) {
+                            Logger::warn(str::format("  pos[", i, "] = (", posData[i*3], ", ", posData[i*3+1], ", ", posData[i*3+2], ")"));
+                        }
+                        // Check for NaN/Inf positions
+                        uint32_t nanCount = 0, infCount = 0, zeroCount = 0;
+                        for (uint32_t i = 0; i < numPos; i++) {
+                            float x = posData[i*3], y = posData[i*3+1], z = posData[i*3+2];
+                            if (std::isnan(x) || std::isnan(y) || std::isnan(z)) nanCount++;
+                            if (std::isinf(x) || std::isinf(y) || std::isinf(z)) infCount++;
+                            if (x == 0 && y == 0 && z == 0) zeroCount++;
+                        }
+                        Logger::warn(str::format("  POS SUMMARY: total=", numPos, " nan=", nanCount, " inf=", infCount, " zero=", zeroCount));
+                    }
+
+                    if (descData) commandList->getDevice()->unmapBuffer(descReadback.Get());
+                    if (cpiData) commandList->getDevice()->unmapBuffer(cpiReadback.Get());
+                    if (posData) commandList->getDevice()->unmapBuffer(posReadback.Get());
+
+                    Logger::warn("=== END GPU Buffer Readback ===");
+                    commandList->open();
+                }
+            }
+        }
+
         // Bindings matching sample style (separate namespaces per resource type)
         // Order must match [[vk::binding]] in fill_clusters.comp.slang
         size_t gridSamplerStride = m_gridSamplersBuffer.GetElementBytes();
@@ -1236,18 +1404,19 @@ void ClusterAccelBuilder::FillInstanceClusters(const RTXMGScene& scene, ClusterA
                     Logger::warn(str::format("CHECKPOINT: debug readback (attempt=", s_fillDbgAttempts, ")"));
 
                     // Slots 0-7: compute_cluster_tiling debug (payloadType=103)
-                    // Slot 0: entry point marker (lineNumber=1, uintData.x=999)
-                    // Slots 1-7: per-cluster data (GPU addresses for CLAS)
-                    Logger::warn("  === compute_cluster_tiling debug ===");
+                    // RAW DUMP first - show all data regardless of payloadType
+                    Logger::warn("  === compute_cluster_tiling debug (RAW) ===");
                     for (uint32_t i = 0; i < 8 && i < debugOutput.size(); ++i) {
                         const auto& e = debugOutput[i];
+                        Logger::warn(str::format("  tiling[", i, "] RAW: uint=(",
+                            e.uintData.x, ",", e.uintData.y, ",", e.uintData.z, ",", e.uintData.w,
+                            ") float=(", e.floatData.x, ",", e.floatData.y, ",", e.floatData.z, ",", e.floatData.w,
+                            ") payloadType=", e.payloadType, " lineNumber=", e.lineNumber));
                         if (e.payloadType == 103) {
                             if (e.lineNumber == 1) {
-                                // Entry point marker
-                                Logger::warn(str::format("  tiling[", i, "] ENTRY: surfRange=[", e.uintData.y,
+                                Logger::warn(str::format("    -> ENTRY: surfRange=[", e.uintData.y,
                                     ",", e.uintData.z, ") instanceIndex=", e.uintData.w));
                             } else {
-                                // Per-cluster: iSurface, vtxOff, vtxAddr(lo,hi), clusterIdx, templateAddr(lo,hi), sizeof(float3)
                                 uint64_t vtxAddr = uint64_t(e.uintData.z) | (uint64_t(e.uintData.w) << 32);
                                 uint32_t clusterIdx, templateLo, templateHi, sizeofF3;
                                 memcpy(&clusterIdx, &e.floatData.x, 4);
@@ -1255,15 +1424,11 @@ void ClusterAccelBuilder::FillInstanceClusters(const RTXMGScene& scene, ClusterA
                                 memcpy(&templateHi, &e.floatData.z, 4);
                                 memcpy(&sizeofF3, &e.floatData.w, 4);
                                 uint64_t templateAddr = uint64_t(templateLo) | (uint64_t(templateHi) << 32);
-                                Logger::warn(str::format("  tiling[", i, "] iSurface=", e.uintData.x,
+                                Logger::warn(str::format("    -> iSurface=", e.uintData.x,
                                     " vtxOff=", e.uintData.y, " vtxAddr=0x", std::hex, vtxAddr, std::dec,
                                     " clusterIdx=", clusterIdx, " templateAddr=0x", std::hex, templateAddr, std::dec,
                                     " sizeof(float3)=", sizeofF3));
                             }
-                        } else if (e.payloadType != 0) {
-                            Logger::warn(str::format("  tiling[", i, "] payloadType=", e.payloadType));
-                        } else {
-                            Logger::warn(str::format("  tiling[", i, "] EMPTY"));
                         }
                     }
 
@@ -1344,6 +1509,135 @@ void ClusterAccelBuilder::FillInstanceClusters(const RTXMGScene& scene, ClusterA
                             " size=", uint32_t(c.sizeX), "x", uint32_t(c.sizeY),
                             " expectedVtxAddr=0x", std::hex, expectedVtxAddr));
                     }
+
+                    // Slots 16-23: Control point diagnostic data (payloadType=105)
+                    Logger::warn("  === Control Point Chain (GPU shader readback) ===");
+                    for (uint32_t i = 16; i <= 23 && i < debugOutput.size(); ++i) {
+                        const auto& e = debugOutput[i];
+                        if (e.payloadType != 105) {
+                            Logger::warn(str::format("  cp[", i, "] NOT WRITTEN (payloadType=", e.payloadType, ")"));
+                            continue;
+                        }
+                        switch (e.lineNumber) {
+                            case 1: // Surface descriptor
+                                Logger::warn(str::format("  cp[16] SurfaceDesc: iSurface=", e.uintData.x,
+                                    " field0=0x", std::hex, e.uintData.y, std::dec,
+                                    " firstControlPoint=", e.uintData.z));
+                                break;
+                            case 2: // Control point indices
+                            {
+                                float firstCP;
+                                memcpy(&firstCP, &e.floatData.x, 4);
+                                uint32_t firstCPu;
+                                memcpy(&firstCPu, &firstCP, 4);
+                                Logger::warn(str::format("  cp[17] CPIndices: cpi[0]=", e.uintData.x,
+                                    " cpi[1]=", e.uintData.y, " cpi[2]=", e.uintData.z,
+                                    " cpi[3]=", e.uintData.w, " (firstCP=", firstCPu, ")"));
+                                break;
+                            }
+                            case 3: case 4: case 5: case 6: // Control point positions
+                                Logger::warn(str::format("  cp[", i, "] pos[cpi", e.lineNumber-3, "=", e.uintData.x,
+                                    "] = (", e.floatData.x, ", ", e.floatData.y, ", ", e.floatData.z, ")"));
+                                break;
+                            case 7: // Buffer dimensions
+                            {
+                                uint32_t cpiStride, posStride;
+                                memcpy(&cpiStride, &e.floatData.x, 4);
+                                memcpy(&posStride, &e.floatData.y, 4);
+                                Logger::warn(str::format("  cp[22] BufferDims: numDescriptors=", e.uintData.x,
+                                    " numCPIndices=", e.uintData.y, " numPositions=", e.uintData.z,
+                                    " descStride=", e.uintData.w, " cpiStride=", cpiStride, " posStride=", posStride));
+                                break;
+                            }
+                            case 8: // Evaluated limit position
+                                Logger::warn(str::format("  cp[23] EvalLimit: pos=(", e.floatData.x,
+                                    ", ", e.floatData.y, ", ", e.floatData.z, ")"));
+                                break;
+                            default:
+                                Logger::warn(str::format("  cp[", i, "] lineNumber=", e.lineNumber));
+                                break;
+                        }
+                    }
+
+                    // Slots 24-30: Bilinear vs Evaluate() comparison (payloadType=106)
+                    Logger::warn("  === Bilinear vs Evaluate Comparison (GPU shader) ===");
+                    for (uint32_t i = 24; i <= 30 && i < debugOutput.size(); ++i) {
+                        const auto& e = debugOutput[i];
+                        if (e.payloadType != 106) {
+                            Logger::warn(str::format("  cmp[", i, "] NOT WRITTEN (payloadType=", e.payloadType, ")"));
+                            continue;
+                        }
+                        switch (e.lineNumber) {
+                            case 1: // Slot 24: path info + bilinear pos + diff at UV=(0.5, 0.5)
+                            {
+                                const char* pathNames[] = {"PureBSpline", "RegularBSpline", "Limit"};
+                                uint32_t path = e.uintData.x < 3 ? e.uintData.x : 2;
+                                float diffX, diffY;
+                                memcpy(&diffX, &e.uintData.z, 4);
+                                memcpy(&diffY, &e.uintData.w, 4);
+                                Logger::warn(str::format("  cmp[24] path=", pathNames[path],
+                                    " planIdx=", e.uintData.y,
+                                    " bilin@(0.5,0.5)=(", e.floatData.x, ",", e.floatData.y, ",", e.floatData.z, ")",
+                                    " diff_xy=(", diffX, ",", diffY, ")"));
+                                break;
+                            }
+                            case 2: // Slot 25: Evaluate result at UV=(0.5, 0.5)
+                            {
+                                float diffZ;
+                                memcpy(&diffZ, &e.uintData.x, 4);
+                                Logger::warn(str::format("  cmp[25] subd@(0.5,0.5)=(", e.floatData.x, ",", e.floatData.y, ",", e.floatData.z, ")",
+                                    " diff_z=", diffZ));
+                                break;
+                            }
+                            case 3: // Slot 26: bilinear pos + diff at UV=(0.25, 0.75)
+                            {
+                                float diffX, diffY, diffZ;
+                                memcpy(&diffX, &e.uintData.x, 4);
+                                memcpy(&diffY, &e.uintData.y, 4);
+                                memcpy(&diffZ, &e.uintData.z, 4);
+                                Logger::warn(str::format("  cmp[26] bilin@(0.25,0.75)=(", e.floatData.x, ",", e.floatData.y, ",", e.floatData.z, ")",
+                                    " diff_xyz=(", diffX, ",", diffY, ",", diffZ, ")"));
+                                break;
+                            }
+                            case 4: // Slot 27: Evaluate at UV=(0.25, 0.75)
+                            {
+                                Logger::warn(str::format("  cmp[27] subd@(0.25,0.75)=(", e.floatData.x, ",", e.floatData.y, ",", e.floatData.z, ")"));
+                                break;
+                            }
+                            case 5: // Slot 28: Surface 0 comparison
+                            {
+                                const char* pathNames[] = {"PureBSpline", "RegularBSpline", "Limit"};
+                                uint32_t path0 = e.uintData.x < 3 ? e.uintData.x : 2;
+                                Logger::warn(str::format("  cmp[28] surf0: path=", pathNames[path0],
+                                    " planIdx=", e.uintData.y,
+                                    " firstCP=", e.uintData.z,
+                                    " bilin-subd=(", e.floatData.x, ",", e.floatData.y, ",", e.floatData.z, ")"));
+                                break;
+                            }
+                            case 6: // Slot 29: Sharpness info
+                            {
+                                Logger::warn(str::format("  cmp[29] hasSharp=", e.uintData.x,
+                                    " bndMask=0x", std::hex, e.uintData.y, std::dec,
+                                    " numCP=", e.uintData.z,
+                                    " evalPath=", e.uintData.w,
+                                    " sharp=", e.floatData.x,
+                                    " computedSharp=", e.floatData.y));
+                                break;
+                            }
+                            case 7: // Slot 30: BSpline weights at UV=(0.5,0.5)
+                            {
+                                float outerSum, wP0, wP3, wP15;
+                                memcpy(&outerSum, &e.uintData.x, 4);
+                                memcpy(&wP0, &e.uintData.y, 4);
+                                memcpy(&wP3, &e.uintData.z, 4);
+                                memcpy(&wP15, &e.uintData.w, 4);
+                                Logger::warn(str::format("  cmp[30] wP[5,6,9,10]=(", e.floatData.x, ",", e.floatData.y, ",", e.floatData.z, ",", e.floatData.w, ")",
+                                    " outerSum=", outerSum,
+                                    " wP[0]=", wP0, " wP[3]=", wP3, " wP[15]=", wP15));
+                                break;
+                            }
+                        }
+                    }
                 } else if (s_fillDbgAttempts % 50 == 0) {
                     Logger::warn(str::format("CHECKPOINT: debug readback attempt ", s_fillDbgAttempts, " - still empty"));
                 }
@@ -1421,47 +1715,33 @@ void ClusterAccelBuilder::ComputeInstanceClusterTiling(ClusterAccels& accels,
     params.debugLaneIndex = uint32_t(m_tessellatorConfig.debugLaneIndex);
     RTXMG_LOG(str::format("RTX MegaGeo: params - camera ptr=", (void*)m_tessellatorConfig.camera));
 
-    // Convert dxvk matrices to float4x4
-    RTXMG_LOG("RTX MegaGeo: params - getting projection matrix");
-    auto projMatrix = m_tessellatorConfig.camera->GetProjectionMatrix();
-    RTXMG_LOG("RTX MegaGeo: params - getting view matrix");
-    auto viewMatrix = m_tessellatorConfig.camera->GetViewMatrix();
-    RTXMG_LOG("RTX MegaGeo: params - multiplying matrices");
-    auto viewProj = projMatrix * viewMatrix;
-    RTXMG_LOG("RTX MegaGeo: params - copying matWorldToClip");
-    memcpy(&params.matWorldToClip, &viewProj.data[0][0], sizeof(float) * 16);
+    // Get ViewProjection matrix using Camera's standard multiply (P * V)
+    // Camera now returns column-vector convention matrices matching sample:
+    //   mul(VP, worldPos) in shader = VP * worldPos
+    // NOTE: Do NOT use projMatrix * viewMatrix here — DXVK's operator* reverses
+    // the multiplication order (A*B = B*A in standard math), giving V*P instead of P*V.
+    RTXMG_LOG("RTX MegaGeo: params - getting ViewProjection matrix (standard P*V multiply)");
+    auto viewProj = m_tessellatorConfig.camera->GetViewProjectionMatrix();
+    // Slang compiles with -matrix-layout-column-major, so float4x4 in the CB is read column-major.
+    // DXVK Matrix4 is row-major in memory (data[row][col]). Transpose so that the shader
+    // reads the correct matrix: memory columns become shader columns.
+    auto viewProjForShader = transpose(viewProj);
+    memcpy(&params.matWorldToClip, &viewProjForShader.data[0][0], sizeof(float) * 16);
 
-    // Log viewProj matrix values
+    // viewProj matrix logging (verbose only)
     RTXMG_LOG(str::format("RTX MegaGeo: viewProj row0=(", viewProj.data[0][0], ",", viewProj.data[0][1], ",", viewProj.data[0][2], ",", viewProj.data[0][3], ")"));
     RTXMG_LOG(str::format("RTX MegaGeo: viewProj row1=(", viewProj.data[1][0], ",", viewProj.data[1][1], ",", viewProj.data[1][2], ",", viewProj.data[1][3], ")"));
     RTXMG_LOG(str::format("RTX MegaGeo: viewProj row2=(", viewProj.data[2][0], ",", viewProj.data[2][1], ",", viewProj.data[2][2], ",", viewProj.data[2][3], ")"));
     RTXMG_LOG(str::format("RTX MegaGeo: viewProj row3=(", viewProj.data[3][0], ",", viewProj.data[3][1], ",", viewProj.data[3][2], ",", viewProj.data[3][3], ")"));
 
-    // DEBUG: Test project a sample point at (5, 5, 10) to see screen coordinates
-#if RTXMG_VERBOSE_LOGGING
-    {
-        float testX = 5.0f, testY = 5.0f, testZ = 10.0f;
-        float clipX = testX * viewProj.data[0][0] + testY * viewProj.data[1][0] + testZ * viewProj.data[2][0] + viewProj.data[3][0];
-        float clipY = testX * viewProj.data[0][1] + testY * viewProj.data[1][1] + testZ * viewProj.data[2][1] + viewProj.data[3][1];
-        float clipZ = testX * viewProj.data[0][2] + testY * viewProj.data[1][2] + testZ * viewProj.data[2][2] + viewProj.data[3][2];
-        float clipW = testX * viewProj.data[0][3] + testY * viewProj.data[1][3] + testZ * viewProj.data[2][3] + viewProj.data[3][3];
-        float ndcX = clipX / clipW;
-        float ndcY = clipY / clipW;
-        float screenX = (ndcX * 0.5f + 0.5f) * m_tessellatorConfig.viewportSize.x;
-        float screenY = (ndcY * 0.5f + 0.5f) * m_tessellatorConfig.viewportSize.y;
-        RTXMG_LOG(str::format("RTX MegaGeo: TEST POINT (5,5,10) -> clip=(", clipX, ",", clipY, ",", clipZ, ",", clipW,
-            ") ndc=(", ndcX, ",", ndcY, ") screen=(", screenX, ",", screenY, ")"));
-    }
-#endif
-
-    RTXMG_LOG("RTX MegaGeo: params - copying localToWorld");
-    // Store in row-major format for use with dot products in shader
-    // Each row is (linear_row + translation_component): dot(row, (x,y,z,1)) = linear*pos + translation
-    // Matrix4::data[i] is row i, data[i][j] is row i, column j
-    // Translation is in column 3 (data[i][3]), NOT row 3 (data[3][i])
-    params.localToWorld[0] = float4(localToWorld.data[0][0], localToWorld.data[0][1], localToWorld.data[0][2], localToWorld.data[0][3]);
-    params.localToWorld[1] = float4(localToWorld.data[1][0], localToWorld.data[1][1], localToWorld.data[1][2], localToWorld.data[1][3]);
-    params.localToWorld[2] = float4(localToWorld.data[2][0], localToWorld.data[2][1], localToWorld.data[2][2], localToWorld.data[2][3]);
+    RTXMG_LOG("RTX MegaGeo: params - copying localToWorld (column-vector convention)");
+    // DXVK Matrix4 is row-vector convention: pos * M, translation in row 3 (data[3]).
+    // Shader uses column-vector convention: dot(localToWorld[i], (pos, 1)) = M * pos.
+    // So we transpose the 3x3 part (read columns, not rows) and include translation from row 3.
+    // This matches sample's affineToColumnMajor() which transposes linear part + adds translation.
+    params.localToWorld[0] = float4(localToWorld.data[0][0], localToWorld.data[1][0], localToWorld.data[2][0], localToWorld.data[3][0]);
+    params.localToWorld[1] = float4(localToWorld.data[0][1], localToWorld.data[1][1], localToWorld.data[2][1], localToWorld.data[3][1]);
+    params.localToWorld[2] = float4(localToWorld.data[0][2], localToWorld.data[1][2], localToWorld.data[2][2], localToWorld.data[3][2]);
 
     // Log localToWorld values sent to shader
     RTXMG_LOG(str::format("RTX MegaGeo: localToWorld[0]=(", params.localToWorld[0].x, ",", params.localToWorld[0].y, ",", params.localToWorld[0].z, ",", params.localToWorld[0].w, ")"));
@@ -1499,30 +1779,32 @@ void ClusterAccelBuilder::ComputeInstanceClusterTiling(ClusterAccels& accels,
 
     // Transform aabb from local space to world space using localToWorld matrix
     // This matches the sample's: params.aabb = subdivisionSurface.m_aabb * localToWorld;
-    // Using the fast AABB transform algorithm from donut's box3::operator*
+    // DXVK Matrix4 row-vector convention: translation in row 3 (data[3][0..2]),
+    // worldPos = localPos * M → world[j] = sum_i local[i] * M[i][j] + M[3][j]
     {
         auto& aabb = subdivisionSurface.m_aabb;
 
-        // Start with translation (DXVK Matrix4 column-vector convention: translation in column 3)
-        float4 translation = float4(localToWorld.data[0][3], localToWorld.data[1][3], localToWorld.data[2][3], 0.0f);
+        // Start with translation from row 3 (DXVK row-vector convention)
+        float4 translation = float4(localToWorld.data[3][0], localToWorld.data[3][1], localToWorld.data[3][2], 0.0f);
         params.aabb.m_min = translation;
         params.aabb.m_max = translation;
 
         // Apply the linear transform to bounds using the standard AABB transform algorithm
-        // For each output axis i, accumulate contributions from all input axes j
-        for (int i = 0; i < 3; i++) {
-            for (int j = 0; j < 3; j++) {
-                float m = localToWorld.data[i][j];  // M[i][j] = row i, col j
-                float minVal = aabb.m_mins[j];
-                float maxVal = aabb.m_maxs[j];
+        // Row-vector: world[j] = sum_i local[i] * M[i][j]
+        // For output axis j, accumulate contributions from input axes i
+        for (int j = 0; j < 3; j++) {
+            for (int i = 0; i < 3; i++) {
+                float m = localToWorld.data[i][j];  // M[i][j] for row-vector: local[i] contributes to world[j]
+                float minVal = aabb.m_mins[i];
+                float maxVal = aabb.m_maxs[i];
 
                 float e = m * minVal;
                 float f = m * maxVal;
 
-                if (i == 0) {
+                if (j == 0) {
                     params.aabb.m_min.x += std::min(e, f);
                     params.aabb.m_max.x += std::max(e, f);
-                } else if (i == 1) {
+                } else if (j == 1) {
                     params.aabb.m_min.y += std::min(e, f);
                     params.aabb.m_max.y += std::max(e, f);
                 } else {
@@ -1541,6 +1823,47 @@ void ClusterAccelBuilder::ComputeInstanceClusterTiling(ClusterAccels& accels,
         RTXMG_LOG(str::format("RTX MegaGeo: aabb (world space) min=(", params.aabb.m_min.x, ",", params.aabb.m_min.y, ",", params.aabb.m_min.z,
             ") max=(", params.aabb.m_max.x, ",", params.aabb.m_max.y, ",", params.aabb.m_max.z, ") diag=", diagonalLength));
 #endif
+    }
+
+    // One-shot matrix debug dump (instance 0 only, fires once)
+    {
+        static bool s_matrixDumped = false;
+        if (!s_matrixDumped && instanceIndex == 0) {
+            s_matrixDumped = true;
+            auto eye = m_tessellatorConfig.camera->GetEye();
+            auto lookat = m_tessellatorConfig.camera->GetLookat();
+            Logger::warn(str::format("MATRIX_DBG: camera eye=(", eye.x, ",", eye.y, ",", eye.z,
+                ") lookat=(", lookat.x, ",", lookat.y, ",", lookat.z, ")"));
+            Logger::warn(str::format("MATRIX_DBG: viewProj[0]=(", viewProj.data[0][0], ",", viewProj.data[0][1], ",", viewProj.data[0][2], ",", viewProj.data[0][3], ")"));
+            Logger::warn(str::format("MATRIX_DBG: viewProj[1]=(", viewProj.data[1][0], ",", viewProj.data[1][1], ",", viewProj.data[1][2], ",", viewProj.data[1][3], ")"));
+            Logger::warn(str::format("MATRIX_DBG: viewProj[2]=(", viewProj.data[2][0], ",", viewProj.data[2][1], ",", viewProj.data[2][2], ",", viewProj.data[2][3], ")"));
+            Logger::warn(str::format("MATRIX_DBG: viewProj[3]=(", viewProj.data[3][0], ",", viewProj.data[3][1], ",", viewProj.data[3][2], ",", viewProj.data[3][3], ")"));
+
+            // Test project the camera lookat point — should be near screen center with positive clip.w
+            // Column-vector: clip[i] = sum_j VP[i][j] * pos[j]  (same as mul(VP, pos) in shader)
+            float px = lookat.x, py = lookat.y, pz = lookat.z;
+            float clipX = viewProj.data[0][0]*px + viewProj.data[0][1]*py + viewProj.data[0][2]*pz + viewProj.data[0][3];
+            float clipY = viewProj.data[1][0]*px + viewProj.data[1][1]*py + viewProj.data[1][2]*pz + viewProj.data[1][3];
+            float clipZ = viewProj.data[2][0]*px + viewProj.data[2][1]*py + viewProj.data[2][2]*pz + viewProj.data[2][3];
+            float clipW = viewProj.data[3][0]*px + viewProj.data[3][1]*py + viewProj.data[3][2]*pz + viewProj.data[3][3];
+            Logger::warn(str::format("MATRIX_DBG: project lookat -> clip=(", clipX, ",", clipY, ",", clipZ, ",", clipW,
+                ") ndc=(", clipX/clipW, ",", clipY/clipW, ") clipW>0=", clipW > 0 ? "YES" : "NO ***WRONG***"));
+
+            // Log localToWorld raw DXVK data vs transposed sent to shader
+            Logger::warn(str::format("MATRIX_DBG: localToWorld DXVK[0]=(", localToWorld.data[0][0], ",", localToWorld.data[0][1], ",", localToWorld.data[0][2], ",", localToWorld.data[0][3], ")"));
+            Logger::warn(str::format("MATRIX_DBG: localToWorld DXVK[1]=(", localToWorld.data[1][0], ",", localToWorld.data[1][1], ",", localToWorld.data[1][2], ",", localToWorld.data[1][3], ")"));
+            Logger::warn(str::format("MATRIX_DBG: localToWorld DXVK[2]=(", localToWorld.data[2][0], ",", localToWorld.data[2][1], ",", localToWorld.data[2][2], ",", localToWorld.data[2][3], ")"));
+            Logger::warn(str::format("MATRIX_DBG: localToWorld DXVK[3]=(", localToWorld.data[3][0], ",", localToWorld.data[3][1], ",", localToWorld.data[3][2], ",", localToWorld.data[3][3], ") <- translation"));
+            Logger::warn(str::format("MATRIX_DBG: localToWorld shader[0]=(", params.localToWorld[0].x, ",", params.localToWorld[0].y, ",", params.localToWorld[0].z, ",", params.localToWorld[0].w, ")"));
+            Logger::warn(str::format("MATRIX_DBG: localToWorld shader[1]=(", params.localToWorld[1].x, ",", params.localToWorld[1].y, ",", params.localToWorld[1].z, ",", params.localToWorld[1].w, ")"));
+            Logger::warn(str::format("MATRIX_DBG: localToWorld shader[2]=(", params.localToWorld[2].x, ",", params.localToWorld[2].y, ",", params.localToWorld[2].z, ",", params.localToWorld[2].w, ")"));
+
+            // Log AABB
+            Logger::warn(str::format("MATRIX_DBG: aabb local min=(", subdivisionSurface.m_aabb.m_mins[0], ",", subdivisionSurface.m_aabb.m_mins[1], ",", subdivisionSurface.m_aabb.m_mins[2],
+                ") max=(", subdivisionSurface.m_aabb.m_maxs[0], ",", subdivisionSurface.m_aabb.m_maxs[1], ",", subdivisionSurface.m_aabb.m_maxs[2], ")"));
+            Logger::warn(str::format("MATRIX_DBG: aabb world min=(", params.aabb.m_min.x, ",", params.aabb.m_min.y, ",", params.aabb.m_min.z,
+                ") max=(", params.aabb.m_max.x, ",", params.aabb.m_max.y, ",", params.aabb.m_max.z, ")"));
+        }
     }
 
     params.enableBackfaceVisibility = m_tessellatorConfig.enableBackfaceVisibility && !m_tessellatorConfig.disableSubdivision;
@@ -1718,14 +2041,29 @@ void ClusterAccelBuilder::ComputeInstanceClusterTiling(ClusterAccels& accels,
         .addItem(nvrhi::BindingSetItem::StructuredBuffer_UAV(6, subdivisionSurface.m_vertexDeviceData.patchPoints))
         .addItem(nvrhi::BindingSetItem::StructuredBuffer_UAV(7, subdivisionSurface.m_texcoordDeviceData.patchPoints))
         .addItem(nvrhi::BindingSetItem::StructuredBuffer_UAV(8, m_debugBuffer));
+    // One-shot diagnostic: log UAV 6/7/8 buffer handles for first instance
+    {
+        static bool s_loggedUavBuffers = false;
+        if (!s_loggedUavBuffers) {
+            s_loggedUavBuffers = true;
+            Logger::warn(str::format("TILING_UAV_DBG: UAV(6) vertexPatchPoints ptr=",
+                (void*)subdivisionSurface.m_vertexDeviceData.patchPoints.Get(),
+                " bytes=", subdivisionSurface.m_vertexDeviceData.patchPoints ?
+                    subdivisionSurface.m_vertexDeviceData.patchPoints->getDesc().byteSize : 0));
+            Logger::warn(str::format("TILING_UAV_DBG: UAV(7) texcoordPatchPoints ptr=",
+                (void*)subdivisionSurface.m_texcoordDeviceData.patchPoints.Get(),
+                " bytes=", subdivisionSurface.m_texcoordDeviceData.patchPoints ?
+                    subdivisionSurface.m_texcoordDeviceData.patchPoints->getDesc().byteSize : 0));
+            Logger::warn(str::format("TILING_UAV_DBG: UAV(8) debugBuffer ptr=",
+                (void*)m_debugBuffer.Get(),
+                " bytes=", m_debugBuffer.GetBytes()));
+        }
+    }
     RTXMG_LOG("RTX MegaGeo: ComputeInstanceClusterTiling - main bindingSetDesc built");
 
-    nvrhi::BindingSetHandle bindingSet = m_device->createBindingSet(bindingSetDesc, m_computeClusterTilingBL);
-    if (!bindingSet)
-    {
-        Logger::err("Failed to create main binding set for compute_cluster_tiling.hlsl");
-    }
-    RTXMG_LOG("RTX MegaGeo: ComputeInstanceClusterTiling - main binding set created");
+    // NOTE: Binding set creation deferred to after writeBuffer to ensure volatile CB
+    // descriptor offset matches the CURRENT version (not the stale previous version).
+    // See createBindingSet calls in monolithic/loop paths below.
 
     // HiZ binding set (set 1) - use real zbuffer textures if available
     nvrhi::BindingSetHandle hizBindingSet;
@@ -1847,11 +2185,6 @@ void ClusterAccelBuilder::ComputeInstanceClusterTiling(ClusterAccels& accels,
             return m_computeClusterTilingPSOs[shaderPermutation.index()];
         };
 
-    RTXMG_LOG("RTX MegaGeo: ComputeInstanceClusterTiling - creating compute state");
-    auto state = nvrhi::ComputeState()
-        .addBindingSet(bindingSet)           // Set 0: Main bindings
-        .addBindingSet(hizBindingSet)        // Set 1: HiZ textures
-        .addBindingSet(m_descriptorTable);   // Set 2: Bindless textures
     RTXMG_LOG(str::format("RTX MegaGeo: ComputeInstanceClusterTiling - enableMonolithicClusterBuild=", m_tessellatorConfig.enableMonolithicClusterBuild));
 
     if (m_tessellatorConfig.enableMonolithicClusterBuild)
@@ -1876,15 +2209,28 @@ void ClusterAccelBuilder::ComputeInstanceClusterTiling(ClusterAccels& accels,
             subdivisionSurface.m_surfaceOffsets[1], ",", subdivisionSurface.m_surfaceOffsets[2], ",",
             subdivisionSurface.m_surfaceOffsets[3], "]"));
 
+        // Write params FIRST so volatile CB advances to current version
         RTXMG_LOG("RTX MegaGeo: Monolithic - writeBuffer");
         commandList->writeBuffer(m_computeClusterTilingParamsBuffer, &params, sizeof(ComputeClusterTilingParams));
+
+        // Create binding set AFTER writeBuffer so volatile CB descriptor offset
+        // snapshots the CURRENT version (not the stale previous version)
+        nvrhi::BindingSetHandle bindingSet = m_device->createBindingSet(bindingSetDesc, m_computeClusterTilingBL);
+        if (!bindingSet)
+        {
+            Logger::err("Failed to create main binding set for compute_cluster_tiling.hlsl");
+        }
+
         ShaderPermutationSurfaceType shaderSurfaceType = ShaderPermutationSurfaceType::All;
         shaderPermutation.setSurfaceType(shaderSurfaceType);
         RTXMG_LOG("RTX MegaGeo: Monolithic - GetComputeClusterTilingPSO");
+        auto state = nvrhi::ComputeState()
+            .addBindingSet(bindingSet)           // Set 0: Main bindings
+            .addBindingSet(hizBindingSet)        // Set 1: HiZ textures
+            .addBindingSet(m_descriptorTable);   // Set 2: Bindless textures
         state.setPipeline(GetComputeClusterTilingPSO(shaderPermutation));
         RTXMG_LOG("RTX MegaGeo: Monolithic - setComputeState");
         commandList->setComputeState(state);
-
 
         RTXMG_LOG("RTX MegaGeo: Monolithic - dispatch");
         commandList->dispatch(div_ceil(dispatchCount, kComputeClusterTilingWaves), 1, 1);
@@ -1917,12 +2263,25 @@ void ClusterAccelBuilder::ComputeInstanceClusterTiling(ClusterAccels& accels,
             RTXMG_LOG(str::format("RTX MegaGeo: Loop - surfaceStart=", params.surfaceStart, " surfaceEnd=", params.surfaceEnd, " dispatchCount=", dispatchCount));
             if (dispatchCount)
             {
+                // Write params FIRST so volatile CB advances to current version
                 RTXMG_LOG("RTX MegaGeo: Loop - writeBuffer");
                 commandList->writeBuffer(m_computeClusterTilingParamsBuffer, &params, sizeof(ComputeClusterTilingParams));
+
+                // Create binding set AFTER writeBuffer so volatile CB descriptor offset
+                // snapshots the CURRENT version (not the stale previous version)
+                nvrhi::BindingSetHandle bindingSet = m_device->createBindingSet(bindingSetDesc, m_computeClusterTilingBL);
+                if (!bindingSet)
+                {
+                    Logger::err("Failed to create main binding set for compute_cluster_tiling.hlsl (loop)");
+                }
 
                 ShaderPermutationSurfaceType shaderSurfaceType = ShaderPermutationSurfaceType(i);
                 shaderPermutation.setSurfaceType(shaderSurfaceType);
                 RTXMG_LOG("RTX MegaGeo: Loop - GetComputeClusterTilingPSO");
+                auto state = nvrhi::ComputeState()
+                    .addBindingSet(bindingSet)           // Set 0: Main bindings
+                    .addBindingSet(hizBindingSet)        // Set 1: HiZ textures
+                    .addBindingSet(m_descriptorTable);   // Set 2: Bindless textures
                 state.setPipeline(GetComputeClusterTilingPSO(shaderPermutation));
                 RTXMG_LOG("RTX MegaGeo: Loop - setComputeState");
                 commandList->setComputeState(state);
@@ -2458,7 +2817,11 @@ void ClusterAccelBuilder::UpdateMemoryAllocations(ClusterAccels& accels, uint32_
 
     if (instanceBuffersNeedResize)
     {
-        // m_copyClusterOffsetParamsBuffer is created once at init (always 256 bytes, no resizing needed)
+        // Volatile CB: each writeBuffer call gets a new ring buffer version, preventing data races
+        // when CopyClusterOffset is dispatched once per instance per frame (matching sample exactly).
+        m_copyClusterOffsetParamsBuffer = m_device->createBuffer(nvrhi::utils::CreateVolatileConstantBufferDesc(
+            sizeof(CopyClusterOffsetParams), "CopyClusterOffsetParams", m_numInstances * ClusterDispatchType::NumTypes * kFrameCount));
+
         // Use m_instanceCapacity (not m_numInstances) for buffer sizing - capacity >= actual count
 
         m_clusterOffsetCountsBuffer.Create(m_instanceCapacity * ClusterDispatchType::NumTypes, "ClusterOffsets", m_device.Get());
@@ -2798,6 +3161,7 @@ void ClusterAccelBuilder::BuildAccel(const RTXMGScene& scene, const TessellatorC
     // Clear debug buffer before tiling loop so compute_cluster_tiling can write to slots 0-7
     // and fill_clusters can write to slots 8-15. Only do it until we get data.
     if (!g_megageoDbgGotData) {
+        Logger::warn(str::format("TILING_DBG: Clearing debug buffer (size=", m_debugBuffer.GetBytes(), " bytes) + barrier"));
         commandList->clearBufferUInt(m_debugBuffer.Get(), 0);
         // Explicit barrier: clearBufferUInt leaves dual-tracked state (NVRHI CopyDest + DXVK TRANSFER).
         // Without this barrier, the tiling shader's UAV writes to the debug buffer may be lost.
@@ -2881,8 +3245,72 @@ void ClusterAccelBuilder::BuildAccel(const RTXMGScene& scene, const TessellatorC
 #endif
     }
 
-    // NOTE: enableLogging block removed - Log()/Download() calls close/reopen command list
-    // which destroys bound image views and causes VK_ERROR_DEVICE_LOST in DXVK.
+    // One-shot readback of debug buffer after tiling loop (before fill_clusters)
+    // This tests whether compute_cluster_tiling's UAV(8) writes actually persist.
+    // NOTE: Download() closes/reopens command list - safe here since no HiZ image views
+    // are bound between tiling and fill (binding sets are created fresh per dispatch).
+    {
+        // Delay debug readback to frame 3 so we skip UI-only frames (frame 1 has 0 clusters)
+        // NOTE: removed !g_megageoDbgGotData guard — DumpDiagnosticData sets it true on frame 1,
+        // which prevented this from ever firing on frame 3.
+        static uint32_t s_tilingDbgFrameCount = 0;
+        s_tilingDbgFrameCount++;
+        Logger::warn(str::format("TILING_DBG_CANARY: frame=", s_tilingDbgFrameCount, " instances=", instances.size()));
+        if (s_tilingDbgFrameCount == 3) {
+            Logger::warn(str::format("TILING_DBG: ENTERING readback block (frame=3, instances=", instances.size(), ")"));
+            Logger::warn(str::format("TILING_DBG: Readback AFTER tiling loop (frame=3, instances=", instances.size(), ")"));
+
+            // FIRST: read back debug buffer as-is (should have shader writes)
+            Logger::warn("TILING_DBG: === Phase 1: Read back shader writes ===");
+            Logger::warn("TILING_DBG: about to call m_debugBuffer.Download()...");
+            auto tilingDbg = m_debugBuffer.Download(commandList);
+            Logger::warn(str::format("TILING_DBG: Download returned, size=", tilingDbg.size(), " elements, instances=", instances.size()));
+            uint32_t numSlots = std::min((uint32_t)instances.size() + 2, (uint32_t)tilingDbg.size());
+            numSlots = std::min(numSlots, 48u);  // cap at 48
+            uint32_t slotsWithData = 0;
+            uint32_t slotsZero = 0;
+            for (uint32_t i = 0; i < numSlots; ++i) {
+                const auto& e = tilingDbg[i];
+                bool hasData = (e.uintData.x || e.uintData.y || e.payloadType);
+                if (hasData) slotsWithData++; else slotsZero++;
+                // Log first 8 and last 4 slots, plus any with data
+                if (i < 8 || i >= numSlots - 4 || hasData) {
+                    Logger::warn(str::format("TILING_DBG[", i, "] uint=(0x", std::hex, e.uintData.x, std::dec,
+                        ",", e.uintData.y, ",", e.uintData.z, ",", e.uintData.w,
+                        ") pt=", e.payloadType, " ln=", e.lineNumber,
+                        hasData ? "" : " ZERO"));
+                }
+            }
+            Logger::warn(str::format("TILING_DBG: SUMMARY: ", slotsWithData, " slots with data, ", slotsZero, " zero slots (of ", numSlots, " checked)"));
+
+            // SECOND: Read back u_Clusters[0] to check if UAV2 (binding 202) got the marker
+            Logger::warn("TILING_DBG: === Phase 2: Check u_Clusters[0] for marker (UAV2/binding202) ===");
+            auto tilingClusters = m_clustersBuffer.Download(commandList);
+            if (!tilingClusters.empty()) {
+                bool clusterMarkerFound = (tilingClusters[0].iSurface == 0xDEAD0202);
+                Logger::warn(str::format("TILING_DBG: u_Clusters[0].iSurface = 0x", std::hex, tilingClusters[0].iSurface, std::dec,
+                    " - marker ", clusterMarkerFound ? "FOUND (UAV2 WORKS!)" : "NOT FOUND"));
+                Logger::warn(str::format("TILING_DBG: u_Clusters[0].nVertexOffset = ", tilingClusters[0].nVertexOffset));
+                // Show first 4 clusters for context
+                for (uint32_t i = 0; i < 4 && i < tilingClusters.size(); ++i) {
+                    Logger::warn(str::format("TILING_DBG: cluster[", i, "] iSurface=0x", std::hex, tilingClusters[i].iSurface,
+                        std::dec, " vtxOff=", tilingClusters[i].nVertexOffset));
+                }
+            }
+
+            // THIRD: vkCmdFillBuffer test on debug buffer
+            Logger::warn("TILING_DBG: === Phase 3: vkCmdFillBuffer test pattern ===");
+            commandList->clearBufferUInt(m_debugBuffer.Get(), 0xDEADBEEF);
+            commandList->bufferBarrier(m_debugBuffer, nvrhi::ResourceStates::CopyDest, nvrhi::ResourceStates::CopySource);
+            auto fillTestDbg = m_debugBuffer.Download(commandList);
+            if (!fillTestDbg.empty()) {
+                const auto& e = fillTestDbg[0];
+                bool fillWorked = (e.uintData.x == 0xDEADBEEF);
+                Logger::warn(str::format("TILING_DBG: vkCmdFillBuffer test: [0].uint.x=0x", std::hex, e.uintData.x, std::dec,
+                    " - readback path ", fillWorked ? "WORKS" : "BROKEN"));
+            }
+        }
+    }
 
     // UAV barriers after compute_cluster_tiling / CopyClusterOffset.
     // CopyClusterOffset writes these as UAVs; FillInstanceClusters reads them as SRVs / indirect args.

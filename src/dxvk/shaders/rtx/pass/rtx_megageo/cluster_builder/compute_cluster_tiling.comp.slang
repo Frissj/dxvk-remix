@@ -845,12 +845,16 @@ void main(uint3 threadIdx : SV_GroupThreadID, uint3 groupIdx : SV_GroupID)
 
     SHADER_DEBUG_INIT(u_Debug, uint2(g_Params.debugSurfaceIndex, g_Params.debugLaneIndex), uint2(iSurface, iLane));
 
-    // DEBUG: Verify tiling shader runs for instance 0 - write to slot 0 from first thread
-    if (g_Params.instanceIndex == 0 && threadIdx.x == 0 && groupIdx.x == 0) {
-        u_Debug[0].uintData = uint4(999, g_Params.surfaceStart, g_Params.surfaceEnd, g_Params.instanceIndex);
-        u_Debug[0].floatData = float4(0, 0, 0, 0);
-        u_Debug[0].payloadType = 103;
-        u_Debug[0].lineNumber = 1; // lineNumber=1 means entry point marker
+    // PER-INSTANCE TEST: Each instance writes to its own debug slot.
+    // This lets us verify which instances actually have working writes.
+    // u_Debug has 512 elements, and we have up to 42 instances, so this is safe.
+    if (threadIdx.x == 0 && groupIdx.x == 0) {
+        uint32_t slot = g_Params.instanceIndex;
+        if (slot < 64) {  // safety bound
+            u_Debug[slot].uintData = uint4(0xDEAD0000 + slot, g_Params.surfaceStart, g_Params.surfaceEnd, g_Params.instanceIndex);
+            u_Debug[slot].payloadType = 777;
+            u_Debug[slot].lineNumber = slot;
+        }
     }
 
 #if ENABLE_GROUP_ATOMICS

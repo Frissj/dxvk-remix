@@ -37,7 +37,7 @@
 #include "patch_param.h"
 
 enum class SingleCreaseDynamicIsolation : uint16_t { SHARP = 0, SMOOTH = 1, };
-static const SingleCreaseDynamicIsolation kSingleCreaseDynamicIsolation = SingleCreaseDynamicIsolation::SMOOTH;
+static const SingleCreaseDynamicIsolation kSingleCreaseDynamicIsolation = SingleCreaseDynamicIsolation::SHARP;
 static const float kMinFloat = 1.17549435e-38f;
 // translators for Tmr => Far types
 inline PatchDescriptorType

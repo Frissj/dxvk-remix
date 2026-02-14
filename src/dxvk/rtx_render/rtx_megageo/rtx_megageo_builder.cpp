@@ -615,7 +615,7 @@ private:
     config.zbuffer = nullptr;  // Disable HiZ culling to prevent oscillation
     config.camera = &m_tessellationCamera;
     config.isolationLevel = m_topologyCaches[0]->options.isoLevelSharp;  // Must match TMR plan isolation level
-    config.disableSubdivision = false;  // Use proper subdivision evaluation
+    config.disableSubdivision = true;  // Use bilinear interpolation (bypass subdivision)
 
     // Dynamic memory sizing based on GPU-reported demand from previous frame.
     //

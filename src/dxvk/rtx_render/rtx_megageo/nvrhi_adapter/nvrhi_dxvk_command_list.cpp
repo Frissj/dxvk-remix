@@ -572,12 +572,41 @@ namespace dxvk {
     if (m_hasHiZBinding || m_hasUAVArrayBinding || !m_pendingDescriptorSets.empty()) {
       VkCommandBuffer cmdBuffer = m_context->getCmdBuffer(DxvkCmdBuffer::ExecBuffer);
 
-      if (hasNativePipeline) {
+      // Diagnostic: log dispatch state when we have multiple pending descriptor sets (tiling shader)
+    {
+      static uint32_t s_tilingDispatchLogCount = 0;
+      // Tiling shader has 2 pending sets (main + HiZ), other shaders have 1
+      bool isTilingDispatch = m_pendingDescriptorSets.size() >= 2;
+      // Also log first dispatch of any kind
+      static bool s_loggedFirstDispatch = false;
+      if (!s_loggedFirstDispatch || (isTilingDispatch && s_tilingDispatchLogCount < 3)) {
+        if (isTilingDispatch) s_tilingDispatchLogCount++;
+        s_loggedFirstDispatch = true;
+        Logger::warn(str::format("DISPATCH_DBG: hasNativePipeline=", hasNativePipeline ? "YES" : "NO",
+          " nativePipeline=", (void*)nativePipeline,
+          " nativePipelineLayout=", (void*)nativePipelineLayout,
+          " pendingDescSets=", m_pendingDescriptorSets.size(),
+          " dispatch(", x, ",", y, ",", z, ")",
+          isTilingDispatch ? " [TILING]" : ""));
+        for (size_t di = 0; di < m_pendingDescriptorSets.size(); ++di) {
+          const auto& p = m_pendingDescriptorSets[di];
+          Logger::warn(str::format("DISPATCH_DBG:   pendingSet[", di, "] descSet=", (void*)p.descriptorSet,
+            " setIndex=", p.setIndex,
+            " pipelineLayout=", (void*)p.pipelineLayout));
+        }
+      }
+    }
+
+    if (hasNativePipeline) {
         // Use native Vulkan pipeline - completely bypass DXVK's pipeline
         m_device->getDxvkDevice()->vkd()->vkCmdBindPipeline(cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, nativePipeline);
         RTXMG_LOG(str::format("RTX MegaGeo: bound native VkPipeline ", (void*)nativePipeline));
       } else {
         // Commit DXVK compute state - this binds the pipeline and set 0 resources
+        if (!m_pendingDescriptorSets.empty()) {
+          Logger::err("RTX MegaGeo: CRITICAL WARNING - DXVK fallback path with pre-built descriptor sets! "
+            "Descriptor set layout will NOT match DXVK's pipeline layout. Native VkPipeline creation may have failed.");
+        }
         RtxContext* rtxContext = static_cast<RtxContext*>(m_context.ptr());
         if (!rtxContext->commitComputeStateForMegaGeo()) {
           Logger::err("RTX MegaGeo: Failed to commit compute state for MegaGeo dispatch");

@@ -36,6 +36,8 @@
 
 #include <algorithm>
 #include <fstream>
+#include "../../../util/log/log.h"
+#include "../../../util/util_string.h"
 
 // Undefine min/max macros if they exist (Windows headers)
 #ifdef min
@@ -149,6 +151,51 @@ void TopologyMap::InitDeviceData(nvrhi::ICommandList* commandList, bool keepHost
     }
 
     plansBuffer = CreateAndUploadBuffer<SubdivisionPlanHLSL>(gpuPlans, "plans", commandList);
+
+    // CPU-side plan data dump for debugging
+    {
+        static bool s_dumpedOnce = false;
+        if (!s_dumpedOnce) {
+            s_dumpedOnce = true;
+            dxvk::Logger::warn(dxvk::str::format("TopologyMap: numPlans=", numPlans,
+                " totalPatchPoints=", gpuPatchPointIndexArrays.elements.size(),
+                " totalTrees=", gpuTrees.elements.size(),
+                " totalStencils=", gpuStencilMatrixArrays.elements.size()));
+            // Dump a few plans including plan 33
+            for (int pi : {0, 1, 2, 33, 34}) {
+                if (pi >= numPlans) continue;
+                auto& p = gpuPlans[pi];
+                dxvk::Logger::warn(dxvk::str::format("  Plan[", pi, "] numCP=", p.numControlPoints,
+                    " faceSize=", p.coarseFaceSize, " quadrant=", p.coarseFaceQuadrant,
+                    " treeOff=", p.treeOffset, " treeSz=", p.treeSize,
+                    " ppOff=", p.patchPointsOffset, " ppSz=", p.patchPointsSize,
+                    " stOff=", p.stencilMatrixOffset, " stSz=", p.stencilMatrixSize,
+                    " scheme=", (int)p.scheme, " endCap=", (int)p.endCap));
+                // Dump patchPointIndices for this plan
+                if (p.patchPointsSize > 0) {
+                    std::string ppStr = "    patchPoints[" + std::to_string(pi) + "]: ";
+                    int count = std::min((int)p.patchPointsSize, 32);
+                    for (int j = 0; j < count; j++) {
+                        if (j > 0) ppStr += ",";
+                        ppStr += std::to_string(gpuPatchPointIndexArrays.elements[p.patchPointsOffset + j]);
+                    }
+                    dxvk::Logger::warn(ppStr);
+                }
+                // Dump first 16 tree words for this plan
+                if (p.treeSize > 0) {
+                    std::string treeStr = "    tree[" + std::to_string(pi) + "]: ";
+                    int count = std::min((int)p.treeSize, 20);
+                    for (int j = 0; j < count; j++) {
+                        if (j > 0) treeStr += ",";
+                        char buf[16];
+                        snprintf(buf, sizeof(buf), "0x%x", gpuTrees.elements[p.treeOffset + j]);
+                        treeStr += buf;
+                    }
+                    dxvk::Logger::warn(treeStr);
+                }
+            }
+        }
+    }
 
     if (!keepHostData)
         aTopologyMap.reset();
