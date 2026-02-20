@@ -583,13 +583,13 @@ namespace dxvk {
     static uint32_t lastFrameProcessed = 0;
     uint32_t currentFrame = m_device->getCurrentFrameId();
     if (currentFrame != lastFrameProcessed) {
-      Logger::warn(str::format("CHECKPOINT: submitDrawState NEW FRAME ", currentFrame));
+
       lastFrameProcessed = currentFrame;
       RtxMegaGeoBuilder* megaGeoBuilder = m_accelManager.getMegaGeoBuilder();
       if (megaGeoBuilder) {
-        Logger::warn("CHECKPOINT: pre-processCompletedSurfaces");
+
         megaGeoBuilder->processCompletedSurfaces();
-        Logger::warn("CHECKPOINT: post-processCompletedSurfaces");
+
       }
     }
 
@@ -1093,7 +1093,7 @@ namespace dxvk {
 
     // DEBUG: Set to true to hide ALL non-MegaGeo geometry (only ClusterBlas surfaces visible)
     // Waits until ClusterBlas instances exist before hiding, to avoid empty TLAS crash
-    static const bool s_megaGeoOnly = false;
+    static const bool s_megaGeoOnly = true;
     static bool s_hasSeenClusterBlas = false;
     if (pBlas->isClusterBlas()) {
       s_hasSeenClusterBlas = true;
@@ -1582,7 +1582,6 @@ namespace dxvk {
   }
 
   void SceneManager::prepareSceneData(Rc<RtxContext> ctx, DxvkBarrierSet& execBarriers) {
-    Logger::warn("CHECKPOINT: prepareSceneData ENTER");
     ScopedGpuProfileZone(ctx, "Build Scene");
 
   #ifdef REMIX_DEVELOPMENT
@@ -1593,22 +1592,16 @@ namespace dxvk {
   #endif
 
     // Needs to happen before garbageCollection to avoid destroying dynamic lights
-    Logger::warn("CHECKPOINT: pre-dynamicLightMatching");
     m_lightManager.dynamicLightMatching();
 
-    Logger::warn("CHECKPOINT: pre-garbageCollection");
     garbageCollection();
-    Logger::warn("CHECKPOINT: post-garbageCollection");
 
     m_graphManager.applySceneOverrides(ctx);
-    Logger::warn("CHECKPOINT: post-applySceneOverrides");
 
     m_terrainBaker->prepareSceneData(ctx);
-    Logger::warn("CHECKPOINT: post-terrainBaker");
 
     auto& textureManager = m_device->getCommon()->getTextureManager();
     m_bindlessResourceManager.prepareSceneData(ctx, textureManager.getTextureTable(), getBufferTable(), getSamplerTable());
-    Logger::warn("CHECKPOINT: post-bindlessResourceManager");
 
     // If there are no instances, we should do nothing!
     if (m_instanceManager.getActiveCount() == 0) {
@@ -1659,19 +1652,14 @@ namespace dxvk {
     m_instanceManager.createViewModelInstances(ctx, m_cameraManager, m_rayPortalManager);
     m_instanceManager.createPlayerModelVirtualInstances(ctx, m_cameraManager, m_rayPortalManager);
 
-    Logger::warn("CHECKPOINT: pre-mergeInstancesIntoBlas");
     m_accelManager.mergeInstancesIntoBlas(ctx, execBarriers, textureManager.getTextureTable(), m_cameraManager, m_instanceManager, m_opacityMicromapManager.get());
-    Logger::warn("CHECKPOINT: post-mergeInstancesIntoBlas");
 
     // Call on the other managers to prepare their GPU data for the current scene
-    Logger::warn("CHECKPOINT: pre-accelManager-prepareSceneData");
     m_accelManager.prepareSceneData(ctx, execBarriers, m_instanceManager);
-    Logger::warn("CHECKPOINT: post-accelManager-prepareSceneData");
     m_lightManager.prepareSceneData(ctx, m_cameraManager);
 
     // Build the TLAS
     m_accelManager.buildTlas(ctx);
-    Logger::warn("CHECKPOINT: post-buildTlas in prepareSceneData");
 
     // Todo: These updates require a lot of temporary buffer allocations and memcopies, ideally we should memcpy directly into a mapped pointer provided by Vulkan,
     // but we have to create a buffer to pass to DXVK's updateBuffer for now.
@@ -1685,7 +1673,6 @@ namespace dxvk {
       // Surface Material buffer
       if (m_surfaceMaterialCache.getTotalCount() > 0) {
         ScopedGpuProfileZone(ctx, "updateSurfaceMaterials");
-        Logger::warn(str::format("CHECKPOINT: updateSurfaceMaterials surfaceCount=", m_accelManager.getSurfaceCount(), " matCacheCount=", m_surfaceMaterialCache.getTotalCount()));
         // Note: We duplicate the materials in the buffer so we don't have to do pointer chasing on the GPU (i.e. rather than BLAS->Surface->Material, do, BLAS->Surface, BLAS->Material)
         size_t surfaceMaterialsGPUSize = m_accelManager.getSurfaceCount() * kSurfaceMaterialGPUSize;
         if (m_startInMediumMaterialIndex_inCache != UINT32_MAX) {
@@ -1703,7 +1690,7 @@ namespace dxvk {
         std::vector<unsigned char> surfaceMaterialsGPUData(surfaceMaterialsGPUSize);
         const auto& orderedInstances = m_accelManager.getOrderedInstances();
         const auto& matTable = m_surfaceMaterialCache.getObjectTable();
-        Logger::warn(str::format("CHECKPOINT: matLoop orderedInstances=", orderedInstances.size(), " matTableSize=", matTable.size(), " gpuSize=", surfaceMaterialsGPUSize));
+
         for (auto&& pInstance : orderedInstances) {
           uint32_t matIdx = pInstance->surface.surfaceMaterialIndex;
           if (matIdx >= matTable.size()) {
@@ -1715,7 +1702,7 @@ namespace dxvk {
           surfaceMaterial.writeGPUData(surfaceMaterialsGPUData.data(), dataOffset, surfaceIndex);
           surfaceIndex++;
         }
-        Logger::warn(str::format("CHECKPOINT: matLoop done surfaceIndex=", surfaceIndex));
+
 
         if (m_startInMediumMaterialIndex_inCache != UINT32_MAX) {
           auto&& surfaceMaterial = m_surfaceMaterialCache.getObjectTable()[m_startInMediumMaterialIndex_inCache];
@@ -1728,7 +1715,6 @@ namespace dxvk {
         assert(surfaceMaterialsGPUData.size() == surfaceMaterialsGPUSize);
 
         ctx->writeToBuffer(m_surfaceMaterialBuffer, 0, surfaceMaterialsGPUData.size(), surfaceMaterialsGPUData.data());
-        Logger::warn("CHECKPOINT: surfaceMaterial writeToBuffer done");
       }
 
       // Surface Material Extension Buffer
@@ -1756,7 +1742,7 @@ namespace dxvk {
 
         ctx->writeToBuffer(m_surfaceMaterialExtensionBuffer, 0, surfaceMaterialExtensionsGPUData.size(), surfaceMaterialExtensionsGPUData.data());
       }
-      Logger::warn("CHECKPOINT: post-materialExtensions");
+
 
       // Volume Material buffer
       if (m_volumeMaterialCache.getTotalCount() > 0) {
@@ -1782,7 +1768,7 @@ namespace dxvk {
         ctx->writeToBuffer(m_volumeMaterialBuffer, 0, volumeMaterialsGPUData.size(), volumeMaterialsGPUData.data());
       }
     }
-    Logger::warn("CHECKPOINT: post-allMaterialUploads");
+
 
     ctx->emitMemoryBarrier(0,
       VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -1806,7 +1792,7 @@ namespace dxvk {
       capturer->triggerNewCapture();
     }
     capturer->step(ctx, ctx->getCommonObjects()->getLastKnownWindowHandle());
-    Logger::warn("CHECKPOINT: prepareSceneData COMPLETE");
+
 
     // Clear the ray portal data before the next frame
     m_rayPortalManager.clear();
@@ -1985,6 +1971,7 @@ namespace dxvk {
     // Note: We check indexCount > 0 instead of usesIndices() because the temporary geometry
     // passed from tryCreateSubdivisionSurface doesn't have an actual index buffer set
     if (convertedGeom.indexCount == 0 || convertedGeom.vertexCount == 0) {
+      Logger::warn(str::format("RTX MegaGeo: CANDIDATE REJECTED: no indices/vertices (indexCount=", convertedGeom.indexCount, " vertexCount=", convertedGeom.vertexCount, ")"));
       return false;
     }
 
@@ -1995,6 +1982,7 @@ namespace dxvk {
     // In DX9/legacy games, quads are typically submitted as 2 triangles per quad
     // Check if index count is divisible by 6 (2 triangles * 3 indices per quad)
     if (convertedGeom.indexCount % 6 != 0) {
+      Logger::warn(str::format("RTX MegaGeo: CANDIDATE REJECTED: indexCount not divisible by 6 (indexCount=", convertedGeom.indexCount, " vertexCount=", convertedGeom.vertexCount, ")"));
       return false;
     }
 
@@ -2002,6 +1990,7 @@ namespace dxvk {
 
     // Sanity check: Must have at least 1 quad
     if (potentialQuadCount == 0) {
+      Logger::warn("RTX MegaGeo: CANDIDATE REJECTED: potentialQuadCount=0");
       return false;
     }
 
@@ -2031,6 +2020,7 @@ namespace dxvk {
                                          (potentialQuadCount >= 4 && potentialQuadCount <= 16384);
 
     if (!hasReasonableComplexity) {
+      Logger::warn(str::format("RTX MegaGeo: CANDIDATE REJECTED: unreasonable complexity (vertexCount=", convertedGeom.vertexCount, " potentialQuadCount=", potentialQuadCount, ")"));
       return false;
     }
 
@@ -2053,6 +2043,10 @@ namespace dxvk {
     // TEMPORARY: Accept all meshes with reasonable complexity for testing
     // TODO: Re-enable conservative check once mega geometry is proven working
     bool result = hasReasonableComplexity;  // Changed from isTrackedReplacementMesh
+
+    Logger::warn(str::format("RTX MegaGeo: CANDIDATE CHECK: vertexCount=", convertedGeom.vertexCount,
+        " indexCount=", convertedGeom.indexCount, " potentialQuadCount=", potentialQuadCount,
+        " hasReasonableComplexity=", hasReasonableComplexity, " RESULT=", result));
 
     // Conservative approach: Only enable for tracked replacement meshes with quad topology
     // This can be relaxed with additional configuration options
@@ -2464,9 +2458,6 @@ namespace dxvk {
           cpMax.y = std::max(cpMax.y, controlPoints[i].y);
           cpMax.z = std::max(cpMax.z, controlPoints[i].z);
         }
-        Logger::warn(str::format("CHECKPOINT: SubdivSurface[", s_cpSurfIdx, "] ", vertexCount, "v ", totalFaces, "f (",
-            validQuadCount, "q+", validTriCount, "t) AABB min=(", cpMin.x, ",", cpMin.y, ",", cpMin.z,
-            ") max=(", cpMax.x, ",", cpMax.y, ",", cpMax.z, ")"));
         s_cpSurfIdx++;
         if (s_cpSurfIdx >= 50) s_cpLogDone = true; // Stop after 50 surfaces
       }

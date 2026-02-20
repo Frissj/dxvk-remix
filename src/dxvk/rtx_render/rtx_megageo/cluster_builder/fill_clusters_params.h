@@ -49,7 +49,7 @@ struct FillClustersParams
 
     float globalDisplacementScale;
     uint32_t clusterPattern;
-    uint32_t disableSubdivision;  // 1 = bypass stencil evaluation, use bilinear interpolation
+    uint32_t pad0;
     uint32_t pad1;
 
     uint32_t debugSurfaceIndex;

@@ -633,6 +633,16 @@ namespace dxvk {
       enabledFeatures.extShaderSubgroupExtendedTypes.shaderSubgroupExtendedTypes = VK_TRUE;
     }
 
+    // RTX MegaGeo: Enable cluster acceleration structure feature (required for CLAS/BLAS operations)
+    if (m_deviceFeatures.nvClusterAccelerationStructureFeatures.clusterAccelerationStructure) {
+      enabledFeatures.nvClusterAccelerationStructureFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CLUSTER_ACCELERATION_STRUCTURE_FEATURES_NV;
+      enabledFeatures.nvClusterAccelerationStructureFeatures.pNext = std::exchange(enabledFeatures.core.pNext, &enabledFeatures.nvClusterAccelerationStructureFeatures);
+      enabledFeatures.nvClusterAccelerationStructureFeatures.clusterAccelerationStructure = VK_TRUE;
+      Logger::warn("RTX MegaGeo: Cluster acceleration structure feature ENABLED");
+    } else {
+      Logger::warn("RTX MegaGeo: Cluster acceleration structure feature NOT supported by device");
+    }
+
     // NV-DXVK start: Moved logging to where it is on more recent DXVK to properly show enabled features, also added more information to be logged
     // (Still needs driver version from latest DXVK though at the time of writing this, but we can wait on that since it needs larger changes)
 
@@ -1046,6 +1056,11 @@ namespace dxvk {
       m_deviceInfo.nvRayTracingInvocationReorderProperties.pNext = std::exchange(m_deviceInfo.core.pNext, &m_deviceInfo.nvRayTracingInvocationReorderProperties);
     }
 
+    if (m_deviceExtensions.supports(VK_NV_CLUSTER_ACCELERATION_STRUCTURE_EXTENSION_NAME)) {
+      m_deviceInfo.nvClusterAccelerationStructureProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CLUSTER_ACCELERATION_STRUCTURE_PROPERTIES_NV;
+      m_deviceInfo.nvClusterAccelerationStructureProperties.pNext = std::exchange(m_deviceInfo.core.pNext, &m_deviceInfo.nvClusterAccelerationStructureProperties);
+    }
+
     // Query full device properties for all enabled extensions
     m_vki->vkGetPhysicalDeviceProperties2(m_handle, &m_deviceInfo.core);
     
@@ -1065,6 +1080,20 @@ namespace dxvk {
         break;
 
       default:;
+    }
+
+    // RTX MegaGeo: Log cluster acceleration structure properties
+    if (m_deviceExtensions.supports(VK_NV_CLUSTER_ACCELERATION_STRUCTURE_EXTENSION_NAME)) {
+      auto& p = m_deviceInfo.nvClusterAccelerationStructureProperties;
+      Logger::warn(str::format("RTX MegaGeo: Cluster AS Properties:"
+        " maxVerticesPerCluster=", p.maxVerticesPerCluster,
+        " maxTrianglesPerCluster=", p.maxTrianglesPerCluster,
+        " scratchAlign=", p.clusterScratchByteAlignment,
+        " clusterAlign=", p.clusterByteAlignment,
+        " templateAlign=", p.clusterTemplateByteAlignment,
+        " blasAlign=", p.clusterBottomLevelByteAlignment,
+        " boundsAlign=", p.clusterTemplateBoundsByteAlignment,
+        " maxGeometryIndex=", p.maxClusterGeometryIndex));
     }
   }
 
@@ -1157,6 +1186,10 @@ namespace dxvk {
       m_deviceFeatures.extShaderSubgroupExtendedTypes.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_EXTENDED_TYPES_FEATURES;
       m_deviceFeatures.extShaderSubgroupExtendedTypes.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.extShaderSubgroupExtendedTypes);
     }
+
+    // RTX MegaGeo: Query cluster acceleration structure feature support
+    m_deviceFeatures.nvClusterAccelerationStructureFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CLUSTER_ACCELERATION_STRUCTURE_FEATURES_NV;
+    m_deviceFeatures.nvClusterAccelerationStructureFeatures.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.nvClusterAccelerationStructureFeatures);
 
     m_vki->vkGetPhysicalDeviceFeatures2(m_handle, &m_deviceFeatures.core);
   }

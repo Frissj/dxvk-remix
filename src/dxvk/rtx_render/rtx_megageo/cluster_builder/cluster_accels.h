@@ -53,10 +53,18 @@ struct ClusterAccels
     // -------------------------------------------------------------------------
     // Vertex Position buffer that we stage into before creating CLASes
     //
+    // IMPORTANT: C++ float3 (MathLib) = 16 bytes (SSE __m128 padded), but GPU
+    // stride is 12 bytes (Slang float3 with scalar layout). Buffer is allocated
+    // with 12-byte stride (see kGpuFloat3Stride in cluster_accel_builder.cpp).
+    // The RTXMGBuffer<float3> template param affects Download() element counting
+    // but NOT the actual buffer size or GPU layout. Use raw byte readback with
+    // 12-byte stride for correct vertex interpretation.
+    // Sample uses donut::math::vector<float,3> which IS 12 bytes — no mismatch there.
     RTXMGBuffer<float3> clusterVertexPositionsBuffer;
 
     // -------------------------------------------------------------------------
     // Vertex Normal buffer (optional - only allocated when vertex normals are enabled)
+    // Same float3 stride caveat as clusterVertexPositionsBuffer above.
     //
     RTXMGBuffer<float3> clusterVertexNormalsBuffer;
 };

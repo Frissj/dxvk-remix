@@ -36,6 +36,7 @@ inline size_t alignBufferSize(size_t size) {
 #include <algorithm>
 #include <limits>
 #include <chrono>
+#include <set>
 
 // RTX Remix includes
 #include "../../../util/log/log.h"
@@ -87,6 +88,7 @@ using namespace dxvk;
 #include "../profiler/profiler_stub.h"  // Lightweight profiler stub for RTX Remix
 
 #include "../subdivision/subdivision_surface.h"
+#include "../subdivision/shape.h"
 #include "../subdivision/topology_map.h"
 
 #include "../rtxmg_log.h"
@@ -100,8 +102,9 @@ using namespace dxvk;
 using namespace donut;
 using namespace nvrhi::rt;
 
-// Global debug flag shared between BuildAccel (clear) and FillInstanceClusters (readback)
+// Global debug flags shared between BuildAccel (clear) and FillInstanceClusters (readback)
 bool g_megageoDbgGotData = false;
+bool g_megageoDbgGotLimitData = false;
 
 constexpr uint32_t kNumTemplates = kMaxClusterEdgeSegments * kMaxClusterEdgeSegments;
 constexpr uint32_t kClusterMaxTriangles = kMaxClusterEdgeSegments * kMaxClusterEdgeSegments * 2;
@@ -589,9 +592,14 @@ void ClusterAccelBuilder::InitStructuredClusterTemplates(uint32_t maxGeometryCou
                              " config quantNBits=", m_tessellatorConfig.quantNBits));
 
     // maxGeometryIndex must match between template creation and CLAS instantiation.
-    // BuildStructuredCLASes uses m_maxClusters-1 because we store clusterIndex in
-    // geometryIndexOffsetPacked for hit shader lookup of per-cluster shading data.
+    // We use m_maxClusters-1 so each cluster can have a unique geometry index
+    // for hit shader lookup of per-cluster shading data.
     uint32_t maxGeometryIndex = m_maxClusters > 0 ? m_maxClusters - 1 : 0;
+
+    Logger::warn(str::format("RTX MegaGeo: InitStructuredClusterTemplates GEOMETRY INDEX CHECK:"
+        " maxGeometryCountPerMesh(param)=", maxGeometryCountPerMesh,
+        " m_maxClusters=", m_maxClusters,
+        " maxGeometryIndex(used)=", maxGeometryIndex));
 
     // only initialize if maxGeometryIndex or quantNBits changes
     if (m_templateBuffers.dataBuffer.Get() != 0 &&
@@ -631,7 +639,17 @@ void ClusterAccelBuilder::InitStructuredClusterTemplates(uint32_t maxGeometryCou
     cluster::OperationSizeInfo sizeInfo = m_device->getClusterOperationSizeInfo(operationParams);
 
     nvrhi::BufferHandle clusterTemplateArgsBuffer = GenerateStructuredClusterTemplateArgs(grids, commandList);
-    
+
+    // CRITICAL: The template build reads indexBuffer and vertexBuffer via device address
+    // (embedded in clusterTemplateArgsBuffer). writeBuffer() uploads data via DXVK's
+    // updateBuffer() which records in m_execBarriers, but those barriers are only flushed
+    // by DXVK's own dispatch/draw commands. Our vkCmdBuildClusterAccelerationStructureIndirectNV
+    // call bypasses DXVK entirely, so the pending transfer barriers never get flushed.
+    // Without these explicit barriers, the template build can read stale/uninitialized data
+    // from the index/vertex buffers, producing templates with wrong triangle connectivity.
+    commandList->bufferBarrier(m_templateBuffers.indexBuffer.Get(), nvrhi::ResourceStates::CopyDest, nvrhi::ResourceStates::AccelStructBuildInput);
+    commandList->bufferBarrier(m_templateBuffers.vertexBuffer.Get(), nvrhi::ResourceStates::CopyDest, nvrhi::ResourceStates::AccelStructBuildInput);
+
     // CRITICAL: Use member variable to keep buffer alive - GPU caches address references
     m_templateBuffers.sizesBuffer.Create(kNumTemplates, "ClusterTemplateSizes", m_device.Get());
 
@@ -653,25 +671,18 @@ void ClusterAccelBuilder::InitStructuredClusterTemplates(uint32_t maxGeometryCou
     m_templateBuffers.sizesBuffer.Log(commandList);
 #endif
 
-    // Calculate total size with 128-byte alignment padding for CLAS requirements
-    // Each template must be 128-byte aligned, and we need padding for base address alignment too
+    // Match sample: tight packing, no alignment padding between templates
     size_t totalTemplateSize = 0;
-    size_t totalAlignedTemplateSize = 0;
     for (uint32_t i = 0; i < kNumTemplates; i++)
     {
         totalTemplateSize += templateSizes[i];
-        // Round up each template to 128-byte alignment
-        totalAlignedTemplateSize += (templateSizes[i] + cluster::kClasByteAlignment - 1) & ~(cluster::kClasByteAlignment - 1);
     }
-    // Add extra padding for potential base address alignment (up to 127 bytes)
-    size_t bufferSizeWithPadding = totalAlignedTemplateSize + cluster::kClasByteAlignment;
 
-    RTXMG_LOG(str::format("RTX MegaGeo: Template sizes - raw total=", totalTemplateSize,
-        " aligned total=", totalAlignedTemplateSize, " buffer size with padding=", bufferSizeWithPadding));
+    RTXMG_LOG(str::format("RTX MegaGeo: Template sizes - total=", totalTemplateSize));
 
-    // Create template data buffer based off of totalSize of all templates with alignment padding
+    // Create template data buffer based off of totalSize of all templates
     nvrhi::BufferDesc destDataDesc = {
-        .byteSize = bufferSizeWithPadding,
+        .byteSize = totalTemplateSize,
         .debugName = "ClusterTemplateData",
         .canHaveUAVs = true,
         .isAccelStructStorage = true,
@@ -690,23 +701,13 @@ void ClusterAccelBuilder::InitStructuredClusterTemplates(uint32_t maxGeometryCou
         Logger::err("RTX MegaGeo: InitStructuredClusterTemplates - dataBuffer baseAddress is NULL!");
     }
 
+    // Match sample exactly: tight packing from base address
     std::vector<nvrhi::GpuVirtualAddress> addresses(kNumTemplates);
     totalTemplateSize = 0;
-
-    // CRITICAL FIX: Align base address up to 128-byte boundary for CLAS requirements
-    // The buffer itself may not be 128-aligned, so we need to account for this
-    nvrhi::GpuVirtualAddress alignedBaseAddress = (baseAddress + (cluster::kClasByteAlignment - 1)) & ~(nvrhi::GpuVirtualAddress(cluster::kClasByteAlignment - 1));
-    size_t baseAlignmentPadding = alignedBaseAddress - baseAddress;
-
-    RTXMG_LOG(str::format("RTX MegaGeo: Template alignment: baseAddr=", std::hex, baseAddress,
-        " alignedBase=", alignedBaseAddress, " padding=", std::dec, baseAlignmentPadding, " bytes"));
-
     for (size_t i = 0; i < addresses.size(); i++)
     {
-        // Each template address must be 128-byte aligned
-        addresses[i] = alignedBaseAddress + totalTemplateSize;
-        // Round up template size to 128-byte alignment for next template
-        totalTemplateSize += (templateSizes[i] + cluster::kClasByteAlignment - 1) & ~(cluster::kClasByteAlignment - 1);
+        addresses[i] = baseAddress + totalTemplateSize;
+        totalTemplateSize += templateSizes[i];
     }
     RTXMG_LOG(str::format("RTX MegaGeo: InitStructuredClusterTemplates - computed ", addresses.size(), " template addresses"));
 #if RTXMG_VERBOSE_LOGGING
@@ -804,6 +805,27 @@ void ClusterAccelBuilder::InitStructuredClusterTemplates(uint32_t maxGeometryCou
 #if RTXMG_LOG_CLUSTER_ACCEL_BUILDER
     m_templateBuffers.instantiationSizesBuffer.Log(commandList, { .wrap = false });
 #endif
+    // DIAGNOSTIC: Log key template build results
+    {
+        Logger::warn(str::format("DIAG TEMPLATE-BUILD: maxGeometryIndex=", maxGeometryIndex,
+            " m_maxClusters=", m_maxClusters, " kNumTemplates=", kNumTemplates,
+            " quantNBits=", m_tessellatorConfig.quantNBits));
+
+        // Log template addresses
+        nvrhi::GpuVirtualAddress dataBase = m_templateBuffers.dataBuffer->getGpuVirtualAddress();
+        size_t dataSize = m_templateBuffers.dataBuffer->getDesc().byteSize;
+        Logger::warn(str::format("DIAG TEMPLATE-DATA: buffer=[0x", std::hex, dataBase, "-0x", dataBase + dataSize,
+            "] size=", std::dec, dataSize));
+
+        for (size_t i = 0; i < m_templateBuffers.addresses.size() && i < 5; ++i) {
+            int64_t offset = (int64_t)(m_templateBuffers.addresses[i] - dataBase);
+            Logger::warn(str::format("  templateAddr[", i, "]=0x", std::hex, m_templateBuffers.addresses[i],
+                " offset=", std::dec, offset,
+                " aligned(128)=", (m_templateBuffers.addresses[i] % 128 == 0) ? "Y" : "N",
+                " instSize=", i < m_templateBuffers.instantiationSizes.size() ? m_templateBuffers.instantiationSizes[i] : 0));
+        }
+    }
+
     RTXMG_LOG("RTX MegaGeo: InitStructuredClusterTemplates - complete");
 }
 
@@ -825,6 +847,13 @@ void ClusterAccelBuilder::BuildStructuredCLASes(ClusterAccels& accels, uint32_t 
     if (clasPtrsAddr == 0) Logger::err("RTX MegaGeo: BuildStructuredCLASes - clasPtrsAddr is NULL!");
     if (clasBufferAddr == 0) Logger::err("RTX MegaGeo: BuildStructuredCLASes - clasBufferAddr is NULL!");
 
+    uint32_t instantiateMaxGeometryIndex = m_maxClusters > 0 ? m_maxClusters - 1 : 0;
+    Logger::warn(str::format("RTX MegaGeo: BuildStructuredCLASes GEOMETRY INDEX CHECK:"
+        " maxGeometryCountPerMesh(param)=", maxGeometryCountPerMesh,
+        " m_maxClusters=", m_maxClusters,
+        " instantiateMaxGeometryIndex=", instantiateMaxGeometryIndex,
+        " templateMaxGeometryIndex(stored)=", m_templateBuffers.maxGeometryCountPerMesh));
+
     cluster::OperationParams instantiateClasParams =
     {
         .maxArgCount = m_maxClusters,
@@ -837,7 +866,7 @@ void ClusterAccelBuilder::BuildStructuredCLASes(ClusterAccels& accels, uint32_t 
             // The compute_cluster_tiling shader writes clusterIndex into
             // geometryIndexOffsetPacked (not localGeometryIndex like the sample),
             // so maxGeometryIndex must cover the full cluster index range.
-            .maxGeometryIndex = m_maxClusters > 0 ? m_maxClusters - 1 : 0,
+            .maxGeometryIndex = instantiateMaxGeometryIndex,
             .maxUniqueGeometryCount = 1,
             .maxTriangleCount = kClusterMaxTriangles,
             .maxVertexCount = kClusterMaxVertices,
@@ -872,41 +901,292 @@ void ClusterAccelBuilder::BuildStructuredCLASes(ClusterAccels& accels, uint32_t 
         .outAccelerationStructuresOffsetInBytes = 0
     };
 
-#if RTXMG_LOG_CLUSTER_ACCEL_BUILDER
-    // Download and log CLAS indirect args before building (GPU readback - only when logging enabled)
+    // DIAG: Download and log CLAS indirect args before building
     {
         auto clasIndirectArgs = m_clasIndirectArgDataBuffer.Download(commandList);
-        uint32_t numToLog = std::min(uint32_t(clasIndirectArgs.size()), 10u);
-        RTXMG_LOG(str::format("RTX MegaGeo: CLAS indirect args before build (first ", numToLog, " of ", clasIndirectArgs.size(), "):"));
-        for (uint32_t i = 0; i < numToLog; ++i) {
+        uint32_t numActive = 0;
+        uint32_t wrongStride = 0, zeroTemplate = 0, zeroVertex = 0, badTemplateAddr = 0;
+        // Build set of known template addresses for validation
+        std::set<nvrhi::GpuVirtualAddress> knownTemplateAddrs(
+            m_templateBuffers.addresses.begin(), m_templateBuffers.addresses.end());
+
+        for (uint32_t i = 0; i < (uint32_t)clasIndirectArgs.size(); ++i) {
             const auto& arg = clasIndirectArgs[i];
-            bool templateAligned = (arg.clusterTemplate % 128 == 0);
-            bool vertexAligned = (arg.vertexBuffer.startAddress % 16 == 0);
-            RTXMG_LOG(str::format("  [", i, "] clusterIdOff=", arg.clusterIdOffset,
-                " geomIdxPacked=", arg.geometryIndexOffsetPacked,
-                " template=0x", std::hex, arg.clusterTemplate, " (128-aligned=", templateAligned ? "YES" : "NO", ")",
-                " vertexAddr=0x", arg.vertexBuffer.startAddress, " (16-aligned=", vertexAligned ? "YES" : "NO", ")",
-                std::dec, " stride=", arg.vertexBuffer.strideInBytes));
+            if (arg.clusterTemplate == 0 && arg.vertexBuffer.startAddress == 0) continue;
+            numActive++;
+            if (arg.vertexBuffer.strideInBytes != 12) wrongStride++;
+            if (arg.clusterTemplate == 0) zeroTemplate++;
+            if (arg.vertexBuffer.startAddress == 0) zeroVertex++;
+            if (arg.clusterTemplate != 0 && knownTemplateAddrs.find(arg.clusterTemplate) == knownTemplateAddrs.end())
+                badTemplateAddr++;
+        }
+        Logger::warn(str::format("DIAG CLAS-ARGS SUMMARY: active=", numActive, "/", clasIndirectArgs.size(),
+            " wrongStride=", wrongStride, " zeroTemplate=", zeroTemplate, " zeroVertex=", zeroVertex,
+            " unknownTemplateAddr=", badTemplateAddr, " knownTemplates=", knownTemplateAddrs.size()));
+
+        // Log first 5 args with detail
+        for (uint32_t i = 0; i < std::min((uint32_t)clasIndirectArgs.size(), 5u); ++i) {
+            const auto& arg = clasIndirectArgs[i];
+            if (arg.clusterTemplate == 0 && arg.vertexBuffer.startAddress == 0) continue;
+            bool templateKnown = knownTemplateAddrs.count(arg.clusterTemplate) > 0;
+            Logger::warn(str::format("  CLAS-ARG[", i, "] clusterIdOff=", arg.clusterIdOffset,
+                " geomIdx=", (arg.geometryIndexOffsetPacked & 0xFFFFFF),
+                " template=0x", std::hex, arg.clusterTemplate, "(known=", templateKnown ? "Y" : "N", ")",
+                " vtxAddr=0x", arg.vertexBuffer.startAddress, std::dec,
+                " stride=", arg.vertexBuffer.strideInBytes));
         }
     }
-#endif
+
+    // DIAGNOSTIC: Validate CLAS destination addresses before build
+    {
+        auto clasPtrs = accels.clasPtrsBuffer.Download(commandList);
+        nvrhi::GpuVirtualAddress clasBase = accels.clasBuffer.GetGpuVirtualAddress();
+        size_t clasSize = accels.clasBuffer.GetBytes();
+        nvrhi::GpuVirtualAddress clasEnd = clasBase + clasSize;
+
+        uint32_t numActive = 0, outOfRange = 0, misaligned = 0, overlapping = 0;
+        std::vector<std::pair<nvrhi::GpuVirtualAddress, uint32_t>> activeAddrs; // addr, index
+
+        for (uint32_t i = 0; i < (uint32_t)clasPtrs.size(); ++i) {
+            if (clasPtrs[i] == 0) continue;
+            numActive++;
+            if (clasPtrs[i] < clasBase || clasPtrs[i] >= clasEnd) outOfRange++;
+            if (clasPtrs[i] % cluster::kClasByteAlignment != 0) misaligned++;
+            activeAddrs.push_back({clasPtrs[i], i});
+        }
+
+        // Sort by address to check for overlaps
+        std::sort(activeAddrs.begin(), activeAddrs.end());
+        for (size_t i = 1; i < activeAddrs.size(); ++i) {
+            if (activeAddrs[i].first == activeAddrs[i-1].first) overlapping++;
+        }
+
+        Logger::warn(str::format("DIAG PRE-CLAS-BUILD: clasPtrs active=", numActive, "/", clasPtrs.size(),
+            " outOfRange=", outOfRange, " misaligned(128)=", misaligned, " duplicateAddr=", overlapping,
+            " clasBuffer=[0x", std::hex, clasBase, "-0x", clasEnd, "] size=", std::dec, clasSize));
+
+        // Log first few active addresses
+        uint32_t logged = 0;
+        for (uint32_t i = 0; i < (uint32_t)clasPtrs.size() && logged < 10; ++i) {
+            if (clasPtrs[i] == 0) continue;
+            int64_t offsetFromBase = (int64_t)(clasPtrs[i] - clasBase);
+            Logger::warn(str::format("  clasPtrs[", i, "]=0x", std::hex, clasPtrs[i],
+                " offset=", std::dec, offsetFromBase,
+                " aligned=", (clasPtrs[i] % 128 == 0) ? "Y" : "N",
+                " inRange=", (clasPtrs[i] >= clasBase && clasPtrs[i] < clasEnd) ? "Y" : "N"));
+            logged++;
+        }
+
+        // Log instantiation sizes for reference
+        if (!m_templateBuffers.instantiationSizes.empty()) {
+            std::string sizesStr = "DIAG INSTANTIATION-SIZES:";
+            for (size_t i = 0; i < m_templateBuffers.instantiationSizes.size() && i < 10; ++i) {
+                sizesStr += str::format(" [", i, "]=", m_templateBuffers.instantiationSizes[i]);
+            }
+            Logger::warn(sizesStr);
+        }
+    }
+
+    // DIAG: Verify vertex positions are valid right before CLAS instantiation
+    // NOTE: GPU float3 stride = 12 bytes (Slang scalar layout), NOT sizeof(MathLib::float3) = 16.
+    // RTXMGBuffer<float3>::Download() interprets with 16-byte stride, giving wrong element count.
+    // Must use raw byte readback with 12-byte stride for correct vertex data.
+    {
+        static bool s_loggedPreClasVerts = false;
+        if (!s_loggedPreClasVerts) {
+            s_loggedPreClasVerts = true;
+            // Raw byte readback — bypass RTXMGBuffer<float3>::Download() which uses 16-byte stride
+            size_t bufferBytes = accels.clusterVertexPositionsBuffer.GetBytes();
+            static constexpr uint32_t kGpuFloat3Stride = 12; // 3 * sizeof(float)
+            uint32_t numVerts = (uint32_t)(bufferBytes / kGpuFloat3Stride);
+            // Create staging buffer for raw byte download
+            auto stagingDesc = nvrhi::BufferDesc{ .byteSize = bufferBytes, .cpuAccess = nvrhi::CpuAccessMode::Read };
+            auto staging = commandList->getDevice()->createBuffer(stagingDesc);
+            commandList->copyBuffer(staging.Get(), 0, accels.clusterVertexPositionsBuffer, 0, bufferBytes);
+            commandList->close();
+            commandList->getDevice()->executeCommandList(commandList);
+            commandList->getDevice()->waitForIdle();
+            void* mapped = commandList->getDevice()->mapBuffer(staging.Get(), nvrhi::CpuAccessMode::Read);
+            const float* fp = reinterpret_cast<const float*>(mapped);
+            uint32_t numFloats = (uint32_t)(bufferBytes / sizeof(float));
+            uint32_t zeroVerts = 0, nanVerts = 0;
+            for (uint32_t i = 0; i < numVerts; ++i) {
+                size_t fi = i * 3; // 12-byte stride = 3 floats
+                if (fi + 2 >= numFloats) break;
+                bool isZero = (fp[fi] == 0 && fp[fi+1] == 0 && fp[fi+2] == 0);
+                bool isNan = (std::isnan(fp[fi]) || std::isnan(fp[fi+1]) || std::isnan(fp[fi+2]));
+                if (isZero) zeroVerts++;
+                if (isNan) nanVerts++;
+            }
+            // Log first 5 non-zero vertex positions
+            uint32_t logged = 0;
+            std::string posStr;
+            for (uint32_t i = 0; i < numVerts && logged < 5; ++i) {
+                size_t fi = i * 3;
+                if (fi + 2 >= numFloats) break;
+                if (fp[fi] == 0 && fp[fi+1] == 0 && fp[fi+2] == 0) continue;
+                posStr += str::format(" [", i, "]=(", fp[fi], ",", fp[fi+1], ",", fp[fi+2], ")");
+                logged++;
+            }
+            commandList->getDevice()->unmapBuffer(staging.Get());
+            commandList->open();
+            Logger::warn(str::format("DIAG PRE-CLAS-VERTS: total=", numVerts,
+                " zero=", zeroVerts, " nan=", nanVerts, " nonZero=", numVerts - zeroVerts,
+                " bufBytes=", bufferBytes, " gpuStride=", kGpuFloat3Stride,
+                " cppFloat3Size=", sizeof(float3)));
+            Logger::warn(str::format("DIAG PRE-CLAS-VERTS first5:", posStr));
+        }
+    }
+
+    // DIAG: Log CLAS instantiation sizes, cluster count, and CLAS spacing before the build
+    {
+        static bool s_loggedPreBuild = false;
+        if (!s_loggedPreBuild) {
+            s_loggedPreBuild = true;
+
+            // 1. Log all instantiation sizes per template
+            Logger::warn(str::format("DIAG INST-SIZES: kNumTemplates=", kNumTemplates,
+                " stored count=", m_templateBuffers.instantiationSizes.size()));
+            for (uint32_t i = 0; i < std::min((uint32_t)m_templateBuffers.instantiationSizes.size(), 10u); ++i) {
+                Logger::warn(str::format("  instSize[", i, "]=", m_templateBuffers.instantiationSizes[i],
+                    " aligned128=", (m_templateBuffers.instantiationSizes[i] % 128 == 0) ? "Y" : "N"));
+            }
+
+            // 2. Read the actual cluster count from tessellation counters
+            {
+                auto countersData = m_tessellationCountersBuffer.Download(commandList);
+                if (!countersData.empty()) {
+                    // kClusterCountByteOffset is the offset within TessellationCounters struct
+                    const uint32_t* rawData = reinterpret_cast<const uint32_t*>(countersData.data());
+                    uint32_t numCounterWords = (uint32_t)(countersData.size() * sizeof(countersData[0]) / sizeof(uint32_t));
+                    Logger::warn(str::format("DIAG TESS-COUNTERS: buffer words=", numCounterWords));
+                    for (uint32_t i = 0; i < std::min(numCounterWords, 8u); ++i) {
+                        Logger::warn(str::format("  counter[", i, "]=", rawData[i]));
+                    }
+                    // The cluster count is at kClusterCountByteOffset within tessCounterRange
+                    uint32_t clusterCountWordIdx = (uint32_t)(kClusterCountByteOffset / sizeof(uint32_t));
+                    if (clusterCountWordIdx < numCounterWords) {
+                        Logger::warn(str::format("DIAG CLUSTER-COUNT: clusterCountWordIdx=", clusterCountWordIdx,
+                            " value=", rawData[clusterCountWordIdx],
+                            " m_maxClusters=", m_maxClusters));
+                    }
+                }
+            }
+
+            // 3. Check CLAS destination spacing — are CLASes overlapping?
+            {
+                auto clasPtrs = accels.clasPtrsBuffer.Download(commandList);
+                auto clasArgs = m_clasIndirectArgDataBuffer.Download(commandList);
+                // Collect active CLAS ptrs with their template info
+                struct ClasInfo { uint32_t idx; nvrhi::GpuVirtualAddress addr; uint32_t templateInstSize; };
+                std::vector<ClasInfo> activeClases;
+                for (uint32_t i = 0; i < (uint32_t)clasPtrs.size() && i < (uint32_t)clasArgs.size(); ++i) {
+                    if (clasPtrs[i] == 0) continue;
+                    // Find template index for this cluster
+                    nvrhi::GpuVirtualAddress tmplAddr = clasArgs[i].clusterTemplate;
+                    uint32_t tmplIdx = 0;
+                    for (uint32_t t = 0; t < (uint32_t)m_templateBuffers.addresses.size(); ++t) {
+                        if (m_templateBuffers.addresses[t] == tmplAddr) { tmplIdx = t; break; }
+                    }
+                    uint32_t instSize = (tmplIdx < m_templateBuffers.instantiationSizes.size()) ?
+                        m_templateBuffers.instantiationSizes[tmplIdx] : 0;
+                    activeClases.push_back({i, clasPtrs[i], instSize});
+                }
+                // Sort by address and check for overlaps
+                std::sort(activeClases.begin(), activeClases.end(),
+                    [](const ClasInfo& a, const ClasInfo& b) { return a.addr < b.addr; });
+                uint32_t overlaps = 0;
+                for (uint32_t i = 1; i < (uint32_t)activeClases.size(); ++i) {
+                    uint64_t gap = activeClases[i].addr - activeClases[i-1].addr;
+                    if (gap < activeClases[i-1].templateInstSize) overlaps++;
+                }
+                Logger::warn(str::format("DIAG CLAS-SPACING: activeCLASes=", activeClases.size(),
+                    " overlaps=", overlaps));
+                // Log first 5 sorted entries
+                for (uint32_t i = 0; i < std::min((uint32_t)activeClases.size(), 5u); ++i) {
+                    uint64_t gap = (i + 1 < activeClases.size()) ?
+                        activeClases[i+1].addr - activeClases[i].addr : 0;
+                    Logger::warn(str::format("  sorted[", i, "] idx=", activeClases[i].idx,
+                        " addr=0x", std::hex, activeClases[i].addr, std::dec,
+                        " instSize=", activeClases[i].templateInstSize,
+                        " gapToNext=", gap));
+                }
+            }
+        }
+    }
 
     RTXMG_LOG("RTX MegaGeo: BuildStructuredCLASes - calling executeMultiIndirectClusterOperation");
     commandList->executeMultiIndirectClusterOperation(instantiateClasDesc);
 
-#if RTXMG_LOG_CLUSTER_ACCEL_BUILDER
-    // Download and log the first few CLAS pointers to diagnose misaligned address errors (GPU readback - only when logging enabled)
+    // DIAG: Download and log CLAS pointers after instantiation
     {
         auto clasPtrs = accels.clasPtrsBuffer.Download(commandList);
-        uint32_t numToLog = std::min(uint32_t(clasPtrs.size()), 10u);
-        RTXMG_LOG(str::format("RTX MegaGeo: CLAS pointers after build (first ", numToLog, " of ", clasPtrs.size(), "):"));
-        for (uint32_t i = 0; i < numToLog; ++i) {
-            bool aligned128 = (clasPtrs[i] % 128 == 0);
-            RTXMG_LOG(str::format("  [", i, "] 0x", std::hex, clasPtrs[i], std::dec,
-                " aligned(128)=", aligned128 ? "YES" : "NO"));
+        uint32_t numToLog = std::min(uint32_t(clasPtrs.size()), 20u);
+        uint32_t zeroPtrs = 0, nonZeroPtrs = 0;
+        for (size_t i = 0; i < clasPtrs.size(); ++i) {
+            if (clasPtrs[i] == 0) zeroPtrs++;
+            else nonZeroPtrs++;
+        }
+        Logger::warn(str::format("DIAG POST-CLAS: total=", clasPtrs.size(),
+            " nonZero=", nonZeroPtrs, " zero=", zeroPtrs));
+    }
+
+    // DIAG: Read back raw CLAS data at FIRST ACTIVE CLAS address
+    {
+        static bool s_loggedClasData = false;
+        if (!s_loggedClasData) {
+            s_loggedClasData = true;
+            // Find first active CLAS address
+            auto clasPtrsForData = accels.clasPtrsBuffer.Download(commandList);
+            nvrhi::GpuVirtualAddress clasBase = accels.clasBuffer.GetGpuVirtualAddress();
+            size_t clasBytes = accels.clasBuffer.GetBytes();
+            nvrhi::GpuVirtualAddress firstClasAddr = 0;
+            uint32_t firstClasIdx = UINT32_MAX;
+            for (uint32_t i = 0; i < (uint32_t)clasPtrsForData.size(); ++i) {
+                if (clasPtrsForData[i] != 0) { firstClasAddr = clasPtrsForData[i]; firstClasIdx = i; break; }
+            }
+            if (firstClasAddr != 0 && firstClasAddr >= clasBase) {
+                uint64_t offsetInBuffer = firstClasAddr - clasBase;
+                // Read 512 bytes from the first active CLAS
+                size_t readSize = std::min((size_t)512, clasBytes - (size_t)offsetInBuffer);
+                auto stagingDesc = nvrhi::BufferDesc{ .byteSize = readSize, .cpuAccess = nvrhi::CpuAccessMode::Read };
+                auto staging = commandList->getDevice()->createBuffer(stagingDesc);
+                commandList->copyBuffer(staging.Get(), 0, accels.clasBuffer, offsetInBuffer, readSize);
+                commandList->close();
+                commandList->getDevice()->executeCommandList(commandList);
+                commandList->getDevice()->waitForIdle();
+                void* mapped = commandList->getDevice()->mapBuffer(staging.Get(), nvrhi::CpuAccessMode::Read);
+                const uint32_t* data = reinterpret_cast<const uint32_t*>(mapped);
+                uint32_t numWords = (uint32_t)(readSize / sizeof(uint32_t));
+                uint32_t zeroWords = 0;
+                for (uint32_t i = 0; i < numWords; ++i) {
+                    if (data[i] == 0) zeroWords++;
+                }
+                Logger::warn(str::format("DIAG POST-CLAS-DATA: firstClasIdx=", firstClasIdx,
+                    " addr=0x", std::hex, firstClasAddr, std::dec,
+                    " bufferOffset=", offsetInBuffer,
+                    " read=", readSize, " words=", numWords,
+                    " zeroWords=", zeroWords, " nonZeroWords=", numWords - zeroWords));
+                // Dump first 32 dwords of the actual CLAS
+                std::string hexDump;
+                for (uint32_t i = 0; i < std::min(numWords, 32u); ++i) {
+                    hexDump += str::format(" ", std::hex, data[i]);
+                }
+                Logger::warn(str::format("DIAG POST-CLAS-DATA raw:", hexDump));
+                // Also dump as floats to see if vertex positions are recognizable
+                const float* fp = reinterpret_cast<const float*>(mapped);
+                std::string floatDump;
+                for (uint32_t i = 0; i < std::min(numWords, 12u); ++i) {
+                    floatDump += str::format(" ", fp[i]);
+                }
+                Logger::warn(str::format("DIAG POST-CLAS-DATA floats:", floatDump));
+                commandList->getDevice()->unmapBuffer(staging.Get());
+                commandList->open();
+            } else {
+                Logger::warn("DIAG POST-CLAS-DATA: no active CLAS found!");
+            }
         }
     }
-#endif
 
     RTXMG_LOG("RTX MegaGeo: BuildStructuredCLASes - complete");
 }
@@ -966,10 +1246,6 @@ void ClusterAccelBuilder::FillInstanceClusters(const RTXMGScene& scene, ClusterA
             if (!s_loggedInst0 && instanceIndex == 0) {
                 const auto& aabb = subd.m_aabb;
                 uint32_t posBufBytes = subd.m_positionsBuffer ? (uint32_t)subd.m_positionsBuffer->getDesc().byteSize : 0;
-                Logger::warn(str::format("CHECKPOINT: Instance 0 mesh: meshID=", instance.meshID,
-                    " posBufBytes=", posBufBytes, " surfaceCount=", surfaceCount,
-                    " AABB min=(", aabb.m_mins[0], ",", aabb.m_mins[1], ",", aabb.m_mins[2],
-                    ") max=(", aabb.m_maxs[0], ",", aabb.m_maxs[1], ",", aabb.m_maxs[2], ")"));
                 s_loggedInst0 = true;
             }
         }
@@ -1026,7 +1302,6 @@ void ClusterAccelBuilder::FillInstanceClusters(const RTXMGScene& scene, ClusterA
         params.isolationLevel = m_tessellatorConfig.isolationLevel;
         params.globalDisplacementScale = m_tessellatorConfig.displacementScale;
         params.clusterPattern = uint32_t(m_tessellatorConfig.clusterPattern);
-        params.disableSubdivision = m_tessellatorConfig.disableSubdivision ? 1 : 0;
         params.firstGeometryIndex = firstGeometryIndex;
         params.debugSurfaceIndex = uint32_t(m_tessellatorConfig.debugSurfaceIndex);
         params.debugClusterIndex = uint32_t(m_tessellatorConfig.debugClusterIndex);
@@ -1049,8 +1324,7 @@ void ClusterAccelBuilder::FillInstanceClusters(const RTXMGScene& scene, ClusterA
                     " quantNBits=", params.quantNBits, " isolationLevel=", params.isolationLevel,
                     " firstGeomIdx=", params.firstGeometryIndex));
                 Logger::warn(str::format("  FillClustersParams: displacementScale=", params.globalDisplacementScale,
-                    " clusterPattern=", params.clusterPattern,
-                    " disableSubdivision=", params.disableSubdivision));
+                    " clusterPattern=", params.clusterPattern));
                 Logger::warn(str::format("  sizeof(FillClustersParams)=", sizeof(FillClustersParams),
                     " sizeof(SurfaceDescriptor)=", sizeof(OpenSubdiv::Tmr::SurfaceDescriptor)));
                 Logger::warn(str::format("  surfaceOffset=", surfaceOffset, " surfaceCount=", surfaceCount));
@@ -1175,6 +1449,64 @@ void ClusterAccelBuilder::FillInstanceClusters(const RTXMGScene& scene, ClusterA
                             if (x == 0 && y == 0 && z == 0) zeroCount++;
                         }
                         Logger::warn(str::format("  POS SUMMARY: total=", numPos, " nan=", nanCount, " inf=", infCount, " zero=", zeroCount));
+                    }
+
+                    // --- CPU-side bilinear check: compute what the shader SHOULD produce ---
+                    if (descData && cpiData && posData) {
+                        Logger::warn("  === CPU-Side Bilinear Check (first 10 surfaces) ===");
+                        uint32_t checkCount = std::min(numDescs, 10u);
+                        for (uint32_t s = 0; s < checkCount; s++) {
+                            uint32_t field0 = descData[s * 2];
+                            uint32_t firstCP = descData[s * 2 + 1];
+                            // Read 4 control point indices
+                            if (firstCP + 3 >= numCPIs) {
+                                Logger::warn(str::format("  surf[", s, "] firstCP=", firstCP, " OOB (numCPIs=", numCPIs, ")"));
+                                continue;
+                            }
+                            int32_t cpi0 = cpiData[firstCP + 0];
+                            int32_t cpi1 = cpiData[firstCP + 1];
+                            int32_t cpi2 = cpiData[firstCP + 2];
+                            int32_t cpi3 = cpiData[firstCP + 3];
+                            // Read 4 positions
+                            auto getPos = [&](int32_t idx) -> std::tuple<float,float,float> {
+                                if (idx < 0 || (uint32_t)idx >= numPos) return {0.f, 0.f, 0.f};
+                                return {posData[idx*3], posData[idx*3+1], posData[idx*3+2]};
+                            };
+                            auto [x0,y0,z0] = getPos(cpi0);
+                            auto [x1,y1,z1] = getPos(cpi1);
+                            auto [x2,y2,z2] = getPos(cpi2);
+                            auto [x3,y3,z3] = getPos(cpi3);
+                            // Bilinear at UV=(0.5,0.5) = average of 4 corners
+                            float cx = 0.25f*(x0+x1+x2+x3);
+                            float cy = 0.25f*(y0+y1+y2+y3);
+                            float cz = 0.25f*(z0+z1+z2+z3);
+                            Logger::warn(str::format("  surf[", s, "] firstCP=", firstCP,
+                                " cpi=[", cpi0, ",", cpi1, ",", cpi2, ",", cpi3, "]",
+                                " p00=(", x0, ",", y0, ",", z0, ")",
+                                " p10=(", x1, ",", y1, ",", z1, ")",
+                                " p11=(", x2, ",", y2, ",", z2, ")",
+                                " p01=(", x3, ",", y3, ",", z3, ")",
+                                " center=(", cx, ",", cy, ",", cz, ")"));
+                        }
+
+                        // Compare GPU positions buffer with CPU-side Shape::verts
+                        Logger::warn("  === GPU vs CPU Position Comparison ===");
+                        auto& cpuVerts = subd.GetShape()->verts;
+                        uint32_t cmpCount = std::min((uint32_t)cpuVerts.size(), std::min(numPos, 10u));
+                        uint32_t mismatchCount = 0;
+                        for (uint32_t i = 0; i < std::min((uint32_t)cpuVerts.size(), numPos); i++) {
+                            float gx = posData[i*3], gy = posData[i*3+1], gz = posData[i*3+2];
+                            float cx = cpuVerts[i].x, cy = cpuVerts[i].y, cz = cpuVerts[i].z;
+                            bool match = (gx == cx && gy == cy && gz == cz);
+                            if (!match) mismatchCount++;
+                            if (i < cmpCount) {
+                                Logger::warn(str::format("  vert[", i, "] GPU=(", gx, ",", gy, ",", gz,
+                                    ") CPU=(", cx, ",", cy, ",", cz, ")", match ? "" : " **MISMATCH**"));
+                            }
+                        }
+                        Logger::warn(str::format("  VERT MATCH: compared=", std::min((uint32_t)cpuVerts.size(), numPos),
+                            " mismatches=", mismatchCount,
+                            " cpuCount=", cpuVerts.size(), " gpuCount=", numPos));
                     }
 
                     if (descData) commandList->getDevice()->unmapBuffer(descReadback.Get());
@@ -1401,7 +1733,6 @@ void ClusterAccelBuilder::FillInstanceClusters(const RTXMGScene& scene, ClusterA
                 }
                 if (hasData) {
                     g_megageoDbgGotData = true;
-                    Logger::warn(str::format("CHECKPOINT: debug readback (attempt=", s_fillDbgAttempts, ")"));
 
                     // Slots 0-7: compute_cluster_tiling debug (payloadType=103)
                     // RAW DUMP first - show all data regardless of payloadType
@@ -1638,8 +1969,154 @@ void ClusterAccelBuilder::FillInstanceClusters(const RTXMGScene& scene, ClusterA
                             }
                         }
                     }
+                    // Slots 31-38: Per-vertex UV and position for first 8 vertices of cluster 0 (payloadType=107)
+                    Logger::warn("  === Per-Vertex UV + Position (first 8 vertices, cluster 0) ===");
+                    for (uint32_t i = 31; i <= 38 && i < debugOutput.size(); ++i) {
+                        const auto& e = debugOutput[i];
+                        if (e.payloadType != 107) {
+                            Logger::warn(str::format("  vtx[", i-31, "] NOT WRITTEN (payloadType=", e.payloadType, ")"));
+                            continue;
+                        }
+                        float uvX, uvY;
+                        memcpy(&uvX, &e.uintData.x, 4);
+                        memcpy(&uvY, &e.uintData.y, 4);
+                        uint32_t sizeX = e.uintData.w & 0xFFFF;
+                        uint32_t sizeY = (e.uintData.w >> 16) & 0xFFFF;
+                        Logger::warn(str::format("  vtx[", e.uintData.z, "] uv=(", uvX, ",", uvY,
+                            ") pos=(", e.floatData.x, ",", e.floatData.y, ",", e.floatData.z,
+                            ") clusterSize=", sizeX, "x", sizeY));
+                    }
+
+                    // Slots 40-55: Limit surface diagnostics — now read post-loop (after all instances)
+                    Logger::warn("  === LIMIT Surface Diagnostics: deferred to post-loop readback ===");
+
+                    // === Output Vertex Positions Readback ===
+                    // Read back the actual output of fill_clusters (clusterVertexPositions buffer)
+                    Logger::warn("  === Output Vertex Positions (clusterVertexPositionsBuffer) ===");
+                    {
+                        size_t vtxBufBytes = accels.clusterVertexPositionsBuffer.GetBytes();
+                        uint32_t vtxBufCount = (uint32_t)(vtxBufBytes / 12); // stride=12 on GPU (float3)
+                        Logger::warn(str::format("  vtxBuf: bytes=", vtxBufBytes, " count=", vtxBufCount));
+
+                        // Create readback buffer and copy
+                        auto readbackBuf = commandList->getDevice()->createBuffer(nvrhi::BufferDesc{
+                            .byteSize = vtxBufBytes,
+                            .cpuAccess = nvrhi::CpuAccessMode::Read,
+                        });
+
+                        commandList->close();
+                        commandList->getDevice()->executeCommandList(commandList);
+                        commandList->getDevice()->waitForIdle();
+
+                        commandList->open();
+                        commandList->copyBuffer(readbackBuf.Get(), 0, accels.clusterVertexPositionsBuffer.Get(), 0, vtxBufBytes);
+                        commandList->close();
+                        commandList->getDevice()->executeCommandList(commandList);
+                        commandList->getDevice()->waitForIdle();
+
+                        const float* vtxData = static_cast<const float*>(
+                            commandList->getDevice()->mapBuffer(readbackBuf.Get(), nvrhi::CpuAccessMode::Read));
+                        if (vtxData) {
+                            // Log first cluster's corner vertices (9x9 grid for 8x8 cluster)
+                            // Row-major: vertex(row, col) = row * 9 + col
+                            uint32_t sampleIndices[] = {0, 8, 72, 80, 1, 9, 40, 4, 36, 44};
+                            const char* sampleNames[] = {"(r0,c0)", "(r0,c8)", "(r8,c0)", "(r8,c8)", "(r0,c1)", "(r1,c0)", "(r4,c4)", "(r0,c4)", "(r4,c0)", "(r4,c8)"};
+                            for (int ci = 0; ci < 10; ci++) {
+                                uint32_t vi = sampleIndices[ci];
+                                if (vi < vtxBufCount) {
+                                    Logger::warn(str::format("  outVtx[", vi, "] ", sampleNames[ci],
+                                        " = (", vtxData[vi*3], ", ", vtxData[vi*3+1], ", ", vtxData[vi*3+2], ")"));
+                                }
+                            }
+
+                            // Log first 3 vertices of cluster[1] (vtxOff=81)
+                            for (uint32_t vi = 81; vi < 84 && vi < vtxBufCount; vi++) {
+                                Logger::warn(str::format("  outVtx[", vi, "] cluster1 = (", vtxData[vi*3], ", ", vtxData[vi*3+1], ", ", vtxData[vi*3+2], ")"));
+                            }
+
+                            // Check for all-same positions in cluster 0
+                            bool allSame = true;
+                            for (uint32_t vi = 1; vi < std::min(vtxBufCount, 81u); vi++) {
+                                if (vtxData[vi*3] != vtxData[0] || vtxData[vi*3+1] != vtxData[1] || vtxData[vi*3+2] != vtxData[2]) {
+                                    allSame = false;
+                                    break;
+                                }
+                            }
+                            Logger::warn(str::format("  cluster0 allSame=", allSame ? "YES (BUG!)" : "no (vertices vary)"));
+
+                            // Compute expected bilinear at corners by re-reading the input buffers
+                            if (clusters.size() > 0) {
+                                uint32_t iSurf = clusters[0].iSurface;
+                                auto descBuf2 = subd.m_vertexDeviceData.surfaceDescriptors;
+                                auto cpiBuf2 = subd.m_vertexDeviceData.controlPointIndices;
+                                auto posBuf2 = subd.m_positionsBuffer;
+                                uint32_t dBytes = (uint32_t)descBuf2->getDesc().byteSize;
+                                uint32_t cBytes = (uint32_t)cpiBuf2->getDesc().byteSize;
+                                uint32_t pBytes = (uint32_t)posBuf2->getDesc().byteSize;
+                                uint32_t nDescs = dBytes / 8, nCPIs = cBytes / 4, nPos = pBytes / 12;
+
+                                auto dr = commandList->getDevice()->createBuffer(nvrhi::BufferDesc{.byteSize = dBytes, .cpuAccess = nvrhi::CpuAccessMode::Read});
+                                auto cr = commandList->getDevice()->createBuffer(nvrhi::BufferDesc{.byteSize = cBytes, .cpuAccess = nvrhi::CpuAccessMode::Read});
+                                auto pr = commandList->getDevice()->createBuffer(nvrhi::BufferDesc{.byteSize = pBytes, .cpuAccess = nvrhi::CpuAccessMode::Read});
+
+                                commandList->open();
+                                commandList->copyBuffer(dr.Get(), 0, descBuf2.Get(), 0, dBytes);
+                                commandList->copyBuffer(cr.Get(), 0, cpiBuf2.Get(), 0, cBytes);
+                                commandList->copyBuffer(pr.Get(), 0, posBuf2.Get(), 0, pBytes);
+                                commandList->close();
+                                commandList->getDevice()->executeCommandList(commandList);
+                                commandList->getDevice()->waitForIdle();
+
+                                auto dd = static_cast<const uint32_t*>(commandList->getDevice()->mapBuffer(dr.Get(), nvrhi::CpuAccessMode::Read));
+                                auto cd = static_cast<const int32_t*>(commandList->getDevice()->mapBuffer(cr.Get(), nvrhi::CpuAccessMode::Read));
+                                auto pd = static_cast<const float*>(commandList->getDevice()->mapBuffer(pr.Get(), nvrhi::CpuAccessMode::Read));
+                                if (dd && cd && pd && iSurf < nDescs) {
+                                    uint32_t firstCP = dd[iSurf * 2 + 1];
+                                    if (firstCP + 3 < nCPIs) {
+                                        int32_t cpi[4] = {cd[firstCP], cd[firstCP+1], cd[firstCP+2], cd[firstCP+3]};
+                                        float cp[4][3];
+                                        for (int c = 0; c < 4; c++) {
+                                            if (cpi[c] >= 0 && (uint32_t)cpi[c] < nPos) {
+                                                cp[c][0] = pd[cpi[c]*3]; cp[c][1] = pd[cpi[c]*3+1]; cp[c][2] = pd[cpi[c]*3+2];
+                                            } else { cp[c][0] = cp[c][1] = cp[c][2] = 0; }
+                                        }
+                                        Logger::warn(str::format("  CPU bilinear for cluster0 iSurface=", iSurf,
+                                            " firstCP=", firstCP, " cpi=[", cpi[0], ",", cpi[1], ",", cpi[2], ",", cpi[3], "]"));
+                                        Logger::warn(str::format("    p00=(", cp[0][0], ",", cp[0][1], ",", cp[0][2], ")"));
+                                        Logger::warn(str::format("    p10=(", cp[1][0], ",", cp[1][1], ",", cp[1][2], ")"));
+                                        Logger::warn(str::format("    p11=(", cp[2][0], ",", cp[2][1], ",", cp[2][2], ")"));
+                                        Logger::warn(str::format("    p01=(", cp[3][0], ",", cp[3][1], ",", cp[3][2], ")"));
+                                        float center[3];
+                                        for (int d = 0; d < 3; d++)
+                                            center[d] = 0.25f * (cp[0][d] + cp[1][d] + cp[2][d] + cp[3][d]);
+                                        Logger::warn(str::format("    expected center=(", center[0], ",", center[1], ",", center[2], ")"));
+
+                                        // Compare GPU outVtx[0] with CPU p00
+                                        if (vtxBufCount > 0) {
+                                            float dx = vtxData[0]-cp[0][0], dy = vtxData[1]-cp[0][1], dz = vtxData[2]-cp[0][2];
+                                            Logger::warn(str::format("    outVtx[0] vs p00: diff=(", dx, ",", dy, ",", dz, ")",
+                                                (dx==0 && dy==0 && dz==0) ? " MATCH" : " MISMATCH"));
+                                        }
+                                        // Compare GPU outVtx[80] with CPU bilinear at UV=(1,1) = p11
+                                        if (vtxBufCount > 80) {
+                                            float dx = vtxData[80*3]-cp[2][0], dy = vtxData[80*3+1]-cp[2][1], dz = vtxData[80*3+2]-cp[2][2];
+                                            Logger::warn(str::format("    outVtx[80] vs p11: diff=(", dx, ",", dy, ",", dz, ")",
+                                                (dx==0 && dy==0 && dz==0) ? " MATCH" : " MISMATCH"));
+                                        }
+                                    }
+                                }
+                                if (dd) commandList->getDevice()->unmapBuffer(dr.Get());
+                                if (cd) commandList->getDevice()->unmapBuffer(cr.Get());
+                                if (pd) commandList->getDevice()->unmapBuffer(pr.Get());
+                            }
+
+                            commandList->getDevice()->unmapBuffer(readbackBuf.Get());
+                        } else {
+                            Logger::warn("  FAILED to map vtx readback buffer");
+                        }
+                        commandList->open();
+                    }
                 } else if (s_fillDbgAttempts % 50 == 0) {
-                    Logger::warn(str::format("CHECKPOINT: debug readback attempt ", s_fillDbgAttempts, " - still empty"));
                 }
             }
         }
@@ -1651,6 +2128,617 @@ void ClusterAccelBuilder::FillInstanceClusters(const RTXMGScene& scene, ClusterA
     }
 
     stats::clusterAccelSamplers.fillClustersTime.Stop();
+
+    // Post-loop: Survey ALL Limit surfaces + read output vertices for Limit clusters
+    {
+        static bool s_limitSurveyDone = false;
+        if (!s_limitSurveyDone) {
+            s_limitSurveyDone = true;
+
+            // 1) GPU shader debug readback (slots 40-55) for one detailed Limit surface
+            auto debugOutput = m_debugBuffer.Download(commandList);
+            if (debugOutput.size() > 55 && debugOutput[40].payloadType == 110) {
+                g_megageoDbgGotLimitData = true;
+                Logger::warn("  === LIMIT Surface Detailed Diagnostic (shader slots 40-55) ===");
+                for (uint32_t i = 40; i <= 55 && i < debugOutput.size(); ++i) {
+                    const auto& e = debugOutput[i];
+                    if (e.payloadType != 110) {
+                        Logger::warn(str::format("  limit[", i, "] EMPTY (payloadType=", e.payloadType, ")"));
+                        continue;
+                    }
+                    switch (e.lineNumber) {
+                        case 0:
+                            Logger::warn(str::format("  limit[40] iSurface=", e.uintData.x,
+                                " planIdx=", e.uintData.y, " numCP=", e.uintData.z,
+                                " numPP=", e.uintData.w,
+                                " evalPos=(", e.floatData.x, ",", e.floatData.y, ",", e.floatData.z, ")"));
+                            break;
+                        case 1:
+                        {
+                            uint32_t sOff, sSize, tOff;
+                            memcpy(&sOff, &e.floatData.x, 4);
+                            memcpy(&sSize, &e.floatData.y, 4);
+                            memcpy(&tOff, &e.floatData.z, 4);
+                            Logger::warn(str::format("  limit[41] field0=0x", std::hex, e.uintData.x, std::dec,
+                                " firstCP=", e.uintData.y, " ppOff=", e.uintData.z,
+                                " ppOffNext=", e.uintData.w,
+                                " stencilOff=", sOff, " stencilSize=", sSize, " treeOff=", tOff));
+                            break;
+                        }
+                        case 2:
+                        {
+                            uint32_t offX, offY;
+                            memcpy(&offX, &e.floatData.y, 4);
+                            memcpy(&offY, &e.floatData.z, 4);
+                            Logger::warn(str::format("  limit[42] clusterIdx=", e.uintData.x,
+                                " vtxOff=", e.uintData.y,
+                                " size=", (e.uintData.z & 0xFFFF), "x", ((e.uintData.z >> 16) & 0xFFFF),
+                                " groupClusterIdx=", e.uintData.w));
+                            break;
+                        }
+                        default:
+                            if (e.lineNumber >= 3 && e.lineNumber <= 6)
+                                Logger::warn(str::format("  limit[", i, "] pp[", e.uintData.y,
+                                    "] idx=", e.uintData.x,
+                                    " pos=(", e.floatData.x, ",", e.floatData.y, ",", e.floatData.z, ")"));
+                            else if (e.lineNumber >= 7 && e.lineNumber <= 10)
+                                Logger::warn(str::format("  limit[", i, "] CP[", e.uintData.y,
+                                    "] cpi=", e.uintData.x,
+                                    " pos=(", e.floatData.x, ",", e.floatData.y, ",", e.floatData.z, ")",
+                                    " numCP=", e.uintData.w));
+                            else if (e.lineNumber >= 11 && e.lineNumber <= 14)
+                                Logger::warn(str::format("  limit[", i, "] stencil[", e.uintData.y,
+                                    "] val=", e.floatData.x, " idx=", e.uintData.x,
+                                    " numCP=", e.uintData.z));
+                            else if (e.lineNumber == 15)
+                                Logger::warn(str::format("  limit[55] EvalLimit@(0.5,0.5)=(", e.floatData.x, ",", e.floatData.y, ",", e.floatData.z, ")",
+                                    " iSurface=", e.uintData.x, " numPP=", e.uintData.y,
+                                    " ppOff=", e.uintData.z, " instIdx=", e.uintData.w));
+                            break;
+                    }
+                }
+            }
+
+            // 2) CPU-side survey: ALL Limit surfaces across ALL instances
+            Logger::warn("  === ALL LIMIT SURFACES SURVEY ===");
+            const auto& subdMeshes = scene.GetSubdMeshes();
+            const auto& instances = scene.GetSubdMeshInstances();
+            uint32_t maxInst = std::min((uint32_t)instances.size(), m_instanceCapacity);
+            uint32_t totalLimitSurfaces = 0;
+            std::vector<uint32_t> surveyedMeshes; // avoid re-surveying same mesh
+
+            // Read back the output vertex positions buffer (once, shared across all instances)
+            size_t vtxBufBytes = accels.clusterVertexPositionsBuffer.GetBytes();
+            uint32_t vtxBufCount = (uint32_t)(vtxBufBytes / 12);
+            auto vtxReadback = commandList->getDevice()->createBuffer(nvrhi::BufferDesc{
+                .byteSize = vtxBufBytes, .cpuAccess = nvrhi::CpuAccessMode::Read });
+            commandList->close();
+            commandList->getDevice()->executeCommandList(commandList);
+            commandList->getDevice()->waitForIdle();
+            commandList->open();
+            commandList->copyBuffer(vtxReadback.Get(), 0, accels.clusterVertexPositionsBuffer.Get(), 0, vtxBufBytes);
+            commandList->close();
+            commandList->getDevice()->executeCommandList(commandList);
+            commandList->getDevice()->waitForIdle();
+            const float* vtxData = static_cast<const float*>(
+                commandList->getDevice()->mapBuffer(vtxReadback.Get(), nvrhi::CpuAccessMode::Read));
+
+            // Read back clusters buffer (Cluster struct = 16 bytes: iSurface, nVertexOffset, offset, sizeX|sizeY)
+            size_t clusterBufBytes = m_clustersBuffer.GetBytes();
+            uint32_t clusterEntries = (uint32_t)(clusterBufBytes / 16);
+            auto clusterReadback = commandList->getDevice()->createBuffer(nvrhi::BufferDesc{
+                .byteSize = clusterBufBytes, .cpuAccess = nvrhi::CpuAccessMode::Read });
+            commandList->open();
+            commandList->copyBuffer(clusterReadback.Get(), 0, m_clustersBuffer.Get(), 0, clusterBufBytes);
+            commandList->close();
+            commandList->getDevice()->executeCommandList(commandList);
+            commandList->getDevice()->waitForIdle();
+            const uint32_t* clusterRaw = static_cast<const uint32_t*>(
+                commandList->getDevice()->mapBuffer(clusterReadback.Get(), nvrhi::CpuAccessMode::Read));
+
+            for (uint32_t inst = 0; inst < maxInst; inst++) {
+                const auto& instance = instances[inst];
+                const auto& subd = *subdMeshes[instance.meshID];
+
+                uint32_t limitStart = subd.m_surfaceOffsets[uint32_t(SubdivisionSurface::SurfaceType::Limit)];
+                uint32_t limitEnd = subd.m_surfaceOffsets[uint32_t(SubdivisionSurface::SurfaceType::NoLimit)];
+                uint32_t limitCount = limitEnd - limitStart;
+                if (limitCount == 0) continue;
+
+                bool newMesh = std::find(surveyedMeshes.begin(), surveyedMeshes.end(), instance.meshID) == surveyedMeshes.end();
+                if (!newMesh) continue; // already surveyed this mesh
+                surveyedMeshes.push_back(instance.meshID);
+
+                totalLimitSurfaces += limitCount;
+
+                // Read back this mesh's descriptor buffer
+                auto descBuf = subd.m_vertexDeviceData.surfaceDescriptors;
+                uint32_t descBytes = (uint32_t)descBuf->getDesc().byteSize;
+                uint32_t numDescs = descBytes / 8;
+                auto descRB = commandList->getDevice()->createBuffer(nvrhi::BufferDesc{
+                    .byteSize = descBytes, .cpuAccess = nvrhi::CpuAccessMode::Read });
+                commandList->open();
+                commandList->copyBuffer(descRB.Get(), 0, descBuf.Get(), 0, descBytes);
+                commandList->close();
+                commandList->getDevice()->executeCommandList(commandList);
+                commandList->getDevice()->waitForIdle();
+                const uint32_t* descData = static_cast<const uint32_t*>(
+                    commandList->getDevice()->mapBuffer(descRB.Get(), nvrhi::CpuAccessMode::Read));
+
+                // Read back plans buffer to get numCP per planIdx
+                auto plansBuf = subd.GetTopologyMap()->plansBuffer;
+                uint32_t plansBytes = (uint32_t)plansBuf->getDesc().byteSize;
+                auto plansRB = commandList->getDevice()->createBuffer(nvrhi::BufferDesc{
+                    .byteSize = plansBytes, .cpuAccess = nvrhi::CpuAccessMode::Read });
+                commandList->open();
+                commandList->copyBuffer(plansRB.Get(), 0, plansBuf.Get(), 0, plansBytes);
+                commandList->close();
+                commandList->getDevice()->executeCommandList(commandList);
+                commandList->getDevice()->waitForIdle();
+                const uint8_t* plansData = static_cast<const uint8_t*>(
+                    commandList->getDevice()->mapBuffer(plansRB.Get(), nvrhi::CpuAccessMode::Read));
+                uint32_t planStride = (uint32_t)(plansBuf->getDesc().structStride);
+                if (planStride == 0) planStride = 40; // fallback: sizeof(SubdivisionPlanHLSL)
+
+                Logger::warn(str::format("  inst[", inst, "] meshID=", instance.meshID,
+                    " surfaces=", subd.m_surfaceCount,
+                    " limitRange=[", limitStart, "..", limitEnd, ") count=", limitCount,
+                    " planStride=", planStride));
+
+                // Log each Limit surface
+                for (uint32_t s = limitStart; s < limitEnd; s++) {
+                    if (s >= numDescs) break;
+                    uint32_t field0 = descData[s * 2];
+                    uint32_t firstCP = descData[s * 2 + 1];
+                    uint32_t planIdx = (field0 >> 12) & 0xFFFFF;
+
+                    // Read numCP from plans buffer
+                    uint16_t numCP = 0;
+                    if (planIdx * planStride + 2 <= plansBytes) {
+                        memcpy(&numCP, plansData + planIdx * planStride, 2);
+                    }
+
+                    Logger::warn(str::format("    limitSurf[", s, "] planIdx=", planIdx,
+                        " numCP=", numCP, " firstCP=", firstCP,
+                        " field0=0x", std::hex, field0, std::dec));
+                }
+
+                if (descData) commandList->getDevice()->unmapBuffer(descRB.Get());
+                if (plansData) commandList->getDevice()->unmapBuffer(plansRB.Get());
+            }
+
+            Logger::warn(str::format("  TOTAL: ", totalLimitSurfaces, " Limit surfaces across ",
+                surveyedMeshes.size(), " unique meshes"));
+
+            // 3) Proper per-instance cluster -> mesh mapping using clusterOffsetCounts
+            if (vtxData && clusterRaw) {
+                Logger::warn("  === CLUSTER CORNER + CP CHECK (using per-instance offsets) ===");
+
+                // Read back clusterOffsetCounts to know which instance owns which clusters
+                // Layout: instanceIndex * NumTypes(4) + dispatchType, uint2(offset, count)
+                size_t offsetBufBytes = m_clusterOffsetCountsBuffer.GetBytes();
+                auto offsetRB = commandList->getDevice()->createBuffer(nvrhi::BufferDesc{
+                    .byteSize = offsetBufBytes, .cpuAccess = nvrhi::CpuAccessMode::Read });
+                commandList->open();
+                commandList->copyBuffer(offsetRB.Get(), 0, m_clusterOffsetCountsBuffer.Get(), 0, offsetBufBytes);
+                commandList->close();
+                commandList->getDevice()->executeCommandList(commandList);
+                commandList->getDevice()->waitForIdle();
+                const uint32_t* offsetData = static_cast<const uint32_t*>(
+                    commandList->getDevice()->mapBuffer(offsetRB.Get(), nvrhi::CpuAccessMode::Read));
+
+                // Build instance -> cluster range mapping
+                struct InstRange {
+                    uint32_t instIdx, meshID, clusterStart, clusterCount;
+                    uint32_t limitStart, limitEnd; // surface indices for Limit range
+                };
+                std::vector<InstRange> instRanges;
+                for (uint32_t inst = 0; inst < maxInst; inst++) {
+                    // All slot = inst * 4 + 3, each entry = 2 uint32s (offset, count)
+                    uint32_t allIdx = inst * 4 + 3;
+                    uint32_t offset = offsetData[allIdx * 2];
+                    uint32_t count = offsetData[allIdx * 2 + 1];
+                    if (count == 0) continue;
+                    const auto& ii = instances[inst];
+                    const auto& ss = *subdMeshes[ii.meshID];
+                    uint32_t ls = ss.m_surfaceOffsets[uint32_t(SubdivisionSurface::SurfaceType::Limit)];
+                    uint32_t le = ss.m_surfaceOffsets[uint32_t(SubdivisionSurface::SurfaceType::NoLimit)];
+                    instRanges.push_back({inst, ii.meshID, offset, count, ls, le});
+                }
+
+                // Per-mesh readback cache
+                struct MeshData {
+                    uint32_t meshID;
+                    const uint32_t* descData = nullptr;
+                    const uint32_t* cpiData = nullptr;
+                    const float* posData = nullptr;
+                    const uint8_t* plansData = nullptr;
+                    uint32_t numDescs = 0, numCPIs = 0, numPositions = 0, planStride = 0;
+                    nvrhi::BufferHandle descRB, cpiRB, posRB, plansRB;
+                };
+                std::vector<MeshData> meshCache;
+
+                auto getMeshData = [&](uint32_t meshID) -> MeshData* {
+                    for (auto& m : meshCache) if (m.meshID == meshID) return &m;
+                    const auto& ss = *subdMeshes[meshID];
+                    MeshData md;
+                    md.meshID = meshID;
+                    // Descriptors
+                    auto descBuf = ss.m_vertexDeviceData.surfaceDescriptors;
+                    uint32_t descBytes = (uint32_t)descBuf->getDesc().byteSize;
+                    md.numDescs = descBytes / 8;
+                    md.descRB = commandList->getDevice()->createBuffer(nvrhi::BufferDesc{.byteSize = descBytes, .cpuAccess = nvrhi::CpuAccessMode::Read});
+                    commandList->open(); commandList->copyBuffer(md.descRB.Get(), 0, descBuf.Get(), 0, descBytes);
+                    commandList->close(); commandList->getDevice()->executeCommandList(commandList); commandList->getDevice()->waitForIdle();
+                    md.descData = static_cast<const uint32_t*>(commandList->getDevice()->mapBuffer(md.descRB.Get(), nvrhi::CpuAccessMode::Read));
+                    // CPI
+                    auto cpiBuf = ss.m_vertexDeviceData.controlPointIndices;
+                    uint32_t cpiBytes = (uint32_t)cpiBuf->getDesc().byteSize;
+                    md.numCPIs = cpiBytes / 4;
+                    md.cpiRB = commandList->getDevice()->createBuffer(nvrhi::BufferDesc{.byteSize = cpiBytes, .cpuAccess = nvrhi::CpuAccessMode::Read});
+                    commandList->open(); commandList->copyBuffer(md.cpiRB.Get(), 0, cpiBuf.Get(), 0, cpiBytes);
+                    commandList->close(); commandList->getDevice()->executeCommandList(commandList); commandList->getDevice()->waitForIdle();
+                    md.cpiData = static_cast<const uint32_t*>(commandList->getDevice()->mapBuffer(md.cpiRB.Get(), nvrhi::CpuAccessMode::Read));
+                    // Positions
+                    auto posBuf = ss.m_positionsBuffer;
+                    uint32_t posBytes = (uint32_t)posBuf->getDesc().byteSize;
+                    md.numPositions = posBytes / 12;
+                    md.posRB = commandList->getDevice()->createBuffer(nvrhi::BufferDesc{.byteSize = posBytes, .cpuAccess = nvrhi::CpuAccessMode::Read});
+                    commandList->open(); commandList->copyBuffer(md.posRB.Get(), 0, posBuf.Get(), 0, posBytes);
+                    commandList->close(); commandList->getDevice()->executeCommandList(commandList); commandList->getDevice()->waitForIdle();
+                    md.posData = static_cast<const float*>(commandList->getDevice()->mapBuffer(md.posRB.Get(), nvrhi::CpuAccessMode::Read));
+                    // Plans
+                    auto plansBuf = ss.GetTopologyMap()->plansBuffer;
+                    uint32_t plansBytes = (uint32_t)plansBuf->getDesc().byteSize;
+                    md.planStride = (uint32_t)(plansBuf->getDesc().structStride);
+                    if (md.planStride == 0) md.planStride = 40;
+                    md.plansRB = commandList->getDevice()->createBuffer(nvrhi::BufferDesc{.byteSize = plansBytes, .cpuAccess = nvrhi::CpuAccessMode::Read});
+                    commandList->open(); commandList->copyBuffer(md.plansRB.Get(), 0, plansBuf.Get(), 0, plansBytes);
+                    commandList->close(); commandList->getDevice()->executeCommandList(commandList); commandList->getDevice()->waitForIdle();
+                    md.plansData = static_cast<const uint8_t*>(commandList->getDevice()->mapBuffer(md.plansRB.Get(), nvrhi::CpuAccessMode::Read));
+                    meshCache.push_back(md);
+                    return &meshCache.back();
+                };
+
+                // Helper to log cluster details
+                auto logCluster = [&](uint32_t c, uint32_t instIdx, uint32_t meshID, uint32_t limitStart, uint32_t limitEnd, const char* label) {
+                    uint32_t iSurf = clusterRaw[c * 4 + 0];
+                    uint32_t vtxOff = clusterRaw[c * 4 + 1];
+                    uint32_t sizePacked = clusterRaw[c * 4 + 3];
+                    uint32_t sizeX = sizePacked & 0xFF;
+                    uint32_t sizeY = (sizePacked >> 8) & 0xFF;
+                    if (sizeX == 0 || sizeY == 0) return;
+
+                    bool isLimit = (iSurf >= limitStart && iSurf < limitEnd);
+                    uint32_t vertsX = sizeX + 1, vertsY = sizeY + 1;
+                    uint32_t vertsPerCluster = vertsX * vertsY;
+
+                    auto getVtx = [&](uint32_t idx) -> std::string {
+                        uint32_t vi = vtxOff + idx;
+                        if (vi >= vtxBufCount) return "(OOB)";
+                        float x = vtxData[vi*3], y = vtxData[vi*3+1], z = vtxData[vi*3+2];
+                        return str::format("(", x, ",", y, ",", z, ")");
+                    };
+
+                    Logger::warn(str::format("  ", label, " cluster[", c, "] inst=", instIdx,
+                        " meshID=", meshID, " iSurf=", iSurf,
+                        " type=", (isLimit ? "LIMIT" : "RegBSpline"),
+                        " vtxOff=", vtxOff, " size=", sizeX, "x", sizeY));
+                    Logger::warn(str::format("    corners: (0,0)=", getVtx(0),
+                        " (1,0)=", getVtx(sizeX),
+                        " (0,1)=", getVtx(sizeY * vertsX),
+                        " (1,1)=", getVtx(vertsPerCluster - 1)));
+
+                    MeshData* md = getMeshData(meshID);
+                    if (!md || iSurf >= md->numDescs) return;
+
+                    uint32_t field0 = md->descData[iSurf * 2];
+                    uint32_t firstCP = md->descData[iSurf * 2 + 1];
+                    uint32_t planIdx = (field0 >> 12) & 0xFFFFF;
+
+                    uint16_t numCP = 0, coarseFaceSize = 0;
+                    int16_t coarseFaceQuadrant = 0;
+                    if (md->plansData) {
+                        const uint8_t* pp = md->plansData + planIdx * md->planStride;
+                        memcpy(&numCP, pp, 2);
+                        memcpy(&coarseFaceSize, pp + 2, 2);
+                        memcpy(&coarseFaceQuadrant, pp + 4, 2);
+                    }
+
+                    Logger::warn(str::format("    desc: planIdx=", planIdx, " firstCP=", firstCP,
+                        " numCP=", numCP, " coarseFaceSize=", coarseFaceSize,
+                        " quadrant=", coarseFaceQuadrant));
+
+                    float cpCX = 0, cpCY = 0, cpCZ = 0;
+                    uint32_t vc = 0;
+                    for (uint32_t cp = 0; cp < numCP && cp < 16; cp++) {
+                        uint32_t cpiIdx = firstCP + cp;
+                        if (cpiIdx < md->numCPIs) {
+                            uint32_t posIdx = md->cpiData[cpiIdx];
+                            if (posIdx < md->numPositions) {
+                                float px = md->posData[posIdx*3], py = md->posData[posIdx*3+1], pz = md->posData[posIdx*3+2];
+                                Logger::warn(str::format("    CP[", cp, "] posIdx=", posIdx,
+                                    " pos=(", px, ",", py, ",", pz, ")"));
+                                cpCX += px; cpCY += py; cpCZ += pz; vc++;
+                            }
+                        }
+                    }
+                    if (vc > 0) {
+                        cpCX /= vc; cpCY /= vc; cpCZ /= vc;
+                        float mnX=1e30f, mxX=-1e30f, mnY=1e30f, mxY=-1e30f, mnZ=1e30f, mxZ=-1e30f;
+                        for (uint32_t v = 0; v < vertsPerCluster && (vtxOff+v) < vtxBufCount; v++) {
+                            float x = vtxData[(vtxOff+v)*3], y = vtxData[(vtxOff+v)*3+1], z = vtxData[(vtxOff+v)*3+2];
+                            mnX = std::min(mnX, x); mxX = std::max(mxX, x);
+                            mnY = std::min(mnY, y); mxY = std::max(mxY, y);
+                            mnZ = std::min(mnZ, z); mxZ = std::max(mxZ, z);
+                        }
+                        float bcX=(mnX+mxX)/2, bcY=(mnY+mxY)/2, bcZ=(mnZ+mxZ)/2;
+                        float dist = sqrtf((cpCX-bcX)*(cpCX-bcX)+(cpCY-bcY)*(cpCY-bcY)+(cpCZ-bcZ)*(cpCZ-bcZ));
+                        Logger::warn(str::format("    CP centroid=(", cpCX, ",", cpCY, ",", cpCZ,
+                            ") bbox center=(", bcX, ",", bcY, ",", bcZ, ") dist=", dist));
+                    }
+
+                    // BILINEAR FLATNESS CHECK: With infinite sharpness, all surfaces should be
+                    // perfectly flat (bilinear interpolation of 4 corners). Check if center vertex
+                    // matches bilinear midpoint of corners.
+                    if (vertsPerCluster >= 4 && (vtxOff + vertsPerCluster - 1) < vtxBufCount) {
+                        // Corner indices in 9x9 grid (sizeX=8, sizeY=8):
+                        // v[0] = grid(0,0), v[sizeX] = grid(sizeX,0)
+                        // v[sizeY*vertsX] = grid(0,sizeY), v[vertsPerCluster-1] = grid(sizeX,sizeY)
+                        uint32_t i00 = 0, i10 = sizeX, i01 = sizeY * vertsX, i11 = vertsPerCluster - 1;
+                        uint32_t iMid = (sizeY/2) * vertsX + (sizeX/2); // center vertex
+
+                        auto getV3 = [&](uint32_t localIdx, float& ox, float& oy, float& oz) {
+                            uint32_t vi = vtxOff + localIdx;
+                            ox = vtxData[vi*3]; oy = vtxData[vi*3+1]; oz = vtxData[vi*3+2];
+                        };
+
+                        float c00x,c00y,c00z, c10x,c10y,c10z, c01x,c01y,c01z, c11x,c11y,c11z;
+                        float midx,midy,midz;
+                        getV3(i00, c00x,c00y,c00z);
+                        getV3(i10, c10x,c10y,c10z);
+                        getV3(i01, c01x,c01y,c01z);
+                        getV3(i11, c11x,c11y,c11z);
+                        getV3(iMid, midx,midy,midz);
+
+                        // Expected bilinear center = average of 4 corners
+                        float expX = (c00x+c10x+c01x+c11x)/4.0f;
+                        float expY = (c00y+c10y+c01y+c11y)/4.0f;
+                        float expZ = (c00z+c10z+c01z+c11z)/4.0f;
+
+                        float bilinErr = sqrtf((midx-expX)*(midx-expX)+(midy-expY)*(midy-expY)+(midz-expZ)*(midz-expZ));
+
+                        // Also check max deviation of ALL interior vertices from bilinear
+                        float maxBilinErr = 0;
+                        uint32_t maxErrVtx = 0;
+                        for (uint32_t vy = 0; vy < vertsY; vy++) {
+                            for (uint32_t vx = 0; vx < vertsX; vx++) {
+                                uint32_t vi = vtxOff + vy * vertsX + vx;
+                                if (vi >= vtxBufCount) continue;
+                                float ax = vtxData[vi*3], ay = vtxData[vi*3+1], az = vtxData[vi*3+2];
+                                // Expected bilinear position
+                                float u = (float)vx / (float)sizeX;
+                                float v = (float)vy / (float)sizeY;
+                                float ex = (1-u)*(1-v)*c00x + u*(1-v)*c10x + u*v*c11x + (1-u)*v*c01x;
+                                float ey = (1-u)*(1-v)*c00y + u*(1-v)*c10y + u*v*c11y + (1-u)*v*c01y;
+                                float ez = (1-u)*(1-v)*c00z + u*(1-v)*c10z + u*v*c11z + (1-u)*v*c01z;
+                                float err = sqrtf((ax-ex)*(ax-ex)+(ay-ey)*(ay-ey)+(az-ez)*(az-ez));
+                                if (err > maxBilinErr) { maxBilinErr = err; maxErrVtx = vy * vertsX + vx; }
+                            }
+                        }
+
+                        // PLANARITY CHECK: Compute plane from first 3 corners, check max distance
+                        float ax = vtxData[(vtxOff+i00)*3], ay = vtxData[(vtxOff+i00)*3+1], az = vtxData[(vtxOff+i00)*3+2];
+                        float bx = vtxData[(vtxOff+i10)*3] - ax, by = vtxData[(vtxOff+i10)*3+1] - ay, bz = vtxData[(vtxOff+i10)*3+2] - az;
+                        float cx = vtxData[(vtxOff+i01)*3] - ax, cy = vtxData[(vtxOff+i01)*3+1] - ay, cz = vtxData[(vtxOff+i01)*3+2] - az;
+                        // Plane normal = cross(b, c)
+                        float nx = by*cz - bz*cy, ny = bz*cx - bx*cz, nz = bx*cy - by*cx;
+                        float nlen = sqrtf(nx*nx + ny*ny + nz*nz);
+                        float maxPlaneDist = 0;
+                        uint32_t maxPlaneVtx = 0;
+                        if (nlen > 1e-12f) {
+                            nx /= nlen; ny /= nlen; nz /= nlen;
+                            for (uint32_t v = 0; v < vertsPerCluster && (vtxOff+v) < vtxBufCount; v++) {
+                                float px = vtxData[(vtxOff+v)*3] - ax;
+                                float py = vtxData[(vtxOff+v)*3+1] - ay;
+                                float pz = vtxData[(vtxOff+v)*3+2] - az;
+                                float d = fabsf(px*nx + py*ny + pz*nz);
+                                if (d > maxPlaneDist) { maxPlaneDist = d; maxPlaneVtx = v; }
+                            }
+                        }
+
+                        Logger::warn(str::format("    FLATNESS: centerErr=", bilinErr,
+                            " maxBilinErr=", maxBilinErr, " @vtx=", maxErrVtx,
+                            " PLANARITY: maxDist=", maxPlaneDist, " @vtx=", maxPlaneVtx,
+                            " corners: (0,0)=", getVtx(i00), " (1,0)=", getVtx(i10),
+                            " (0,1)=", getVtx(i01), " (1,1)=", getVtx(i11)));
+                    }
+                };
+
+                // For each instance, check first 2 Limit clusters + first 2 RegBSpline clusters
+                uint32_t totalLimitChecked = 0, totalRegChecked = 0;
+                for (auto& ir : instRanges) {
+                    if (totalLimitChecked >= 10 && totalRegChecked >= 5) break;
+                    uint32_t limitChecked = 0, regChecked = 0;
+                    for (uint32_t c = ir.clusterStart; c < ir.clusterStart + ir.clusterCount; c++) {
+                        if (c >= clusterEntries) break;
+                        uint32_t iSurf = clusterRaw[c * 4 + 0];
+                        uint32_t sizePacked = clusterRaw[c * 4 + 3];
+                        if ((sizePacked & 0xFF) == 0) continue;
+                        bool isLimit = (iSurf >= ir.limitStart && iSurf < ir.limitEnd);
+                        if (isLimit && limitChecked < 2 && totalLimitChecked < 10) {
+                            logCluster(c, ir.instIdx, ir.meshID, ir.limitStart, ir.limitEnd, "LIMIT");
+                            limitChecked++; totalLimitChecked++;
+                        } else if (!isLimit && regChecked < 2 && totalRegChecked < 5) {
+                            logCluster(c, ir.instIdx, ir.meshID, ir.limitStart, ir.limitEnd, "REG");
+                            regChecked++; totalRegChecked++;
+                        }
+                        if (limitChecked >= 2 && regChecked >= 2) break;
+                    }
+                }
+                Logger::warn(str::format("  Total checked: ", totalLimitChecked, " Limit + ", totalRegChecked, " RegBSpline"));
+
+                // TRIANGLE RECONSTRUCTION CHECK: For first instance with Limit surfaces,
+                // find 3 consecutive Limit surfaces (same triangle face, quadrants 0,1,2)
+                // and verify their corners form a valid triangle tiling.
+                // Each triangle face produces 3 sub-quads with quadrant 0, 1, 2.
+                // The sub-quads should share edges and reconstruct the original triangle.
+                for (auto& ir : instRanges) {
+                    if (ir.limitStart >= ir.limitEnd) continue; // No Limit surfaces
+                    MeshData* md = getMeshData(ir.meshID);
+                    if (!md || !md->plansData) continue;
+
+                    // Find groups of 3 consecutive Limit surfaces from same triangle
+                    // They'll have coarseFaceSize=3 and quadrant 0,1,2
+                    struct LimitSurf {
+                        uint32_t iSurf, planIdx;
+                        int16_t quadrant;
+                        float cpPos[3][3]; // 3 control points × (x,y,z)
+                    };
+                    std::vector<LimitSurf> limitSurfs;
+                    for (uint32_t s = ir.limitStart; s < ir.limitEnd && s < md->numDescs; s++) {
+                        uint32_t field0 = md->descData[s * 2];
+                        uint32_t firstCP = md->descData[s * 2 + 1];
+                        uint32_t planIdx = (field0 >> 12) & 0xFFFFF;
+                        const uint8_t* pp = md->plansData + planIdx * md->planStride;
+                        uint16_t numCP = 0; int16_t quadrant = 0; uint16_t coarseFaceSize = 0;
+                        memcpy(&numCP, pp, 2);
+                        memcpy(&coarseFaceSize, pp + 2, 2);
+                        memcpy(&quadrant, pp + 4, 2);
+                        if (coarseFaceSize != 3 || numCP != 3) continue;
+                        LimitSurf ls;
+                        ls.iSurf = s; ls.planIdx = planIdx; ls.quadrant = quadrant;
+                        for (uint32_t cp = 0; cp < 3; cp++) {
+                            uint32_t cpiIdx = firstCP + cp;
+                            uint32_t posIdx = (cpiIdx < md->numCPIs) ? md->cpiData[cpiIdx] : 0;
+                            if (posIdx < md->numPositions) {
+                                ls.cpPos[cp][0] = md->posData[posIdx*3];
+                                ls.cpPos[cp][1] = md->posData[posIdx*3+1];
+                                ls.cpPos[cp][2] = md->posData[posIdx*3+2];
+                            } else {
+                                ls.cpPos[cp][0] = ls.cpPos[cp][1] = ls.cpPos[cp][2] = 0;
+                            }
+                        }
+                        limitSurfs.push_back(ls);
+                    }
+
+                    // Find first group of 3 with matching CPs (same triangle face)
+                    // Surfaces from the same triangle share the same 3 control points
+                    uint32_t groupsFound = 0;
+                    for (uint32_t i = 0; i + 2 < limitSurfs.size() && groupsFound < 2; i++) {
+                        // Check if surfaces i, i+1, i+2 share the same 3 CPs
+                        // (Same triangle → same control points, just different quadrants)
+                        auto sameCP = [](const LimitSurf& a, const LimitSurf& b) {
+                            // Check if all 3 CPs match (any order)
+                            for (int j = 0; j < 3; j++) {
+                                if (fabsf(a.cpPos[j][0] - b.cpPos[j][0]) > 0.001f ||
+                                    fabsf(a.cpPos[j][1] - b.cpPos[j][1]) > 0.001f ||
+                                    fabsf(a.cpPos[j][2] - b.cpPos[j][2]) > 0.001f)
+                                    return false;
+                            }
+                            return true;
+                        };
+
+                        if (!sameCP(limitSurfs[i], limitSurfs[i+1]) || !sameCP(limitSurfs[i], limitSurfs[i+2]))
+                            continue;
+
+                        auto& s0 = limitSurfs[i], &s1 = limitSurfs[i+1], &s2 = limitSurfs[i+2];
+                        Logger::warn(str::format("  TRIANGLE GROUP inst=", ir.instIdx, " meshID=", ir.meshID,
+                            " surfaces=[", s0.iSurf, ",", s1.iSurf, ",", s2.iSurf,
+                            "] quadrants=[", s0.quadrant, ",", s1.quadrant, ",", s2.quadrant, "]"));
+                        Logger::warn(str::format("    CP[0]=(", s0.cpPos[0][0], ",", s0.cpPos[0][1], ",", s0.cpPos[0][2], ")"));
+                        Logger::warn(str::format("    CP[1]=(", s0.cpPos[1][0], ",", s0.cpPos[1][1], ",", s0.cpPos[1][2], ")"));
+                        Logger::warn(str::format("    CP[2]=(", s0.cpPos[2][0], ",", s0.cpPos[2][1], ",", s0.cpPos[2][2], ")"));
+
+                        // Expected: centroid = (CP0 + CP1 + CP2) / 3
+                        float centX = (s0.cpPos[0][0]+s0.cpPos[1][0]+s0.cpPos[2][0])/3.0f;
+                        float centY = (s0.cpPos[0][1]+s0.cpPos[1][1]+s0.cpPos[2][1])/3.0f;
+                        float centZ = (s0.cpPos[0][2]+s0.cpPos[1][2]+s0.cpPos[2][2])/3.0f;
+
+                        // For each sub-quad cluster, check if the corner (1,1) is near centroid
+                        // (All 3 sub-quads share the centroid at one corner)
+                        for (auto* sp : { &s0, &s1, &s2 }) {
+                            // Find cluster for this surface
+                            for (uint32_t c = ir.clusterStart; c < ir.clusterStart + ir.clusterCount; c++) {
+                                if (c >= clusterEntries) break;
+                                if (clusterRaw[c * 4] != sp->iSurf) continue;
+                                uint32_t vtxOff2 = clusterRaw[c * 4 + 1];
+                                uint32_t sp2 = clusterRaw[c * 4 + 3];
+                                uint32_t sx2 = sp2 & 0xFF, sy2 = (sp2 >> 8) & 0xFF;
+                                if (sx2 == 0 || sy2 == 0) break;
+                                uint32_t vx2 = sx2 + 1, vy2 = sy2 + 1;
+                                uint32_t vpc = vx2 * vy2;
+                                if (vtxOff2 + vpc > vtxBufCount) break;
+
+                                // Get all 4 corners
+                                auto gv = [&](uint32_t li) -> std::string {
+                                    float x = vtxData[(vtxOff2+li)*3], y = vtxData[(vtxOff2+li)*3+1], z = vtxData[(vtxOff2+li)*3+2];
+                                    return str::format("(", x, ",", y, ",", z, ")");
+                                };
+                                float v00x = vtxData[(vtxOff2)*3], v00y = vtxData[(vtxOff2)*3+1], v00z = vtxData[(vtxOff2)*3+2];
+                                float v10x = vtxData[(vtxOff2+sx2)*3], v10y = vtxData[(vtxOff2+sx2)*3+1], v10z = vtxData[(vtxOff2+sx2)*3+2];
+                                float v01x = vtxData[(vtxOff2+sy2*vx2)*3], v01y = vtxData[(vtxOff2+sy2*vx2)*3+1], v01z = vtxData[(vtxOff2+sy2*vx2)*3+2];
+                                float v11x = vtxData[(vtxOff2+vpc-1)*3], v11y = vtxData[(vtxOff2+vpc-1)*3+1], v11z = vtxData[(vtxOff2+vpc-1)*3+2];
+
+                                // Distance from each corner to centroid and to each CP
+                                auto dist3 = [](float ax2, float ay2, float az2, float bx, float by, float bz) {
+                                    return sqrtf((ax2-bx)*(ax2-bx)+(ay2-by)*(ay2-by)+(az2-bz)*(az2-bz));
+                                };
+                                float d00cent = dist3(v00x,v00y,v00z, centX,centY,centZ);
+                                float d10cent = dist3(v10x,v10y,v10z, centX,centY,centZ);
+                                float d01cent = dist3(v01x,v01y,v01z, centX,centY,centZ);
+                                float d11cent = dist3(v11x,v11y,v11z, centX,centY,centZ);
+
+                                // Find which corner is closest to centroid
+                                float minCentDist = std::min({d00cent, d10cent, d01cent, d11cent});
+                                const char* centCorner = (d00cent == minCentDist) ? "(0,0)" :
+                                    (d10cent == minCentDist) ? "(1,0)" :
+                                    (d01cent == minCentDist) ? "(0,1)" : "(1,1)";
+
+                                // Check if any corner matches any CP exactly
+                                float minCP0 = std::min({dist3(v00x,v00y,v00z, sp->cpPos[0][0],sp->cpPos[0][1],sp->cpPos[0][2]),
+                                                         dist3(v10x,v10y,v10z, sp->cpPos[0][0],sp->cpPos[0][1],sp->cpPos[0][2]),
+                                                         dist3(v01x,v01y,v01z, sp->cpPos[0][0],sp->cpPos[0][1],sp->cpPos[0][2]),
+                                                         dist3(v11x,v11y,v11z, sp->cpPos[0][0],sp->cpPos[0][1],sp->cpPos[0][2])});
+                                float minCP1 = std::min({dist3(v00x,v00y,v00z, sp->cpPos[1][0],sp->cpPos[1][1],sp->cpPos[1][2]),
+                                                         dist3(v10x,v10y,v10z, sp->cpPos[1][0],sp->cpPos[1][1],sp->cpPos[1][2]),
+                                                         dist3(v01x,v01y,v01z, sp->cpPos[1][0],sp->cpPos[1][1],sp->cpPos[1][2]),
+                                                         dist3(v11x,v11y,v11z, sp->cpPos[1][0],sp->cpPos[1][1],sp->cpPos[1][2])});
+                                float minCP2 = std::min({dist3(v00x,v00y,v00z, sp->cpPos[2][0],sp->cpPos[2][1],sp->cpPos[2][2]),
+                                                         dist3(v10x,v10y,v10z, sp->cpPos[2][0],sp->cpPos[2][1],sp->cpPos[2][2]),
+                                                         dist3(v01x,v01y,v01z, sp->cpPos[2][0],sp->cpPos[2][1],sp->cpPos[2][2]),
+                                                         dist3(v11x,v11y,v11z, sp->cpPos[2][0],sp->cpPos[2][1],sp->cpPos[2][2])});
+
+                                Logger::warn(str::format("    surf[", sp->iSurf, "] q=", sp->quadrant,
+                                    " corners: (0,0)=", gv(0), " (1,0)=", gv(sx2),
+                                    " (0,1)=", gv(sy2*vx2), " (1,1)=", gv(vpc-1)));
+                                Logger::warn(str::format("      centroid=(", centX, ",", centY, ",", centZ,
+                                    ") nearest@", centCorner, " dist=", minCentDist,
+                                    " | CP0dist=", minCP0, " CP1dist=", minCP1, " CP2dist=", minCP2));
+                                break;
+                            }
+                        }
+                        groupsFound++;
+                    }
+                    if (groupsFound > 0) break; // Only check first instance with Limit surfaces
+                }
+
+                // Cleanup
+                if (offsetData) commandList->getDevice()->unmapBuffer(offsetRB.Get());
+                for (auto& md : meshCache) {
+                    if (md.descData) commandList->getDevice()->unmapBuffer(md.descRB.Get());
+                    if (md.cpiData) commandList->getDevice()->unmapBuffer(md.cpiRB.Get());
+                    if (md.posData) commandList->getDevice()->unmapBuffer(md.posRB.Get());
+                    if (md.plansData) commandList->getDevice()->unmapBuffer(md.plansRB.Get());
+                }
+            }
+
+            if (vtxData) commandList->getDevice()->unmapBuffer(vtxReadback.Get());
+            if (clusterRaw) commandList->getDevice()->unmapBuffer(clusterReadback.Get());
+            commandList->open();
+        }
+    }
+
 #if RTXMG_CHRONO_TIMING
     auto fillEnd = std::chrono::high_resolution_clock::now();
     float totalMs = std::chrono::duration_cast<std::chrono::microseconds>(fillEnd - fillStart).count() * 0.001f;
@@ -1866,10 +2954,9 @@ void ClusterAccelBuilder::ComputeInstanceClusterTiling(ClusterAccels& accels,
         }
     }
 
-    params.enableBackfaceVisibility = m_tessellatorConfig.enableBackfaceVisibility && !m_tessellatorConfig.disableSubdivision;
-    params.enableFrustumVisibility = m_tessellatorConfig.enableFrustumVisibility && !m_tessellatorConfig.disableSubdivision;
-    // Disable HiZ when subdivision is disabled to avoid descriptor binding issues with NoLimit surfaces
-    params.enableHiZVisibility = m_tessellatorConfig.enableHiZVisibility && m_tessellatorConfig.zbuffer != nullptr && !m_tessellatorConfig.disableSubdivision;
+    params.enableBackfaceVisibility = m_tessellatorConfig.enableBackfaceVisibility;
+    params.enableFrustumVisibility = m_tessellatorConfig.enableFrustumVisibility;
+    params.enableHiZVisibility = m_tessellatorConfig.enableHiZVisibility && m_tessellatorConfig.zbuffer != nullptr;
     params.edgeSegments = m_tessellatorConfig.edgeSegments;
     params.globalDisplacementScale = m_tessellatorConfig.displacementScale;
 
@@ -1882,7 +2969,6 @@ void ClusterAccelBuilder::ComputeInstanceClusterTiling(ClusterAccels& accels,
     params.maxVertices = m_maxVertices;
     params.clusterVertexPositionsBaseAddress = accels.clusterVertexPositionsBuffer.GetGpuVirtualAddress();
     params.clasDataBaseAddress = accels.clasBuffer.GetGpuVirtualAddress();
-    params.disableSubdivision = m_tessellatorConfig.disableSubdivision ? 1 : 0;
     params.instanceIndex = instanceIndex;
 
     // Safety check: if clasDataBaseAddress is 0, all CLAS addresses will be invalid
@@ -2189,12 +3275,8 @@ void ClusterAccelBuilder::ComputeInstanceClusterTiling(ClusterAccels& accels,
 
     if (m_tessellatorConfig.enableMonolithicClusterBuild)
     {
-        // When subdivision is disabled, process ALL surfaces using bilinear interpolation
-        // When enabled, skip NoLimit surfaces as they don't have valid limit data
         params.surfaceStart = 0;
-        params.surfaceEnd = m_tessellatorConfig.disableSubdivision
-            ? subdivisionSurface.m_surfaceCount
-            : subdivisionSurface.m_surfaceOffsets[uint32_t(SubdivisionSurface::SurfaceType::NoLimit)];
+        params.surfaceEnd = subdivisionSurface.m_surfaceOffsets[uint32_t(SubdivisionSurface::SurfaceType::NoLimit)];
         uint32_t dispatchCount = params.surfaceEnd - params.surfaceStart;
 
         if (dispatchCount == 0) {
@@ -2434,11 +3516,9 @@ void ClusterAccelBuilder::BuildBlasFromClas(ClusterAccels& accels, const Instanc
     // This causes commitBarriers to emit a TRANSFER→COMPUTE barrier instead of the required
     // COMPUTE→COMPUTE barrier, missing the compute shader's write entirely.
     // This global memory barrier ensures compute shader writes are visible to the BLAS build.
-    Logger::warn("CHECKPOINT: BuildBlasFromClas pre-indirectArgs-barrier");
     commandList->bufferBarrier(m_blasFromClasIndirectArgsBuffer,
         nvrhi::ResourceStates::UnorderedAccess,
         nvrhi::ResourceStates::ShaderResource);
-    Logger::warn("CHECKPOINT: BuildBlasFromClas post-indirectArgs-barrier");
 
 #if RTXMG_LOG_CLUSTER_ACCEL_BUILDER
     m_blasFromClasIndirectArgsBuffer.Log(commandList, [](std::ostream& ss, const cluster::IndirectArgs& e)
@@ -2605,6 +3685,22 @@ void ClusterAccelBuilder::BuildBlasFromClas(ClusterAccels& accels, const Instanc
         " capacityScratchBytes=", m_createBlasSizeInfo.scratchSizeInBytes));
     commandList->executeMultiIndirectClusterOperation(createBlasDesc);
     RTXMG_LOG("RTX MegaGeo: BuildBlasFromClas - executeMultiIndirectClusterOperation complete");
+
+    // DIAG: Download and log BLAS addresses after build
+    {
+        auto blasPtrs = accels.blasPtrsBuffer.Download(commandList);
+        uint32_t numToLog = std::min(uint32_t(blasPtrs.size()), numInstances);
+        uint32_t zeroCount = 0, nonZeroCount = 0;
+        for (uint32_t i = 0; i < numToLog; ++i) {
+            if (blasPtrs[i] == 0) zeroCount++;
+            else nonZeroCount++;
+        }
+        Logger::warn(str::format("DIAG POST-BLAS: numInstances=", numInstances,
+            " nonZero=", nonZeroCount, " zero=", zeroCount));
+        for (uint32_t i = 0; i < std::min(numToLog, 10u); ++i) {
+            Logger::warn(str::format("  blasPtr[", i, "] = 0x", std::hex, blasPtrs[i], std::dec));
+        }
+    }
 
     stats::clusterAccelSamplers.buildBlasTime.Stop();
 }
@@ -2965,6 +4061,10 @@ void ClusterAccelBuilder::UpdateMemoryAllocations(ClusterAccels& accels, uint32_
 
     if (maxVerticesChanged || enableVertexNormalsChanged)
     {
+        // WARNING: This uses RTXMGBuffer<float3>::Create(nElements, ...) which sizes with
+        // sizeof(MathLib::float3)=16. GPU shader writes at 12-byte stride. Buffer is oversized
+        // but normals aren't used for CLAS geometry, only for shading, so this is OK for now.
+        // TODO: Use explicit 12-byte stride allocation like vertexPositionsBuffer above.
         accels.clusterVertexNormalsBuffer.Create(m_tessellatorConfig.enableVertexNormals ? m_maxVertices : 1, "cluster vertex normals", m_device.Get());
     }
 }
@@ -3006,7 +4106,6 @@ void ClusterAccelBuilder::BuildAccel(const RTXMGScene& scene, const TessellatorC
 #if RTXMG_CHRONO_TIMING
     auto setupStart = std::chrono::high_resolution_clock::now();
 #endif
-    Logger::warn(str::format("CHECKPOINT: BuildAccel pre-UpdateMemoryAllocations inst=", instances.size(), " patches=", totalSubdPatches));
     UpdateMemoryAllocations(accels, uint32_t(instances.size()), totalSubdPatches);
 #if RTXMG_CHRONO_TIMING
     auto afterMemAlloc = std::chrono::high_resolution_clock::now();
@@ -3015,7 +4114,6 @@ void ClusterAccelBuilder::BuildAccel(const RTXMGScene& scene, const TessellatorC
         RTXMG_LOG(str::format(">>> RTXMG CHRONO: UpdateMemoryAllocations=", memAllocMs, "ms (SLOW - likely waitForIdle)"));
     }
 #endif
-    Logger::warn("CHECKPOINT: BuildAccel post-UpdateMemoryAllocations");
 
     const uint32_t maxGeometryCountPerMesh = uint32_t(scene.GetSceneGraph()->GetMaxGeometryCountPerMesh());
     InitStructuredClusterTemplates(maxGeometryCountPerMesh, commandList);
@@ -3116,7 +4214,6 @@ void ClusterAccelBuilder::BuildAccel(const RTXMGScene& scene, const TessellatorC
         RTXMG_LOG(str::format(">>> RTXMG CHRONO: BufferClears=", clearsMs, "ms (SLOW)"));
     }
 #endif
-    Logger::warn("CHECKPOINT: BuildAccel post-clears");
 
     // Transition dummy HiZ textures to ShaderResource on first use only
     // Use RtxContext's initImage to initialize the textures from UNDEFINED to their stable layout
@@ -3175,7 +4272,6 @@ void ClusterAccelBuilder::BuildAccel(const RTXMGScene& scene, const TessellatorC
         uint32_t surfaceOffset = 0;
         // Limit to m_numInstances to avoid buffer overflows
         uint32_t maxInstances = std::min(uint32_t(instances.size()), m_numInstances);
-        Logger::warn(str::format("CHECKPOINT: BuildAccel pre-tiling-loop maxInstances=", maxInstances));
 #if RTXMG_CHRONO_TIMING
         float totalInstanceMs = 0.0f;
         uint32_t totalSurfaces = 0;
@@ -3232,7 +4328,6 @@ void ClusterAccelBuilder::BuildAccel(const RTXMGScene& scene, const TessellatorC
             }
 #endif
         }
-        Logger::warn("CHECKPOINT: BuildAccel post-tiling-loop");
         stats::clusterAccelSamplers.clusterTilingTime.Stop();
 #if RTXMG_CHRONO_TIMING
         auto chronoNow = std::chrono::high_resolution_clock::now();
@@ -3273,7 +4368,6 @@ void ClusterAccelBuilder::BuildAccel(const RTXMGScene& scene, const TessellatorC
                 const auto& e = tilingDbg[i];
                 bool hasData = (e.uintData.x || e.uintData.y || e.payloadType);
                 if (hasData) slotsWithData++; else slotsZero++;
-                // Log first 8 and last 4 slots, plus any with data
                 if (i < 8 || i >= numSlots - 4 || hasData) {
                     Logger::warn(str::format("TILING_DBG[", i, "] uint=(0x", std::hex, e.uintData.x, std::dec,
                         ",", e.uintData.y, ",", e.uintData.z, ",", e.uintData.w,
@@ -3291,7 +4385,6 @@ void ClusterAccelBuilder::BuildAccel(const RTXMGScene& scene, const TessellatorC
                 Logger::warn(str::format("TILING_DBG: u_Clusters[0].iSurface = 0x", std::hex, tilingClusters[0].iSurface, std::dec,
                     " - marker ", clusterMarkerFound ? "FOUND (UAV2 WORKS!)" : "NOT FOUND"));
                 Logger::warn(str::format("TILING_DBG: u_Clusters[0].nVertexOffset = ", tilingClusters[0].nVertexOffset));
-                // Show first 4 clusters for context
                 for (uint32_t i = 0; i < 4 && i < tilingClusters.size(); ++i) {
                     Logger::warn(str::format("TILING_DBG: cluster[", i, "] iSurface=0x", std::hex, tilingClusters[i].iSurface,
                         std::dec, " vtxOff=", tilingClusters[i].nVertexOffset));
@@ -3338,9 +4431,7 @@ void ClusterAccelBuilder::BuildAccel(const RTXMGScene& scene, const TessellatorC
         }
     }
 
-    Logger::warn("CHECKPOINT: BuildAccel pre-FillInstanceClusters");
     FillInstanceClusters(scene, accels, commandList);
-    Logger::warn("CHECKPOINT: BuildAccel post-FillInstanceClusters");
 
     // Full diagnostic readback (vertex positions, clusters, CLAS args, etc.)
     DumpDiagnosticData(accels, commandList);
@@ -3356,18 +4447,13 @@ void ClusterAccelBuilder::BuildAccel(const RTXMGScene& scene, const TessellatorC
 
     // CRITICAL: Add UAV barrier after FillInstanceClusters to ensure vertex positions
     // are written before CLAS instantiation reads them via device addresses
-    // Using AccelStructBuildInput state which maps to:
-    // - VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR
-    // - VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR
     RTXMG_LOG("RTX MegaGeo: BuildAccel - adding UAV barrier for vertex positions (UAV -> AccelStructBuildInput)");
     commandList->bufferBarrier(accels.clusterVertexPositionsBuffer, nvrhi::ResourceStates::UnorderedAccess, nvrhi::ResourceStates::AccelStructBuildInput);
 
     // Build CLASes for all instances at once
-    Logger::warn("CHECKPOINT: BuildAccel pre-BuildStructuredCLASes");
     stats::clusterAccelSamplers.buildClasTime.Start(commandList);
     BuildStructuredCLASes(accels, maxGeometryCountPerMesh, tessCounterRange, commandList);
     stats::clusterAccelSamplers.buildClasTime.Stop();
-    Logger::warn("CHECKPOINT: BuildAccel post-BuildStructuredCLASes");
 #if RTXMG_CHRONO_TIMING
     {
         auto chronoNow = std::chrono::high_resolution_clock::now();
@@ -3387,18 +4473,14 @@ void ClusterAccelBuilder::BuildAccel(const RTXMGScene& scene, const TessellatorC
     // Combined ShaderResource|AccelStructBuildInput covers both SHADER_READ and
     // ACCELERATION_STRUCTURE_READ access, ensuring visibility for both the compute shader
     // (FillBlasFromClasArgs) and the BLAS build's AS-level reads of CLAS data.
-    Logger::warn("CHECKPOINT: BuildAccel pre-CLAS-barrier");
     commandList->bufferBarrier(accels.clasPtrsBuffer, nvrhi::ResourceStates::AccelStructWrite,
         nvrhi::ResourceStates::ShaderResource | nvrhi::ResourceStates::AccelStructBuildInput);
-    Logger::warn("CHECKPOINT: BuildAccel post-CLAS-barrier");
 
     // Build BLAS unconditionally (matching sample behavior)
     // NOTE: Removed sync Download check for clusters > 0 because Download closes/reopens
     // command list which destroys bound image views in DXVK
-    Logger::warn(str::format("CHECKPOINT: BuildAccel pre-BuildBlasFromClas count=", std::min(uint32_t(instances.size()), m_numInstances)));
     uint32_t blasInstanceCount = std::min(uint32_t(instances.size()), m_numInstances);
     BuildBlasFromClas(accels, instances.data(), blasInstanceCount, commandList);
-    Logger::warn("CHECKPOINT: BuildAccel post-BuildBlasFromClas");
 #if RTXMG_CHRONO_TIMING
     {
         auto chronoNow = std::chrono::high_resolution_clock::now();
@@ -3413,9 +4495,7 @@ void ClusterAccelBuilder::BuildAccel(const RTXMGScene& scene, const TessellatorC
     uint32_t readIndex = (tessCounterIndex + 1) % kFrameCount;
     RTXMG_LOG(str::format("RTX MegaGeo: About to download counters - writeIndex=", tessCounterIndex,
                              " readIndex=", readIndex, " frame=", m_buildAccelFrameIndex));
-    Logger::warn("CHECKPOINT: BuildAccel pre-Download-counters");
     auto counterBufferData = m_tessellationCountersBuffer.Download(commandList, true);
-    Logger::warn("CHECKPOINT: BuildAccel post-Download-counters");
 #if RTXMG_CHRONO_TIMING
     {
         auto chronoNow = std::chrono::high_resolution_clock::now();

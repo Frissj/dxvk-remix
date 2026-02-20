@@ -406,55 +406,25 @@ void WaveEvaluateBSplinePatch8(uint32_t iWave,
     uint32_t waveSampleOffset = kNumWaveSurfaceUVSamples * iWave;
 
     // always do the non-displaced evaluation first.  Displacement maps will perturb this calculation below
-    // Check for subdivision bypass - use bilinear interpolation instead
-    if (g_Params.disableSubdivision != 0)
+#if SURFACE_TYPE == SURFACE_TYPE_ALL
+    if (subd.IsPureBSplinePatch())
     {
+        LimitFrame limit = subd.WaveEvaluatePureBsplinePatch8(iLane);
         if (iLane < kNumWaveSurfaceUVSamples)
         {
-            LimitFrame limit = subd.EvaluateBilinear(kWaveSurfaceUVSamples[iLane]);
             samples[waveSampleOffset + iLane] = limit;
         }
     }
-    else
+    else if (subd.IsBSplinePatch())
     {
-#if SURFACE_TYPE == SURFACE_TYPE_ALL
-        if (subd.IsPureBSplinePatch())
-        {
-            LimitFrame limit = subd.WaveEvaluatePureBsplinePatch8(iLane);
-            if (iLane < kNumWaveSurfaceUVSamples)
-            {
-                samples[waveSampleOffset + iLane] = limit;
-            }
-        }
-        else if (subd.IsBSplinePatch())
-        {
-            LimitFrame limit = subd.WaveEvaluateBsplinePatch(iLane);
-            if (iLane < kNumWaveSurfaceUVSamples)
-            {
-                samples[waveSampleOffset + iLane] = limit;
-            }
-        }
-        else
-        {
-            // there is no wave parallel implementation for non-bspline patches falling back to single thread
-            subd.WaveEvaluatePatchPoints(iLane, kComputeClusterTilingLanes);
-            if (iLane < kNumWaveSurfaceUVSamples)
-            {
-                LimitFrame limit = subd.EvaluateLimitSurface(kWaveSurfaceUVSamples[iLane]);
-                samples[waveSampleOffset + iLane] = limit;
-            }
-        }
-#elif SURFACE_TYPE == SURFACE_TYPE_PUREBSPLINE
-        LimitFrame limit = subd.WaveEvaluatePureBsplinePatch8(iLane);
-        if (iLane < kNumWaveSurfaceUVSamples)
-            samples[waveSampleOffset + iLane] = limit;
-#elif SURFACE_TYPE == SURFACE_TYPE_REGULARBSPLINE
         LimitFrame limit = subd.WaveEvaluateBsplinePatch(iLane);
         if (iLane < kNumWaveSurfaceUVSamples)
         {
             samples[waveSampleOffset + iLane] = limit;
         }
-#elif SURFACE_TYPE == SURFACE_TYPE_LIMIT
+    }
+    else
+    {
         // there is no wave parallel implementation for non-bspline patches falling back to single thread
         subd.WaveEvaluatePatchPoints(iLane, kComputeClusterTilingLanes);
         if (iLane < kNumWaveSurfaceUVSamples)
@@ -462,8 +432,26 @@ void WaveEvaluateBSplinePatch8(uint32_t iWave,
             LimitFrame limit = subd.EvaluateLimitSurface(kWaveSurfaceUVSamples[iLane]);
             samples[waveSampleOffset + iLane] = limit;
         }
-#endif
     }
+#elif SURFACE_TYPE == SURFACE_TYPE_PUREBSPLINE
+    LimitFrame limit = subd.WaveEvaluatePureBsplinePatch8(iLane);
+    if (iLane < kNumWaveSurfaceUVSamples)
+        samples[waveSampleOffset + iLane] = limit;
+#elif SURFACE_TYPE == SURFACE_TYPE_REGULARBSPLINE
+    LimitFrame limit = subd.WaveEvaluateBsplinePatch(iLane);
+    if (iLane < kNumWaveSurfaceUVSamples)
+    {
+        samples[waveSampleOffset + iLane] = limit;
+    }
+#elif SURFACE_TYPE == SURFACE_TYPE_LIMIT
+    // there is no wave parallel implementation for non-bspline patches falling back to single thread
+    subd.WaveEvaluatePatchPoints(iLane, kComputeClusterTilingLanes);
+    if (iLane < kNumWaveSurfaceUVSamples)
+    {
+        LimitFrame limit = subd.EvaluateLimitSurface(kWaveSurfaceUVSamples[iLane]);
+        samples[waveSampleOffset + iLane] = limit;
+    }
+#endif
 
 #if DISPLACEMENT_MAPS
     uint32_t geometryIndex = t_SurfaceToGeometryIndex[subd.m_surfaceIndex] + g_Params.firstGeometryIndex;
@@ -613,9 +601,9 @@ void GathererWriteCluster(Cluster cluster, uint32_t clusterIndex, GridSampler gr
 
     nvrhi::rt::cluster::IndirectInstantiateTemplateArgs indirectArgs = (nvrhi::rt::cluster::IndirectInstantiateTemplateArgs)0;
     indirectArgs.clusterIdOffset = clusterIndex;
-    // Use clusterIndex as geometry index so we can retrieve it via GeometryIndex() in hit shaders
-    // The original surface ID is available via ClusterShadingData.m_surfaceId
-    indirectArgs.geometryIndexOffsetPacked = clusterIndex; // Lower 24 bits = clusterIndex for shader lookup
+    // We use clusterIndex so hit shaders can retrieve per-cluster data via GeometryIndex().
+    // Sample uses localGeometryIndex, but we need unique geometry indices per cluster.
+    indirectArgs.geometryIndexOffsetPacked = clusterIndex;
     indirectArgs.clusterTemplate = templateAddress;
     indirectArgs.vertexBuffer.startAddress = vertexBufferAddress;
     indirectArgs.vertexBuffer.strideInBytes = sizeof(float3);

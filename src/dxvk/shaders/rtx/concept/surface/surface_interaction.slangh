@@ -273,6 +273,8 @@ SurfaceInteraction surfaceInteractionCreateCluster<let GenerateTangents : bool>(
   positions[1] = mul(surface.objectToWorld, vec4(localPositions[1], 1.0f));
   positions[2] = mul(surface.objectToWorld, vec4(localPositions[2], 1.0f));
 
+  // (debug removed — hit shader positions don't affect geometry shape, only shading)
+
   // Load vertex normals from cluster vertex buffer (stored in LOCAL/object space)
   vec3 localNormals[3];
   localNormals[0] = clusterVertexNormals[globalVtxIndices[0]];
@@ -393,9 +395,6 @@ SurfaceInteraction surfaceInteractionCreateCluster<let GenerateTangents : bool>(
     surfaceInteraction.textureGradientX = (texcoords[1] - texcoords[0]) / 3.0f;
     surfaceInteraction.textureGradientY = (texcoords[2] - texcoords[0]) / 3.0f;
   }
-
-  // DEBUG: Bright red vertex color for cluster surfaces to visually identify them
-  //surfaceInteraction.vertexColor = f16vec4(1.0, 0.0, 0.0, 1.0);
 
   return surfaceInteraction;
 }

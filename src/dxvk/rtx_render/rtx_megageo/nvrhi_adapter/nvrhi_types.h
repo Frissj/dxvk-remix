@@ -29,7 +29,12 @@
 #include "../../dxvk_context.h"
 
 // Note: Shader math types (float2/3/4, uint2/3/4, float4x4) are provided by RTX Remix's MathLib
-// which is included via dxvk headers
+// (include/MathLib/MathLib_f.h) which is included via dxvk headers.
+// IMPORTANT: MathLib float3 is 16 bytes (contains __m128 xmm for SSE), NOT 12 bytes!
+// The sample uses donut::math::vector<float,3> which is 12 bytes (just {float x,y,z}).
+// Slang GPU float3 with scalar layout is also 12 bytes.
+// Any buffer indexed as float3 on the GPU must use 12-byte stride, not sizeof(float3)=16.
+// See cluster_accels.h and cluster_accel_builder.cpp for the kGpuFloat3Stride pattern.
 
 typedef uint32_t uint;
 

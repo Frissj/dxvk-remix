@@ -475,7 +475,6 @@ namespace dxvk {
     // CRITICAL: buildClusterBlas must run BEFORE addBlas so getInstanceIndexForSurface works
 
     if (m_megaGeoBuilder != nullptr) {
-      Logger::warn("CHECKPOINT: mergeInstances pre-processCompletedSurfaces");
       m_megaGeoBuilder->processCompletedSurfaces();
 
       // Collect transforms for all cluster BLAS instances FIRST
@@ -483,7 +482,6 @@ namespace dxvk {
       // because MegaGeo's affineToColumnMajor expects row-major input
       std::unordered_map<uint32_t, Matrix4> surfaceTransforms;
       uint32_t clusterInstCount = 0;
-      Logger::warn(str::format("CHECKPOINT: mergeInstances collecting transforms, instances=", instances.size()));
       uint32_t identityO2W = 0, nonIdentityO2W = 0;
       uint32_t hasI2O = 0, noI2O = 0;
       for (RtInstance* inst : instances) {
@@ -508,10 +506,6 @@ namespace dxvk {
           clusterInstCount++;
         }
       }
-      Logger::warn(str::format("CHECKPOINT: mergeInstances transforms collected, cluster=", clusterInstCount,
-          " surfaces=", surfaceTransforms.size(),
-          " fullXform(identity=", identityO2W, " nonIdentity=", nonIdentityO2W,
-          ") i2o(has=", hasI2O, " none=", noI2O, ")"));
       // Log first non-identity transform (or first transform if all identity)
       {
         static uint32_t s_transformLogCount = 0;
@@ -525,7 +519,6 @@ namespace dxvk {
             }
           }
           const Matrix4& m = it->second;
-          Logger::warn(str::format("CHECKPOINT: RTXMG localToWorld surfaceId=", it->first, " (from surface.objectToWorld):"));
           Logger::warn(str::format("  data[0]=(", m.data[0][0], ", ", m.data[0][1], ", ", m.data[0][2], ", ", m.data[0][3], ")"));
           Logger::warn(str::format("  data[1]=(", m.data[1][0], ", ", m.data[1][1], ", ", m.data[1][2], ", ", m.data[1][3], ")"));
           Logger::warn(str::format("  data[2]=(", m.data[2][0], ", ", m.data[2][1], ", ", m.data[2][2], ", ", m.data[2][3], ")"));
@@ -554,7 +547,6 @@ namespace dxvk {
 
           // Build cluster BLAS - this rebuilds instances from surfaceTransforms
           // After this call, getInstanceIndexForSurface will return valid indices
-          Logger::warn(str::format("CHECKPOINT: pre-buildClusterBlas surfaces=", surfaceTransforms.size()));
           m_megaGeoBuilder->buildClusterBlas(rtxCtx, depthBuffer, camera, surfaceTransforms);
 
           // Barrier: RTXMG compute writes → ray tracing shader reads
@@ -570,7 +562,6 @@ namespace dxvk {
       }
     }
 
-    Logger::warn("CHECKPOINT: post-buildClusterBlas");
 
     // RTX MegaGeo: Per-frame geometry pipeline counters
     uint32_t geoCountTotal = 0;           // Total input instances from the game
@@ -973,12 +964,9 @@ namespace dxvk {
       s_prevFrameInstances = std::move(thisFrameInstances);
     }
 
-    Logger::warn(str::format("CHECKPOINT: post-instanceLoop total=", geoCountTotal, " cluster=", geoCountClusterSubmitted, " std=", geoCountStandard,
+    ONCE(Logger::info(str::format("RTX MegaGeo: instanceLoop total=", geoCountTotal, " cluster=", geoCountClusterSubmitted, " std=", geoCountStandard,
         " hidden=", geoCountHidden, " zeroMask=", geoCountZeroMask, " noBuffers=", geoCountClusterNoBuffers,
-        " skipZeroTris=", m_frameClusterSkipZeroTris, " skipNoInst=", m_frameClusterSkipNoInstance));
-
-    // Log cluster instance patches before buildBlases
-    Logger::warn(str::format("CHECKPOINT: pre-buildBlases clusterPatches=", m_clusterInstancePatches.size()));
+        " skipZeroTris=", m_frameClusterSkipZeroTris, " skipNoInst=", m_frameClusterSkipNoInstance)));
 
     buildBlases(ctx, execBarriers, cameraManager, opacityMicromapManager, instanceManager,
                 textures, instances, blasBuckets, blasToBuild, blasRangesToBuild, totalScratchMemory);
@@ -1047,7 +1035,6 @@ namespace dxvk {
       if (s_stdLogCount < 2 && !blasEntry->isClusterBlas()) {
         auto& t = blasInstance.transform.matrix;
         const Matrix4& o2w = instance->surface.objectToWorld;
-        Logger::warn(str::format("CHECKPOINT: addBlas STANDARD[", s_stdLogCount, "] instanceToObject=", (instanceToObject ? "YES" : "null")));
         Logger::warn(str::format("  VkTransform row0=(", t[0][0], ", ", t[0][1], ", ", t[0][2], ", ", t[0][3], ")"));
         Logger::warn(str::format("  VkTransform row1=(", t[1][0], ", ", t[1][1], ", ", t[1][2], ", ", t[1][3], ")"));
         Logger::warn(str::format("  VkTransform row2=(", t[2][0], ", ", t[2][1], ", ", t[2][2], ", ", t[2][3], ")"));
@@ -1127,13 +1114,6 @@ namespace dxvk {
         bool doPartialLog = (s_clusterAddBlasCount < 5);  // Then just first 5
 
         if (doFullLog || doPartialLog) {
-          Logger::warn(str::format("CHECKPOINT: addBlas cluster[", s_clusterAddBlasCount, "]: surfaceIdx=", surfaceIndexForCustomIndex,
-              " customIdx=0x", std::hex, blasInstance.instanceCustomIndex, std::dec,
-              " mask=0x", std::hex, blasInstance.mask, std::dec,
-              " remixIdx=", static_cast<uint32_t>(m_mergedInstances[Tlas::Opaque].size()),
-              " transform=", isIdentity ? "IDENTITY" : "NON-IDENTITY",
-              " rtxmgIdx=", (isClusterBlas && blasEntry->megaGeoBuilder) ?
-                  blasEntry->megaGeoBuilder->getInstanceIndexForSurface(blasEntry->megaGeoSurfaceId) : UINT32_MAX));
           if (!isIdentity) {
             Logger::warn(str::format("  row0=(", t[0][0], ", ", t[0][1], ", ", t[0][2], ", ", t[0][3], ")"));
             Logger::warn(str::format("  row1=(", t[1][0], ", ", t[1][1], ", ", t[1][2], ", ", t[1][3], ")"));
@@ -1438,16 +1418,14 @@ namespace dxvk {
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
 
-      // Log mapping details for first few
-      for (size_t i = 0; i < std::min(mappings.size(), (size_t)3); i++) {
-        Logger::warn(str::format("CHECKPOINT: patchGPU mapping[", i, "]: remixIdx=", mappings[i].remixInstanceIndex,
+      // Log mapping details
+      Logger::warn(str::format("DIAG GPU-PATCH: ", mappings.size(), " mappings, ",
+          uniqueRtxmgIndices.size(), " unique RTXMG indices"));
+      for (size_t i = 0; i < std::min(mappings.size(), (size_t)5); i++) {
+        Logger::warn(str::format("  mapping[", i, "] remixIdx=", mappings[i].remixInstanceIndex,
             " rtxmgIdx=", mappings[i].rtxmgInstanceIndex));
       }
-      Logger::warn(str::format("CHECKPOINT: pre-patchGPU mappings=", mappings.size(),
-          " uniqueRtxmgIndices=", uniqueRtxmgIndices.size(),
-          " opaqueCount=", opaqueCount));
       m_megaGeoBuilder->patchClusterBlasAddressesGPU(instanceBufferWrapper.Get(), 0, mappings);
-      Logger::warn("CHECKPOINT: post-patchGPU");
 
       // Barrier: TLAS build needs to read both:
       //  1. Instance buffer (written by patch compute shader → SHADER_WRITE)
@@ -1611,8 +1589,6 @@ namespace dxvk {
       }
     }
 
-    Logger::warn(str::format("CHECKPOINT: uploadSurfaceData reorderedSurfaces=", m_reorderedSurfaces.size(),
-        " clusterSurfaces=", clusterSurfaceCount, " standardSurfaces=", standardSurfaceCount));
 
     assert(dataOffset == surfacesGPUSize);
     assert(surfacesGPUData.size() == surfacesGPUSize);
@@ -1696,10 +1672,8 @@ namespace dxvk {
                                  std::vector<VkAccelerationStructureBuildRangeInfoKHR*>& blasRangesToBuild,
                                  size_t& totalScratchMemory) {
     ScopedGpuProfileZone(ctx, "buildBLAS");
-    Logger::warn("CHECKPOINT: buildBlases-enter");
     // Upload surfaces before opacity micromap generation which reads the surface data on the GPU
     uploadSurfaceData(ctx);
-    Logger::warn("CHECKPOINT: post-uploadSurfaceData");
 
     // Build and bind opacity micromaps
     if (opacityMicromapManager && opacityMicromapManager->isActive()) {
@@ -1850,7 +1824,6 @@ namespace dxvk {
   }
 
   void AccelManager::buildTlas(Rc<DxvkContext> ctx) {
-    Logger::warn("CHECKPOINT: buildTlas-enter");
     RTXMG_LOG("RTX MegaGeo AccelManager: buildTlas entering");
     if (m_vkInstanceBuffer == nullptr) {
       RTXMG_LOG("RTX MegaGeo AccelManager: buildTlas - no instance buffer, returning");
@@ -1871,18 +1844,13 @@ namespace dxvk {
       VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR);
     RTXMG_LOG("RTX MegaGeo AccelManager: buildTlas - memory barrier done");
 
-    Logger::warn(str::format("CHECKPOINT: buildTlas-trackBlas pool=", m_blasPool.size()));
     for (auto&& blas : m_blasPool) {
       ctx->getCommandList()->trackResource<DxvkAccess::Read>(blas->accelStructure);
     }
-    Logger::warn("CHECKPOINT: buildTlas-trackDone");
 
     size_t totalScratchSize = 0;
-    Logger::warn(str::format("CHECKPOINT: buildTlas-opaque instances=", m_mergedInstances[Tlas::Opaque].size()));
     internalBuildTlas<Tlas::Opaque>(ctx, totalScratchSize);
-    Logger::warn(str::format("CHECKPOINT: buildTlas-unordered instances=", m_mergedInstances[Tlas::Unordered].size()));
     internalBuildTlas<Tlas::Unordered>(ctx, totalScratchSize);
-    Logger::warn("CHECKPOINT: buildTlas-complete");
 
     RTXMG_LOG("RTX MegaGeo AccelManager: buildTlas - emitting final barrier");
     // Include COMPUTE_SHADER as source: cluster compute shaders wrote to clusterShadingData,
@@ -1941,10 +1909,8 @@ namespace dxvk {
     buildInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
 
     const uint32_t numInstances = uint32_t(m_mergedInstances[type].size());
-    Logger::warn(str::format("CHECKPOINT: internalBuildTlas type=", type, " numInstances=", numInstances));
     VkAccelerationStructureBuildSizesInfoKHR sizeInfo { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR };
     vkd->vkGetAccelerationStructureBuildSizesKHR(vkd->device(), VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &buildInfo, &numInstances, &sizeInfo);
-    Logger::warn(str::format("CHECKPOINT: internalBuildTlas getSizes done asSize=", sizeInfo.accelerationStructureSize, " scratchSize=", sizeInfo.buildScratchSize));
 
     // Create TLAS
     Tlas& tlas = m_device->getCommon()->getResources().getTLAS(type);
@@ -1968,9 +1934,7 @@ namespace dxvk {
 
     // Allocate the scratch memory, we share the same buffer between all TLAS types, so just ensure we handle the offsetting correctly here.
     const size_t requiredScratchAllocSize = align(sizeInfo.buildScratchSize + m_scratchAlignment, m_scratchAlignment);
-    Logger::warn(str::format("CHECKPOINT: internalBuildTlas scratch totalSoFar=", totalScratchSize, " required=", requiredScratchAllocSize));
     auto scratchMem = getScratchMemory(totalScratchSize + requiredScratchAllocSize);
-    Logger::warn(str::format("CHECKPOINT: internalBuildTlas scratch allocated=", (scratchMem != nullptr)));
     buildInfo.scratchData.deviceAddress = scratchMem->getDeviceAddress() + totalScratchSize;
     totalScratchSize += requiredScratchAllocSize;
 
@@ -1985,13 +1949,10 @@ namespace dxvk {
     const VkAccelerationStructureBuildRangeInfoKHR* pBuildOffsetInfo = &buildOffsetInfo;
 
     // Build the TLAS
-    Logger::warn(str::format("CHECKPOINT: internalBuildTlas pre-vkBuild dstAS=", (buildInfo.dstAccelerationStructure != VK_NULL_HANDLE)));
     ctx->getCommandList()->vkCmdBuildAccelerationStructuresKHR(1, &buildInfo, &pBuildOffsetInfo);
-    Logger::warn("CHECKPOINT: internalBuildTlas post-vkBuild");
 
     ctx->getCommandList()->trackResource<DxvkAccess::Write>(tlas.accelStructure);
     ctx->getCommandList()->trackResource<DxvkAccess::Write>(m_scratchBuffer);
-    Logger::warn("CHECKPOINT: internalBuildTlas DONE");
   }
 
   // Check if the existing build geometry info for this blas is compatible with the new one for the purpose of updating rather than rebuilding

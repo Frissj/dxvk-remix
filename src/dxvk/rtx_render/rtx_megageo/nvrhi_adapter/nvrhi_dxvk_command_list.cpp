@@ -992,16 +992,50 @@ namespace dxvk {
         case 3: opTypeStr = "BuildTriangleClusterTemplate"; break;
         case 4: opTypeStr = "InstantiateTriangleCluster"; break;
       }
-      Logger::warn(str::format("CHECKPOINT: vkCmdBuildClusterAS opType=", opTypeStr,
-          " maxAccelStructCount=", vkCmds.input.maxAccelerationStructureCount,
-          " dstImplicit=0x", std::hex, vkCmds.dstImplicitData,
-          " scratch=0x", vkCmds.scratchData, std::dec));
 
       // Heavy barrier no longer needed. The root cause was bufferBarrier() not updating
       // m_BufferStates, causing requireBufferState() to emit wrong barriers (e.g. TRANSFER→X
       // instead of the correct post-barrier state→X). Now that bufferBarrier() updates
       // m_BufferStates and emits buffer-specific VkBufferMemoryBarrier, the automatic
       // barrier system in executeMultiIndirectClusterOperation sees correct states.
+
+      // ALWAYS-ON: Log key values for CLAS build/instantiate debugging
+      {
+        const char* opTypeStr = "?";
+        const char* opModeStr = "?";
+        switch (vkCmds.input.opType) {
+          case VK_CLUSTER_ACCELERATION_STRUCTURE_OP_TYPE_BUILD_TRIANGLE_CLUSTER_NV: opTypeStr = "BuildTemplate"; break;
+          case VK_CLUSTER_ACCELERATION_STRUCTURE_OP_TYPE_BUILD_TRIANGLE_CLUSTER_TEMPLATE_NV: opTypeStr = "BuildTemplate"; break;
+          case VK_CLUSTER_ACCELERATION_STRUCTURE_OP_TYPE_INSTANTIATE_TRIANGLE_CLUSTER_NV: opTypeStr = "Instantiate"; break;
+          case VK_CLUSTER_ACCELERATION_STRUCTURE_OP_TYPE_BUILD_CLUSTERS_BOTTOM_LEVEL_NV: opTypeStr = "BlasBuild"; break;
+        }
+        switch (vkCmds.input.opMode) {
+          case VK_CLUSTER_ACCELERATION_STRUCTURE_OP_MODE_COMPUTE_SIZES_NV: opModeStr = "GetSizes"; break;
+          case VK_CLUSTER_ACCELERATION_STRUCTURE_OP_MODE_EXPLICIT_DESTINATIONS_NV: opModeStr = "ExplicitDest"; break;
+          case VK_CLUSTER_ACCELERATION_STRUCTURE_OP_MODE_IMPLICIT_DESTINATIONS_NV: opModeStr = "ImplicitDest"; break;
+        }
+        Logger::warn(str::format("DIAG VK-CLAS-CALL: type=", opTypeStr, " mode=", opModeStr,
+            " maxAS=", vkCmds.input.maxAccelerationStructureCount,
+            " srcInfos={0x", std::hex, vkCmds.srcInfosArray.deviceAddress,
+            " stride=", std::dec, vkCmds.srcInfosArray.stride,
+            " size=", vkCmds.srcInfosArray.size, "}",
+            " dstAddrs={0x", std::hex, vkCmds.dstAddressesArray.deviceAddress,
+            " stride=", std::dec, vkCmds.dstAddressesArray.stride,
+            " size=", vkCmds.dstAddressesArray.size, "}",
+            " srcInfosCount=0x", std::hex, vkCmds.srcInfosCount,
+            " scratch=0x", vkCmds.scratchData, std::dec));
+
+        // For CLAS template/instantiate ops, log the triangle cluster input params
+        if (vkCmds.input.opInput.pTriangleClusters) {
+          auto* tc = vkCmds.input.opInput.pTriangleClusters;
+          Logger::warn(str::format("DIAG VK-CLAS-INPUT: vertexFormat=", (uint32_t)tc->vertexFormat,
+              " maxGeomIdx=", tc->maxGeometryIndexValue,
+              " maxUniqueGeom=", tc->maxClusterUniqueGeometryCount,
+              " maxTri=", tc->maxClusterTriangleCount, " maxVert=", tc->maxClusterVertexCount,
+              " totalTri=", tc->maxTotalTriangleCount, " totalVert=", tc->maxTotalVertexCount,
+              " truncBits=", tc->minPositionTruncateBitCount));
+        }
+      }
 
       RTXMG_LOG("RTX MegaGeo: Calling vkCmdBuildClusterAccelerationStructureIndirectNV");
       vkCmdBuildClusterAS(cmdBuffer, &vkCmds);
@@ -1151,17 +1185,22 @@ namespace dxvk {
       vkBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 
       // Translate source state
+      // CRITICAL: Use VK_PIPELINE_STAGE_ALL_COMMANDS_BIT for ShaderResource/UnorderedAccess
+      // (matching sample's NVRHI Vulkan backend convertResourceState table).
+      // Using only COMPUTE_SHADER_BIT misses ACCELERATION_STRUCTURE_BUILD_BIT_KHR and
+      // CLUSTER_ACCELERATION_STRUCTURE_BIT_NV, causing the barrier to not synchronize
+      // with vkCmdBuildClusterAccelerationStructureIndirectNV reads/writes.
       if (static_cast<uint32_t>(barrier.stateBefore & nvrhi::ResourceStates::UnorderedAccess) != 0) {
         vkBarrier.srcAccessMask |= VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-        srcStages |= VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+        srcStages |= VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
       }
       if (static_cast<uint32_t>(barrier.stateBefore & nvrhi::ResourceStates::ShaderResource) != 0) {
         vkBarrier.srcAccessMask |= VK_ACCESS_SHADER_READ_BIT;
-        srcStages |= VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+        srcStages |= VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
       }
       if (static_cast<uint32_t>(barrier.stateBefore & nvrhi::ResourceStates::ConstantBuffer) != 0) {
         vkBarrier.srcAccessMask |= VK_ACCESS_UNIFORM_READ_BIT;
-        srcStages |= VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+        srcStages |= VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
       }
       if (static_cast<uint32_t>(barrier.stateBefore & nvrhi::ResourceStates::CopySource) != 0) {
         vkBarrier.srcAccessMask |= VK_ACCESS_TRANSFER_READ_BIT;
@@ -1181,17 +1220,19 @@ namespace dxvk {
       }
 
       // Translate destination state
+      // CRITICAL: Use VK_PIPELINE_STAGE_ALL_COMMANDS_BIT for ShaderResource/UnorderedAccess
+      // (matching sample's NVRHI Vulkan backend convertResourceState table).
       if (static_cast<uint32_t>(barrier.stateAfter & nvrhi::ResourceStates::UnorderedAccess) != 0) {
         vkBarrier.dstAccessMask |= VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-        dstStages |= VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+        dstStages |= VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
       }
       if (static_cast<uint32_t>(barrier.stateAfter & nvrhi::ResourceStates::ShaderResource) != 0) {
         vkBarrier.dstAccessMask |= VK_ACCESS_SHADER_READ_BIT;
-        dstStages |= VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+        dstStages |= VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
       }
       if (static_cast<uint32_t>(barrier.stateAfter & nvrhi::ResourceStates::ConstantBuffer) != 0) {
         vkBarrier.dstAccessMask |= VK_ACCESS_UNIFORM_READ_BIT;
-        dstStages |= VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+        dstStages |= VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
       }
       if (static_cast<uint32_t>(barrier.stateAfter & nvrhi::ResourceStates::IndirectArgument) != 0) {
         vkBarrier.dstAccessMask |= VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
@@ -1273,10 +1314,12 @@ namespace dxvk {
     VkPipelineStageFlags dstStages = 0;
 
     // Source state - map NVRHI states to proper Vulkan access/stage flags
-    // (matching the reference NVRHI Vulkan backend's convertResourceState table)
+    // CRITICAL: Use ALL_COMMANDS_BIT for ShaderResource/UnorderedAccess to match
+    // the reference NVRHI Vulkan backend's convertResourceState table. Using narrow
+    // stages (COMPUTE_SHADER_BIT only) misses cluster AS build/instantiation stages.
     if (static_cast<uint32_t>(stateBefore & nvrhi::ResourceStates::UnorderedAccess) != 0) {
       srcAccess |= VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-      srcStages |= VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
+      srcStages |= VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
     }
     if (static_cast<uint32_t>(stateBefore & nvrhi::ResourceStates::IndirectArgument) != 0) {
       srcAccess |= VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
@@ -1288,7 +1331,7 @@ namespace dxvk {
     }
     if (static_cast<uint32_t>(stateBefore & nvrhi::ResourceStates::ShaderResource) != 0) {
       srcAccess |= VK_ACCESS_SHADER_READ_BIT;
-      srcStages |= VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
+      srcStages |= VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
     }
     if (static_cast<uint32_t>(stateBefore & nvrhi::ResourceStates::CopySource) != 0) {
       srcAccess |= VK_ACCESS_TRANSFER_READ_BIT;
@@ -1315,9 +1358,10 @@ namespace dxvk {
     }
 
     // Destination state
+    // CRITICAL: Use ALL_COMMANDS_BIT for ShaderResource/UnorderedAccess to match sample.
     if (static_cast<uint32_t>(stateAfter & nvrhi::ResourceStates::UnorderedAccess) != 0) {
       dstAccess |= VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-      dstStages |= VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
+      dstStages |= VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
     }
     if (static_cast<uint32_t>(stateAfter & nvrhi::ResourceStates::IndirectArgument) != 0) {
       dstAccess |= VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
@@ -1329,7 +1373,7 @@ namespace dxvk {
     }
     if (static_cast<uint32_t>(stateAfter & nvrhi::ResourceStates::ShaderResource) != 0) {
       dstAccess |= VK_ACCESS_SHADER_READ_BIT;
-      dstStages |= VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
+      dstStages |= VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
     }
     if (static_cast<uint32_t>(stateAfter & nvrhi::ResourceStates::CopySource) != 0) {
       dstAccess |= VK_ACCESS_TRANSFER_READ_BIT;
@@ -1954,7 +1998,10 @@ namespace dxvk {
                              " input.opType=", (uint32_t)input.opType, " input.opMode=", (uint32_t)input.opMode));
 
     // Set up opInput based on operation type
-    // Note: These structures need to persist for the lifetime of the command
+    // Note: These structures need to persist until vkCmdBuildClusterAS call in the caller.
+    // Since translateClusterOperation fills vkCmds.input.opInput.pTriangleClusters with a
+    // pointer to clusterInput, the storage must outlive this function. static thread_local
+    // ensures this (sample uses locals because it does everything in one function).
     static thread_local VkClusterAccelerationStructureClustersBottomLevelInputNV blasInput;
     static thread_local VkClusterAccelerationStructureTriangleClusterInputNV clusterInput;
 
@@ -2006,37 +2053,30 @@ namespace dxvk {
     }
 
     // Set up srcInfosArray (indirect args buffer)
-    // CRITICAL: size must be maxArgCount * stride, NOT the full buffer byteSize.
-    // Our buffers are capacity-sized (with headroom), but the driver uses
-    // srcInfosArray.size/stride to determine how many entries to process.
-    // If size = capacity * stride but maxArgCount = numInstances, the driver
-    // processes entries beyond what we filled, reading garbage/zeroes → TDR.
-    // The sample's buffers are exactly numInstances-sized, so this is never an issue there.
-    uint32_t maxArgCount = input.maxAccelerationStructureCount;
+    // Match sample: use buffer->getDesc().byteSize - offset for strided array .size
+    // The sample uses full buffer extent, not maxArgCount * stride.
+    // srcInfosCount (indirect count buffer) limits actual processing count.
     if (desc.inIndirectArgsBuffer) {
       NvrhiDxvkBuffer* argsBuffer = static_cast<NvrhiDxvkBuffer*>(desc.inIndirectArgsBuffer);
       vkCmds.srcInfosArray.deviceAddress = argsBuffer->getGpuVirtualAddress() + desc.inIndirectArgsOffsetInBytes;
       vkCmds.srcInfosArray.stride = argsBuffer->getDesc().structStride;
-      vkCmds.srcInfosArray.size = uint64_t(maxArgCount) * vkCmds.srcInfosArray.stride;
-      // Always log for crash debugging
+      vkCmds.srcInfosArray.size = argsBuffer->getDesc().byteSize - desc.inIndirectArgsOffsetInBytes;
       RTXMG_LOG(str::format("RTX MegaGeo: ", opTypeName, " srcInfosArray addr=0x", std::hex, vkCmds.srcInfosArray.deviceAddress,
                                " stride=", std::dec, vkCmds.srcInfosArray.stride, " size=", vkCmds.srcInfosArray.size,
-                               " (numElements=", maxArgCount, " bufferCapacity=",
-                               vkCmds.srcInfosArray.stride > 0 ? (argsBuffer->getDesc().byteSize / vkCmds.srcInfosArray.stride) : 0, ")"));
+                               " (maxArgCount=", input.maxAccelerationStructureCount, " bufByteSize=", argsBuffer->getDesc().byteSize, ")"));
     } else {
       Logger::warn("RTX MegaGeo: inIndirectArgsBuffer is NULL");
     }
 
     // Set up inOutAddressesBuffer (BLAS/CLAS addresses)
-    // For GetSizes mode, this should be NULL/zero
     if (desc.inOutAddressesBuffer) {
       NvrhiDxvkBuffer* addressesBuffer = static_cast<NvrhiDxvkBuffer*>(desc.inOutAddressesBuffer);
       vkCmds.dstAddressesArray.deviceAddress = addressesBuffer->getGpuVirtualAddress() + desc.inOutAddressesOffsetInBytes;
       vkCmds.dstAddressesArray.stride = addressesBuffer->getDesc().structStride;
-      vkCmds.dstAddressesArray.size = uint64_t(maxArgCount) * vkCmds.dstAddressesArray.stride;
-      // Always log for crash debugging
+      vkCmds.dstAddressesArray.size = addressesBuffer->getDesc().byteSize - desc.inOutAddressesOffsetInBytes;
       RTXMG_LOG(str::format("RTX MegaGeo: ", opTypeName, " dstAddressesArray addr=0x", std::hex, vkCmds.dstAddressesArray.deviceAddress,
-                               " stride=", std::dec, vkCmds.dstAddressesArray.stride, " size=", vkCmds.dstAddressesArray.size));
+                               " stride=", std::dec, vkCmds.dstAddressesArray.stride, " size=", vkCmds.dstAddressesArray.size,
+                               " (bufByteSize=", addressesBuffer->getDesc().byteSize, ")"));
     } else {
       // Explicitly zero the array for GetSizes mode
       vkCmds.dstAddressesArray.deviceAddress = 0;
@@ -2064,10 +2104,10 @@ namespace dxvk {
       NvrhiDxvkBuffer* sizesBuffer = static_cast<NvrhiDxvkBuffer*>(desc.outSizesBuffer);
       vkCmds.dstSizesArray.deviceAddress = sizesBuffer->getGpuVirtualAddress() + desc.outSizesOffsetInBytes;
       vkCmds.dstSizesArray.stride = sizesBuffer->getDesc().structStride;
-      vkCmds.dstSizesArray.size = uint64_t(maxArgCount) * vkCmds.dstSizesArray.stride;
+      vkCmds.dstSizesArray.size = sizesBuffer->getDesc().byteSize - desc.outSizesOffsetInBytes;
       RTXMG_LOG(str::format("RTX MegaGeo: dstSizesArray addr=", vkCmds.dstSizesArray.deviceAddress,
                                " stride=", vkCmds.dstSizesArray.stride, " size=", vkCmds.dstSizesArray.size,
-                               " (numElements=", maxArgCount, ")"));
+                               " (bufByteSize=", sizesBuffer->getDesc().byteSize, ")"));
     } else if (!desc.outAccelerationStructuresBuffer && !desc.inOutAddressesBuffer) {
       // GetSizes mode but no sizes output - this is unexpected
       Logger::warn("RTX MegaGeo: outSizesBuffer is NULL in GetSizes mode");

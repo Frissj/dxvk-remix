@@ -18,7 +18,7 @@
 
 // subdivision
 #define RTXMG_LOG_SHAPE                    0  // shape.cpp
-#define RTXMG_LOG_SUBDIVISION_SURFACE      1  // subdivision_surface.cpp
+#define RTXMG_LOG_SUBDIVISION_SURFACE      0  // subdivision_surface.cpp
 
 // utils
 #define RTXMG_LOG_BUFFER                   0  // buffer.cpp

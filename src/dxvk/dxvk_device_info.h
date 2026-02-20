@@ -28,6 +28,9 @@ namespace dxvk {
     VkPhysicalDeviceFloatControlsPropertiesKHR                khrShaderFloatControls;
     VkPhysicalDeviceOpacityMicromapPropertiesEXT              extOpacityMicromapProperties;
     VkPhysicalDeviceRayTracingInvocationReorderPropertiesNV   nvRayTracingInvocationReorderProperties;
+
+    // RTX MegaGeo: Cluster acceleration structure properties (alignment requirements, limits)
+    VkPhysicalDeviceClusterAccelerationStructurePropertiesNV nvClusterAccelerationStructureProperties;
   };
 
 
@@ -64,6 +67,9 @@ namespace dxvk {
 
     // RTX MegaGeo: Required for MegaGeometry shaders that use subgroup extended types
     VkPhysicalDeviceShaderSubgroupExtendedTypesFeatures       extShaderSubgroupExtendedTypes;
+
+    // RTX MegaGeo: Required for cluster acceleration structure operations
+    VkPhysicalDeviceClusterAccelerationStructureFeaturesNV    nvClusterAccelerationStructureFeatures;
   };
 
 }

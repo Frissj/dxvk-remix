@@ -21,6 +21,24 @@
 */
 #pragma once
 
+// RTX Mega Geometry: ClusterIDNV built-in for CLAS hit shader lookup.
+// Only available in ray tracing pipeline shaders (hit/miss/raygen).
+// GeometryIndex() does NOT reliably return the cluster ID for CLAS geometry.
+#ifdef RAY_PIPELINE
+[[vk::ext_extension("SPV_NV_cluster_acceleration_structure")]]
+[[vk::ext_capability(/* ClusterAccelerationStructureNV */ 5437)]]
+[[vk::ext_builtin_input(/* ClusterIdNV */ 5436)]]
+static const int rtxmg_ClusterIdNV;
+#endif
+
+// RTX Mega Geometry: Ray query cluster ID.
+// The proper SPIR-V instruction is OpRayQueryGetIntersectionClusterIdNV (opcode 5438),
+// but Slang does not support this opcode in spirv_asm. GeometryIndex() works correctly
+// because our GathererWriteCluster sets geometryIndexOffsetPacked = clusterIndex
+// (same value as clusterIdOffset), so GeometryIndex() returns the correct cluster ID.
+// If geometryIndexOffset is ever set to a different value than clusterIdOffset,
+// this must be updated (requires Slang spirv_asm support for opcode 5438).
+
 // Ray Constants
 
 // Note: Sign bit of hit distance on Ray Interactions used to indicate no hit.
@@ -40,8 +58,8 @@ struct RayHitInfo
   uint primitiveIndex;
   uint customIndex;
   uint geometryIndex;
-  // RTX Mega Geometry: For cluster surfaces, clusterId is the same as geometryIndex
-  // because compute_cluster_tiling.hlsl sets geometryIndexOffset = clusterIndex
+  // RTX Mega Geometry: Cluster ID from ClusterIdNV built-in (SPV_NV_cluster_acceleration_structure).
+  // NOT the same as GeometryIndex() — GeometryIndex() may return wrong values for CLAS geometry.
   uint clusterId;
   bool hasHit;
   bool frontHit;
@@ -70,7 +88,7 @@ variableName.barycentricCoordinates = barycentricsToUint(barycentricCoordinates)
 variableName.primitiveIndex = PrimitiveIndex();                                   \
 variableName.customIndex = InstanceID();                                          \
 variableName.geometryIndex = GeometryIndex();                                     \
-variableName.clusterId = GeometryIndex();                                         \
+variableName.clusterId = (uint)rtxmg_ClusterIdNV;                                \
 variableName.hasHit = true;                                                       \
 variableName.frontHit = HitKind() == HIT_KIND_TRIANGLE_FRONT_FACE;
 

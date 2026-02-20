@@ -196,44 +196,19 @@ void FillClustersMain(uint3 threadIdx, uint3 groupIdx)
             float2 uv = rSampler.UV(rCluster.Linear2Idx2D(pointIndex) + rCluster.offset, (ClusterPattern)g_TessParams.clusterPattern);
 
             // always do the non-displaced evaluation first.  Displacement maps will perturb this calculation below
-            LimitFrame limit;
-            if (g_TessParams.disableSubdivision != 0)
-            {
-                // Bypass subdivision: use bilinear interpolation of control points
-                limit = subd.EvaluateBilinear(uv);
-            }
-            else
-            {
 #if SURFACE_TYPE == SURFACE_TYPE_ALL
-                limit = subd.Evaluate(uv);
+            LimitFrame limit = subd.Evaluate(uv);
 #elif SURFACE_TYPE == SURFACE_TYPE_PUREBSPLINE
-            #if ENABLE_GROUP_PUREBSPLINE
-                limit = subd.EvaluatePureBsplinePatchGroupShared(iWave, uv);
-            #else
-                limit = subd.EvaluatePureBsplinePatch(uv);
-            #endif
+        #if ENABLE_GROUP_PUREBSPLINE
+            LimitFrame limit = subd.EvaluatePureBsplinePatchGroupShared(iWave, uv);
+        #else
+            LimitFrame limit = subd.EvaluatePureBsplinePatch(uv);
+        #endif
 #elif SURFACE_TYPE == SURFACE_TYPE_REGULARBSPLINE
-                limit = subd.EvaluateBsplinePatch(uv);
+            LimitFrame limit = subd.EvaluateBsplinePatch(uv);
 #elif SURFACE_TYPE == SURFACE_TYPE_LIMIT
-                limit = subd.EvaluateLimitSurface(uv);
+            LimitFrame limit = subd.EvaluateLimitSurface(uv);
 #endif
-            }
-
-#if DISPLACEMENT_MAPS
-            if (displacementTexIndex >= 0)
-            {
-                Texture2D displacementTexture = bindlessTextures[displacementTexIndex];
-
-                float du = rSampler.DU(uv);
-                float dv = rSampler.DV(uv);
-
-                limit = DoDisplacement(texcoordEval,
-                        limit, iSurface, uv, du, dv,
-                        displacementTexture,
-                        s_DisplacementSampler, displacementScale);
-            }
-#endif
-
             GathererWriteLimit(limit, rCluster, pointIndex);
 
             // DEBUG: Log cluster metadata + vertex positions to debug buffer (instance 0 only)
@@ -432,6 +407,96 @@ void FillClustersMain(uint3 threadIdx, uint3 groupIdx)
                         u_Debug[30].lineNumber = 7;
                     }
                 }
+            }
+
+            // Slots 40-55: LIMIT SURFACE diagnostics (first Limit surface cluster, any instance)
+            // Uses atomic CAS on pad0.x to ensure exactly one thread writes all slots
+            if (pointIndex == 0 && !subd.IsPureBSplinePatch() && !subd.IsBSplinePatch()) {
+                uint origFlag;
+                InterlockedCompareExchange(u_Debug[40].pad0.x, 0, 1, origFlag);
+                if (origFlag == 0) {
+
+                    SubdivisionPlanContext limitPlan = subd.GetPlan();
+                    SurfaceDescriptor limitDesc = subd.GetSurfaceDesc();
+                    uint32_t numPP = limitPlan.GetTreeDescriptor().GetNumPatchPoints(subd.m_isolationLevel);
+                    uint32_t ppOffset = t_VertexPatchPointsOffsets[iSurface];
+                    uint32_t ppOffsetNext = t_VertexPatchPointsOffsets[iSurface + 1]; // next surface's offset for size calc
+
+                    // Slot 40: Limit surface identity + plan info
+                    u_Debug[40].uintData = uint4(iSurface, limitDesc.GetSubdivisionPlanIndex(),
+                        limitPlan.m_data.numControlPoints, numPP);
+                    u_Debug[40].floatData = float4(limit.p.x, limit.p.y, limit.p.z, 0);
+                    u_Debug[40].payloadType = 110;
+                    u_Debug[40].lineNumber = 0;
+
+                    // Slot 41: surface descriptor + patch points offset
+                    u_Debug[41].uintData = uint4(limitDesc.field0, limitDesc.firstControlPoint, ppOffset, ppOffsetNext);
+                    u_Debug[41].floatData = float4(asfloat(limitPlan.m_data.stencilMatrixOffset),
+                        asfloat(limitPlan.m_data.stencilMatrixSize),
+                        asfloat(limitPlan.m_data.treeOffset), 0);
+                    u_Debug[41].payloadType = 110;
+                    u_Debug[41].lineNumber = 1;
+
+                    // Slot 42: cluster metadata for this Limit cluster
+                    u_Debug[42].uintData = uint4(clusterIndex, rCluster.nVertexOffset,
+                        rCluster.sizeX | (rCluster.sizeY << 16),
+                        groupClusterIndex);
+                    u_Debug[42].floatData = float4(asfloat(rCluster.offset.x | (rCluster.offset.y << 16)),
+                        asfloat(offsetCount.x), asfloat(offsetCount.y), 0);
+                    u_Debug[42].payloadType = 110;
+                    u_Debug[42].lineNumber = 2;
+
+                    // Slots 43-46: First 4 patch points from the buffer (what compute_cluster_tiling wrote)
+                    for (uint pp = 0; pp < 4 && pp < numPP; pp++) {
+                        float3 patchPt = t_VertexPatchPoints[ppOffset + pp];
+                        u_Debug[43 + pp].floatData = float4(patchPt.x, patchPt.y, patchPt.z, 0);
+                        u_Debug[43 + pp].uintData = uint4(ppOffset + pp, pp, numPP, 0);
+                        u_Debug[43 + pp].payloadType = 110;
+                        u_Debug[43 + pp].lineNumber = 3 + pp;
+                    }
+
+                    // Slots 47-50: First 4 control points for this Limit surface
+                    uint numCP = min(limitPlan.m_data.numControlPoints, 4u);
+                    for (uint cp = 0; cp < numCP; cp++) {
+                        uint cpi = t_VertexControlPointIndices[limitDesc.firstControlPoint + cp];
+                        float3 cpPos = t_VertexControlPoints[cpi];
+                        u_Debug[47 + cp].floatData = float4(cpPos.x, cpPos.y, cpPos.z, 0);
+                        u_Debug[47 + cp].uintData = uint4(cpi, cp, limitDesc.firstControlPoint + cp, limitPlan.m_data.numControlPoints);
+                        u_Debug[47 + cp].payloadType = 110;
+                        u_Debug[47 + cp].lineNumber = 7 + cp;
+                    }
+
+                    // Slots 51-54: First 4 stencil matrix entries for patch point 0
+                    if (numPP > 0) {
+                        uint stencilBase = limitPlan.m_data.stencilMatrixOffset;
+                        uint numCPForStencil = limitPlan.m_data.numControlPoints;
+                        for (uint s = 0; s < 4 && s < numCPForStencil; s++) {
+                            float stencilVal = t_StencilMatrix[stencilBase + s];
+                            u_Debug[51 + s].floatData = float4(stencilVal, 0, 0, 0);
+                            u_Debug[51 + s].uintData = uint4(stencilBase + s, s, numCPForStencil, stencilBase);
+                            u_Debug[51 + s].payloadType = 110;
+                            u_Debug[51 + s].lineNumber = 11 + s;
+                        }
+                    }
+
+                    // Slot 55: Evaluate at (0.5,0.5) for this Limit surface specifically
+                    LimitFrame limitEval = subd.EvaluateLimitSurface(float2(0.5, 0.5));
+                    u_Debug[55].floatData = float4(limitEval.p.x, limitEval.p.y, limitEval.p.z, 0);
+                    u_Debug[55].uintData = uint4(iSurface, numPP, ppOffset, g_TessParams.instanceIndex);
+                    u_Debug[55].payloadType = 110;
+                    u_Debug[55].lineNumber = 15;
+                }
+            }
+
+            // Slots 31-38: UV and position for first 8 vertices of first cluster (instance 0)
+            // This helps verify the UV computation and bilinear interpolation across the grid
+            if (g_TessParams.instanceIndex == 0 && groupClusterIndex == 0 && pointIndex < 8) {
+                uint32_t slot = 31 + pointIndex;
+                u_Debug[slot].floatData = float4(limit.p.x, limit.p.y, limit.p.z, 0);
+                u_Debug[slot].uintData = uint4(asuint(uv.x), asuint(uv.y), pointIndex,
+                    rCluster.sizeX | (uint32_t(rCluster.sizeY) << 16));
+                u_Debug[slot].payloadType = 107;
+                u_Debug[slot].lineNumber = pointIndex;
             }
 
 #if VERTEX_NORMALS
