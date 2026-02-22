@@ -592,14 +592,17 @@ void ClusterAccelBuilder::InitStructuredClusterTemplates(uint32_t maxGeometryCou
                              " config quantNBits=", m_tessellatorConfig.quantNBits));
 
     // maxGeometryIndex must match between template creation and CLAS instantiation.
-    // We use m_maxClusters-1 so each cluster can have a unique geometry index
-    // for hit shader lookup of per-cluster shading data.
-    uint32_t maxGeometryIndex = m_maxClusters > 0 ? m_maxClusters - 1 : 0;
+    // CRITICAL: Use maxGeometryCountPerMesh (the number of surfaces per mesh), NOT m_maxClusters.
+    // The compute shader writes geometryIndexOffset = localGeometryIndex (= t_SurfaceToGeometryIndex[iSurface]),
+    // which is a small per-mesh surface index (0..numSurfaces-1), NOT the global cluster index.
+    // Declaring maxGeometryIndex = m_maxClusters-1 tells the driver to support 17-bit geometry indices
+    // while only 6-bit indices are actually written, causing CLAS internal layout mismatches.
+    uint32_t maxGeometryIndex = maxGeometryCountPerMesh > 0 ? maxGeometryCountPerMesh - 1 : 0;
 
     Logger::warn(str::format("RTX MegaGeo: InitStructuredClusterTemplates GEOMETRY INDEX CHECK:"
         " maxGeometryCountPerMesh(param)=", maxGeometryCountPerMesh,
-        " m_maxClusters=", m_maxClusters,
-        " maxGeometryIndex(used)=", maxGeometryIndex));
+        " maxGeometryIndex(used)=", maxGeometryIndex,
+        " (FIXED: now uses maxGeometryCountPerMesh-1, not m_maxClusters-1)"));
 
     // only initialize if maxGeometryIndex or quantNBits changes
     if (m_templateBuffers.dataBuffer.Get() != 0 &&
@@ -649,6 +652,86 @@ void ClusterAccelBuilder::InitStructuredClusterTemplates(uint32_t maxGeometryCou
     // from the index/vertex buffers, producing templates with wrong triangle connectivity.
     commandList->bufferBarrier(m_templateBuffers.indexBuffer.Get(), nvrhi::ResourceStates::CopyDest, nvrhi::ResourceStates::AccelStructBuildInput);
     commandList->bufferBarrier(m_templateBuffers.vertexBuffer.Get(), nvrhi::ResourceStates::CopyDest, nvrhi::ResourceStates::AccelStructBuildInput);
+
+    // DIAG: Readback template index/vertex buffers AFTER barriers to confirm data survived upload.
+    // If data mismatches CPU-side grids, the barrier or writeBuffer is not working correctly.
+    {
+        // Readback index buffer
+        size_t indexBytes = grids.indices.size() * sizeof(grids.indices[0]);
+        auto indexBuf = m_templateBuffers.indexBuffer;
+        // Use Download-style readback via staging buffer
+        nvrhi::BufferDesc stagingDesc;
+        stagingDesc.byteSize = indexBytes;
+        stagingDesc.cpuAccess = nvrhi::CpuAccessMode::Read;
+        stagingDesc.debugName = "TemplateIndexReadback";
+        auto indexStaging = m_device->createBuffer(stagingDesc);
+
+        nvrhi::BufferDesc vtxStagingDesc;
+        size_t vtxBytes = grids.vertices.size() * sizeof(grids.vertices[0]);
+        vtxStagingDesc.byteSize = vtxBytes;
+        vtxStagingDesc.cpuAccess = nvrhi::CpuAccessMode::Read;
+        vtxStagingDesc.debugName = "TemplateVertexReadback";
+        auto vtxStaging = m_device->createBuffer(vtxStagingDesc);
+
+        commandList->copyBuffer(indexStaging.Get(), 0, indexBuf.Get(), 0, indexBytes);
+        commandList->copyBuffer(vtxStaging.Get(), 0, m_templateBuffers.vertexBuffer.Get(), 0, vtxBytes);
+
+        // Sync readback
+        commandList->close();
+        m_device->executeCommandList(commandList);
+        m_device->waitForIdle();
+
+        // Compare index data
+        void* idxMapped = m_device->mapBuffer(indexStaging.Get(), nvrhi::CpuAccessMode::Read);
+        const uint8_t* gpuIndices = reinterpret_cast<const uint8_t*>(idxMapped);
+        uint32_t idxMismatches = 0;
+        for (size_t i = 0; i < grids.indices.size(); ++i) {
+            if (gpuIndices[i] != grids.indices[i]) idxMismatches++;
+        }
+        // Compute simple checksum
+        uint32_t cpuIdxSum = 0, gpuIdxSum = 0;
+        for (size_t i = 0; i < grids.indices.size(); ++i) {
+            cpuIdxSum += grids.indices[i];
+            gpuIdxSum += gpuIndices[i];
+        }
+        Logger::warn(str::format("DIAG TEMPLATE-INDEX-READBACK: count=", grids.indices.size(),
+            " mismatches=", idxMismatches, " cpuSum=", cpuIdxSum, " gpuSum=", gpuIdxSum));
+
+        // Log first 30 indices for manual inspection
+        std::string idxStr = "  CPU indices: ";
+        std::string gpuStr = "  GPU indices: ";
+        for (size_t i = 0; i < std::min(grids.indices.size(), (size_t)30); ++i) {
+            idxStr += str::format((uint32_t)grids.indices[i], " ");
+            gpuStr += str::format((uint32_t)gpuIndices[i], " ");
+        }
+        Logger::warn(idxStr);
+        Logger::warn(gpuStr);
+        m_device->unmapBuffer(indexStaging.Get());
+
+        // Compare vertex data
+        void* vtxMapped = m_device->mapBuffer(vtxStaging.Get(), nvrhi::CpuAccessMode::Read);
+        const float* gpuVerts = reinterpret_cast<const float*>(vtxMapped);
+        uint32_t vtxMismatches = 0;
+        for (size_t i = 0; i < grids.vertices.size(); ++i) {
+            if (gpuVerts[i] != grids.vertices[i]) vtxMismatches++;
+        }
+        Logger::warn(str::format("DIAG TEMPLATE-VERTEX-READBACK: count=", grids.vertices.size(),
+            " mismatches=", vtxMismatches));
+
+        // Log first 18 floats (6 vertices * xyz) for manual inspection
+        std::string cpuVtxStr = "  CPU verts: ";
+        std::string gpuVtxStr = "  GPU verts: ";
+        for (size_t i = 0; i < std::min(grids.vertices.size(), (size_t)18); ++i) {
+            cpuVtxStr += str::format(grids.vertices[i], " ");
+            gpuVtxStr += str::format(gpuVerts[i], " ");
+        }
+        Logger::warn(cpuVtxStr);
+        Logger::warn(gpuVtxStr);
+        m_device->unmapBuffer(vtxStaging.Get());
+
+        // Reopen command list for subsequent operations
+        commandList->open();
+    }
 
     // CRITICAL: Use member variable to keep buffer alive - GPU caches address references
     m_templateBuffers.sizesBuffer.Create(kNumTemplates, "ClusterTemplateSizes", m_device.Get());
@@ -847,12 +930,14 @@ void ClusterAccelBuilder::BuildStructuredCLASes(ClusterAccels& accels, uint32_t 
     if (clasPtrsAddr == 0) Logger::err("RTX MegaGeo: BuildStructuredCLASes - clasPtrsAddr is NULL!");
     if (clasBufferAddr == 0) Logger::err("RTX MegaGeo: BuildStructuredCLASes - clasBufferAddr is NULL!");
 
-    uint32_t instantiateMaxGeometryIndex = m_maxClusters > 0 ? m_maxClusters - 1 : 0;
+    // CRITICAL: Must use the same maxGeometryIndex as InitStructuredClusterTemplates.
+    // Use the stored value (which now correctly equals maxGeometryCountPerMesh-1).
+    uint32_t instantiateMaxGeometryIndex = m_templateBuffers.maxGeometryCountPerMesh;
     Logger::warn(str::format("RTX MegaGeo: BuildStructuredCLASes GEOMETRY INDEX CHECK:"
         " maxGeometryCountPerMesh(param)=", maxGeometryCountPerMesh,
-        " m_maxClusters=", m_maxClusters,
         " instantiateMaxGeometryIndex=", instantiateMaxGeometryIndex,
-        " templateMaxGeometryIndex(stored)=", m_templateBuffers.maxGeometryCountPerMesh));
+        " templateMaxGeometryIndex(stored)=", m_templateBuffers.maxGeometryCountPerMesh,
+        " (FIXED: uses stored value from InitStructured, not m_maxClusters-1)"));
 
     cluster::OperationParams instantiateClasParams =
     {
@@ -863,9 +948,9 @@ void ClusterAccelBuilder::BuildStructuredCLASes(ClusterAccels& accels, uint32_t 
         .clas =
         {
             .vertexFormat = VK_FORMAT_R32G32B32_SFLOAT,
-            // The compute_cluster_tiling shader writes clusterIndex into
-            // geometryIndexOffsetPacked (not localGeometryIndex like the sample),
-            // so maxGeometryIndex must cover the full cluster index range.
+            // The compute_cluster_tiling shader writes localGeometryIndex (per-mesh surface index)
+            // into geometryIndexOffset. So maxGeometryIndex = maxGeometryCountPerMesh - 1,
+            // matching the sample exactly.
             .maxGeometryIndex = instantiateMaxGeometryIndex,
             .maxUniqueGeometryCount = 1,
             .maxTriangleCount = kClusterMaxTriangles,

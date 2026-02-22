@@ -188,7 +188,9 @@ namespace dxvk {
     void trackPendingBindingSets();  // Transfer binding sets to DXVK's lifetime tracker
     void translateClusterOperation(
       const nvrhi::rt::cluster::OperationDesc& nvrhiDesc,
-      VkClusterAccelerationStructureCommandsInfoNV& vkCmds);
+      VkClusterAccelerationStructureCommandsInfoNV& vkCmds,
+      VkClusterAccelerationStructureClustersBottomLevelInputNV& blasInput,
+      VkClusterAccelerationStructureTriangleClusterInputNV& clusterInput);
 
     // Automatic barrier system (matching sample's NVRHI behavior)
     bool m_EnableAutomaticBarriers = true;

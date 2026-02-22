@@ -225,8 +225,8 @@ void FillClustersMain(uint3 threadIdx, uint3 groupIdx)
             if (g_TessParams.instanceIndex == 0 && pointIndex == 0 && groupClusterIndex < 7) {
                 uint32_t debugIdx = 9 + groupClusterIndex;
                 // Log cluster metadata: iSurface, nVertexOffset, sizeX, sizeY, offset, clusterIndex
-                u_Debug[debugIdx].uintData = uint4(iSurface, rCluster.nVertexOffset, rCluster.sizeX | (rCluster.sizeY << 16), clusterIndex);
-                u_Debug[debugIdx].floatData = float4(limit.p.x, limit.p.y, limit.p.z, asfloat(rCluster.offset.x | (rCluster.offset.y << 16)));
+                u_Debug[debugIdx].uintData = uint4(iSurface, rCluster.nVertexOffset, rCluster.sizeX | (uint(rCluster.sizeY) << 16), clusterIndex);
+                u_Debug[debugIdx].floatData = float4(limit.p.x, limit.p.y, limit.p.z, asfloat(rCluster.offset.x | (uint(rCluster.offset.y) << 16)));
                 u_Debug[debugIdx].payloadType = 104; // Mark as fill_clusters cluster metadata (104 to avoid conflict with ShaderDebug PayloadType_Uint4=4)
                 u_Debug[debugIdx].lineNumber = 0;
             }
@@ -439,9 +439,9 @@ void FillClustersMain(uint3 threadIdx, uint3 groupIdx)
 
                     // Slot 42: cluster metadata for this Limit cluster
                     u_Debug[42].uintData = uint4(clusterIndex, rCluster.nVertexOffset,
-                        rCluster.sizeX | (rCluster.sizeY << 16),
+                        rCluster.sizeX | (uint(rCluster.sizeY) << 16),
                         groupClusterIndex);
-                    u_Debug[42].floatData = float4(asfloat(rCluster.offset.x | (rCluster.offset.y << 16)),
+                    u_Debug[42].floatData = float4(asfloat(rCluster.offset.x | (uint(rCluster.offset.y) << 16)),
                         asfloat(offsetCount.x), asfloat(offsetCount.y), 0);
                     u_Debug[42].payloadType = 110;
                     u_Debug[42].lineNumber = 2;

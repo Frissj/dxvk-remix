@@ -912,10 +912,14 @@ namespace dxvk {
     RTXMG_LOG(str::format("RTX MegaGeo: Got command buffer: ", (void*)cmdBuffer));
 
     // Translate NVRHI descriptor to Vulkan cluster commands
+    // blasInput/clusterInput live here so pointers stored in vkCmds.input.opInput remain valid
+    // until after vkCmdBuildClusterAccelerationStructureIndirectNV is called.
     VkClusterAccelerationStructureCommandsInfoNV vkCmds = {};
+    VkClusterAccelerationStructureClustersBottomLevelInputNV blasInput = {};
+    VkClusterAccelerationStructureTriangleClusterInputNV clusterInput = {};
     vkCmds.sType = VK_STRUCTURE_TYPE_CLUSTER_ACCELERATION_STRUCTURE_COMMANDS_INFO_NV;
     RTXMG_LOG("RTX MegaGeo: About to translate cluster operation");
-    translateClusterOperation(desc, vkCmds);
+    translateClusterOperation(desc, vkCmds, blasInput, clusterInput);
     RTXMG_LOG("RTX MegaGeo: Cluster operation translated");
 
     // Load cluster AS extension function pointer manually
@@ -1026,7 +1030,9 @@ namespace dxvk {
             " scratch=0x", vkCmds.scratchData, std::dec));
 
         // For CLAS template/instantiate ops, log the triangle cluster input params
-        if (vkCmds.input.opInput.pTriangleClusters) {
+        // Only read pTriangleClusters for non-BlasBuild ops to avoid union aliasing
+        if (vkCmds.input.opType != VK_CLUSTER_ACCELERATION_STRUCTURE_OP_TYPE_BUILD_CLUSTERS_BOTTOM_LEVEL_NV
+            && vkCmds.input.opInput.pTriangleClusters) {
           auto* tc = vkCmds.input.opInput.pTriangleClusters;
           Logger::warn(str::format("DIAG VK-CLAS-INPUT: vertexFormat=", (uint32_t)tc->vertexFormat,
               " maxGeomIdx=", tc->maxGeometryIndexValue,
@@ -1942,7 +1948,9 @@ namespace dxvk {
 
   void NvrhiDxvkCommandList::translateClusterOperation(
     const nvrhi::rt::cluster::OperationDesc& desc,
-    VkClusterAccelerationStructureCommandsInfoNV& vkCmds)
+    VkClusterAccelerationStructureCommandsInfoNV& vkCmds,
+    VkClusterAccelerationStructureClustersBottomLevelInputNV& blasInput,
+    VkClusterAccelerationStructureTriangleClusterInputNV& clusterInput)
   {
     // NOTE: The Vulkan cluster AS API has changed significantly from the original SDK version.
     // The actual implementation needs adaptation based on RTX Remix's usage patterns.
@@ -1998,22 +2006,12 @@ namespace dxvk {
                              " input.opType=", (uint32_t)input.opType, " input.opMode=", (uint32_t)input.opMode));
 
     // Set up opInput based on operation type
-    // Note: These structures need to persist until vkCmdBuildClusterAS call in the caller.
-    // Since translateClusterOperation fills vkCmds.input.opInput.pTriangleClusters with a
-    // pointer to clusterInput, the storage must outlive this function. static thread_local
-    // ensures this (sample uses locals because it does everything in one function).
-    static thread_local VkClusterAccelerationStructureClustersBottomLevelInputNV blasInput;
-    static thread_local VkClusterAccelerationStructureTriangleClusterInputNV clusterInput;
-
-    // CRITICAL: Zero the entire opInput union before setting any member
-    memset(&input.opInput, 0, sizeof(input.opInput));
+    // Note: blasInput/clusterInput are allocated in the caller's stack frame so they
+    // persist until after vkCmdBuildClusterAS is called.
 
     switch (desc.params.type) {
       case nvrhi::rt::cluster::OperationType::BlasBuild:
-        // CRITICAL: Explicitly zero and initialize to clear any stale data
-        memset(&blasInput, 0, sizeof(blasInput));
         blasInput.sType = VK_STRUCTURE_TYPE_CLUSTER_ACCELERATION_STRUCTURE_CLUSTERS_BOTTOM_LEVEL_INPUT_NV;
-        blasInput.pNext = nullptr;
         blasInput.maxTotalClusterCount = desc.params.blas.maxTotalClasCount;
         blasInput.maxClusterCountPerAccelerationStructure = desc.params.blas.maxClasPerBlasCount;
         input.opInput.pClustersBottomLevel = &blasInput;
@@ -2025,10 +2023,7 @@ namespace dxvk {
 
       case nvrhi::rt::cluster::OperationType::ClasBuildTemplates:
       case nvrhi::rt::cluster::OperationType::ClasInstantiateTemplates:
-        // CRITICAL: Explicitly zero and initialize to clear any stale data
-        memset(&clusterInput, 0, sizeof(clusterInput));
         clusterInput.sType = VK_STRUCTURE_TYPE_CLUSTER_ACCELERATION_STRUCTURE_TRIANGLE_CLUSTER_INPUT_NV;
-        clusterInput.pNext = nullptr;
         clusterInput.vertexFormat = desc.params.clas.vertexFormat;
         clusterInput.maxGeometryIndexValue = desc.params.clas.maxGeometryIndex;
         clusterInput.maxClusterUniqueGeometryCount = desc.params.clas.maxUniqueGeometryCount;

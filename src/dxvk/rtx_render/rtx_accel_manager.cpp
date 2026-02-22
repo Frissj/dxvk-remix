@@ -1427,6 +1427,91 @@ namespace dxvk {
       }
       m_megaGeoBuilder->patchClusterBlasAddressesGPU(instanceBufferWrapper.Get(), 0, mappings);
 
+      // DIAG: Readback TLAS instance buffer after GPU patching to verify BLAS addresses were patched
+      {
+        static uint32_t s_patchDiagCount = 0;
+        if (s_patchDiagCount < 3) {
+          s_patchDiagCount++;
+
+          // Barrier to make compute shader writes visible for transfer read
+          ctx->emitMemoryBarrier(0,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_ACCESS_SHADER_WRITE_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_ACCESS_TRANSFER_READ_BIT);
+
+          // Create staging buffer for readback
+          size_t instanceBufSize = m_vkInstanceBuffer->info().size;
+          DxvkBufferCreateInfo stagingInfo;
+          stagingInfo.size = instanceBufSize;
+          stagingInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+          stagingInfo.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+          stagingInfo.access = VK_ACCESS_TRANSFER_WRITE_BIT;
+          auto stagingBuf = m_device->createBuffer(stagingInfo,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            DxvkMemoryStats::Category::RTXAccelerationStructure, "DiagPatchReadback");
+
+          VkBufferCopy copyRegion = {};
+          copyRegion.size = instanceBufSize;
+          auto cmdBuf = ctx->getCmdBuffer(DxvkCmdBuffer::ExecBuffer);
+          m_device->vkd()->vkCmdCopyBuffer(cmdBuf,
+            m_vkInstanceBuffer->getSliceHandle().handle, stagingBuf->getSliceHandle().handle,
+            1, &copyRegion);
+
+          // Flush and wait
+          ctx->flushCommandList();
+          m_device->waitForIdle();
+
+          // Read back and inspect
+          auto* instanceData = reinterpret_cast<const VkAccelerationStructureInstanceKHR*>(
+            stagingBuf->mapPtr(0));
+          uint32_t totalInstances = 0;
+          for (auto& tlasInstances : m_mergedInstances) {
+            totalInstances += static_cast<uint32_t>(tlasInstances.size());
+          }
+
+          uint32_t nullBlas = 0, nonNullBlas = 0;
+          uint32_t clusterNullBlas = 0, clusterNonNullBlas = 0;
+          for (const auto& patch : m_clusterInstancePatches) {
+            uint32_t globalIndex = patch.remixInstanceIndex;
+            if (patch.tlasType == Tlas::Unordered) {
+              globalIndex += static_cast<uint32_t>(m_mergedInstances[Tlas::Opaque].size());
+            }
+            if (globalIndex < totalInstances) {
+              uint64_t blasAddr = instanceData[globalIndex].accelerationStructureReference;
+              if (blasAddr == 0) clusterNullBlas++;
+              else clusterNonNullBlas++;
+            }
+          }
+          for (uint32_t i = 0; i < totalInstances; ++i) {
+            if (instanceData[i].accelerationStructureReference == 0) nullBlas++;
+            else nonNullBlas++;
+          }
+          Logger::warn(str::format("DIAG POST-PATCH: totalInstances=", totalInstances,
+              " nullBlas=", nullBlas, " nonNullBlas=", nonNullBlas,
+              " clusterNullBlas=", clusterNullBlas, " clusterNonNullBlas=", clusterNonNullBlas));
+
+          // Log first few patched cluster instances
+          for (size_t i = 0; i < std::min(m_clusterInstancePatches.size(), (size_t)5); ++i) {
+            const auto& patch = m_clusterInstancePatches[i];
+            uint32_t globalIndex = patch.remixInstanceIndex;
+            if (patch.tlasType == Tlas::Unordered) {
+              globalIndex += static_cast<uint32_t>(m_mergedInstances[Tlas::Opaque].size());
+            }
+            if (globalIndex < totalInstances) {
+              const auto& inst = instanceData[globalIndex];
+              Logger::warn(str::format("  patch[", i, "] globalIdx=", globalIndex,
+                  " rtxmgIdx=", patch.rtxmgInstanceIndex,
+                  " blasAddr=0x", std::hex, inst.accelerationStructureReference, std::dec,
+                  " customIdx=", inst.instanceCustomIndex,
+                  " mask=", inst.mask,
+                  " sbtOffset=", inst.instanceShaderBindingTableRecordOffset,
+                  " flags=0x", std::hex, inst.flags, std::dec));
+            }
+          }
+        }
+      }
+
       // Barrier: TLAS build needs to read both:
       //  1. Instance buffer (written by patch compute shader → SHADER_WRITE)
       //  2. BLAS data in blasBuffer (written by cluster BLAS build → AS_WRITE)
