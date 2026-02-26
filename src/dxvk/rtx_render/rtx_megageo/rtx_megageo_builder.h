@@ -35,23 +35,9 @@
 #include <atomic>
 #include <string>
 
-// Include OpenSubdiv version to ensure OPENSUBDIV_VERSION macro is defined
-#include "osd_lite/opensubdiv/version.h"
-
 // Forward declarations for RTX MG classes
-class SubdivisionSurface;
-class TopologyCache;
-struct Shape;
-
-// Forward declarations for OpenSubdiv
-namespace OpenSubdiv {
-  namespace OPENSUBDIV_VERSION {
-    namespace Tmr {
-      class TopologyMap;
-      struct SurfaceTable;
-    }
-  }
-}
+struct ClusterLODData;
+struct MeshletTemplateSet;
 
 namespace dxvk {
 
@@ -61,35 +47,20 @@ namespace dxvk {
   struct BlasEntry;
 
   /**
-   * \brief Subdivision surface descriptor
+   * \brief Triangle mesh descriptor for meshoptimizer cluster path
    *
-   * Describes a Catmull-Clark subdivision surface mesh that will be
-   * tessellated via RTX Mega Geometry cluster-based acceleration structures.
+   * Describes a triangle mesh that will be clusterized via meshoptimizer
+   * and rendered using per-meshlet CLAS templates. No subdivision involved.
    */
-  struct SubdivisionSurfaceDesc {
-    // Topology
-    uint32_t numFaces = 0;                    // Number of faces (quads and/or triangles)
-    uint32_t numVertices = 0;                 // Number of control vertices
-    const uint32_t* faceVertexCounts = nullptr; // Vertices per face (4 for quads, 3 for triangles)
-    const uint32_t* faceVertexIndices = nullptr; // Flattened vertex indices
-
-    // Control point data
-    const Vector3* controlPoints = nullptr;   // Vertex positions (object space)
-    const Vector2* texcoords = nullptr;       // Optional texture coordinates
-    const Vector3* normals = nullptr;         // Optional vertex normals
-
-    // Material
-    uint32_t materialIndex = 0;               // Index into material system
-
-    // Tessellation parameters
-    uint32_t isolationLevel = 2;              // Subdivision isolation level (0-4)
-    float tessellationScale = 1.0f;           // Global tessellation density multiplier
-    bool enableDisplacement = false;          // Enable displacement mapping
-    int displacementTextureIndex = -1;        // Bindless texture index for displacement
-    float displacementScale = 1.0f;           // Displacement magnitude
-
-    // Debug
-    const char* debugName = nullptr;          // Optional debug name
+  struct TriangleMeshDesc {
+    const uint32_t* indices = nullptr;
+    size_t indexCount = 0;
+    const float* vertexPositions = nullptr;
+    size_t vertexCount = 0;
+    size_t vertexPositionsStride = 12; // bytes between consecutive positions (default: packed float3)
+    const float* texcoords = nullptr;       // optional, 2 floats per vertex
+    const float* normals = nullptr;         // optional, 3 floats per vertex
+    const char* debugName = nullptr;
   };
 
   /**
@@ -99,8 +70,8 @@ namespace dxvk {
    * into RTX Remix's scene graph and acceleration structure management.
    *
    * This class:
-   * - Manages subdivision surface data (topology, control points)
-   * - Builds cluster-based BLAS from subdivision surfaces
+   * - Manages cluster meshes (meshoptimizer LOD DAG + CLAS templates)
+   * - Builds cluster-based BLAS from triangle meshes
    * - Integrates with RtxAccelManager for unified AS management
    * - Provides hierarchical Z-buffer (HIZ) for visibility culling
    * - Handles lifecycle of RTX MG resources
@@ -122,54 +93,33 @@ namespace dxvk {
     bool initialize();
 
     /**
-     * \brief Create subdivision surface from mesh data
+     * \brief Create cluster mesh from triangle data (meshoptimizer path)
      *
-     * Converts a mesh descriptor into RTX MG internal representation
-     * and prepares it for cluster-based tessellation.
+     * Clusterizes a triangle mesh using meshoptimizer and builds per-meshlet
+     * CLAS templates. The LOD DAG is built asynchronously on a worker thread.
+     * Templates are built on the first frame after the LOD DAG is ready.
      *
-     * \param [in] desc Subdivision surface descriptor
-     * \param [out] surfaceId Unique ID for this surface (used for updates)
+     * \param [in] desc Triangle mesh descriptor
+     * \param [out] surfaceId Unique ID for this surface
      * \return true on success
      */
-    bool createSubdivisionSurface(
-      const SubdivisionSurfaceDesc& desc,
+    bool createClusterMesh(
+      const TriangleMeshDesc& desc,
       uint32_t& surfaceId);
-
-    /**
-     * \brief Update subdivision surface data
-     *
-     * Updates control points, materials, or tessellation parameters
-     * for an existing surface. Does NOT rebuild topology.
-     *
-     * \param [in] surfaceId Surface ID from createSubdivisionSurface
-     * \param [in] desc Updated surface descriptor
-     * \return true on success
-     */
-    bool updateSubdivisionSurface(
-      uint32_t surfaceId,
-      const SubdivisionSurfaceDesc& desc);
-
-    /**
-     * \brief Remove subdivision surface
-     *
-     * Removes a surface and frees associated resources.
-     *
-     * \param [in] surfaceId Surface ID to remove
-     */
-    void removeSubdivisionSurface(uint32_t surfaceId);
 
     /**
      * \brief Build cluster BLAS for all surfaces
      *
      * Executes the complete RTX MG pipeline:
-     * 1. Compute cluster tiling (tessellation + culling)
-     * 2. Build cluster templates (CLAS)
-     * 3. Instantiate clusters
-     * 4. Build BLAS from clusters
+     * 1. LOD selection per instance (CPU)
+     * 2. Fill instantiation args + vertex positions (CPU)
+     * 3. Instantiate CLAS templates (GPU)
+     * 4. Build BLAS from clusters (GPU)
      *
      * \param [in] context Rendering context for command recording
      * \param [in] depthBuffer Optional depth buffer for HIZ culling
-     * \param [in] viewProj View-projection matrix for frustum culling
+     * \param [in] camera Camera for LOD selection
+     * \param [in] instanceTransforms Per-surface object-to-world transforms
      * \return true on success
      */
     bool buildClusterBlas(
@@ -179,37 +129,26 @@ namespace dxvk {
       const std::unordered_map<uint32_t, Matrix4>& instanceTransforms = {});
 
     /**
-     * \brief Get built BLAS for a surface
+     * \brief Check if surface is ready for ray tracing
      *
-     * Retrieves the VkAccelerationStructureKHR handle for a surface's
-     * cluster-based BLAS. Valid after buildClusterBlas() succeeds.
+     * Returns true if the cluster mesh has been built and its
+     * CLAS templates are ready for instantiation.
      *
      * \param [in] surfaceId Surface ID
-     * \return BLAS handle or VK_NULL_HANDLE if not built
+     * \return true if ready
      */
-    VkAccelerationStructureKHR getSurfaceBlas(uint32_t surfaceId) const;
+    bool isSurfaceReady(uint32_t surfaceId) const;
 
     /**
-     * \brief Get BLAS device address
+     * \brief Get BLAS device address for a surface
      *
-     * Returns the GPU virtual address of a surface's BLAS for use
-     * in ray tracing shader binding tables.
+     * Returns the GPU virtual address of a surface's BLAS, looked up
+     * from the downloaded BLAS addresses buffer.
      *
      * \param [in] surfaceId Surface ID
      * \return Device address or 0 if not built
      */
     VkDeviceAddress getSurfaceBlasAddress(uint32_t surfaceId) const;
-
-    /**
-     * \brief Check if surface is ready for ray tracing
-     *
-     * Returns true if the surface has been tessellated and its
-     * cluster BLAS is ready to be added to a TLAS.
-     *
-     * \param [in] surfaceId Surface ID
-     * \return true if BLAS is ready
-     */
-    bool isSurfaceReady(uint32_t surfaceId) const;
 
     /**
      * \brief Get BLAS pointers buffer for GPU-side TLAS patching
@@ -234,7 +173,7 @@ namespace dxvk {
     uint32_t getInstanceIndexForSurface(uint32_t surfaceId) const;
 
     /** Check if a surface ID still exists in the builder (not pruned). */
-    bool hasSurface(uint32_t surfaceId) const { return m_surfaces.count(surfaceId) > 0; }
+    bool hasSurface(uint32_t surfaceId) const { return m_clusterMeshes.count(surfaceId) > 0; }
 
     /**
      * \brief Patch cluster BLAS addresses in instance buffer (GPU-side)
@@ -292,12 +231,6 @@ namespace dxvk {
 
     /**
      * \brief Get tessellation statistics
-     *
-     * Returns information about the most recent tessellation pass:
-     * - Number of clusters generated
-     * - Number of triangles generated
-     * - Number of vertices generated
-     * - Culling statistics (frustum, backface, HIZ)
      */
     struct TessellationStats {
       uint32_t numClusters = 0;
@@ -312,22 +245,16 @@ namespace dxvk {
 
     /**
      * \brief Show ImGui debug UI
-     *
-     * Displays RTX Mega Geometry debug controls and statistics in ImGui.
      */
     void showImguiSettings();
 
     /**
      * \brief Get NVRHI device adapter
-     *
-     * Provides access to the NVRHI→DXVK adapter for advanced use cases.
      */
     NvrhiDxvkDevice* getNvrhiDevice() const { return m_nvrhiDevice; }
 
     /**
      * \brief Get cluster acceleration builder
-     *
-     * Provides direct access to ClusterAccelBuilder for advanced scenarios.
      */
     ClusterAccelBuilder* getClusterAccelBuilder() const { return m_clusterBuilder.get(); }
 
@@ -365,86 +292,36 @@ namespace dxvk {
 
     /**
      * \brief Get ClusterShadingData buffer for shader binding
-     *
-     * Returns the GPU buffer containing per-cluster shading information
-     * (surface ID, cluster offset, edge segments, etc.) needed for
-     * MegaGeo debug views and material evaluation.
-     *
-     * \return NVRHI buffer handle or nullptr if not initialized
      */
     nvrhi::BufferHandle getClusterShadingDataBuffer() const;
 
     /**
      * \brief Get number of clusters in the ClusterShadingData buffer
-     *
-     * Returns the current number of clusters for bounds checking
-     * when accessing the cluster shading data buffer.
-     *
-     * \return Number of clusters
      */
     uint32_t getClusterCount() const;
 
     /**
      * \brief Get the cluster vertex positions buffer
-     *
-     * Returns the buffer containing tessellated vertex positions for all clusters.
-     * Used for surface interaction vertex lookup.
-     *
-     * \return NVRHI buffer handle or nullptr if not initialized
      */
     nvrhi::BufferHandle getClusterVertexPositionsBuffer() const;
 
     /**
      * \brief Get the cluster vertex normals buffer
-     *
-     * Returns the buffer containing tessellated vertex normals for all clusters.
-     * Used for surface interaction normal lookup.
-     *
-     * \return NVRHI buffer handle or nullptr if not initialized
      */
     nvrhi::BufferHandle getClusterVertexNormalsBuffer() const;
 
     /**
      * \brief Check if cluster buffers are ready for rendering
-     *
-     * Returns true if all cluster buffers (shading data, vertex positions,
-     * vertex normals) are valid and ready for shader access. When this
-     * returns false, cluster surfaces should not be added to the TLAS.
-     *
-     * \return true if all buffers are valid, false otherwise
      */
     bool hasValidBuffers() const;
 
-    /**
-     * \brief Process completed async subdivision surface creations
-     *
-     * Called once per frame to integrate subdivision surfaces that were
-     * created asynchronously on the worker thread.
-     */
-    void processCompletedSurfaces();
-
   private:
-    // Async subdivision surface creation
-    struct PendingSurface {
-      uint32_t surfaceId;
-      std::unique_ptr<Shape> shape;
-      XXH64_hash_t topologyHash;
-    };
-
-    struct CompletedSurface {
-      uint32_t surfaceId;
-      std::unique_ptr<Shape> shape;
-      XXH64_hash_t topologyHash;
-    };
-
-    std::queue<PendingSurface> m_pendingSurfaces;
-    std::queue<CompletedSurface> m_completedSurfaces;
-    std::mutex m_pendingMutex;
-    std::mutex m_completedMutex;
+    // Worker thread infrastructure
+    std::mutex m_pendingMutex; // Guards the CV wait
     std::condition_variable m_workerCV;
     std::vector<std::thread> m_workerThreads;
     std::atomic<bool> m_workerShouldExit{false};
-    uint32_t m_numWorkerThreads = 4; // Use 4 worker threads for parallel processing
+    uint32_t m_numWorkerThreads = 4;
 
     void workerThreadFunc(uint32_t threadIndex);
 
@@ -455,56 +332,51 @@ namespace dxvk {
     // NVRHI adapter layer
     NvrhiDxvkDevice* m_nvrhiDevice = nullptr;
     nvrhi::CommandListHandle m_commandList;
-    uint32_t m_frameIndex = 0;  // Frame counter for transient resource management
+    uint32_t m_frameIndex = 0;
 
     // RTX MG core systems
     std::unique_ptr<ClusterAccelBuilder> m_clusterBuilder;
     std::unique_ptr<HiZBuffer> m_hizBuffer;
     std::unique_ptr<ZBuffer> m_zBuffer;
-    std::unique_ptr<class RTXMGScene> m_scene;
 
     // Cluster acceleration structures
     std::unique_ptr<ClusterAccels> m_clusterAccels;
     ClusterStatistics m_clusterStats;
-    nvrhi::BufferHandle m_scratchBuffer;  // Scratch memory for cluster operations
+    nvrhi::BufferHandle m_scratchBuffer;
 
-    // Subdivision surface management - uses actual SubdivisionSurface class
-    struct RTXMGSubdivisionSurfaceEntry {
-      std::unique_ptr<SubdivisionSurface> subdivSurface;
-      // Store only value-type data from descriptor (pointers become dangling after creation)
+    // Cluster mesh entries (meshoptimizer path)
+    struct RTXMGClusterMeshEntry {
+      std::unique_ptr<ClusterLODData> lodData;       // LOD DAG from meshoptimizer (built async)
+      std::unique_ptr<MeshletTemplateSet> templates;  // CLAS templates (built once, needs GPU)
       std::string debugName;
-      uint32_t numVertices = 0;
-      uint32_t numFaces = 0;
-      uint32_t isolationLevel = 2;
-      float tessellationScale = 1.0f;
-      VkAccelerationStructureKHR blas = VK_NULL_HANDLE;
-      VkDeviceAddress blasAddress = 0;
-      bool isDirty = true;
-      bool isReady = false;
-      bool m_hasDisplacementMaterial = false;
-      float displacementScale = 1.0f;
-      size_t gpuMemoryBytes = 0;
+      bool isReady = false;         // LOD DAG is built
+      bool templatesBuilt = false;  // CLAS templates are built
     };
+    std::unordered_map<uint32_t, RTXMGClusterMeshEntry> m_clusterMeshes;
 
-    std::unordered_map<uint32_t, RTXMGSubdivisionSurfaceEntry> m_surfaces;
+    // Async cluster mesh creation
+    struct PendingClusterMesh {
+      uint32_t surfaceId;
+      std::vector<uint32_t> indices;
+      std::vector<float> vertexPositions;
+      size_t vertexCount;
+      size_t vertexPositionsStride;
+      std::string debugName;
+    };
+    struct CompletedClusterMesh {
+      uint32_t surfaceId;
+      std::unique_ptr<ClusterLODData> lodData;
+      std::string debugName;
+    };
+    std::queue<PendingClusterMesh> m_pendingClusterMeshes;
+    std::queue<CompletedClusterMesh> m_completedClusterMeshes;
+    std::mutex m_pendingClusterMeshMutex;
+    std::mutex m_completedClusterMeshMutex;
+
     uint32_t m_nextSurfaceId = 1;
 
-    // Deferred destruction for SubdivisionSurface objects.
-    // When a surface is pruned, its SubdivisionSurface is moved here temporarily.
-    // In buildClusterBlas, these are transferred to the DXVK command list's lifetime
-    // tracker (via DxvkResource wrapping), which holds them until the GPU fence signals
-    // that all in-flight commands have completed. This is the same pattern used for
-    // binding sets (DxvkBindingSetHolder) and cluster operation buffers.
-    // Frame counting doesn't work because GPU can fall behind CPU with heavy cluster loads.
-    std::vector<std::unique_ptr<SubdivisionSurface>> m_pendingGpuDestructions;
-
     // Mapping from surfaceId to instance index in the scene (rebuilt each frame)
-    // Used to look up BLAS addresses after cluster build
     std::unordered_map<uint32_t, uint32_t> m_surfaceToInstanceIndex;
-
-    // Mapping from surfaceId to mesh index in the scene (persistent)
-    // Used to rebuild instances each frame
-    std::unordered_map<uint32_t, uint32_t> m_surfaceToMeshIndex;
 
     // Instance transforms from RTX Remix (surfaceId -> objectToWorld)
     std::unordered_map<uint32_t, Matrix4> m_instanceTransforms;
@@ -512,19 +384,8 @@ namespace dxvk {
     // Track last frame each surface had a transform (for stale surface cleanup)
     std::unordered_map<uint32_t, uint32_t> m_surfaceLastSeenFrame;
 
-    // Total GPU memory used by all surfaces in the cache
-    size_t m_surfaceCacheVramBytes = 0;
-
-    // Dynamic memory sizing - high-water mark (only grows, never shrinks to avoid reallocation churn)
-    uint32_t m_hwmClusters = 0;
-    size_t m_hwmClasBytes = 0;
-    size_t m_hwmVertexBytes = 0;
-
     // Downloaded BLAS addresses from GPU (populated after BuildAccel)
     std::vector<VkDeviceAddress> m_downloadedBlasAddresses;
-
-    // Topology caches - one per worker thread for thread-safe parallel processing
-    std::vector<std::unique_ptr<TopologyCache>> m_topologyCaches;
 
     // Tessellation statistics
     TessellationStats m_stats;
@@ -541,13 +402,6 @@ namespace dxvk {
 
     // Initialization state
     bool m_initialized = false;
-
-    // Topology management (OpenSubdiv)
-    std::unique_ptr<OpenSubdiv::OPENSUBDIV_VERSION::Tmr::TopologyMap> m_topologyMap;
-    std::unique_ptr<OpenSubdiv::OPENSUBDIV_VERSION::Tmr::SurfaceTable> m_surfaceTable;
-
-    // Internal methods
-    std::unique_ptr<Shape> convertDescToShape(const SubdivisionSurfaceDesc& desc);
 
     void updateHiZBuffer(
       const Rc<DxvkImageView>& depthBuffer);

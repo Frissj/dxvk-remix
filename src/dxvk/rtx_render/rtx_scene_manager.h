@@ -296,9 +296,8 @@ private:
 
   MaterialData determineMaterialData(const MaterialData* overrideMaterialData, const DrawCallState& input);
 
-  // RTX Mega Geometry: Subdivision surface detection and creation
-  bool tryCreateSubdivisionSurface(Rc<DxvkContext> ctx, const DrawCallState& drawCallState, BlasEntry* pBlas);
-  bool isSubdivisionSurfaceCandidate(const RaytraceGeometry& convertedGeom, const DrawCallState& drawCallState) const;
+  // RTX Mega Geometry: Cluster mesh (meshoptimizer path)
+  bool tryCreateClusterMesh(Rc<DxvkContext> ctx, const DrawCallState& drawCallState, BlasEntry* pBlas);
   
   uint32_t m_beginUsdExportFrameNum = -1;
   bool m_enqueueDelayedClear = false;
@@ -317,9 +316,8 @@ private:
 
   DrawCallCache m_drawCallCache;
 
-  // RTX Mega Geometry: Cache subdivision surface IDs by mesh hash
-  // Key: mesh hash, Value: subdivision surface ID in RtxMegaGeoBuilder
-  fast_unordered_cache<uint32_t> m_subdivisionSurfaceCache;
+  // RTX Mega Geometry: Cache cluster mesh IDs by topology hash
+  fast_unordered_cache<uint32_t> m_clusterMeshCache;
 
   CameraManager m_cameraManager;
 

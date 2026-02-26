@@ -321,6 +321,12 @@ namespace dxvk {
       VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
       VK_ACCESS_SHADER_READ_BIT);
 
+    // Ensure scratch buffer exists before using it in the barrier below.
+    // When the scene has only cluster instances (no standard BLAS), m_scratchBuffer
+    // may be null because buildBlases skips allocation when totalScratchMemory == 0.
+    const size_t requiredScratchAllocSize = sizeInfo.buildScratchSize + m_scratchAlignment;
+    getScratchMemory(requiredScratchAllocSize);
+
     execBarriers.accessBuffer(
       m_scratchBuffer->getSliceHandle(),
       VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
@@ -333,8 +339,7 @@ namespace dxvk {
 
     geometry.geometry.aabbs.data.deviceAddress = m_aabbBuffer->getDeviceAddress();
 
-    const size_t requiredScratchAllocSize = sizeInfo.buildScratchSize + m_scratchAlignment;
-    buildInfo.scratchData.deviceAddress = getScratchMemory(requiredScratchAllocSize)->getDeviceAddress();
+    buildInfo.scratchData.deviceAddress = m_scratchBuffer->getDeviceAddress();
     assert(buildInfo.scratchData.deviceAddress % m_scratchAlignment == 0); // Note: Required by the Vulkan specification.
 
     VkAccelerationStructureBuildRangeInfoKHR buildRange {};
@@ -475,8 +480,6 @@ namespace dxvk {
     // CRITICAL: buildClusterBlas must run BEFORE addBlas so getInstanceIndexForSurface works
 
     if (m_megaGeoBuilder != nullptr) {
-      m_megaGeoBuilder->processCompletedSurfaces();
-
       // Collect transforms for all cluster BLAS instances FIRST
       // Note: Use getVkInstance().transform directly (row-major) instead of getTransform() (column-major)
       // because MegaGeo's affineToColumnMajor expects row-major input
@@ -1270,6 +1273,7 @@ namespace dxvk {
 
   void AccelManager::prepareSceneData(Rc<DxvkContext> ctx, DxvkBarrierSet& execBarriers, InstanceManager& instanceManager) {
     ScopedCpuProfileZone();
+    Logger::warn("RTX MegaGeo: prepareSceneData ENTER");
     bool haveInstances = false;
     for (const auto& instances : m_mergedInstances) {
       if (!instances.empty()) {
@@ -1283,6 +1287,7 @@ namespace dxvk {
     }
 
     createAndBuildIntersectionBlas(ctx, execBarriers);
+    Logger::warn("RTX MegaGeo: prepareSceneData after intersectionBlas");
 
     // Prepare billboard data and instances
     std::vector<MemoryBillboard> memoryBillboards;
@@ -1355,6 +1360,8 @@ namespace dxvk {
       numActiveBillboards = index;
     }
 
+    Logger::warn("RTX MegaGeo: prepareSceneData after billboards");
+
     // Allocate the instance buffer and copy its contents from host to device memory
     DxvkBufferCreateInfo info = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
     info.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR
@@ -1373,6 +1380,8 @@ namespace dxvk {
       Logger::debug("DxvkRaytrace: Vulkan AS Instance Realloc");
     }
 
+    Logger::warn(str::format("RTX MegaGeo: prepareSceneData instanceBuf allocated, size=", info.size));
+
     // Write instance data
     size_t offset = 0;
     for (const auto& instances : m_mergedInstances) {
@@ -1382,6 +1391,8 @@ namespace dxvk {
         offset += size;
       }
     }
+
+    Logger::warn("RTX MegaGeo: prepareSceneData instance data written to buffer");
 
     // RTX Mega Geometry: Patch cluster BLAS addresses directly on GPU
     // This is done AFTER uploading instance data so we can patch in-place
@@ -1414,7 +1425,7 @@ namespace dxvk {
       // GPU PATCH compute shader needs to read blasPtrsBuffer and write instance buffer.
       ctx->emitMemoryBarrier(0,
         VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR | VK_PIPELINE_STAGE_TRANSFER_BIT,
-        VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+        VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR | VK_ACCESS_TRANSFER_WRITE_BIT,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
 
@@ -1430,7 +1441,16 @@ namespace dxvk {
       // DIAG: Readback TLAS instance buffer after GPU patching to verify BLAS addresses were patched
       {
         static uint32_t s_patchDiagCount = 0;
-        if (s_patchDiagCount < 3) {
+        static uint32_t s_patchLastMappingCount = 0;
+        // Reset on significant mapping count change
+        uint32_t mappingDiff = (mappings.size() > s_patchLastMappingCount) ? (mappings.size() - s_patchLastMappingCount) : (s_patchLastMappingCount - mappings.size());
+        if (s_patchLastMappingCount == 0 || mappingDiff > s_patchLastMappingCount / 2) {
+          if (mappings.size() != s_patchLastMappingCount) {
+            s_patchDiagCount = 0;
+            s_patchLastMappingCount = static_cast<uint32_t>(mappings.size());
+          }
+        }
+        if (s_patchDiagCount < 2 && mappings.size() > 5) {
           s_patchDiagCount++;
 
           // Barrier to make compute shader writes visible for transfer read

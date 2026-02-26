@@ -99,6 +99,11 @@ namespace dxvk {
     // All buffers used in RTX MG need device address for cluster operations
     dxvkInfo.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     dxvkInfo.usage |= VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    // Any NVRHI buffer may be bound as VK_DESCRIPTOR_TYPE_STORAGE_BUFFER via StructuredBuffer_SRV/UAV,
+    // so always include storage buffer usage to ensure DXVK enforces minStorageBufferOffsetAlignment.
+    dxvkInfo.usage |= VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    dxvkInfo.stages |= VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    dxvkInfo.access |= VK_ACCESS_SHADER_READ_BIT;
 
     // Default stages if none set
     if (dxvkInfo.stages == 0) {
@@ -108,6 +113,19 @@ namespace dxvk {
     // Default access if none set
     if (dxvkInfo.access == 0) {
       dxvkInfo.access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    }
+
+    // Ensure all buffers have 16-byte alignment for descriptor offsets.
+    // Any buffer may be bound as VK_DESCRIPTOR_TYPE_STORAGE_BUFFER via StructuredBuffer_SRV/UAV,
+    // which requires offset to be a multiple of minStorageBufferOffsetAlignment (16 on NVIDIA).
+    dxvkInfo.requiredAlignmentOverride = std::max(dxvkInfo.requiredAlignmentOverride, VkDeviceSize(16));
+
+    // Prevent DXVK buffer renaming for small buffers. DXVK creates multiple slices per VkBuffer
+    // when size < 256 (m_physSliceCount = 256/stride). On writeBuffer, DXVK swaps to a new slice
+    // whose offset may not be 16-byte aligned. By padding to 256 bytes, we force exactly 1 slice
+    // (m_physSliceCount = max(1, 256/256) = 1), keeping the slice offset at 0.
+    if (dxvkInfo.size < 256) {
+      dxvkInfo.size = 256;
     }
 
     // Create DXVK buffer (GPU local memory by default)

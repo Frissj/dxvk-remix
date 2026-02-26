@@ -141,26 +141,35 @@ namespace dxvk {
       commitBarriers();
     }
 
-    // Vulkan requires vkCmdUpdateBuffer size to be a multiple of 4
-    size_t alignedSize = (size + 3) & ~3;
-    size_t copySize = size;
+    // vkCmdUpdateBuffer has a 64KB limit per call. Chunk large writes.
+    static constexpr size_t kMaxUpdateSize = 65536;
+    const uint8_t* src = static_cast<const uint8_t*>(data);
+    size_t remaining = size;
+    size_t curOffset = offset;
 
-    // Clamp if rounding up would overflow buffer
-    if (offset + alignedSize > bufferSize) {
-      alignedSize = size & ~3;
-      copySize = alignedSize;
-      if (alignedSize == 0 && size > 0) {
-        Logger::warn(str::format("RTX MegaGeo: writeBuffer - size ", size, " too small to align to 4 bytes"));
-        return;
+    while (remaining > 0) {
+      size_t chunkSize = std::min(remaining, kMaxUpdateSize);
+      // Vulkan requires vkCmdUpdateBuffer size to be a multiple of 4
+      size_t alignedChunk = (chunkSize + 3) & ~3;
+
+      // Clamp if rounding up would overflow buffer
+      if (curOffset + alignedChunk > bufferSize) {
+        alignedChunk = chunkSize & ~3;
+        if (alignedChunk == 0) break;
+        chunkSize = alignedChunk;
       }
-    }
 
-    if (alignedSize != size) {
-      std::vector<uint8_t> alignedData(alignedSize, 0);
-      std::memcpy(alignedData.data(), data, copySize);
-      m_context->updateBuffer(dxvkBuffer, offset, alignedSize, alignedData.data());
-    } else {
-      m_context->updateBuffer(dxvkBuffer, offset, size, data);
+      if (alignedChunk != chunkSize) {
+        std::vector<uint8_t> alignedData(alignedChunk, 0);
+        std::memcpy(alignedData.data(), src, chunkSize);
+        m_context->updateBuffer(dxvkBuffer, curOffset, alignedChunk, alignedData.data());
+      } else {
+        m_context->updateBuffer(dxvkBuffer, curOffset, chunkSize, src);
+      }
+
+      src += chunkSize;
+      curOffset += chunkSize;
+      remaining -= chunkSize;
     }
   }
 
@@ -677,7 +686,16 @@ namespace dxvk {
         bindUAVArrayDescriptorSet();
       }
 
-      // Commit any pending barriers right before dispatch
+      // Commit any pending barriers right before dispatch.
+      // 1) DXVK barrier flush: updateBuffer() tracks writes in DXVK's m_execBarriers,
+      //    but the native Vulkan dispatch path bypasses DXVK's dispatch() which would normally
+      //    flush them. Emit a full memory barrier to make all prior writes visible to compute.
+      m_context->emitMemoryBarrier(0,
+        VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+        VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_UNIFORM_READ_BIT);
+      // 2) Flush NVRHI-tracked barriers (m_PendingBufferBarriers) for bufferBarrier() calls.
       commitBarriers();
 
       // Call vkCmdDispatch directly
@@ -811,7 +829,14 @@ namespace dxvk {
         bindUAVArrayDescriptorSet();
       }
 
-      // Commit any pending barriers right before dispatch
+      // Commit any pending barriers right before dispatch.
+      // 1) DXVK barrier flush (same rationale as dispatch() above)
+      m_context->emitMemoryBarrier(0,
+        VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+        VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_UNIFORM_READ_BIT);
+      // 2) Flush NVRHI-tracked barriers
       commitBarriers();
 
       // Call vkCmdDispatchIndirect directly

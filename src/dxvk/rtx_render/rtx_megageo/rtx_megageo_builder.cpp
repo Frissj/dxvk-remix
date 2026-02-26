@@ -26,6 +26,8 @@
 #include "../../../util/util_error.h"  // For DxvkError exception handling
 #include "../../dxvk_device.h"         // For DxvkDevice, adapter(), memoryProperties()
 #include "../../dxvk_adapter.h"        // For DxvkAdapterMemoryInfo, getMemoryHeapInfo()
+#include "cluster_builder/cluster_lod_builder.h"
+#include "cluster_builder/meshlet_template_builder.h"
 #include <algorithm>
 #include <cmath>
 #include <chrono>
@@ -35,20 +37,7 @@
 #define RTXMG_CHRONO_TIMING 0
 #include "nvrhi_adapter/nvrhi_dxvk_texture.h"
 #include "nvrhi_adapter/nvrhi_dxvk_buffer.h"
-#include "scene/rtxmg_scene.h"
-#include "scene/instance.h"
-#include "subdivision/subdivision_surface.h"
-#include "subdivision/topology_cache.h"
-#include "subdivision/shape.h"
 #include "cluster_builder/fill_instance_descs_params.h"
-
-// OpenSubdiv includes for topology building (using osd_lite like the sample)
-#include "osd_lite/opensubdiv/far/topologyDescriptor.h"
-#include "osd_lite/opensubdiv/far/topologyRefinerFactory.h"
-#include "osd_lite/opensubdiv/sdc/types.h"
-#include "osd_lite/opensubdiv/sdc/options.h"
-#include "osd_lite/opensubdiv/tmr/topologyMap.h"
-#include "osd_lite/opensubdiv/tmr/surfaceTableFactory.h"
 
 #include "nvrhi_adapter/nvrhi_dxvk_command_list.h"
 
@@ -61,21 +50,6 @@
 #endif
 
 namespace dxvk {
-
-// Wraps a SubdivisionSurface as a DxvkResource so it can be tracked on the
-// DXVK command list. When the GPU fence signals completion, this holder is
-// destroyed, which frees the SubdivisionSurface and all its GPU buffers.
-class DxvkSubdSurfaceHolder : public DxvkResource {
-public:
-  DxvkSubdSurfaceHolder(std::unique_ptr<SubdivisionSurface> surface)
-    : m_surface(std::move(surface)) {}
-private:
-  std::unique_ptr<SubdivisionSurface> m_surface;
-};
-
-  // Use OpenSubdiv namespace (from osd_lite, matching the sample)
-  // Only use the versioned namespace to avoid ambiguity
-  using namespace OpenSubdiv::OPENSUBDIV_VERSION;
 
   RtxMegaGeoBuilder::RtxMegaGeoBuilder(
     const Rc<DxvkDevice>& device,
@@ -98,14 +72,6 @@ private:
       }
       m_workerThreads.clear();
       RTXMG_LOG("RTX MegaGeo: All worker threads shut down");
-    }
-
-    // Cleanup BLAS handles
-    for (auto& [id, surface] : m_surfaces) {
-      if (surface.blas != VK_NULL_HANDLE) {
-        // BLAS cleanup will be handled by DXVK's resource management
-        surface.blas = VK_NULL_HANDLE;
-      }
     }
 
     // NVRHI adapter cleanup
@@ -158,31 +124,6 @@ private:
     // Create ClusterAccels storage
     m_clusterAccels = std::make_unique<ClusterAccels>();
 
-    // Create RTXMGScene for managing subdivision surfaces and instances
-    m_scene = std::make_unique<RTXMGScene>(m_nvrhiDevice);
-    m_scene->Initialize();
-
-    // Create TopologyCache for each worker thread (thread-safe parallel processing)
-    TopologyCache::Options topoCacheOptions{
-      .isoLevelSharp = 1,
-      .isoLevelSmooth = 1,
-      .useTerminalNodes = false
-    };
-    m_topologyCaches.reserve(m_numWorkerThreads);
-    for (uint32_t i = 0; i < m_numWorkerThreads; ++i) {
-      m_topologyCaches.push_back(std::make_unique<TopologyCache>(topoCacheOptions));
-    }
-
-    RTXMG_LOG(str::format("RTX MegaGeo: Scene and ", m_numWorkerThreads, " topology caches initialized"));
-
-    // Create HIZ buffer (for visibility culling)
-    // Note: HIZ buffer will be created on-demand with appropriate size when needed
-    // The static Create method requires size parameters that aren't known at init time
-
-    // Create Z buffer (depth buffer interface)
-    // Note: Z buffer will be created on-demand when needed
-    // The static Create method requires size parameters that aren't known at init time
-
     // Create scratch buffer for cluster operations
     // Start with a reasonable default size (16 MB), will grow if needed
     const uint64_t initialScratchSize = 16 * 1024 * 1024;
@@ -202,7 +143,7 @@ private:
 
     RTXMG_LOG(str::format("RTX MegaGeo: Created scratch buffer (", initialScratchSize / 1024, " KB)"));
 
-    // Start async worker threads for subdivision surface creation
+    // Start async worker threads for cluster mesh LOD DAG building
     RTXMG_LOG(str::format("RTX MegaGeo: Starting ", m_numWorkerThreads, " worker threads"));
     m_workerThreads.reserve(m_numWorkerThreads);
     for (uint32_t i = 0; i < m_numWorkerThreads; ++i) {
@@ -218,48 +159,61 @@ private:
     RTXMG_LOG(str::format("RTX MegaGeo: Worker thread ", threadIndex, " started"));
 
     while (!m_workerShouldExit.load()) {
-      PendingSurface pending;
-      bool hasPending = false;
+      PendingClusterMesh pendingMesh;
+      bool hasPendingMesh = false;
 
       {
         std::unique_lock<std::mutex> lock(m_pendingMutex);
         m_workerCV.wait(lock, [this] {
-          return !m_pendingSurfaces.empty() || m_workerShouldExit.load();
+          std::lock_guard<std::mutex> meshLock(m_pendingClusterMeshMutex);
+          return !m_pendingClusterMeshes.empty() || m_workerShouldExit.load();
         });
 
-        if (m_workerShouldExit.load() && m_pendingSurfaces.empty()) {
-          break;
-        }
-
-        if (!m_pendingSurfaces.empty()) {
-          pending = std::move(m_pendingSurfaces.front());
-          m_pendingSurfaces.pop();
-          hasPending = true;
+        if (m_workerShouldExit.load()) {
+          std::lock_guard<std::mutex> meshLock(m_pendingClusterMeshMutex);
+          if (m_pendingClusterMeshes.empty())
+            break;
         }
       }
 
-      if (hasPending) {
-        uint32_t numFaces = pending.shape ? pending.shape->nvertsPerFace.size() : 0;
-        RTXMG_LOG(str::format("RTX MegaGeo: Worker[", threadIndex, "] processing surface ", pending.surfaceId, " (", numFaces, " faces)"));
+      // Grab a pending mesh from the queue
+      {
+        std::lock_guard<std::mutex> meshLock(m_pendingClusterMeshMutex);
+        if (!m_pendingClusterMeshes.empty()) {
+          pendingMesh = std::move(m_pendingClusterMeshes.front());
+          m_pendingClusterMeshes.pop();
+          hasPendingMesh = true;
+        }
+      }
+
+      if (hasPendingMesh) {
+        Logger::info(str::format("RTX MegaGeo: Worker[", threadIndex, "] building LOD DAG for cluster mesh ",
+            pendingMesh.surfaceId, " (", pendingMesh.indices.size() / 3, " triangles)"));
 
         try {
-          // Just validate and return the Shape - SubdivisionSurface will be created on main thread
-          // The Shape object already contains all the topology data needed
-          RTXMG_LOG(str::format("RTX MegaGeo: Worker[", threadIndex, "] completed surface ", pending.surfaceId));
+          auto lodData = ClusterLODBuilder::build(
+              pendingMesh.indices.data(),
+              pendingMesh.indices.size(),
+              pendingMesh.vertexPositions.data(),
+              pendingMesh.vertexCount,
+              12); // packed float3 stride
 
-          // Move to completed queue
           {
-            std::lock_guard<std::mutex> lock(m_completedMutex);
-            m_completedSurfaces.push({
-              pending.surfaceId,
-              std::move(pending.shape),
-              pending.topologyHash
+            std::lock_guard<std::mutex> lock(m_completedClusterMeshMutex);
+            m_completedClusterMeshes.push({
+              pendingMesh.surfaceId,
+              std::move(lodData),
+              pendingMesh.debugName
             });
           }
+
+          Logger::info(str::format("RTX MegaGeo: Worker[", threadIndex, "] completed LOD DAG for cluster mesh ", pendingMesh.surfaceId));
         } catch (const std::exception& e) {
-          Logger::err(str::format("RTX MegaGeo: Worker[", threadIndex, "] failed to process surface ", pending.surfaceId, ": ", e.what()));
+          Logger::err(str::format("RTX MegaGeo: Worker[", threadIndex, "] failed to build LOD DAG for mesh ",
+              pendingMesh.surfaceId, ": ", e.what()));
         } catch (...) {
-          Logger::err(str::format("RTX MegaGeo: Worker[", threadIndex, "] failed to process surface ", pending.surfaceId, ": unknown exception"));
+          Logger::err(str::format("RTX MegaGeo: Worker[", threadIndex, "] failed to build LOD DAG for mesh ",
+              pendingMesh.surfaceId, ": unknown error"));
         }
       }
     }
@@ -267,8 +221,8 @@ private:
     RTXMG_LOG(str::format("RTX MegaGeo: Worker thread ", threadIndex, " exiting"));
   }
 
-  bool RtxMegaGeoBuilder::createSubdivisionSurface(
-    const SubdivisionSurfaceDesc& desc,
+  bool RtxMegaGeoBuilder::createClusterMesh(
+    const TriangleMeshDesc& desc,
     uint32_t& surfaceId)
   {
     if (!m_initialized) {
@@ -276,136 +230,73 @@ private:
       return false;
     }
 
-    // Validate input
-    if (desc.numFaces == 0 || desc.numVertices == 0) {
-      Logger::err("Invalid subdivision surface: numFaces or numVertices is zero");
+    if (!desc.indices || desc.indexCount == 0 || !desc.vertexPositions || desc.vertexCount == 0) {
+      Logger::err("Invalid cluster mesh: missing indices or vertices");
       return false;
     }
 
-    if (!desc.faceVertexIndices || !desc.controlPoints) {
-      Logger::err("Invalid subdivision surface: missing required data");
+    if (desc.indexCount % 3 != 0) {
+      Logger::err(str::format("Invalid cluster mesh: indexCount ", desc.indexCount, " not divisible by 3"));
       return false;
     }
 
-    // Allocate surface ID
     surfaceId = m_nextSurfaceId++;
 
-    // Convert descriptor to Shape format
-    auto shape = convertDescToShape(desc);
-    if (!shape) {
-      Logger::err(str::format("Failed to convert descriptor to Shape for surface ", surfaceId));
-      return false;
+    Logger::info(str::format("RTX MegaGeo: Creating cluster mesh ", surfaceId,
+        " (", desc.indexCount / 3, " triangles, ", desc.vertexCount, " vertices)",
+        desc.debugName ? str::format(" name='", desc.debugName, "'") : ""));
+
+    // Create placeholder entry
+    RTXMGClusterMeshEntry entry;
+    entry.debugName = desc.debugName ? desc.debugName : "";
+    entry.isReady = false;
+    entry.templatesBuilt = false;
+    m_clusterMeshes[surfaceId] = std::move(entry);
+
+    // Copy data for async processing
+    PendingClusterMesh pending;
+    pending.surfaceId = surfaceId;
+    pending.vertexCount = desc.vertexCount;
+    pending.vertexPositionsStride = desc.vertexPositionsStride;
+    pending.debugName = desc.debugName ? desc.debugName : "";
+
+    // Copy indices
+    pending.indices.assign(desc.indices, desc.indices + desc.indexCount);
+
+    // Copy vertex positions (packed float3)
+    pending.vertexPositions.resize(desc.vertexCount * 3);
+    size_t srcStrideFloats = desc.vertexPositionsStride / sizeof(float);
+    for (size_t i = 0; i < desc.vertexCount; ++i) {
+      pending.vertexPositions[i * 3 + 0] = desc.vertexPositions[i * srcStrideFloats + 0];
+      pending.vertexPositions[i * 3 + 1] = desc.vertexPositions[i * srcStrideFloats + 1];
+      pending.vertexPositions[i * 3 + 2] = desc.vertexPositions[i * srcStrideFloats + 2];
     }
 
-    // Queue for async creation on worker thread
-    RTXMG_LOG(str::format("RTX MegaGeo: Queuing surface ", surfaceId, " for async creation (", desc.numFaces, " faces)"));
-
+    // Queue for async processing
     {
-      std::lock_guard<std::mutex> lock(m_pendingMutex);
-      m_pendingSurfaces.push({
-        surfaceId,
-        std::move(shape),
-        0 // topologyHash - caller can set this if needed
-      });
+      std::lock_guard<std::mutex> lock(m_pendingClusterMeshMutex);
+      m_pendingClusterMeshes.push(std::move(pending));
     }
     m_workerCV.notify_one();
 
-    // Create placeholder entry
-    RTXMGSubdivisionSurfaceEntry surface;
-    // Store only value-type data (raw pointers in desc become dangling after caller returns)
-    surface.debugName = desc.debugName ? desc.debugName : "";
-    surface.numVertices = desc.numVertices;
-    surface.numFaces = desc.numFaces;
-    surface.isolationLevel = desc.isolationLevel;
-    surface.tessellationScale = desc.tessellationScale;
-    surface.isDirty = true;
-    surface.isReady = false; // Will be set to true when worker completes
-    surface.m_hasDisplacementMaterial = desc.enableDisplacement;
-    surface.displacementScale = desc.displacementScale;
-
-    // Store placeholder in map
-    m_surfaces[surfaceId] = std::move(surface);
-
-    RTXMG_LOG(str::format("Queued subdivision surface ", surfaceId,
-                             " for async creation (", desc.numFaces, " faces, ",
-                             desc.numVertices, " vertices)"));
-
     return true;
   }
 
-  bool RtxMegaGeoBuilder::updateSubdivisionSurface(
-    uint32_t surfaceId,
-    const SubdivisionSurfaceDesc& desc)
-  {
-    auto it = m_surfaces.find(surfaceId);
-    if (it == m_surfaces.end()) {
-      Logger::err(str::format("Surface ", surfaceId, " not found"));
+  bool RtxMegaGeoBuilder::isSurfaceReady(uint32_t surfaceId) const {
+    auto it = m_clusterMeshes.find(surfaceId);
+    if (it == m_clusterMeshes.end())
       return false;
-    }
-
-    RTXMGSubdivisionSurfaceEntry& surface = it->second;
-
-    surface.isDirty = true;
-    surface.isReady = false;
-
-    // Recreate Shape and SubdivisionSurface with updated data
-    auto shape = convertDescToShape(desc);
-    if (!shape) {
-      Logger::err(str::format("Failed to convert descriptor to Shape for surface ", surfaceId));
-      return false;
-    }
-
-    std::vector<std::unique_ptr<Shape>> keyFrames;
-    surface.subdivSurface = std::make_unique<SubdivisionSurface>(
-      *m_topologyCaches[0],
-      std::move(shape),
-      keyFrames,
-      nullptr,
-      m_commandList.Get());
-
-    RTXMG_LOG(str::format("Updated subdivision surface ", surfaceId));
-    return true;
+    return it->second.templatesBuilt;
   }
 
-  void RtxMegaGeoBuilder::removeSubdivisionSurface(uint32_t surfaceId) {
-    auto it = m_surfaces.find(surfaceId);
-    if (it == m_surfaces.end()) {
-      return;
-    }
-
-    RTXMGSubdivisionSurfaceEntry& surface = it->second;
-
-    // Decrement tracked VRAM before removing
-    if (m_surfaceCacheVramBytes >= surface.gpuMemoryBytes) {
-      m_surfaceCacheVramBytes -= surface.gpuMemoryBytes;
-    } else {
-      m_surfaceCacheVramBytes = 0;
-    }
-
-    // Cleanup BLAS
-    if (surface.blas != VK_NULL_HANDLE) {
-      // BLAS cleanup handled by DXVK
-      surface.blas = VK_NULL_HANDLE;
-    }
-
-    // Null out the raw pointer in m_subdMeshes to prevent dangling pointer access.
-    // The m_surfaceToMeshIndex mapping was already erased by the caller, so no new
-    // instances will reference this mesh index. But we null it for safety.
-    auto meshIt = m_surfaceToMeshIndex.find(surfaceId);
-    if (meshIt != m_surfaceToMeshIndex.end() && m_scene) {
-      m_scene->NullifySubdMesh(meshIt->second);
-    }
-
-    // Move SubdivisionSurface to pending list. In buildClusterBlas, these will be
-    // tracked on the DXVK command list so the GPU fence keeps them alive until all
-    // in-flight GPU work completes. This replaces frame-counting which gets out of
-    // sync with the GPU under heavy cluster loads.
-    if (surface.subdivSurface) {
-      m_pendingGpuDestructions.push_back(std::move(surface.subdivSurface));
-    }
-
-    m_surfaces.erase(it);
-    RTXMG_LOG(str::format("Removed subdivision surface ", surfaceId));
+  VkDeviceAddress RtxMegaGeoBuilder::getSurfaceBlasAddress(uint32_t surfaceId) const {
+    auto instIt = m_surfaceToInstanceIndex.find(surfaceId);
+    if (instIt == m_surfaceToInstanceIndex.end())
+      return 0;
+    uint32_t instanceIndex = instIt->second;
+    if (instanceIndex >= m_downloadedBlasAddresses.size())
+      return 0;
+    return m_downloadedBlasAddresses[instanceIndex];
   }
 
   bool RtxMegaGeoBuilder::buildClusterBlas(
@@ -422,65 +313,6 @@ private:
     // Update last-seen frame for surfaces that have transforms this frame
     for (const auto& [surfaceId, _] : instanceTransforms) {
       m_surfaceLastSeenFrame[surfaceId] = s_frameCounter;
-    }
-
-    // VRAM budget-based surface cache eviction
-    // Evict oldest surfaces when cache exceeds 10% of total VRAM budget
-    {
-      // Query VRAM budget from the adapter (same pattern as OMM manager)
-      VkDeviceSize totalVramBudget = 0;
-      const VkPhysicalDeviceMemoryProperties memory = m_device->adapter()->memoryProperties();
-      const DxvkAdapterMemoryInfo memHeapInfo = m_device->adapter()->getMemoryHeapInfo();
-      for (uint32_t i = 0; i < memory.memoryHeapCount; i++) {
-        if (memory.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
-          totalVramBudget += memHeapInfo.heaps[i].memoryBudget;
-        }
-      }
-
-      // Surface cache budget = 10% of total VRAM
-      const size_t surfaceCacheBudget = static_cast<size_t>(totalVramBudget / 10);
-      const size_t evictionTarget = static_cast<size_t>(surfaceCacheBudget * 8 / 10); // 80% to avoid thrashing
-
-      if (m_surfaceCacheVramBytes > surfaceCacheBudget) {
-        // Collect eviction candidates: surfaces not referenced this frame
-        struct EvictionCandidate {
-          uint32_t surfaceId;
-          uint32_t lastSeenFrame;
-          size_t gpuMemoryBytes;
-        };
-        std::vector<EvictionCandidate> candidates;
-
-        for (const auto& [surfaceId, surface] : m_surfaces) {
-          // Only evict surfaces that don't have a transform this frame
-          if (instanceTransforms.count(surfaceId) > 0)
-            continue;
-          auto it = m_surfaceLastSeenFrame.find(surfaceId);
-          uint32_t lastSeen = (it != m_surfaceLastSeenFrame.end()) ? it->second : 0;
-          candidates.push_back({surfaceId, lastSeen, surface.gpuMemoryBytes});
-        }
-
-        // Sort by last seen frame (oldest first)
-        std::sort(candidates.begin(), candidates.end(),
-          [](const EvictionCandidate& a, const EvictionCandidate& b) {
-            return a.lastSeenFrame < b.lastSeenFrame;
-          });
-
-        // Evict until we're at or below the eviction target (80% of budget)
-        size_t bytesFreed = 0;
-        uint32_t evictedCount = 0;
-        for (const auto& candidate : candidates) {
-          if (m_surfaceCacheVramBytes <= evictionTarget)
-            break;
-          bytesFreed += candidate.gpuMemoryBytes;
-          m_surfaceToMeshIndex.erase(candidate.surfaceId);
-          m_surfaceLastSeenFrame.erase(candidate.surfaceId);
-          removeSubdivisionSurface(candidate.surfaceId);
-          evictedCount++;
-        }
-
-        (void)evictedCount;
-        (void)bytesFreed;
-      }
     }
 
     // VRAM capacity monitoring — log warnings when approaching total VRAM limits
@@ -500,36 +332,21 @@ private:
         if (totalVramUsed > totalVramBudget * 95 / 100) {
           Logger::err(str::format("RTX MegaGeo: CRITICAL VRAM usage ",
               totalVramUsed / (1024 * 1024), " MB / ", totalVramBudget / (1024 * 1024),
-              " MB (", totalVramUsed * 100 / totalVramBudget, "%) - surface cache: ",
-              m_surfaceCacheVramBytes / (1024 * 1024), " MB"));
+              " MB (", totalVramUsed * 100 / totalVramBudget, "%)"));
         } else if (totalVramUsed > totalVramBudget * 90 / 100) {
           Logger::warn(str::format("RTX MegaGeo: High VRAM usage ",
               totalVramUsed / (1024 * 1024), " MB / ", totalVramBudget / (1024 * 1024),
-              " MB (", totalVramUsed * 100 / totalVramBudget, "%) - surface cache: ",
-              m_surfaceCacheVramBytes / (1024 * 1024), " MB"));
+              " MB (", totalVramUsed * 100 / totalVramBudget, "%)"));
         }
 
         // Periodic monitoring every 60 frames
         if (s_frameCounter % 60 == 0) {
           RTXMG_LOG(str::format("RTX MegaGeo: VRAM ",
               totalVramUsed / (1024 * 1024), " MB / ", totalVramBudget / (1024 * 1024),
-              " MB (", totalVramUsed * 100 / totalVramBudget, "%) - surface cache: ",
-              m_surfaceCacheVramBytes / (1024 * 1024), " MB, ",
-              m_surfaces.size(), " surfaces"));
+              " MB (", totalVramUsed * 100 / totalVramBudget, "%) - ",
+              m_clusterMeshes.size(), " cluster meshes"));
         }
       }
-    }
-
-
-    // Track pending SubdivisionSurface destructions on the DXVK command list.
-    // The GPU fence will hold them alive until all in-flight GPU work completes.
-    if (!m_pendingGpuDestructions.empty()) {
-      Rc<DxvkCommandList> cmdList = context->getCommandList();
-      for (auto& surface : m_pendingGpuDestructions) {
-        Rc<DxvkResource> holder = new DxvkSubdSurfaceHolder(std::move(surface));
-        cmdList->trackResource<DxvkAccess::Read>(std::move(holder));
-      }
-      m_pendingGpuDestructions.clear();
     }
 
     // Reset scratch buffers at start of frame - DXVK ensures GPU is done with previous frame
@@ -539,532 +356,144 @@ private:
       RTXMG_LOG(str::format("RTX MegaGeo: FRAME ", s_frameCounter, " - clearState done"));
     }
 
-
     if (!m_initialized) {
       Logger::err("RtxMegaGeoBuilder not initialized");
       return false;
     }
 
-    RTXMG_LOG(str::format("RTX MegaGeo: buildClusterBlas - Surface count: ", m_surfaces.size()));
-
-    if (m_surfaces.empty()) {
-      // No surfaces to tessellate
-      return true;
-    }
-
-    // Update tessellation camera from RTX Remix camera
-    // Use actual world space camera position for distance-based LOD calculations
-    // Control points are stored in world space, so we need world space camera position
-    dxvk::Vector3 camPos = rtCamera.getPosition(true);
-    Vector3 actualCameraPos(camPos.x, camPos.y, camPos.z);
-    m_tessellationCamera.SetEye(actualCameraPos);
-
-    // Extract forward direction from view matrix for lookat
-    Matrix4d worldToView = rtCamera.getWorldToView(true);
-    float fwdX = -static_cast<float>(worldToView[0][2]);
-    float fwdY = -static_cast<float>(worldToView[1][2]);
-    float fwdZ = -static_cast<float>(worldToView[2][2]);
-    Vector3 forward(fwdX, fwdY, fwdZ);
-    m_tessellationCamera.SetLookat(actualCameraPos + forward);
-    float upX = static_cast<float>(worldToView[0][1]);
-    float upY = static_cast<float>(worldToView[1][1]);
-    float upZ = static_cast<float>(worldToView[2][1]);
-    Vector3 up(upX, upY, upZ);
-    m_tessellationCamera.SetUp(up);
-    // Extract FOV and aspect from projection matrix
-    Matrix4d projMat = rtCamera.getViewToProjection();
-    float proj11 = static_cast<float>(projMat[1][1]);
-    float proj00 = static_cast<float>(projMat[0][0]);
-    float fovY = 2.0f * std::atan(1.0f / proj11) * (180.0f / 3.14159265f);
-    float aspectRatio = proj11 / proj00;
-    m_tessellationCamera.SetFovY(fovY);
-    m_tessellationCamera.SetAspectRatio(aspectRatio);
-    // Get near/far planes directly from RtCamera - use actual game values
-    float zNear = rtCamera.getNearPlane();
-    float zFar = rtCamera.getFarPlane();
-    // Only prevent degenerate values that would break the projection matrix
-    if (zNear <= 0.0f) zNear = 0.001f;  // Tiny near plane to support close objects
-    if (zFar <= zNear) zFar = 1000000.0f;  // Very large far plane - no artificial limit
-    m_tessellationCamera.SetNear(zNear);
-    m_tessellationCamera.SetFar(zFar);
-
-    // CRITICAL: Initialize cluster templates BEFORE binding any image views (like HiZ)
-    // The sync Downloads in template initialization close/reopen the command list
-    // which destroys any bound resources. Must happen before updateHiZBuffer!
+    // =====================================================================
+    // Process completed cluster mesh LOD DAG builds (async worker thread)
+    // =====================================================================
     {
-      uint32_t maxGeometryCountPerMesh = m_scene ?
-          static_cast<uint32_t>(m_scene->GetSceneGraph()->GetMaxGeometryCountPerMesh()) : 1;
-      RTXMG_LOG(str::format("RTX MegaGeo: buildClusterBlas - Ensuring templates initialized, maxGeoPerMesh=", maxGeometryCountPerMesh));
-      m_clusterBuilder->EnsureTemplatesInitialized(maxGeometryCountPerMesh, m_commandList.Get());
-    }
-
-    // HiZ culling DISABLED: With s_megaGeoOnly=true, only cluster geometry produces depth.
-    // This creates a feedback loop where HiZ oscillates between aggressive/no culling each frame,
-    // causing geometry to appear and disappear randomly.
-    // TODO: Re-enable when non-cluster geometry also provides depth, or use a rasterization pre-pass.
-    RTXMG_LOG("RTX MegaGeo: buildClusterBlas - HiZ culling disabled (feedback loop prevention)");
-
-    // Configure tessellator
-    TessellatorConfig config;
-    config.enableVertexNormals = true;
-    config.enableLogging = false;  // DISABLED - causes GPU readback stalls (~1 second per frame)
-    config.zbuffer = nullptr;  // Disable HiZ culling to prevent oscillation
-    config.camera = &m_tessellationCamera;
-    config.isolationLevel = m_topologyCaches[0]->options.isoLevelSharp;  // Must match TMR plan isolation level
-    // Dynamic memory sizing based on GPU-reported demand from previous frame.
-    //
-    // The GPU shader (compute_cluster_tiling.hlsl) handles overflow gracefully:
-    //   - desiredClusters: unclamped atomic counter tracking ACTUAL demand
-    //   - clusters: clamped counter that stays within maxClusters
-    //   - When desired > max, excess clusters return early (no crash, no OOB)
-    //
-    // Strategy: grow-only high-water mark. We never shrink allocations because:
-    //   1. Shrinking causes constant reallocation churn (buffer destroy/create every frame)
-    //   2. The peak demand for this game is tiny vs the 4GB sample defaults
-    //   3. Reallocation triggers driver overhead and risks use-after-free with deferred destruction
-    {
-      constexpr uint32_t kMaxClusters = 1u << 21;          // 2M (sample default cap)
-      constexpr size_t kMaxVertexBytes = 1024ull << 20;     // 1GB
-      constexpr size_t kMaxClasBytes = 3076ull << 20;       // 3GB
-      constexpr uint32_t kInitialClusters = 1u << 16;       // 64K (conservative first frame)
-      constexpr size_t kInitialVertexBytes = 64ull << 20;    // 64MB
-      constexpr size_t kInitialClasBytes = 128ull << 20;     // 128MB
-      constexpr float kHeadroom = 2.0f;
-
-      // Compute demand-based target from previous frame's stats
-      uint32_t demandClusters = kInitialClusters;
-      size_t demandClasBytes = kInitialClasBytes;
-      size_t demandVertexBytes = kInitialVertexBytes;
-
-      if (m_clusterStats.desired.m_numClusters > 0) {
-        demandClusters = uint32_t(std::min(double(kMaxClusters),
-            double(m_clusterStats.desired.m_numClusters) * kHeadroom));
-        demandClasBytes = size_t(std::min(double(kMaxClasBytes),
-            double(m_clusterStats.desired.m_clasSize) * kHeadroom));
-        demandVertexBytes = size_t(std::min(double(kMaxVertexBytes),
-            double(m_clusterStats.desired.m_vertexBufferSize) * kHeadroom));
-      }
-
-      // Grow-only: high-water mark never shrinks, so buffers are allocated once and reused
-      m_hwmClusters = std::max(m_hwmClusters, demandClusters);
-      m_hwmClasBytes = std::max(m_hwmClasBytes, demandClasBytes);
-      m_hwmVertexBytes = std::max(m_hwmVertexBytes, demandVertexBytes);
-
-      config.memorySettings.maxClusters = std::min(kMaxClusters, m_hwmClusters);
-      config.memorySettings.clasBufferBytes = std::min(kMaxClasBytes, m_hwmClasBytes);
-      config.memorySettings.vertexBufferBytes = std::min(kMaxVertexBytes, m_hwmVertexBytes);
-    }
-
-    // Set viewport size from depth buffer - CRITICAL for tessellation rate calculations
-    // Without this, viewportSize is {0,0} and edge tessellation rates are all 0, causing clusters=0
-    if (depthBuffer != nullptr) {
-      VkExtent3D extent = depthBuffer->mipLevelExtent(0);
-      config.viewportSize = { extent.width, extent.height };
-      RTXMG_LOG(str::format("RTX MegaGeo: viewportSize set to ", extent.width, "x", extent.height));
-    } else {
-      // Fallback to a reasonable default if no depth buffer
-      config.viewportSize = { 1920, 1080 };
-      RTXMG_LOG("RTX MegaGeo: No depth buffer, using default viewportSize 1920x1080");
-    }
-
-
-    // Initialize TopologyCache GPU buffers (plansBuffer, subpatchTreesArraysBuffer, etc.)
-    // This must be called before BuildAccel to ensure TopologyMap buffers are available
-    // for FillInstanceClusters shader bindings
-    RTXMG_LOG("RTX MegaGeo: buildClusterBlas - Initializing TopologyCache device data");
-    m_topologyCaches[0]->InitDeviceData(m_commandList.Get());
-    RTXMG_LOG("RTX MegaGeo: buildClusterBlas - TopologyCache device data initialized");
-
-    // PROPER FIX: Rebuild instance list each frame from active transforms
-    // This ensures only surfaces with valid transforms this frame are rendered
-    // Prevents "sticking to screen" bug from identity transforms on inactive surfaces
-    {
-      uint32_t pendingQueueSize = 0;
-      uint32_t completedQueueSize = 0;
+      std::queue<CompletedClusterMesh> completed;
       {
-        std::lock_guard<std::mutex> lock(m_pendingMutex);
-        pendingQueueSize = static_cast<uint32_t>(m_pendingSurfaces.size());
+        std::lock_guard<std::mutex> lock(m_completedClusterMeshMutex);
+        completed.swap(m_completedClusterMeshes);
       }
-      {
-        std::lock_guard<std::mutex> lock(m_completedMutex);
-        completedQueueSize = static_cast<uint32_t>(m_completedSurfaces.size());
+      while (!completed.empty()) {
+        CompletedClusterMesh& comp = completed.front();
+        auto it = m_clusterMeshes.find(comp.surfaceId);
+        if (it != m_clusterMeshes.end() && comp.lodData) {
+          it->second.lodData = std::move(comp.lodData);
+          it->second.isReady = true;
+          it->second.debugName = comp.debugName;
+          Logger::info(str::format("RTX MegaGeo: Cluster mesh ", comp.surfaceId,
+              " LOD DAG ready (", it->second.lodData->clusters.size(), " clusters)"));
+        }
+        completed.pop();
       }
-      RTXMG_LOG(str::format("RTX MegaGeo: Rebuilding instances - transforms=", m_instanceTransforms.size(),
-          " meshIndex=", m_surfaceToMeshIndex.size(),
-          " surfaces=", m_surfaces.size(),
-          " pendingQueue=", pendingQueueSize,
-          " completedQueue=", completedQueueSize));
     }
 
-    if (m_scene) {
-      // Clear instances from previous frame
-      m_scene->ClearInstances();
-      m_surfaceToInstanceIndex.clear();
+    // =====================================================================
+    // Build per-meshlet CLAS templates for ready cluster meshes (one-time GPU work)
+    // =====================================================================
+    for (auto& [surfaceId, entry] : m_clusterMeshes) {
+      if (entry.isReady && !entry.templatesBuilt && entry.lodData) {
+        Logger::info(str::format("RTX MegaGeo: Building meshlet templates for cluster mesh ", surfaceId));
 
-      uint32_t instancesCreated = 0;
-      uint32_t meshesNotReady = 0;
-      uint32_t meshesSkippedDegenerate = 0;
+        // Use a large maxGeometryIndex to allow global cluster indexing during instantiation.
+        // The template's maxGeometryIndex must be >= any geometryIndex produced during instantiation
+        // (per Vulkan spec). We use global cluster indices (0..totalClusters-1) as geometry indices,
+        // so the template must accommodate the maximum possible cluster count.
+        // 16383 supports up to 16384 clusters per frame — well above typical usage.
+        uint32_t maxGeomIdx = 16383;
 
-      // Rebuild instances only for surfaceIds that have transforms this frame
-      // IMPORTANT: Sort by surfaceId for deterministic instance ordering.
-      // When dirty tracking skips BuildAccel, m_surfaceToInstanceIndex must match
-      // the blasPtrsBuffer from the previous BuildAccel. Unordered_map iteration
-      // order is nondeterministic, so we sort to ensure consistent instance indices.
-      std::vector<uint32_t> sortedSurfaceIds;
-      sortedSurfaceIds.reserve(m_instanceTransforms.size());
-      for (const auto& [surfaceId, _] : m_instanceTransforms) {
-        sortedSurfaceIds.push_back(surfaceId);
+        entry.templates = MeshletTemplateBuilder::build(
+            *entry.lodData,
+            m_nvrhiDevice,
+            m_commandList.Get(),
+            maxGeomIdx);
+
+        if (entry.templates && entry.templates->isBuilt) {
+          entry.templatesBuilt = true;
+          Logger::info(str::format("RTX MegaGeo: Meshlet templates built for cluster mesh ", surfaceId,
+              " (", entry.templates->numTemplates, " templates)"));
+        } else {
+          Logger::err(str::format("RTX MegaGeo: Failed to build meshlet templates for cluster mesh ", surfaceId));
+        }
       }
-      std::sort(sortedSurfaceIds.begin(), sortedSurfaceIds.end());
+    }
 
-      for (uint32_t surfaceId : sortedSurfaceIds) {
-        const Matrix4& transform = m_instanceTransforms[surfaceId];
-        auto meshIt = m_surfaceToMeshIndex.find(surfaceId);
-        if (meshIt == m_surfaceToMeshIndex.end()) {
-          // Mesh not ready yet (async creation in progress)
-          meshesNotReady++;
-          // Check if this surface even exists in m_surfaces
-          auto surfIt = m_surfaces.find(surfaceId);
-          bool existsInSurfaces = (surfIt != m_surfaces.end());
-          bool isReady = existsInSurfaces && surfIt->second.isReady;
-          RTXMG_LOG(str::format("RTX MegaGeo: NOT READY surfaceId=", surfaceId,
-              " existsInSurfaces=", existsInSurfaces ? "YES" : "NO",
-              " isReady=", isReady ? "YES" : "NO"));
+    // =====================================================================
+    // Meshlet BuildAccel path (if we have cluster meshes with templates)
+    // =====================================================================
+    {
+      // Collect meshlet instances from cluster meshes that have active transforms
+      std::vector<ClusterAccelBuilder::MeshletInstance> meshletInstances;
+      std::vector<uint32_t> meshletSurfaceIds; // Track surfaceId per instance
+
+      for (const auto& [surfaceId, entry] : m_clusterMeshes) {
+        if (!entry.templatesBuilt || !entry.lodData || !entry.templates)
           continue;
-        }
 
-        uint32_t meshIndex = meshIt->second;
-
-        // Verify mesh exists
-        if (meshIndex >= m_scene->GetSubdMeshes().size()) {
-          Logger::warn(str::format("RTX MegaGeo: Invalid meshIndex ", meshIndex, " for surfaceId ", surfaceId));
+        // Check if this surface has a transform this frame
+        auto transformIt = m_instanceTransforms.find(surfaceId);
+        if (transformIt == m_instanceTransforms.end())
           continue;
-        }
 
-        // Check for degenerate/invalid AABB that could cause GPU crashes
-        SubdivisionSurface* meshForCheck = m_scene->GetSubdMeshes()[meshIndex];
-        if (meshForCheck) {
-          const box3& aabb = meshForCheck->m_aabb;
-          float extentX = aabb.m_maxs[0] - aabb.m_mins[0];
-          float extentY = aabb.m_maxs[1] - aabb.m_mins[1];
-          float extentZ = aabb.m_maxs[2] - aabb.m_mins[2];
-          bool isDegenerate = (extentX <= 0.0f || extentY <= 0.0f || extentZ <= 0.0f);
-          bool isInvalid = std::isnan(aabb.m_mins[0]) || std::isnan(aabb.m_maxs[0]) ||
-                           std::isinf(aabb.m_mins[0]) || std::isinf(aabb.m_maxs[0]);
-          if (isDegenerate || isInvalid) {
-            meshesSkippedDegenerate++;
-            continue;  // Skip to prevent GPU crashes
-          }
-        }
+        ClusterAccelBuilder::MeshletInstance mi;
+        mi.meshIndex = 0; // Not used in meshlet path
+        mi.templates = entry.templates.get();
+        mi.lodData = entry.lodData.get();
+        mi.surfaceId = surfaceId;
 
-        // Create instance for this surface with the proper transform
-        Instance instance;
-        instance.meshID = meshIndex;
-        instance.localToWorld = transform;  // Use actual transform, NOT identity
+        // Extract 3x4 row-major transform from Matrix4
+        const Matrix4& xform = transformIt->second;
+        mi.localToWorld[0] = xform.data[0][0]; mi.localToWorld[1] = xform.data[0][1]; mi.localToWorld[2] = xform.data[0][2];
+        mi.localToWorld[3] = xform.data[1][0]; mi.localToWorld[4] = xform.data[1][1]; mi.localToWorld[5] = xform.data[1][2];
+        mi.localToWorld[6] = xform.data[2][0]; mi.localToWorld[7] = xform.data[2][1]; mi.localToWorld[8] = xform.data[2][2];
+        mi.localToWorld[9] = xform.data[3][0]; mi.localToWorld[10] = xform.data[3][1]; mi.localToWorld[11] = xform.data[3][2];
 
-        // Create MeshInfo for instance
-        auto meshInfo = std::make_shared<MeshInfo>();
-        SubdivisionSurface* mesh = m_scene->GetSubdMeshes()[meshIndex];
-        const Shape* shape = mesh ? mesh->GetShape() : nullptr;
-        meshInfo->name = shape ? shape->filepath.string() : "RTXMGSurface";
-        meshInfo->geometryCount = 1;
-
-        auto geomInfo = std::make_shared<GeometryInfo>();
-        geomInfo->globalGeometryIndex = meshIndex;
-        geomInfo->name = meshInfo->name;
-        meshInfo->geometries.push_back(geomInfo);
-
-        instance.meshInstance = std::make_shared<MeshInstance>(meshInfo);
-
-        // Record mapping BEFORE adding (so instanceIndex is correct)
-        uint32_t instanceIndex = static_cast<uint32_t>(m_scene->GetSubdMeshInstances().size());
-        m_surfaceToInstanceIndex[surfaceId] = instanceIndex;
-
-        m_scene->AddInstance(instance);
-        instancesCreated++;
-
-        // Log first few for debugging - show full matrix to verify layout
-#if RTXMG_VERBOSE_LOGGING
-        if (instancesCreated <= 3) {
-          RTXMG_LOG(str::format("RTX MegaGeo: Created instance surfaceId=", surfaceId,
-              " meshIdx=", meshIndex, " instanceIdx=", instanceIndex));
-          // Log full matrix to understand layout (row-major: row3 = translation, column-major: col3 = translation)
-          RTXMG_LOG(str::format("  row0=(", transform.data[0][0], ",", transform.data[0][1], ",", transform.data[0][2], ",", transform.data[0][3], ")"));
-          RTXMG_LOG(str::format("  row1=(", transform.data[1][0], ",", transform.data[1][1], ",", transform.data[1][2], ",", transform.data[1][3], ")"));
-          RTXMG_LOG(str::format("  row2=(", transform.data[2][0], ",", transform.data[2][1], ",", transform.data[2][2], ",", transform.data[2][3], ")"));
-          RTXMG_LOG(str::format("  row3=(", transform.data[3][0], ",", transform.data[3][1], ",", transform.data[3][2], ",", transform.data[3][3], ")"));
-          // Also show what col3 looks like (in case it's column-major)
-          RTXMG_LOG(str::format("  col3=(", transform.data[0][3], ",", transform.data[1][3], ",", transform.data[2][3], ",", transform.data[3][3], ")"));
-        }
-#endif
+        meshletInstances.push_back(mi);
+        meshletSurfaceIds.push_back(surfaceId);
       }
 
-    } else {
-      RTXMG_LOG("RTX MegaGeo: Scene is null, cannot rebuild instances");
-    }
+      if (!meshletInstances.empty()) {
+        // Extract camera data for LOD selection
+        dxvk::Vector3 camPos = rtCamera.getPosition(true);
+        float cameraPos[3] = { camPos.x, camPos.y, camPos.z };
+        Matrix4d projMat = rtCamera.getViewToProjection();
+        float cameraProj = static_cast<float>(projMat[1][1]); // cot(fovy/2)
+        float cameraNear = rtCamera.getNearPlane();
+        if (cameraNear <= 0.0f) cameraNear = 0.001f;
+        float errorThreshold = 0.01f; // ~1% screen space error
 
-    // Always rebuild - skipping BuildAccel when camera is stationary causes
-    // GPU hangs because the TLAS is rebuilt with stale BLAS references.
-    // TODO: Investigate proper dirty tracking that keeps BLAS/TLAS consistent.
-    {
-    }
-
-    // Chrono timing for BuildAccel
-#if RTXMG_CHRONO_TIMING
-    static float s_buildTimeMs = 0.0f;
-    auto buildStart = std::chrono::high_resolution_clock::now();
-#endif
-
-    try {
-      // Actually call ClusterAccelBuilder::BuildAccel
-      // The command list wraps RTX Remix's DxvkContext, which is always "open"
-      // Commands are recorded immediately and will be submitted by the rendering pipeline
-      // Do NOT call open() or close() here - let RTX Remix manage command submission
-      m_clusterBuilder->BuildAccel(*m_scene, config, *m_clusterAccels, m_clusterStats, m_frameIndex++, m_commandList.Get());
-    } catch (const dxvk::DxvkError& e) {
-      // DxvkError doesn't inherit from std::exception, so catch it separately
-      Logger::err(str::format("RTX MegaGeo: Failed to build cluster BLAS: ", e.message()));
-      Logger::err("RTX MegaGeo: This is likely a memory allocation failure - try reducing memory settings");
-      return false;
-    } catch (const std::exception& e) {
-      Logger::err(str::format("RTX MegaGeo: Failed to build cluster BLAS: ", e.what()));
-      Logger::err("RTX MegaGeo: This likely means VK_NV_cluster_acceleration_structure extension is not available");
-      Logger::err("RTX MegaGeo: Cluster-based tessellation requires NVIDIA RTX GPU with latest drivers");
-      return false;
-    } catch (...) {
-      Logger::err("RTX MegaGeo: Failed to build cluster BLAS: unknown error");
-      return false;
-    }
-
-#if RTXMG_CHRONO_TIMING
-    auto buildEnd = std::chrono::high_resolution_clock::now();
-    auto buildDuration = std::chrono::duration_cast<std::chrono::microseconds>(buildEnd - buildStart);
-    float frameTimeMs = buildDuration.count() * 0.001f;
-    s_buildTimeMs = s_buildTimeMs * 0.9f + frameTimeMs * 0.1f; // Smoothed average
-    RTXMG_LOG(str::format(">>> RTXMG CHRONO: BuildAccel frame=", frameTimeMs, "ms smoothed=", s_buildTimeMs, "ms"));
-#endif
-
-    // Mark all surfaces as ready
-    // Note: BLAS addresses will be patched directly on GPU by AccelManager::patchClusterBlasAddresses()
-    // The blasPtrsBuffer contains GPU-side addresses that will be copied to the instance buffer
-    if (m_clusterAccels->blasBuffer) {
-      RTXMG_LOG("RTX MegaGeo: Cluster BLAS built successfully");
-      RTXMG_LOG(str::format("RTX MegaGeo: blasPtrsBuffer available: ", (m_clusterAccels->blasPtrsBuffer.Get() != nullptr)));
-
-      // Log buffer sizes for debugging GPU crashes
-      RTXMG_LOG(str::format("RTX MegaGeo: Buffer sizes - clusterShadingData: ",
-          m_clusterAccels->clusterShadingDataBuffer.GetBytes(), " bytes (",
-          m_clusterAccels->clusterShadingDataBuffer.GetNumElements(), " elements)"));
-      RTXMG_LOG(str::format("RTX MegaGeo: Buffer sizes - clusterVertexPositions: ",
-          m_clusterAccels->clusterVertexPositionsBuffer.GetBytes(), " bytes (",
-          m_clusterAccels->clusterVertexPositionsBuffer.GetNumElements(), " elements)"));
-      RTXMG_LOG(str::format("RTX MegaGeo: Buffer sizes - clusterVertexNormals: ",
-          m_clusterAccels->clusterVertexNormalsBuffer.GetBytes(), " bytes (",
-          m_clusterAccels->clusterVertexNormalsBuffer.GetNumElements(), " elements)"));
-      RTXMG_LOG(str::format("RTX MegaGeo: numClusters=", m_clusterStats.allocated.m_numClusters,
-          " numTriangles=", m_clusterStats.allocated.m_numTriangles));
-
-      // Log stats periodically (every 120 frames) and always on zero-triangle errors
-      static uint32_t s_statsLogCounter = 0;
-      bool logStats = (s_statsLogCounter++ % 120) == 0;
-      if (m_clusterStats.allocated.m_numTriangles == 0) {
-        Logger::err("RTX MegaGeo STATS: *** ZERO TRIANGLES PRODUCED! Tessellation is not generating geometry ***");
-        Logger::err(str::format("RTX MegaGeo STATS: Config: tessMode=", (int)config.tessMode,
-            " isolationLevel=", config.isolationLevel,
-            " fineTessRate=", config.fineTessellationRate,
-            " coarseTessRate=", config.coarseTessellationRate,
-            " viewportSize=", config.viewportSize.x, "x", config.viewportSize.y));
-        Logger::err(str::format("RTX MegaGeo STATS: Scene: meshes=", m_scene ? m_scene->GetSubdMeshes().size() : 0,
-            " instances=", m_scene ? m_scene->GetSubdMeshInstances().size() : 0));
-        logStats = true;
-      }
-      (void)logStats;
-
-      // DIAGNOSTIC: Log per-surface info to identify rendering issues
-      RTXMG_LOG("=== RTXMG SURFACE DIAGNOSTICS ===");
-      for (auto& [id, surface] : m_surfaces) {
-        if (surface.subdivSurface) {
-          const Shape* shape = surface.subdivSurface->GetShape();
-          const box3& aabb = surface.subdivSurface->m_aabb;
-          uint32_t numSurfaces = surface.subdivSurface->SurfaceCount();
-          uint32_t numVertices = surface.subdivSurface->NumVertices();
-
-          // Check if surface has valid geometry
-          bool hasValidGeometry = (numSurfaces > 0 && numVertices > 0);
-
-          // Check AABB validity - look for degenerate or suspicious bounds
-          float extentX = aabb.m_maxs[0] - aabb.m_mins[0];
-          float extentY = aabb.m_maxs[1] - aabb.m_mins[1];
-          float extentZ = aabb.m_maxs[2] - aabb.m_mins[2];
-          bool aabbDegenerate = (extentX <= 0.0f || extentY <= 0.0f || extentZ <= 0.0f);
-          bool aabbHuge = (extentX > 10000.0f || extentY > 10000.0f || extentZ > 10000.0f);
-          bool aabbTiny = (extentX < 0.001f && extentY < 0.001f && extentZ < 0.001f);
-
-          // Check for NaN/Inf in AABB
-          bool aabbInvalid = std::isnan(aabb.m_mins[0]) || std::isnan(aabb.m_maxs[0]) ||
-                            std::isinf(aabb.m_mins[0]) || std::isinf(aabb.m_maxs[0]);
-
-          // Check transform for this surface
-          auto transformIt = m_instanceTransforms.find(id);
-          bool hasTransform = (transformIt != m_instanceTransforms.end());
-
-          // Log warning for actually problematic surfaces (not just missing transform, which is normal)
-          bool hasRealIssue = !hasValidGeometry || aabbDegenerate || aabbHuge || aabbTiny || aabbInvalid;
-          if (hasRealIssue) {
-            Logger::warn(str::format("RTXMG DIAG: Surface ", id, " ISSUES:"));
-            if (!hasValidGeometry) Logger::warn(str::format("  - No geometry: surfaces=", numSurfaces, " verts=", numVertices));
-            if (aabbDegenerate) Logger::warn("  - AABB degenerate (zero or negative extent)");
-            if (aabbHuge) Logger::warn(str::format("  - AABB huge: extent=(", extentX, ",", extentY, ",", extentZ, ")"));
-            if (aabbTiny) Logger::warn(str::format("  - AABB tiny: extent=(", extentX, ",", extentY, ",", extentZ, ")"));
-            if (aabbInvalid) Logger::warn("  - AABB contains NaN/Inf");
-            Logger::warn(str::format("  AABB: min=(", aabb.m_mins[0], ",", aabb.m_mins[1], ",", aabb.m_mins[2],
-                ") max=(", aabb.m_maxs[0], ",", aabb.m_maxs[1], ",", aabb.m_maxs[2], ")"));
-          } else {
-            // Log healthy surfaces too for comparison
-            RTXMG_LOG(str::format("RTXMG DIAG: Surface ", id, " OK: ", numSurfaces, " patches, ", numVertices, " verts, extent=(",
-                extentX, ",", extentY, ",", extentZ, ")"));
-          }
-
-          // Check control point positions against AABB (sample first few)
-          if (shape && shape->verts.size() > 0) {
-            uint32_t outOfBoundsCount = 0;
-            float maxOutOfBounds = 0.0f;
-            for (size_t i = 0; i < std::min(shape->verts.size(), size_t(100)); ++i) {
-              const Vector3& v = shape->verts[i];
-              bool outX = (v.x < aabb.m_mins[0] - 0.01f || v.x > aabb.m_maxs[0] + 0.01f);
-              bool outY = (v.y < aabb.m_mins[1] - 0.01f || v.y > aabb.m_maxs[1] + 0.01f);
-              bool outZ = (v.z < aabb.m_mins[2] - 0.01f || v.z > aabb.m_maxs[2] + 0.01f);
-              if (outX || outY || outZ) {
-                outOfBoundsCount++;
-                float distX = std::max(aabb.m_mins[0] - v.x, v.x - aabb.m_maxs[0]);
-                float distY = std::max(aabb.m_mins[1] - v.y, v.y - aabb.m_maxs[1]);
-                float distZ = std::max(aabb.m_mins[2] - v.z, v.z - aabb.m_maxs[2]);
-                maxOutOfBounds = std::max(maxOutOfBounds, std::max(distX, std::max(distY, distZ)));
-              }
-            }
-            if (outOfBoundsCount > 0) {
-              Logger::warn(str::format("RTXMG DIAG: Surface ", id, " has ", outOfBoundsCount,
-                  " control points outside AABB (max dist=", maxOutOfBounds, ")"));
-            }
-          }
+        // Record instance index mapping for BLAS address patching
+        m_surfaceToInstanceIndex.clear();
+        for (uint32_t i = 0; i < meshletSurfaceIds.size(); ++i) {
+          m_surfaceToInstanceIndex[meshletSurfaceIds[i]] = i;
         }
-      }
-      RTXMG_LOG("=== END RTXMG DIAGNOSTICS ===");
 
-      // DIAGNOSTIC: Dump full pipeline data (cluster offsets, vertex positions, shading data, etc.)
-      m_clusterBuilder->DumpDiagnosticData(*m_clusterAccels, m_commandList.Get());
+        try {
+          m_clusterBuilder->BuildAccelMeshlet(
+              meshletInstances,
+              cameraPos,
+              cameraProj,
+              cameraNear,
+              errorThreshold,
+              *m_clusterAccels,
+              m_clusterStats,
+              m_frameIndex++,
+              m_commandList.Get());
 
-      // DIAGNOSTIC: Download BLAS addresses to verify they're valid
-      // Only count frames that actually have cluster data (>1 address), log up to 10 such frames
-      {
-        static uint32_t s_readbackCount = 0;
-        static uint32_t s_frameNumber = 0;
-        s_frameNumber++;
-        if (s_readbackCount < 10) {
-          downloadBlasAddresses();
-          if (!m_downloadedBlasAddresses.empty() && m_downloadedBlasAddresses.size() > 1) {
-            uint32_t zeroCount = 0, nonZeroCount = 0;
-            for (size_t i = 0; i < m_downloadedBlasAddresses.size(); i++) {
-              if (m_downloadedBlasAddresses[i] == 0) zeroCount++;
-              else nonZeroCount++;
-            }
-            // Log first 10 addresses
-            for (size_t i = 0; i < std::min<size_t>(10, m_downloadedBlasAddresses.size()); i++) {
-            }
-            s_readbackCount++;
-          } else if (!m_downloadedBlasAddresses.empty()) {
-          }
-        }
-      }
+          // Populate TessellationStats from ClusterStatistics so the accel manager
+          // knows we have valid geometry (numTriangles > 0 gates TLAS inclusion).
+          m_stats.numClusters = m_clusterStats.allocated.m_numClusters;
+          m_stats.numTriangles = m_clusterStats.allocated.m_numTriangles;
+          m_stats.numDesiredClusters = m_clusterStats.desired.m_numClusters;
+          m_stats.clasMemoryBytes = m_clusterStats.allocated.m_clasSize;
 
-      // Mark all surfaces as ready - BLAS addresses will be patched on GPU
-      for (auto& [id, surface] : m_surfaces) {
-        if (surface.isDirty && surface.subdivSurface) {
-          surface.isDirty = false;
-          surface.isReady = true;
-          // BLAS addresses available via getDownloadedBlasAddress() for AccelManager
-          RTXMG_LOG(str::format("RTX MegaGeo: Surface ", id, " marked ready"));
+        } catch (const dxvk::DxvkError& e) {
+          Logger::err(str::format("RTX MegaGeo: Meshlet BuildAccel failed: ", e.message()));
+        } catch (const std::exception& e) {
+          Logger::err(str::format("RTX MegaGeo: Meshlet BuildAccel failed: ", e.what()));
+        } catch (...) {
+          Logger::err("RTX MegaGeo: Meshlet BuildAccel failed: unknown error");
         }
       }
     }
 
-    // Collect statistics from ClusterStatistics
-    m_stats.numClusters = m_clusterStats.allocated.m_numClusters;
-    m_stats.numDesiredClusters = m_clusterStats.desired.m_numClusters;
-    m_stats.numTriangles = m_clusterStats.allocated.m_numTriangles;
-    m_stats.numVertices = 0; // Not directly available in ClusterStatistics
-    m_stats.clasMemoryBytes = m_clusterStats.allocated.m_clasSize;
-    m_stats.cullRatio = (m_stats.numDesiredClusters > 0) ?
-      1.0f - (float)m_stats.numClusters / (float)m_stats.numDesiredClusters : 0.0f;
-
-    RTXMG_LOG(str::format("RTX MegaGeo: Built cluster BLAS: ", m_stats.numClusters, " clusters, ",
-                            m_stats.numTriangles, " triangles"));
-
-    // Always log RTXMG stats prominently so user can verify it's working
-    static uint32_t frameLogCounter = 0;
-    if ((frameLogCounter++ % 60) == 0) { // Log every 60 frames (~1 second)
-      if (m_stats.numClusters > 0) {
-#if RTXMG_CHRONO_TIMING
-        RTXMG_LOG(str::format(">>> RTXMG: ", m_stats.numClusters, " clusters, ",
-                                  m_stats.numTriangles, " tris, ", m_surfaces.size(), " surfaces, ",
-                                  s_buildTimeMs, "ms <<<"));
-#else
-        RTXMG_LOG(str::format(">>> RTXMG ACTIVE: ", m_stats.numClusters, " clusters, ",
-                                  m_stats.numTriangles, " triangles from ", m_surfaces.size(), " surfaces <<<"));
-#endif
-      } else {
-        Logger::warn(str::format(">>> RTXMG: 0 clusters (desired: ", m_stats.numDesiredClusters, ") from ", m_surfaces.size(), " surfaces - CHECK TESSELLATION <<<"));
-      }
-    }
-
-    // Log cluster buffer status after build
-    {
-      static uint32_t s_bufDiagCount = 0;
-      if (s_bufDiagCount < 5) {
-        auto shadingBuf = getClusterShadingDataBuffer();
-        auto posBuf = getClusterVertexPositionsBuffer();
-        auto normBuf = getClusterVertexNormalsBuffer();
-        RTXMG_LOG(str::format("RTX MegaGeo POST-BUILD[", s_bufDiagCount, "]: shadingBuf=", (void*)shadingBuf.Get(),
-            " posBuf=", (void*)posBuf.Get(), " normBuf=", (void*)normBuf.Get()));
-
-        // Log BLAS addresses for first few surfaces
-        for (auto& [surfId, surfData] : m_surfaces) {
-          if (s_bufDiagCount == 0) {
-            VkDeviceAddress blasAddr = getSurfaceBlasAddress(surfId);
-            RTXMG_LOG(str::format("RTX MegaGeo POST-BUILD: surface[", surfId, "] blasAddr=0x", std::hex, blasAddr, std::dec));
-            if (surfId >= 5) break; // Only log first few
-          }
-        }
-        s_bufDiagCount++;
-      }
-    }
-
-    RTXMG_LOG("RTX MegaGeo: buildClusterBlas - returning true");
     return true;
-  }
-
-  VkAccelerationStructureKHR RtxMegaGeoBuilder::getSurfaceBlas(uint32_t surfaceId) const {
-    auto it = m_surfaces.find(surfaceId);
-    if (it == m_surfaces.end()) {
-      return VK_NULL_HANDLE;
-    }
-    return it->second.blas;
-  }
-
-  VkDeviceAddress RtxMegaGeoBuilder::getSurfaceBlasAddress(uint32_t surfaceId) const {
-    auto it = m_surfaces.find(surfaceId);
-    if (it == m_surfaces.end()) {
-      return 0;
-    }
-    return it->second.blasAddress;
-  }
-
-  bool RtxMegaGeoBuilder::isSurfaceReady(uint32_t surfaceId) const {
-    auto it = m_surfaces.find(surfaceId);
-    if (it == m_surfaces.end()) {
-      return false;
-    }
-    return it->second.isReady;
   }
 
   nvrhi::IBuffer* RtxMegaGeoBuilder::getBlasPointersBuffer() const {
@@ -1123,7 +552,6 @@ private:
     }
 
     // Check that the underlying DxvkBuffers are actually valid, not just the NVRHI handles
-    // This matches the validation done in rtx_context.cpp when binding buffers
     bool shadingValid = isNvrhiBufferReady(m_clusterAccels->clusterShadingDataBuffer.Get());
     bool posValid = isNvrhiBufferReady(m_clusterAccels->clusterVertexPositionsBuffer.Get());
     bool normValid = isNvrhiBufferReady(m_clusterAccels->clusterVertexNormalsBuffer.Get());
@@ -1137,258 +565,7 @@ private:
     return shadingValid && posValid && normValid;
   }
 
-  void RtxMegaGeoBuilder::processCompletedSurfaces() {
-    std::queue<CompletedSurface> completed;
-
-    {
-      std::lock_guard<std::mutex> lock(m_completedMutex);
-      completed.swap(m_completedSurfaces);
-    }
-
-    if (completed.empty()) {
-      return;
-    }
-
-    uint32_t processedCount = 0;
-    while (!completed.empty()) {
-      CompletedSurface& comp = completed.front();
-
-      auto it = m_surfaces.find(comp.surfaceId);
-      if (it != m_surfaces.end()) {
-        RTXMGSubdivisionSurfaceEntry& surface = it->second;
-
-        // Create SubdivisionSurface on main thread with proper GPU resources
-        m_commandList->open();
-
-        try {
-          std::vector<std::unique_ptr<Shape>> keyFrames;
-          surface.subdivSurface = std::make_unique<SubdivisionSurface>(
-            *m_topologyCaches[0], // Use first topology cache on main thread
-            std::move(comp.shape),
-            keyFrames,
-            nullptr, // descriptorTableManager - may need to provide this
-            m_commandList.Get());
-
-          m_commandList->close();
-          m_nvrhiDevice->executeCommandList(m_commandList.Get());
-
-          // Add to RTXMGScene - get the actual index for meshID
-          uint32_t meshIndex = static_cast<uint32_t>(m_scene->GetSubdMeshes().size());
-          m_scene->AddSubdMesh(surface.subdivSurface.get());
-
-          // Record the PERSISTENT mapping from surfaceId to mesh index
-          // Instances will be rebuilt each frame in buildClusterBlas based on active transforms
-          m_surfaceToMeshIndex[comp.surfaceId] = meshIndex;
-
-          surface.isReady = true;
-
-          // Track GPU memory for VRAM budget eviction
-          surface.gpuMemoryBytes = surface.subdivSurface->getGpuMemoryBytes();
-          m_surfaceCacheVramBytes += surface.gpuMemoryBytes;
-        } catch (const std::exception& e) {
-          m_commandList->close();
-          Logger::err(str::format("RTX MegaGeo: Failed to create SubdivisionSurface for surface ", comp.surfaceId, ": ", e.what()));
-        }
-      } else {
-        Logger::warn(str::format("RTX MegaGeo: processCompletedSurfaces surfaceId=", comp.surfaceId, " NOT FOUND in m_surfaces"));
-      }
-
-      completed.pop();
-      processedCount++;
-    }
-  }
-
-  std::unique_ptr<Shape> RtxMegaGeoBuilder::convertDescToShape(const SubdivisionSurfaceDesc& desc)
-  {
-    RTXMG_LOG("RTX MegaGeo: Converting SubdivisionSurfaceDesc to Shape");
-
-    // Validate input pointers
-    if (!desc.controlPoints || !desc.faceVertexIndices || !desc.faceVertexCounts) {
-      Logger::err("RTX MegaGeo: Invalid desc - null pointers");
-      return nullptr;
-    }
-
-    // Log first few values to verify data is valid
-    if (desc.numVertices > 0) {
-      const Vector3& firstVert = desc.controlPoints[0];
-      RTXMG_LOG(str::format("RTX MegaGeo: First vertex: (", firstVert.x, ", ", firstVert.y, ", ", firstVert.z, ")"));
-    }
-    if (desc.numFaces > 0 && desc.faceVertexCounts[0] > 0) {
-      uint32_t firstIndex = desc.faceVertexIndices[0];
-      RTXMG_LOG(str::format("RTX MegaGeo: First face index: ", firstIndex));
-    }
-
-    auto shape = std::make_unique<Shape>();
-
-    // Set scheme to Catmull-Clark
-    shape->scheme = Scheme::kCatmark;
-
-    // Set filepath as name (Shape doesn't have a separate name field)
-    if (desc.debugName) {
-      shape->filepath = desc.debugName;
-    }
-
-    // Copy vertex positions
-    shape->verts.resize(desc.numVertices);
-    for (uint32_t i = 0; i < desc.numVertices; ++i) {
-      shape->verts[i] = desc.controlPoints[i];
-    }
-    RTXMG_LOG(str::format("RTX MegaGeo: Copied ", desc.numVertices, " vertices"));
-
-    // Copy UVs if present
-    if (desc.texcoords) {
-      shape->uvs.resize(desc.numVertices);
-      for (uint32_t i = 0; i < desc.numVertices; ++i) {
-        shape->uvs[i] = desc.texcoords[i];
-      }
-    }
-
-    // Build face vertex counts and indices
-    shape->nvertsPerFace.resize(desc.numFaces);
-    uint32_t totalIndices = 0;
-    for (uint32_t i = 0; i < desc.numFaces; ++i) {
-      shape->nvertsPerFace[i] = static_cast<int>(desc.faceVertexCounts[i]);
-      totalIndices += desc.faceVertexCounts[i];
-    }
-
-    shape->faceverts.resize(totalIndices);
-    for (uint32_t i = 0; i < totalIndices; ++i) {
-      uint32_t vertexIndex = desc.faceVertexIndices[i];
-
-      // Validate vertex index is within bounds - fail immediately if invalid
-      if (vertexIndex >= desc.numVertices) {
-        Logger::err(str::format("RTX MegaGeo: Invalid vertex index ", vertexIndex,
-                                " at position ", i, " (numVertices=", desc.numVertices, ")"));
-        Logger::err("RTX MegaGeo: This indicates corrupted mesh data or incorrect index buffer format");
-        return nullptr;
-      }
-
-      shape->faceverts[i] = static_cast<int>(vertexIndex);
-    }
-
-    RTXMG_LOG(str::format("RTX MegaGeo: Copied ", totalIndices, " face indices"));
-
-    // Setup face UV indices (faceuvs) if UVs are present
-    // Since UVs are per-vertex, face UV indices are the same as face vertex indices
-    if (desc.texcoords) {
-      shape->faceuvs = shape->faceverts; // Copy the same indices
-    }
-
-    // Setup material bindings (required by OpenSubdiv)
-    shape->mtlbind.resize(desc.numFaces, 0); // All faces use material 0
-    shape->mtls.push_back(std::make_unique<Shape::material>()); // Create default material
-
-    // Create single subshape for all faces
-    Shape::Subshape subshape;
-    subshape.startFaceIndex = 0;
-    subshape.mtlBind = 0; // Single material
-    shape->subshapes.push_back(subshape);
-
-    // Map all faces to subshape 0
-    shape->faceToSubshapeIndex.resize(desc.numFaces, 0);
-
-    // Mark all edges and vertices as infinitely sharp to prevent Catmull-Clark smoothing.
-    // This keeps subdivision (more triangles for cluster ray tracing) but the limit surface
-    // matches the control cage exactly — angular geometry is preserved.
-    {
-      const float SHARPNESS_INFINITE = 10.0f;
-
-      // Collect all unique edges from face topology
-      std::set<std::pair<int,int>> edgeSet;
-      uint32_t idx = 0;
-      for (uint32_t f = 0; f < desc.numFaces; ++f) {
-        uint32_t nv = desc.faceVertexCounts[f];
-        for (uint32_t j = 0; j < nv; ++j) {
-          int v0 = shape->faceverts[idx + j];
-          int v1 = shape->faceverts[idx + ((j + 1) % nv)];
-          edgeSet.insert(std::make_pair(std::min(v0, v1), std::max(v0, v1)));
-        }
-        idx += nv;
-      }
-
-      // Crease tag: mark all edges as infinitely sharp
-      {
-        Shape::tag creaseTag;
-        creaseTag.name = "crease";
-        creaseTag.intargs.reserve(edgeSet.size() * 2);
-        for (auto const& edge : edgeSet) {
-          creaseTag.intargs.push_back(edge.first);
-          creaseTag.intargs.push_back(edge.second);
-        }
-        creaseTag.floatargs.push_back(SHARPNESS_INFINITE);
-        shape->tags.push_back(std::move(creaseTag));
-      }
-
-      // Corner tag: mark all vertices as infinitely sharp
-      {
-        Shape::tag cornerTag;
-        cornerTag.name = "corner";
-        cornerTag.intargs.reserve(desc.numVertices);
-        for (uint32_t i = 0; i < desc.numVertices; ++i) {
-          cornerTag.intargs.push_back(static_cast<int>(i));
-        }
-        cornerTag.floatargs.push_back(SHARPNESS_INFINITE);
-        shape->tags.push_back(std::move(cornerTag));
-      }
-
-      // Prevent UV smoothing too — FVAR_LINEAR_ALL (value 5)
-      {
-        Shape::tag fvarTag;
-        fvarTag.name = "facevaryinginterpolateboundary";
-        fvarTag.intargs.push_back(5);
-        shape->tags.push_back(std::move(fvarTag));
-      }
-
-      RTXMG_LOG(str::format("RTX MegaGeo: Added infinite sharpness tags: ",
-          edgeSet.size(), " crease edges, ", desc.numVertices, " corner vertices"));
-    }
-
-    // Compute bounding box
-    if (desc.numVertices > 0 && desc.controlPoints != nullptr) {
-      Vector3 minPt = desc.controlPoints[0];
-      Vector3 maxPt = desc.controlPoints[0];
-      for (uint32_t i = 1; i < desc.numVertices; ++i) {
-        const Vector3& p = desc.controlPoints[i];
-        minPt.x = std::min(minPt.x, p.x);
-        minPt.y = std::min(minPt.y, p.y);
-        minPt.z = std::min(minPt.z, p.z);
-        maxPt.x = std::max(maxPt.x, p.x);
-        maxPt.y = std::max(maxPt.y, p.y);
-        maxPt.z = std::max(maxPt.z, p.z);
-      }
-      // Ensure AABB has minimum extent to avoid degenerate acceleration structures
-      // Flat geometry (floors, walls) can have zero extent in one dimension which causes GPU hangs
-      const float kMinExtent = 0.001f;
-      for (int i = 0; i < 3; ++i) {
-        float extent = (&maxPt.x)[i] - (&minPt.x)[i];
-        if (extent < kMinExtent) {
-          float center = ((&maxPt.x)[i] + (&minPt.x)[i]) * 0.5f;
-          (&minPt.x)[i] = center - kMinExtent * 0.5f;
-          (&maxPt.x)[i] = center + kMinExtent * 0.5f;
-        }
-      }
-
-      shape->aabb.m_mins[0] = minPt.x;
-      shape->aabb.m_mins[1] = minPt.y;
-      shape->aabb.m_mins[2] = minPt.z;
-      shape->aabb.m_maxs[0] = maxPt.x;
-      shape->aabb.m_maxs[1] = maxPt.y;
-      shape->aabb.m_maxs[2] = maxPt.z;
-      RTXMG_LOG(str::format("convertToShape: Computed aabb min=(", minPt.x, ",", minPt.y, ",", minPt.z,
-          ") max=(", maxPt.x, ",", maxPt.y, ",", maxPt.z, ")"));
-    } else {
-      Logger::warn(str::format("convertToShape: Cannot compute aabb - numVertices=", desc.numVertices,
-          " controlPoints=", (void*)desc.controlPoints));
-    }
-
-    RTXMG_LOG(str::format("Converted to Shape: ", desc.numFaces, " faces, ", desc.numVertices, " vertices"));
-    return shape;
-  }
-
   void RtxMegaGeoBuilder::updateHiZBuffer(const Rc<DxvkImageView>& depthBuffer) {
-    // Integrate RTX Remix depth buffer with RTX MG HiZ system
-    // This follows the SDK pattern from zbuffer.cpp:154-161
-
     RTXMG_LOG("RTX MegaGeo: updateHiZBuffer - Entry");
 
     if (!m_commandList) {
@@ -1405,7 +582,6 @@ private:
     const Rc<DxvkImage>& image = depthBuffer->image();
     const DxvkImageCreateInfo& imageInfo = image->info();
 
-    // Check if depth buffer has valid content (not UNDEFINED layout)
     if (imageInfo.layout == VK_IMAGE_LAYOUT_UNDEFINED) {
       RTXMG_LOG("RTX MegaGeo: updateHiZBuffer - Depth buffer layout is UNDEFINED, skipping");
       return;
@@ -1417,9 +593,6 @@ private:
         imageInfo.extent.width, "x", imageInfo.extent.height));
 
       uint2 bufferSize = { imageInfo.extent.width, imageInfo.extent.height };
-
-      // Create ZBuffer following reference sample pattern from zbuffer.cpp:85-119
-      RTXMG_LOG("RTX MegaGeo: updateHiZBuffer - Calling ZBuffer::Create");
       m_zBuffer = ZBuffer::Create(bufferSize, m_nvrhiDevice, m_commandList.Get());
 
       if (!m_zBuffer) {
@@ -1430,12 +603,8 @@ private:
       RTXMG_LOG("RTX MegaGeo: ZBuffer and HiZ hierarchy created successfully");
     }
 
-    RTXMG_LOG("RTX MegaGeo: updateHiZBuffer - Creating scoped marker");
     nvrhi::utils::ScopedMarker marker(m_commandList.Get(), "RtxMegaGeo::updateHiZBuffer");
 
-    RTXMG_LOG("RTX MegaGeo: updateHiZBuffer - Creating texture wrapper");
-    // Copy depth buffer to ZBuffer current texture
-    // Note: ZBuffer doesn't have Read() method in our adapter, so we directly copy
     nvrhi::TextureDesc depthDesc;
     depthDesc.width = imageInfo.extent.width;
     depthDesc.height = imageInfo.extent.height;
@@ -1447,21 +616,14 @@ private:
 
     nvrhi::TextureHandle depthTexture = new dxvk::NvrhiDxvkTexture(depthDesc, image);
 
-    RTXMG_LOG("RTX MegaGeo: updateHiZBuffer - Copying texture");
-    // Copy to ZBuffer's current texture if available
     nvrhi::TextureHandle zbufferTex = m_zBuffer->GetCurrent();
     if (zbufferTex) {
       m_commandList->copyTexture(zbufferTex.Get(), depthTexture.Get());
     }
 
-    RTXMG_LOG("RTX MegaGeo: updateHiZBuffer - Reducing HiZ hierarchy");
-    // Reduce ZBuffer hierarchy to build HiZ mip chain
-    // This performs min/max reduction across mip levels for efficient culling
     m_zBuffer->ReduceHierarchy(m_commandList.Get());
 
     RTXMG_LOG("RTX MegaGeo: updateHiZBuffer - Complete");
-    // The HiZ buffer is now ready for use in compute_cluster_tiling shader
-    // It will be bound via the TessellatorConfig::zbuffer pointer
   }
 
   void RtxMegaGeoBuilder::showImguiSettings() {
@@ -1484,7 +646,7 @@ private:
 
     ImGui::Checkbox("Enable Tessellation", &m_enableTessellation);
     if (!m_enableTessellation) {
-      ImGui::TextDisabled("(Subdivision surfaces disabled)");
+      ImGui::TextDisabled("(Cluster meshes disabled)");
       return;
     }
 
@@ -1492,7 +654,6 @@ private:
 
     // Micro triangle visualization
     if (ImGui::Checkbox("Show Micro Triangles", &m_showMicroTriangles)) {
-      // When micro triangles are shown, override color mode
       if (m_showMicroTriangles) {
         m_colorMode = ColorMode::COLOR_BY_MICROTRI_ID;
       }
@@ -1518,10 +679,10 @@ private:
     }
 
     ImGui::Separator();
-    ImGui::Text("Tessellation Statistics:");
+    ImGui::Text("Cluster Mesh Statistics:");
 
     // Display statistics
-    ImGui::Text("Surfaces: %u", static_cast<uint32_t>(m_surfaces.size()));
+    ImGui::Text("Cluster Meshes: %u", static_cast<uint32_t>(m_clusterMeshes.size()));
     ImGui::Text("Clusters: %u / %u", m_stats.numClusters, m_stats.numDesiredClusters);
     ImGui::Text("Triangles: %u", m_stats.numTriangles);
     ImGui::Text("Vertices: %u", m_stats.numVertices);
@@ -1535,18 +696,18 @@ private:
       ImGui::Text("Cull Ratio: %.1f%%", m_stats.cullRatio * 100.0f);
     }
 
-    // Per-surface statistics
-    if (ImGui::TreeNode("Per-Surface Stats")) {
-      for (const auto& [id, surface] : m_surfaces) {
-        std::string label = str::format("Surface ", id, ": ", surface.debugName.empty() ? "unnamed" : surface.debugName.c_str());
+    // Per-mesh statistics
+    if (ImGui::TreeNode("Per-Mesh Stats")) {
+      for (const auto& [id, entry] : m_clusterMeshes) {
+        std::string label = str::format("Mesh ", id, ": ", entry.debugName.empty() ? "unnamed" : entry.debugName.c_str());
         if (ImGui::TreeNode(label.c_str())) {
-          ImGui::Text("Vertices: %u", surface.numVertices);
-          ImGui::Text("Faces: %u", surface.numFaces);
-          ImGui::Text("Isolation Level: %u", surface.isolationLevel);
-          ImGui::Text("Tessellation Scale: %.2f", surface.tessellationScale);
-          ImGui::Text("Status: %s", surface.isReady ? "Ready" : (surface.isDirty ? "Dirty" : "Building"));
-          if (surface.m_hasDisplacementMaterial) {
-            ImGui::Text("Displacement: Enabled (scale=%.2f)", surface.displacementScale);
+          ImGui::Text("LOD Ready: %s", entry.isReady ? "Yes" : "No");
+          ImGui::Text("Templates Built: %s", entry.templatesBuilt ? "Yes" : "No");
+          if (entry.lodData) {
+            ImGui::Text("Clusters: %zu", entry.lodData->clusters.size());
+          }
+          if (entry.templates) {
+            ImGui::Text("Templates: %u", entry.templates->numTemplates);
           }
           ImGui::TreePop();
         }
@@ -1605,32 +766,7 @@ private:
     }
     m_commandList->writeBuffer(m_patchMappingsBuffer, gpuMappings.data(), mappingsSize);
 
-    // Create wrapper for the instance buffer
-    // We need to create a temporary wrapper that references the external VkBuffer
-    nvrhi::BufferDesc instanceBufDesc;
-    instanceBufDesc.byteSize = mappings.size() * sizeof(VkAccelerationStructureInstanceKHR) * 4; // Conservative
-    instanceBufDesc.structStride = sizeof(VkAccelerationStructureInstanceKHR);
-    instanceBufDesc.debugName = "InstanceBufferWrapper";
-    instanceBufDesc.canHaveUAVs = true;
-    instanceBufDesc.initialState = nvrhi::ResourceStates::UnorderedAccess;
-
-    // Get the DxvkBuffer from the VkBuffer handle
-    // Since we have the raw VkBuffer, we need to use it directly via the device address
-    // Create a binding set that uses the blasPtrsBuffer and dispatches with device addresses
-
-    // Set up binding set
-    // Bindings:
-    //   t0 = mappings buffer (SRV)
-    //   t1 = blasPtrsBuffer (SRV)
-    //   u0 = instance buffer (UAV) - need to create wrapper
-
-    auto bindingSetDesc = nvrhi::BindingSetDesc()
-        .addItem(nvrhi::BindingSetItem::StructuredBuffer_SRV(0, m_patchMappingsBuffer))
-        .addItem(nvrhi::BindingSetItem::StructuredBuffer_SRV(1, m_clusterAccels->blasPtrsBuffer.Get()));
-
     // CPU download path for cases where only a raw VkBuffer handle is available.
-    // The GPU-optimized path (patchClusterBlasAddressesGPU) is the primary method
-    // used by AccelManager when an NVRHI buffer wrapper is available.
     std::vector<nvrhi::GpuVirtualAddress> blasAddresses = m_clusterAccels->blasPtrsBuffer.Download(m_commandList.Get());
 
     if (blasAddresses.empty()) {
@@ -1677,7 +813,6 @@ private:
       if (m.rtxmgInstanceIndex > maxRtxmgIdx) maxRtxmgIdx = m.rtxmgInstanceIndex;
     }
 
-
     // Check if we have downloaded BLAS addresses for verification
     if (!m_downloadedBlasAddresses.empty()) {
       uint32_t zeroAddrs = 0, nonZeroAddrs = 0;
@@ -1688,7 +823,6 @@ private:
     }
 
     // Abort on OOB - dispatching with out-of-bounds indices would read garbage
-    // BLAS addresses from blasPtrsBuffer, causing GPU crash during ray tracing
     if (maxRtxmgIdx >= blasElements) {
       Logger::err(str::format("RTX MegaGeo GPU PATCH: *** OUT OF BOUNDS *** maxRtxmgIdx=", maxRtxmgIdx,
           " >= blasPtrsBuffer elements=", blasElements, " mappings=", mappings.size()));
@@ -1696,6 +830,12 @@ private:
     }
 
     nvrhi::utils::ScopedMarker marker(m_commandList.Get(), "RtxMegaGeoBuilder::patchClusterBlasAddressesGPU");
+
+    // Barrier: BLAS build (on this same NVRHI cmd list) wrote blasPtrsBuffer.
+    // The patching shader needs to read it. Without this barrier, the GPU may
+    // execute the patching dispatch before the BLAS build output is visible.
+    m_commandList->bufferBarrier(m_clusterAccels->blasPtrsBuffer,
+        nvrhi::ResourceStates::AccelStructWrite, nvrhi::ResourceStates::ShaderResource);
 
     // Create params buffer on first use
     if (!m_patchParamsBuffer) {
@@ -1735,7 +875,6 @@ private:
     m_commandList->writeBuffer(m_patchParamsBuffer, &params, sizeof(params));
 
     // Set up binding set
-    // Note: u0 uses StructuredBuffer_UAV to match the Slang shader's RWStructuredBuffer<VkInstanceRaw>
     auto bindingSetDesc = nvrhi::BindingSetDesc()
         .addItem(nvrhi::BindingSetItem::StructuredBuffer_SRV(0, m_patchMappingsBuffer))
         .addItem(nvrhi::BindingSetItem::StructuredBuffer_SRV(1, m_clusterAccels->blasPtrsBuffer.Get()))
@@ -1774,19 +913,44 @@ private:
         .setPipeline(m_patchBlasAddressesPSO)
         .addBindingSet(bindingSet);
 
-    RTXMG_LOG(str::format("RTX MegaGeo: patchClusterBlasAddressesGPU - Setting compute state"));
-    RTXMG_LOG(str::format("RTX MegaGeo: patchClusterBlasAddressesGPU - blasPtrsBuffer bytes=", m_clusterAccels->blasPtrsBuffer.GetBytes(),
-        " numElements=", m_clusterAccels->blasPtrsBuffer.GetNumElements()));
-    RTXMG_LOG(str::format("RTX MegaGeo: patchClusterBlasAddressesGPU - instanceBuffer byteSize=", instanceBuffer->getDesc().byteSize));
+    {
+      static uint32_t s_patchLogCount = 0;
+      static uint32_t s_lastMappingCount = 0;
+      // Reset when mapping count changes (level transition)
+      if (params.numMappings != s_lastMappingCount) {
+        s_patchLogCount = 0;
+        s_lastMappingCount = params.numMappings;
+      }
+      if (s_patchLogCount < 2) {
+        s_patchLogCount++;
+        Logger::warn(str::format("RTX MegaGeo PATCH-GPU[", s_patchLogCount, "]: ",
+            " blasPtrsBuffer bytes=", m_clusterAccels->blasPtrsBuffer.GetBytes(),
+            " numElements=", m_clusterAccels->blasPtrsBuffer.GetNumElements(),
+            " instanceBuffer byteSize=", instanceBuffer->getDesc().byteSize,
+            " numMappings=", params.numMappings,
+            " instanceBufferStride=", params.instanceBufferStride));
+
+        // Log the BLAS ptr buffer GPU address and instance buffer address
+        Logger::warn(str::format("RTX MegaGeo PATCH-GPU: blasPtrsAddr=0x", std::hex,
+            m_clusterAccels->blasPtrsBuffer.GetGpuVirtualAddress(), std::dec,
+            " instanceBufAddr=0x", std::hex,
+            static_cast<NvrhiDxvkBuffer*>(instanceBuffer)->getDxvkBuffer()->getDeviceAddress(), std::dec));
+
+        // Log individual mappings
+        Logger::warn(str::format("RTX MegaGeo PATCH-GPU: mappings (first 10 of ", params.numMappings, "):"));
+        for (uint32_t i = 0; i < std::min(params.numMappings, 10u); ++i) {
+          Logger::warn(str::format("  mapping[", i, "] remixInst=", mappings[i].remixInstanceIndex,
+              " rtxmgInst=", mappings[i].rtxmgInstanceIndex));
+        }
+      }
+    }
 
     m_commandList->setComputeState(state);
 
     // Dispatch - one thread per mapping
     uint32_t numGroups = (params.numMappings + kFillInstanceDescsThreads - 1) / kFillInstanceDescsThreads;
-    RTXMG_LOG(str::format("RTX MegaGeo: patchClusterBlasAddressesGPU - dispatching numGroups=", numGroups, " for ", params.numMappings, " mappings"));
+    Logger::warn(str::format("RTX MegaGeo PATCH-GPU: dispatching ", numGroups, " groups for ", params.numMappings, " mappings"));
     m_commandList->dispatch(numGroups, 1, 1);
-
-    RTXMG_LOG(str::format("RTX MegaGeo: patchClusterBlasAddressesGPU - dispatch complete for ", mappings.size(), " instances"));
   }
 
   VkDeviceAddress RtxMegaGeoBuilder::getDownloadedBlasAddress(uint32_t rtxmgInstanceIndex) const {

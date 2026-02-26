@@ -2,89 +2,39 @@
 # Based on NVIDIA's RTX MG sample, adapted for RTX Remix
 
 # =============================================================================
-# OSD Lite (OpenSubdiv) - Vendored Library (mirroring the sample)
+# meshoptimizer - Vendored Library (mesh clusterization + LOD DAG)
 # =============================================================================
 
-osd_lite_sources = files([
-  # BFR (Base Face Representation) - 16 files
-  'osd_lite/opensubdiv/bfr/faceSurface.cpp',
-  'osd_lite/opensubdiv/bfr/faceTopology.cpp',
-  'osd_lite/opensubdiv/bfr/faceVertex.cpp',
-  'osd_lite/opensubdiv/bfr/hash.cpp',
-  'osd_lite/opensubdiv/bfr/irregularPatchBuilder.cpp',
-  'osd_lite/opensubdiv/bfr/parameterization.cpp',
-  'osd_lite/opensubdiv/bfr/patchTree.cpp',
-  'osd_lite/opensubdiv/bfr/patchTreeBuilder.cpp',
-  'osd_lite/opensubdiv/bfr/refinerSurfaceFactory.cpp',
-  'osd_lite/opensubdiv/bfr/regularPatchBuilder.cpp',
-  'osd_lite/opensubdiv/bfr/surface.cpp',
-  'osd_lite/opensubdiv/bfr/surfaceData.cpp',
-  'osd_lite/opensubdiv/bfr/surfaceFactory.cpp',
-  'osd_lite/opensubdiv/bfr/surfaceFactoryCache.cpp',
-  'osd_lite/opensubdiv/bfr/tessellation.cpp',
-  'osd_lite/opensubdiv/bfr/vertexDescriptor.cpp',
-
-  # FAR (Feature Adaptive Representation) - 17 files
-  'osd_lite/opensubdiv/far/bilinearPatchBuilder.cpp',
-  'osd_lite/opensubdiv/far/catmarkPatchBuilder.cpp',
-  'osd_lite/opensubdiv/far/error.cpp',
-  'osd_lite/opensubdiv/far/loopPatchBuilder.cpp',
-  'osd_lite/opensubdiv/far/patchBasis.cpp',
-  'osd_lite/opensubdiv/far/patchBuilder.cpp',
-  'osd_lite/opensubdiv/far/patchDescriptor.cpp',
-  'osd_lite/opensubdiv/far/patchMap.cpp',
-  'osd_lite/opensubdiv/far/patchTable.cpp',
-  'osd_lite/opensubdiv/far/patchTableFactory.cpp',
-  'osd_lite/opensubdiv/far/ptexIndices.cpp',
-  'osd_lite/opensubdiv/far/stencilBuilder.cpp',
-  'osd_lite/opensubdiv/far/stencilTable.cpp',
-  'osd_lite/opensubdiv/far/stencilTableFactory.cpp',
-  'osd_lite/opensubdiv/far/topologyDescriptor.cpp',
-  'osd_lite/opensubdiv/far/topologyRefiner.cpp',
-  'osd_lite/opensubdiv/far/topologyRefinerFactory.cpp',
-
-  # SDC (Subdivision) - 3 files
-  'osd_lite/opensubdiv/sdc/crease.cpp',
-  'osd_lite/opensubdiv/sdc/typeTraits.cpp',
-
-  # TMR (Tessellation Mesh Refinement) - 8 files
-  'osd_lite/opensubdiv/tmr/neighborhood.cpp',
-  'osd_lite/opensubdiv/tmr/neighborhoodBuilder.cpp',
-  'osd_lite/opensubdiv/tmr/subdivisionPlan.cpp',
-  'osd_lite/opensubdiv/tmr/subdivisionPlanBuilder.cpp',
-  'osd_lite/opensubdiv/tmr/surfaceTable.cpp',
-  'osd_lite/opensubdiv/tmr/surfaceTableFactory.cpp',
-  'osd_lite/opensubdiv/tmr/topologyMap.cpp',
-  'osd_lite/opensubdiv/tmr/unorderedSubset.cpp',
-
-  # VTR (Vertex Topology Representation) - 7 files
-  'osd_lite/opensubdiv/vtr/fvarLevel.cpp',
-  'osd_lite/opensubdiv/vtr/fvarRefinement.cpp',
-  'osd_lite/opensubdiv/vtr/level.cpp',
-  'osd_lite/opensubdiv/vtr/quadRefinement.cpp',
-  'osd_lite/opensubdiv/vtr/refinement.cpp',
-  'osd_lite/opensubdiv/vtr/sparseSelector.cpp',
-  'osd_lite/opensubdiv/vtr/triRefinement.cpp',
-
-  # Version - 1 file
-  'osd_lite/opensubdiv/version.cpp',
+meshopt_sources = files([
+  'meshoptimizer/allocator.cpp',
+  'meshoptimizer/clusterizer.cpp',
+  'meshoptimizer/clusterlod_impl.cpp',
+  'meshoptimizer/indexanalyzer.cpp',
+  'meshoptimizer/indexcodec.cpp',
+  'meshoptimizer/indexgenerator.cpp',
+  'meshoptimizer/overdrawoptimizer.cpp',
+  'meshoptimizer/partition.cpp',
+  'meshoptimizer/quantization.cpp',
+  'meshoptimizer/rasterizer.cpp',
+  'meshoptimizer/simplifier.cpp',
+  'meshoptimizer/spatialorder.cpp',
+  'meshoptimizer/stripifier.cpp',
+  'meshoptimizer/vcacheoptimizer.cpp',
+  'meshoptimizer/vertexcodec.cpp',
+  'meshoptimizer/vertexfilter.cpp',
+  'meshoptimizer/vfetchoptimizer.cpp',
 ])
 
-osd_lite_include = include_directories('osd_lite')
+meshopt_include = include_directories('meshoptimizer')
 
-# Build OSD Lite as static library (matching the sample)
-osd_lite_lib = static_library('osd_lite', osd_lite_sources,
-  include_directories : osd_lite_include,
-  cpp_args : [
-    '-DNOMINMAX',
-    '-D_USE_MATH_DEFINES'
-  ],
+meshopt_lib = static_library('meshoptimizer', meshopt_sources,
+  include_directories : meshopt_include,
   override_options : ['cpp_std=c++20']
 )
 
-osd_lite_dep = declare_dependency(
-  link_with : osd_lite_lib,
-  include_directories : osd_lite_include
+meshopt_dep = declare_dependency(
+  link_with : meshopt_lib,
+  include_directories : meshopt_include
 )
 
 # =============================================================================
@@ -103,22 +53,17 @@ rtx_mg_sources = files([
   # High-Level Wrapper (1 file - RTX Remix integration point)
   'rtx_megageo_builder.cpp',
 
-  # Cluster Builder (1 file)
+  # Cluster Builder (3 files)
   'cluster_builder/cluster_accel_builder.cpp',
+  'cluster_builder/cluster_lod_builder.cpp',
+  'cluster_builder/meshlet_template_builder.cpp',
 
   # HIZ (Hierarchical Z-Buffer) (2 files)
   'hiz/hiz_buffer.cpp',
   'hiz/zbuffer.cpp',
 
-  # Subdivision (4 files)
-  'subdivision/shape.cpp',
-  'subdivision/subdivision_surface.cpp',
-  'subdivision/topology_cache.cpp',
-  'subdivision/topology_map.cpp',
-
-  # Scene (2 files - RTX MG scene integration)
+  # Scene (1 file - camera for tessellation)
   'scene/camera.cpp',
-  'scene/rtxmg_scene.cpp',
 
   # Utils (1 file - buffer helpers)
   'utils/buffer.cpp',
@@ -127,31 +72,27 @@ rtx_mg_sources = files([
   'profiler/profiler_stub.cpp',
 ])
 
-# Build RTX MG as a static library with access to OSD Lite includes
+# Build RTX MG as a static library
 # Note: Needs all DXVK dependencies including USD for RTX Remix headers
 # Note: include_directories('../..') adds src/dxvk/ so dxvk_include.h can be found
-# Note: Using C++20 to match osd_lite (which uses 'using enum' and other C++20 features)
 rtx_mg_lib = static_library('rtx_mg', rtx_mg_sources,
   include_directories : [rtx_mg_include, include_directories('../..'), dxvk_include_path, remix_api_include_path, dxvk_shader_include_path],
-  dependencies : [osd_lite_dep, usd_dep],
+  dependencies : [meshopt_dep, usd_dep],
   override_options : ['cpp_std=c++20']
 )
 
 # RTX MG Shaders - Cluster Builder
-# Note: All HLSL files removed - actual shaders come from pre-compiled Slang versions via donut_adapter.cpp
-# The shaders are: copy_cluster_offset, compute_cluster_tiling, fill_clusters, fill_blas_from_clas_args, patch_cluster_blas_addresses
+# Note: Actual shaders come from pre-compiled Slang versions via donut_adapter.cpp
 rtx_mg_cluster_shaders = files([])
 
 # RTX MG Shaders - HIZ
-# Note: All HLSL files removed - actual shaders come from pre-compiled Slang versions in src/dxvk/shaders/rtx/pass/rtx_megageo/hiz/
+# Note: Actual shaders come from pre-compiled Slang versions in src/dxvk/shaders/rtx/pass/rtx_megageo/hiz/
 rtx_mg_hiz_shaders = files([])
 
 # RTX MG Dependency (to be used by main dxvk build)
-# Note: osd_lite include is NOT exposed to avoid shadowing DXVK's version.h
-# RTX MG and OSD Lite are provided as linked libraries
 rtx_mg_dep = declare_dependency(
   include_directories : rtx_mg_include,
-  link_with : [rtx_mg_lib, osd_lite_lib]
+  link_with : [rtx_mg_lib, meshopt_lib]
 )
 
 # Export sources and shaders to parent build

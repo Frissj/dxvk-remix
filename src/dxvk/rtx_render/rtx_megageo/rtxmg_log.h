@@ -16,12 +16,5 @@
 // Core
 #define RTXMG_LOG_RTX_MEGAGEO_BUILDER      0  // rtx_megageo_builder.cpp
 
-// subdivision
-#define RTXMG_LOG_SHAPE                    0  // shape.cpp
-#define RTXMG_LOG_SUBDIVISION_SURFACE      0  // subdivision_surface.cpp
-
 // utils
 #define RTXMG_LOG_BUFFER                   0  // buffer.cpp
-#define RTXMG_LOG_STRING_UTILS             0  // string_utils.cpp
-#define RTXMG_LOG_VECTORLOG                0  // vectorlog.h
-

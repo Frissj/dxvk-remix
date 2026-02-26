@@ -47,22 +47,21 @@ inline uint16_t2 index2D(uint32_t indexLinear, uint16_t lineStride)
 }
 
 // Get vertex indices for a cluster triangle.
-// Cluster triangles are arranged in a grid of quads, each quad split into 2 triangles.
-// The vertex indices are computed from the primitive index within the cluster.
+// For subdivision surfaces: triangles are arranged in a grid of quads, each split into 2 triangles.
+// For meshlets (m_clusterSizeX == 0): vertices are stored per-triangle (3 per tri), sequential.
 uint3 clusterGetVertexIndices(uint32_t clusterId, uint32_t primId, StructuredBuffer<ClusterShadingData> shadingData)
 {
-    const uint16_t triID = (uint16_t)primId;
-
-    // vertex quad ordering:
-    // 23
-    // 01
-    // triangle ordering: left edge first -- 032+013 (diagonal:03) or 012+132 (diagonal:12)
-    // 21 .5    or   2. 54
-    // 0. 34    or   01 .3
-    // vx,vy are row-major vertex indices in range [0..sx][0..sy] sx,sy are cluster edge size
-    // if vx,vy are the lower left corner vtx idxs, then diagonal:03 == ((vx & 1) == (vy & 1))
-
     uint16_t2 clusterEdgeSize = clusterGetEdgeSize(clusterId, shadingData);
+
+    // Meshlet path: per-triangle expanded vertices, sequential indexing
+    if (clusterEdgeSize.x == 0)
+    {
+        uint base = primId * 3;
+        return uint3(base, base + 1, base + 2);
+    }
+
+    // Subdivision surface grid path
+    const uint16_t triID = (uint16_t)primId;
 
     const uint16_t qs = clusterEdgeSize.x;      // quad stride
     const uint16_t vs = clusterEdgeSize.x + 1;  // vert stride
@@ -89,8 +88,19 @@ uint3 clusterGetVertexIndices(uint32_t clusterId, uint32_t primId, StructuredBuf
 
 // Compute surface UV coordinates for the three vertices of a cluster triangle.
 // This maps from cluster-local coordinates to the parametric surface coordinates.
+// For meshlets (m_clusterSizeX == 0), returns default UVs (meshlets don't have subdivision surface UVs).
 void clusterGetSurfaceUV(out float2 uvs[3], uint32_t clusterId, ClusterShadingData clusterData, uint primId)
 {
+    // Meshlet path: no subdivision surface UV mapping available
+    if (clusterData.m_clusterSizeX == 0)
+    {
+        uvs[0] = float2(0.0, 0.0);
+        uvs[1] = float2(1.0, 0.0);
+        uvs[2] = float2(0.0, 1.0);
+        return;
+    }
+
+    // Subdivision surface path
     const uint3 localVtxIDs = clusterGetVertexIndices(clusterId, primId, clusterShadingData);
 
     const uint16_t2 clusterSize = uint16_t2(clusterData.m_clusterSizeX, clusterData.m_clusterSizeY);

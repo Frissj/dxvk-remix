@@ -578,8 +578,10 @@ namespace dxvk {
   }
 
   VkAccelerationStructureKHR BlasEntry::getBlasHandle() const {
-    if (isClusterBlas() && megaGeoBuilder) {
-      return megaGeoBuilder->getSurfaceBlas(megaGeoSurfaceId);
+    // Cluster BLAS uses device addresses (not VkAccelerationStructureKHR handles)
+    // patched GPU-side via patchClusterBlasAddressesGPU
+    if (isClusterBlas()) {
+      return VK_NULL_HANDLE;
     }
     return (dynamicBlas != nullptr) ? dynamicBlas->accelStructure->getAccelStructure() : VK_NULL_HANDLE;
   }
