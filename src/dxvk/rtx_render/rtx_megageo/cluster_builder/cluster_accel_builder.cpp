@@ -47,6 +47,7 @@
 #include "cluster_accel_builder.h"
 #include "copy_cluster_offset_params.h"
 #include "tessellation_counters.h"
+#include "fill_meshlet_clusters_params.h"
 
 using namespace dxvk;
 
@@ -305,7 +306,7 @@ void ClusterAccelBuilder::BuildAccelMeshlet(
     // =====================================================================
     struct SelectedCluster {
         uint32_t instanceIdx;
-        uint32_t meshletIdx;     // Index into ClusterLODData::clusters
+        uint32_t meshletIdx;
     };
     std::vector<SelectedCluster> allSelectedClusters;
     std::vector<uint32_t> perInstanceClusterCount(numInstances, 0);
@@ -329,37 +330,48 @@ void ClusterAccelBuilder::BuildAccelMeshlet(
 
     uint32_t totalClusters = static_cast<uint32_t>(allSelectedClusters.size());
 
-    if (totalClusters == 0) {
-        Logger::warn("RTX MegaGeo MESHLET: No clusters selected for any instance");
+    if (totalClusters == 0)
         return;
+
+    // DIAG: Log LOD selection results
+    Logger::info(str::format("RTX MegaGeo MESHLET: === BuildAccelMeshlet frame=", frameIndex,
+        " instances=", numInstances, " totalClusters=", totalClusters, " ==="));
+    for (uint32_t inst = 0; inst < numInstances; ++inst) {
+        Logger::info(str::format("RTX MegaGeo MESHLET:   inst[", inst, "] clusters=", perInstanceClusterCount[inst],
+            " offset=", perInstanceClusterOffset[inst],
+            " surfaceId=", instances[inst].surfaceId));
     }
 
-    Logger::info(str::format("RTX MegaGeo MESHLET: Selected ", totalClusters,
-        " clusters across ", numInstances, " instances"));
+    // =====================================================================
+    // CPU prefix sums: compute per-frame offsets for each selected cluster
+    // This is trivial O(N) work, stays on CPU since it depends on LOD selection
+    // =====================================================================
+    static constexpr uint32_t kGpuFloat3Stride = 12;
 
-    // =====================================================================
-    // Calculate total vertices needed
-    // Per-triangle expanded (3 per tri) for hit shader vertex/normal buffers
-    // Unique vertices for CLAS instantiation (uses template's own vertex buffer)
-    // =====================================================================
-    uint32_t totalVertices = 0;     // per-tri expanded for hit shader
-    uint32_t totalUniqueVtx = 0;    // unique for CLAS params
+    uint32_t totalExpandedVtx = 0;
+    uint32_t totalUniqueVtx = 0;
     uint32_t totalTriangles = 0;
+
+    // Build compact GPU info array + compute prefix sums
+    std::vector<MeshletClusterGPUInfo> clusterInfos(totalClusters);
+    nvrhi::GpuVirtualAddress clasBaseAddr = 0; // set after allocation
+    uint64_t clasOffset = 0;
+
+    // First pass: compute totals for memory allocation
+    size_t totalClasBytes = 0;
     for (const auto& sc : allSelectedClusters) {
         const MeshletInstance& mi = instances[sc.instanceIdx];
         totalTriangles += mi.templates->meshletTriangleCounts[sc.meshletIdx];
         totalUniqueVtx += mi.templates->meshletVertexCounts[sc.meshletIdx];
-        totalVertices += mi.templates->meshletTriangleCounts[sc.meshletIdx] * 3;
+        totalExpandedVtx += mi.templates->meshletTriangleCounts[sc.meshletIdx] * 3;
+        uint32_t instSize = mi.templates->instantiationSizes[sc.meshletIdx];
+        totalClasBytes += ((instSize + cluster::kClasByteAlignment - 1) / cluster::kClasByteAlignment) * cluster::kClasByteAlignment;
     }
+    totalClasBytes = std::max(totalClasBytes, (size_t)cluster::kClasByteAlignment);
 
-    // =====================================================================
-    // Memory allocation
-    // =====================================================================
     uint32_t maxClusters = std::max(totalClusters, 1u);
-    uint32_t maxVertices = std::max(totalVertices, 1u);
+    uint32_t maxVertices = std::max(totalExpandedVtx + totalUniqueVtx, 1u);
 
-    // Determine actual max triangles/vertices per meshlet across all selected clusters.
-    // These MUST match the template build params for CLAS instantiation to succeed.
     uint32_t maxTriPerMeshlet = 0;
     uint32_t maxVtxPerMeshlet = 0;
     for (const auto& sc : allSelectedClusters) {
@@ -370,62 +382,59 @@ void ClusterAccelBuilder::BuildAccelMeshlet(
     if (maxTriPerMeshlet == 0) maxTriPerMeshlet = 128;
     if (maxVtxPerMeshlet == 0) maxVtxPerMeshlet = 128;
 
-    // Estimate CLAS size: sum of instantiation sizes for selected clusters
-    size_t totalClasBytes = 0;
-    for (const auto& sc : allSelectedClusters) {
-        const MeshletInstance& mi = instances[sc.instanceIdx];
-        uint32_t instSize = mi.templates->instantiationSizes[sc.meshletIdx];
-        totalClasBytes += ((instSize + cluster::kClasByteAlignment - 1) / cluster::kClasByteAlignment) * cluster::kClasByteAlignment;
-    }
-    totalClasBytes = std::max(totalClasBytes, (size_t)cluster::kClasByteAlignment);
+    // DIAG: Log allocation sizes
+    Logger::info(str::format("RTX MegaGeo MESHLET: totalExpandedVtx=", totalExpandedVtx,
+        " totalUniqueVtx=", totalUniqueVtx, " totalTriangles=", totalTriangles,
+        " totalClasBytes=", totalClasBytes, " maxTriPerMeshlet=", maxTriPerMeshlet,
+        " maxVtxPerMeshlet=", maxVtxPerMeshlet));
 
     UpdateMemoryAllocationsMeshlet(accels, numInstances, maxClusters, maxVertices, totalClasBytes);
 
-    // STRIDE/SIZE DIAGNOSTICS — log buffer strides and struct sizes for debugging
-    {
-        Logger::warn(str::format("RTX MegaGeo STRIDE-DIAG: sizeof(ClusterShadingData)=", sizeof(ClusterShadingData),
-            " sizeof(float2)=", sizeof(float2), " sizeof(float3)=", sizeof(float3),
-            " sizeof(IndirectInstantiateTemplateArgs)=", sizeof(cluster::IndirectInstantiateTemplateArgs),
-            " sizeof(IndirectArgs)=", sizeof(cluster::IndirectArgs)));
-        Logger::warn(str::format("RTX MegaGeo STRIDE-DIAG: vtxPosBuffer structStride=",
-            accels.clusterVertexPositionsBuffer.GetBuffer() ? accels.clusterVertexPositionsBuffer.GetBuffer()->getDesc().structStride : 0,
-            " byteSize=", accels.clusterVertexPositionsBuffer.GetBytes(),
-            " normBuffer structStride=",
-            accels.clusterVertexNormalsBuffer.GetBuffer() ? accels.clusterVertexNormalsBuffer.GetBuffer()->getDesc().structStride : 0,
-            " byteSize=", accels.clusterVertexNormalsBuffer.GetBytes(),
-            " shadingBuffer structStride=",
-            accels.clusterShadingDataBuffer.GetBuffer() ? accels.clusterShadingDataBuffer.GetBuffer()->getDesc().structStride : 0,
-            " byteSize=", accels.clusterShadingDataBuffer.GetBytes()));
-        Logger::warn(str::format("RTX MegaGeo STRIDE-DIAG: clasArgsBuffer structStride=",
-            m_clasIndirectArgDataBuffer.GetBuffer() ? m_clasIndirectArgDataBuffer.GetBuffer()->getDesc().structStride : 0,
-            " clasPtrsBuffer structStride=",
-            accels.clasPtrsBuffer.GetBuffer() ? accels.clasPtrsBuffer.GetBuffer()->getDesc().structStride : 0,
-            " blasArgsBuffer structStride=",
-            m_blasFromClasIndirectArgsBuffer.GetBuffer() ? m_blasFromClasIndirectArgsBuffer.GetBuffer()->getDesc().structStride : 0));
-        Logger::warn(str::format("RTX MegaGeo STRIDE-DIAG: kGpuFloat3Stride=", 12,
-            " totalVertices(perTriExpanded)=", totalVertices, " totalUniqueVtx=", totalUniqueVtx,
-            " totalTriangles=", totalTriangles, " totalClusters=", totalClusters));
+    // Now that buffers are allocated, compute GPU addresses
+    clasBaseAddr = accels.clasBuffer.GetGpuVirtualAddress();
+    nvrhi::GpuVirtualAddress vertexBaseAddr = accels.clusterVertexPositionsBuffer.GetGpuVirtualAddress();
+
+    // Second pass: fill per-cluster GPU info with prefix sums
+    uint32_t expandedVtxOffset = 0;
+    uint32_t uniqueVtxOffset = 0;
+    clasOffset = 0;
+    for (uint32_t ci = 0; ci < totalClusters; ++ci) {
+        const SelectedCluster& sc = allSelectedClusters[ci];
+        const MeshletInstance& mi = instances[sc.instanceIdx];
+        uint32_t triCount = mi.templates->meshletTriangleCounts[sc.meshletIdx];
+        uint32_t vtxCount = mi.templates->meshletVertexCounts[sc.meshletIdx];
+
+        clusterInfos[ci].persistentExpandedVtxOffset = mi.templates->meshletExpandedVtxOffsets[sc.meshletIdx];
+        clusterInfos[ci].persistentUniqueVtxOffset = mi.templates->meshletVertexOffsets[sc.meshletIdx];
+        clusterInfos[ci].perFrameExpandedVtxOffset = expandedVtxOffset;
+        clusterInfos[ci].perFrameUniqueVtxOffset = uniqueVtxOffset;
+        clusterInfos[ci].triCount = triCount;
+        clusterInfos[ci].uniqueVtxCount = vtxCount;
+        clusterInfos[ci].surfaceId = mi.surfaceId;
+        clusterInfos[ci].clusterIndex = ci;
+        clusterInfos[ci].templateAddr = mi.templates->templateAddresses[sc.meshletIdx];
+        clusterInfos[ci].clasDestAddr = clasBaseAddr + clasOffset;
+
+        uint32_t instSize = mi.templates->instantiationSizes[sc.meshletIdx];
+        clasOffset += ((instSize + cluster::kClasByteAlignment - 1) / cluster::kClasByteAlignment) * cluster::kClasByteAlignment;
+        expandedVtxOffset += triCount * 3;
+        uniqueVtxOffset += vtxCount;
     }
 
-    // DEBUG ISOLATION: Set to 0-4 to progressively enable GPU stages
-    // 0 = skip all GPU work (just stats)
-    // 1 = buffer clears only
-    // 2 = clears + uploads + barriers
-    // 3 = clears + uploads + barriers + CLAS instantiation (no BLAS)
-    // 4 = full pipeline (normal operation)
-    constexpr int kMeshletDebugStage = 4;
-
-    if (kMeshletDebugStage < 1) {
-        Logger::warn("RTX MegaGeo MESHLET DEBUG: Stage 0 — skipping all GPU work");
-        stats.allocated.m_numClusters = totalClusters;
-        stats.allocated.m_numTriangles = 0;
-        for (const auto& sc : allSelectedClusters) {
-            const MeshletInstance& mi = instances[sc.instanceIdx];
-            stats.allocated.m_numTriangles += mi.templates->meshletTriangleCounts[sc.meshletIdx];
-        }
-        stats.desired = stats.allocated;
-        m_buildAccelFrameIndex++;
-        return;
+    // DIAG: Log GPU addresses and first few cluster infos
+    Logger::info(str::format("RTX MegaGeo MESHLET: clasBaseAddr=0x", std::hex, clasBaseAddr,
+        " vertexBaseAddr=0x", vertexBaseAddr, std::dec));
+    for (uint32_t ci = 0; ci < std::min(totalClusters, 3u); ++ci) {
+        const auto& info = clusterInfos[ci];
+        Logger::info(str::format("RTX MegaGeo MESHLET:   cluster[", ci, "] triCount=", info.triCount,
+            " uniqueVtxCount=", info.uniqueVtxCount,
+            " persistExpVtxOff=", info.persistentExpandedVtxOffset,
+            " persistUniqVtxOff=", info.persistentUniqueVtxOffset,
+            " perFrameExpVtxOff=", info.perFrameExpandedVtxOffset,
+            " perFrameUniqVtxOff=", info.perFrameUniqueVtxOffset));
+        Logger::info(str::format("RTX MegaGeo MESHLET:     templateAddr=0x", std::hex, info.templateAddr,
+            " clasDestAddr=0x", info.clasDestAddr, std::dec,
+            " surfaceId=", info.surfaceId, " clusterIndex=", info.clusterIndex));
     }
 
     // =====================================================================
@@ -439,199 +448,198 @@ void ClusterAccelBuilder::BuildAccelMeshlet(
     commandList->clearBufferUInt(accels.blasBuffer.Get(), 0);
 
     // =====================================================================
-    // CPU fill: vertex positions, CLAS indirect args, CLAS dest addrs, shading data
+    // Upload cluster selection info to GPU (small: 48 bytes × numClusters)
     // =====================================================================
-    static constexpr uint32_t kGpuFloat3Stride = 12;
-
-    // Build CPU-side data for all selected clusters
-    std::vector<float> vertexData(totalVertices * 3);
-    std::vector<cluster::IndirectInstantiateTemplateArgs> clasArgs(totalClusters);
-    std::vector<nvrhi::GpuVirtualAddress> clasDests(totalClusters);
-    std::vector<ClusterShadingData> shadingData(totalClusters);
-
-    nvrhi::GpuVirtualAddress vertexBaseAddr = accels.clusterVertexPositionsBuffer.GetGpuVirtualAddress();
-    nvrhi::GpuVirtualAddress clasBaseAddr = accels.clasBuffer.GetGpuVirtualAddress();
-
-    uint32_t vertexOffset = 0;
-    uint64_t clasOffset = 0;
-
-    for (uint32_t ci = 0; ci < totalClusters; ++ci) {
-        const SelectedCluster& sc = allSelectedClusters[ci];
-        const MeshletInstance& mi = instances[sc.instanceIdx];
-        const MeshletCluster& meshlet = mi.lodData->clusters[sc.meshletIdx];
-
-        // Copy vertex positions per-triangle expanded (3 vertices per triangle, sequential)
-        // This is for the HIT SHADER to index with primId * 3 + {0,1,2}
-        float* dst = vertexData.data() + vertexOffset * 3;
-        for (uint32_t t = 0; t < meshlet.triangleCount; ++t) {
-            for (uint32_t vi = 0; vi < 3; ++vi) {
-                uint32_t localIdx = meshlet.localTriangles[t * 3 + vi];
-                uint32_t globalVtx = meshlet.localVertices[localIdx];
-                uint32_t dstIdx = (t * 3 + vi) * 3;
-                dst[dstIdx + 0] = mi.lodData->vertexPositions[globalVtx * 3 + 0];
-                dst[dstIdx + 1] = mi.lodData->vertexPositions[globalVtx * 3 + 1];
-                dst[dstIdx + 2] = mi.lodData->vertexPositions[globalVtx * 3 + 2];
-            }
-        }
-
-        // Fill CLAS indirect args
-        // IMPORTANT: CLAS instantiation uses the TEMPLATE's own vertex buffer (unique-vertex layout)
-        // since meshlet geometry is static. The template was built with these same positions.
-        nvrhi::GpuVirtualAddress templateVtxAddr = mi.templates->vertexBuffer->getGpuVirtualAddress()
-            + (uint64_t)mi.templates->meshletVertexOffsets[sc.meshletIdx] * kGpuFloat3Stride;
-        clasArgs[ci].clusterIdOffset = ci;
-        clasArgs[ci].geometryIndexOffsetPacked = ci & 0xFFFFFF; // lower 24 bits = geometryIndex
-        clasArgs[ci].clusterTemplate = mi.templates->templateAddresses[sc.meshletIdx];
-        clasArgs[ci].vertexBuffer.startAddress = templateVtxAddr;
-        clasArgs[ci].vertexBuffer.strideInBytes = kGpuFloat3Stride;
-
-        // Fill CLAS destination address (128-byte aligned)
-        clasDests[ci] = clasBaseAddr + clasOffset;
-        uint32_t instSize = mi.templates->instantiationSizes[sc.meshletIdx];
-        clasOffset += ((instSize + cluster::kClasByteAlignment - 1) / cluster::kClasByteAlignment) * cluster::kClasByteAlignment;
-
-        // Fill shading data — m_clusterSizeX stays 0 to signal meshlet path to hit shader
-        shadingData[ci] = {};
-        shadingData[ci].m_surfaceId = mi.surfaceId;
-        shadingData[ci].m_vertexOffset = vertexOffset;
-
-        vertexOffset += meshlet.triangleCount * 3;  // per-triangle expanded for hit shader
-    }
-
-    // Log key addresses for debugging
-    Logger::warn(str::format("RTX MegaGeo MESHLET BUFFERS: vtxBase=0x", std::hex, vertexBaseAddr,
-        " clasBase=0x", clasBaseAddr, std::dec,
-        " totalClusters=", totalClusters, " totalVtx=", totalVertices,
-        " totalClasBytes=", totalClasBytes));
-    if (!clasDests.empty()) {
-        Logger::warn(str::format("RTX MegaGeo MESHLET CLAS-DEST[0]: addr=0x", std::hex, clasDests[0], std::dec,
-            " instSize=", instances[allSelectedClusters[0].instanceIdx].templates->instantiationSizes[allSelectedClusters[0].meshletIdx]));
-    }
-
-    // Log first few shading data entries for debugging
-    for (uint32_t i = 0; i < std::min(totalClusters, 5u); ++i) {
-        Logger::warn(str::format("RTX MegaGeo SHADING[", i, "]: surfaceId=", shadingData[i].m_surfaceId,
-            " vertexOffset=", shadingData[i].m_vertexOffset,
-            " clusterSizeX=", (uint32_t)shadingData[i].m_clusterSizeX,
-            " clusterSizeY=", (uint32_t)shadingData[i].m_clusterSizeY));
-    }
-
-    // Log upload sizes for debugging stride/overrun issues
-    Logger::warn(str::format("RTX MegaGeo UPLOAD-SIZES: vtxData=", vertexData.size() * sizeof(float),
-        " bytes, clasArgs=", clasArgs.size() * sizeof(clasArgs[0]),
-        " bytes, clasDests=", clasDests.size() * sizeof(clasDests[0]),
-        " bytes, shadingData=", shadingData.size() * sizeof(shadingData[0]),
-        " bytes (sizeof(ClusterShadingData)=", sizeof(ClusterShadingData), ")"));
+    // Create temporary buffer for cluster infos (per-frame upload)
+    size_t clusterInfoBytes = clusterInfos.size() * sizeof(MeshletClusterGPUInfo);
+    nvrhi::BufferDesc clusterInfoDesc = {
+        .byteSize = clusterInfoBytes,
+        .debugName = "MeshletClusterInfos",
+        .structStride = sizeof(MeshletClusterGPUInfo),
+        .initialState = nvrhi::ResourceStates::ShaderResource,
+        .keepInitialState = true,
+    };
+    nvrhi::BufferHandle clusterInfoBuffer = m_device->createBuffer(clusterInfoDesc);
+    commandList->writeBuffer(clusterInfoBuffer, clusterInfos.data(), clusterInfoBytes);
+    commandList->bufferBarrier(clusterInfoBuffer.Get(),
+        nvrhi::ResourceStates::CopyDest, nvrhi::ResourceStates::ShaderResource);
 
     // =====================================================================
-    // Upload CPU data to GPU buffers
+    // GPU compute dispatch: fill per-frame buffers from persistent data
+    // Replaces ALL CPU vertex/normal/CLAS-args loops
     // =====================================================================
-
-    // Vertex positions
-    if (!vertexData.empty()) {
-        commandList->writeBuffer(accels.clusterVertexPositionsBuffer.Get(), vertexData.data(),
-            vertexData.size() * sizeof(float));
-    }
-
-    // CLAS indirect args
-    if (!clasArgs.empty()) {
-        commandList->writeBuffer(m_clasIndirectArgDataBuffer.Get(), clasArgs.data(),
-            clasArgs.size() * sizeof(clasArgs[0]));
-    }
-
-    // CLAS destination addresses
-    if (!clasDests.empty()) {
-        commandList->writeBuffer(accels.clasPtrsBuffer.Get(), clasDests.data(),
-            clasDests.size() * sizeof(clasDests[0]));
-    }
-
-    // Shading data
-    if (!shadingData.empty()) {
-        commandList->writeBuffer(accels.clusterShadingDataBuffer.Get(), shadingData.data(),
-            shadingData.size() * sizeof(shadingData[0]));
-    }
-
-    // Compute face normals per-triangle expanded and upload
     {
-        std::vector<float> normalData(totalVertices * 3, 0.0f);
-        for (uint32_t ci = 0; ci < totalClusters; ++ci) {
-            const SelectedCluster& sc = allSelectedClusters[ci];
-            const MeshletInstance& mi = instances[sc.instanceIdx];
-            const MeshletCluster& meshlet = mi.lodData->clusters[sc.meshletIdx];
-            uint32_t baseVtx = shadingData[ci].m_vertexOffset;
+        nvrhi::utils::ScopedMarker marker(commandList, "FillMeshletClusters_GPU");
 
-            // Per-triangle expanded: each triangle gets its own 3 normal slots
-            for (uint32_t t = 0; t < meshlet.triangleCount; ++t) {
-                uint32_t i0 = meshlet.localTriangles[t * 3 + 0];
-                uint32_t i1 = meshlet.localTriangles[t * 3 + 1];
-                uint32_t i2 = meshlet.localTriangles[t * 3 + 2];
-                uint32_t g0 = meshlet.localVertices[i0];
-                uint32_t g1 = meshlet.localVertices[i1];
-                uint32_t g2 = meshlet.localVertices[i2];
+        // Get the persistent buffers from the first valid instance's template set
+        // (all instances with the same mesh share the same template set)
+        const MeshletTemplateSet* templateSet = nullptr;
+        for (const auto& sc : allSelectedClusters) {
+            templateSet = instances[sc.instanceIdx].templates;
+            if (templateSet && templateSet->isBuilt)
+                break;
+        }
 
-                float ax = mi.lodData->vertexPositions[g1 * 3 + 0] - mi.lodData->vertexPositions[g0 * 3 + 0];
-                float ay = mi.lodData->vertexPositions[g1 * 3 + 1] - mi.lodData->vertexPositions[g0 * 3 + 1];
-                float az = mi.lodData->vertexPositions[g1 * 3 + 2] - mi.lodData->vertexPositions[g0 * 3 + 2];
-                float bx = mi.lodData->vertexPositions[g2 * 3 + 0] - mi.lodData->vertexPositions[g0 * 3 + 0];
-                float by = mi.lodData->vertexPositions[g2 * 3 + 1] - mi.lodData->vertexPositions[g0 * 3 + 1];
-                float bz = mi.lodData->vertexPositions[g2 * 3 + 2] - mi.lodData->vertexPositions[g0 * 3 + 2];
+        if (!templateSet || !templateSet->expandedVerticesBuffer || !templateSet->expandedNormalsBuffer) {
+            Logger::err("RTX MegaGeo MESHLET: Missing persistent expanded buffers!");
+            return;
+        }
 
-                float nx = ay * bz - az * by;
-                float ny = az * bx - ax * bz;
-                float nz = ax * by - ay * bx;
-                float len = std::sqrt(nx * nx + ny * ny + nz * nz);
-                if (len > 1e-8f) { nx /= len; ny /= len; nz /= len; }
+        // Create push constant params buffer (non-volatile, uses vkCmdUpdateBuffer)
+        FillMeshletClustersParams params = {};
+        params.numClusters = totalClusters;
+        params.totalExpandedVertices = totalExpandedVtx;
+        params.perFrameVertexAddr = vertexBaseAddr;
 
-                // Write face normal to all 3 expanded vertex slots for this triangle
-                uint32_t vtxBase = baseVtx + t * 3;
-                normalData[vtxBase * 3 + 0] = nx; normalData[vtxBase * 3 + 1] = ny; normalData[vtxBase * 3 + 2] = nz;
-                normalData[(vtxBase + 1) * 3 + 0] = nx; normalData[(vtxBase + 1) * 3 + 1] = ny; normalData[(vtxBase + 1) * 3 + 2] = nz;
-                normalData[(vtxBase + 2) * 3 + 0] = nx; normalData[(vtxBase + 2) * 3 + 1] = ny; normalData[(vtxBase + 2) * 3 + 2] = nz;
+        nvrhi::BufferDesc paramsDesc;
+        paramsDesc.byteSize = 256; // Aligned for constant buffer requirements
+        paramsDesc.debugName = "FillMeshletClustersParams";
+        paramsDesc.isConstantBuffer = true;
+        paramsDesc.initialState = nvrhi::ResourceStates::ConstantBuffer;
+        paramsDesc.keepInitialState = true;
+        nvrhi::BufferHandle paramsBuffer = m_device->createBuffer(paramsDesc);
+        commandList->writeBuffer(paramsBuffer, &params, sizeof(params));
+
+        // Create binding set
+        auto bindingSetDesc = nvrhi::BindingSetDesc()
+            .addItem(nvrhi::BindingSetItem::ConstantBuffer(0, paramsBuffer))
+            .addItem(nvrhi::BindingSetItem::StructuredBuffer_SRV(0, clusterInfoBuffer))
+            .addItem(nvrhi::BindingSetItem::StructuredBuffer_SRV(1, templateSet->expandedVerticesBuffer))
+            .addItem(nvrhi::BindingSetItem::StructuredBuffer_SRV(2, templateSet->expandedNormalsBuffer))
+            .addItem(nvrhi::BindingSetItem::StructuredBuffer_SRV(3, templateSet->vertexBuffer))
+            .addItem(nvrhi::BindingSetItem::StructuredBuffer_UAV(0, accels.clusterVertexPositionsBuffer.Get()))
+            .addItem(nvrhi::BindingSetItem::StructuredBuffer_UAV(1, accels.clusterVertexNormalsBuffer.Get()))
+            .addItem(nvrhi::BindingSetItem::StructuredBuffer_UAV(2, m_clasIndirectArgDataBuffer.Get()))
+            .addItem(nvrhi::BindingSetItem::StructuredBuffer_UAV(3, accels.clasPtrsBuffer.Get()))
+            .addItem(nvrhi::BindingSetItem::StructuredBuffer_UAV(4, accels.clusterShadingDataBuffer.Get()));
+
+        nvrhi::BindingSetHandle bindingSet;
+        if (!nvrhi::utils::CreateBindingSetAndLayout(m_device, nvrhi::ShaderType::Compute, 0, bindingSetDesc, m_fillMeshletClustersBL, bindingSet)) {
+            Logger::err("RTX MegaGeo: Failed to create binding set for fill_meshlet_clusters");
+            return;
+        }
+
+        // Create pipeline on first use
+        if (!m_fillMeshletClustersPSO) {
+            nvrhi::ShaderHandle shader = m_shaderFactory.CreateShader(
+                "cluster_builder/fill_meshlet_clusters.hlsl", "main", nullptr, nvrhi::ShaderType::Compute);
+            if (!shader) {
+                Logger::err("RTX MegaGeo: Failed to create fill_meshlet_clusters shader");
+                return;
+            }
+
+            auto pipelineDesc = nvrhi::ComputePipelineDesc()
+                .setComputeShader(shader)
+                .addBindingLayout(m_fillMeshletClustersBL);
+
+            m_fillMeshletClustersPSO = m_device->createComputePipeline(pipelineDesc);
+            if (!m_fillMeshletClustersPSO) {
+                Logger::err("RTX MegaGeo: Failed to create fill_meshlet_clusters pipeline");
+                return;
             }
         }
 
-        if (accels.clusterVertexNormalsBuffer.GetBuffer()) {
-            commandList->writeBuffer(accels.clusterVertexNormalsBuffer.Get(), normalData.data(),
-                normalData.size() * sizeof(float));
-        }
+        auto state = nvrhi::ComputeState()
+            .setPipeline(m_fillMeshletClustersPSO)
+            .addBindingSet(bindingSet);
+
+        commandList->setComputeState(state);
+
+        uint32_t numGroups = (totalClusters + kFillMeshletClustersThreads - 1) / kFillMeshletClustersThreads;
+        commandList->dispatch(numGroups, 1, 1);
+
+        Logger::info(str::format("RTX MegaGeo MESHLET: GPU compute dispatched ", numGroups, " groups for ", totalClusters, " clusters"));
+        Logger::info(str::format("RTX MegaGeo MESHLET: FillParams numClusters=", params.numClusters,
+            " totalExpandedVertices=", params.totalExpandedVertices,
+            " perFrameVertexAddr=0x", std::hex, params.perFrameVertexAddr, std::dec));
     }
 
-    if (kMeshletDebugStage < 3) {
-        Logger::warn(str::format("RTX MegaGeo MESHLET DEBUG: Stage ", kMeshletDebugStage, " — skipping CLAS+BLAS"));
-        stats.allocated.m_numClusters = totalClusters;
-        stats.allocated.m_numTriangles = 0;
-        for (const auto& sc : allSelectedClusters) {
-            const MeshletInstance& mi = instances[sc.instanceIdx];
-            stats.allocated.m_numTriangles += mi.templates->meshletTriangleCounts[sc.meshletIdx];
+    // DIAG: Readback CLAS indirect args after GPU compute
+    {
+        static uint32_t s_argsDiagCount = 0;
+        if (s_argsDiagCount < 3) {
+            s_argsDiagCount++;
+            std::vector<cluster::IndirectInstantiateTemplateArgs> clasArgs =
+                m_clasIndirectArgDataBuffer.Download(commandList);
+            Logger::info(str::format("RTX MegaGeo MESHLET DIAG: CLAS args readback: total=", clasArgs.size()));
+            for (size_t i = 0; i < std::min(clasArgs.size(), (size_t)3); ++i) {
+                Logger::info(str::format("RTX MegaGeo MESHLET DIAG:   clasArgs[", i, "] clusterIdOffset=", clasArgs[i].clusterIdOffset,
+                    " geometryIndexOffsetPacked=", clasArgs[i].geometryIndexOffsetPacked,
+                    " clusterTemplate=0x", std::hex, clasArgs[i].clusterTemplate,
+                    " vtxAddr=0x", clasArgs[i].vertexBuffer.startAddress,
+                    " vtxStride=", std::dec, clasArgs[i].vertexBuffer.strideInBytes));
+            }
+
+            // Also readback first few per-frame vertex positions
+            // Use raw byte readback since structStride is 12 (float3)
+            size_t vtxBufBytes = accels.clusterVertexPositionsBuffer.GetBytes();
+            size_t numFloat3 = vtxBufBytes / 12;
+            size_t readCount = std::min(numFloat3, (size_t)10);
+            if (readCount > 0) {
+                // Create readback buffer
+                nvrhi::BufferDesc rbDesc = {
+                    .byteSize = readCount * 12,
+                    .debugName = "DiagVtxReadback",
+                    .cpuAccess = nvrhi::CpuAccessMode::Read,
+                    .initialState = nvrhi::ResourceStates::CopyDest,
+                    .keepInitialState = true
+                };
+                nvrhi::BufferHandle rbBuf = m_device->createBuffer(rbDesc);
+                commandList->copyBuffer(rbBuf.Get(), 0, accels.clusterVertexPositionsBuffer.Get(), 0, readCount * 12);
+                commandList->close();
+                m_device->executeCommandList(commandList);
+                m_device->waitForIdle();
+                float* mapped = (float*)m_device->mapBuffer(rbBuf.Get(), nvrhi::CpuAccessMode::Read);
+                if (mapped) {
+                    for (size_t i = 0; i < readCount; ++i) {
+                        Logger::info(str::format("RTX MegaGeo MESHLET DIAG:   vtxPos[", i, "] = (",
+                            mapped[i*3+0], ", ", mapped[i*3+1], ", ", mapped[i*3+2], ")"));
+                    }
+                }
+                m_device->unmapBuffer(rbBuf.Get());
+                commandList->open();
+            }
+
+            // Also readback ClusterShadingData to verify hit shader lookup data
+            {
+                std::vector<ClusterShadingData> shadingData = accels.clusterShadingDataBuffer.Download(commandList);
+                Logger::warn(str::format("RTX MegaGeo MESHLET DIAG: ClusterShadingData readback: total=", shadingData.size()));
+                for (size_t i = 0; i < std::min(shadingData.size(), (size_t)5); ++i) {
+                    const auto& sd = shadingData[i];
+                    Logger::warn(str::format("RTX MegaGeo MESHLET DIAG:   shadingData[", i, "] surfaceId=", sd.m_surfaceId,
+                        " vertexOffset=", sd.m_vertexOffset,
+                        " clusterSizeX=", sd.m_clusterSizeX, " clusterSizeY=", sd.m_clusterSizeY,
+                        " edgeSegments=(", sd.m_edgeSegments.x, ",", sd.m_edgeSegments.y, ",", sd.m_edgeSegments.z, ",", sd.m_edgeSegments.w, ")",
+                        " clusterOffset=(", sd.m_clusterOffset.x, ",", sd.m_clusterOffset.y, ")"));
+                    // For meshlet path, vertexOffset should point to expanded vertices (primId*3 + vertexOffset)
+                    // Verify: expanded vertices at vertexOffset should match what we expect
+                    if (sd.m_clusterSizeX == 0) {
+                        Logger::warn(str::format("RTX MegaGeo MESHLET DIAG:     -> meshlet path (sizeX==0), hit shader will read vtxPos[vertexOffset + primId*3 + {0,1,2}]"));
+                        Logger::warn(str::format("RTX MegaGeo MESHLET DIAG:     -> for primId=0: vtxPos[", sd.m_vertexOffset, "], vtxPos[", sd.m_vertexOffset+1, "], vtxPos[", sd.m_vertexOffset+2, "]"));
+                    } else {
+                        Logger::warn(str::format("RTX MegaGeo MESHLET DIAG:     -> subdivision path (sizeX=", sd.m_clusterSizeX, ")"));
+                    }
+                }
+            }
         }
-        stats.desired = stats.allocated;
-        m_buildAccelFrameIndex++;
-        return;
     }
 
     // =====================================================================
-    // Barriers: CPU uploads → CLAS instantiation
-    // Use ShaderResource as destination state since that's what executeMultiIndirectClusterOperation
-    // expects for inIndirectArgsBuffer (matching sample's NVRHI adapter)
+    // Barriers: GPU compute output → CLAS instantiation
     // =====================================================================
     commandList->bufferBarrier(accels.clusterVertexPositionsBuffer,
-        nvrhi::ResourceStates::CopyDest, nvrhi::ResourceStates::AccelStructBuildInput);
+        nvrhi::ResourceStates::UnorderedAccess, nvrhi::ResourceStates::AccelStructBuildInput);
     commandList->bufferBarrier(m_clasIndirectArgDataBuffer,
-        nvrhi::ResourceStates::CopyDest, nvrhi::ResourceStates::ShaderResource);
+        nvrhi::ResourceStates::UnorderedAccess, nvrhi::ResourceStates::ShaderResource);
     commandList->bufferBarrier(accels.clasPtrsBuffer,
-        nvrhi::ResourceStates::CopyDest, nvrhi::ResourceStates::UnorderedAccess);
+        nvrhi::ResourceStates::UnorderedAccess, nvrhi::ResourceStates::UnorderedAccess);
 
     // =====================================================================
     // CLAS Instantiation
-    // Use srcInfosCount=0 (no indirect count buffer) — driver uses maxArgCount directly.
-    // This avoids tessellation counter buffer barrier issues.
     // =====================================================================
     {
         nvrhi::utils::ScopedMarker marker(commandList, "BuildStructuredCLASes_Meshlet");
 
-        // Must match the maxGeometryIndex used during template build (MeshletTemplateBuilder).
-        // The Vulkan spec requires the resulting geometryIndex (baseGeometryIndex + geometryIndexOffset)
-        // not exceed maxGeometryIndex from BOTH the template build AND the instantiation call.
         constexpr uint32_t kMaxMeshletGeometryIndex = 16383;
 
         cluster::OperationParams instantiateClasParams = {
@@ -646,36 +654,13 @@ void ClusterAccelBuilder::BuildAccelMeshlet(
                 .maxTriangleCount = maxTriPerMeshlet,
                 .maxVertexCount = maxVtxPerMeshlet,
                 .maxTotalTriangleCount = totalClusters * maxTriPerMeshlet,
-                .maxTotalVertexCount = totalUniqueVtx,  // unique vertices (matches template)
+                .maxTotalVertexCount = totalUniqueVtx,
                 .minPositionTruncateBitCount = 0,
             }
         };
 
         cluster::OperationSizeInfo sizeInfo = m_device->getClusterOperationSizeInfo(instantiateClasParams);
 
-        Logger::warn(str::format("RTX MegaGeo MESHLET CLAS-INST: maxArg=", totalClusters,
-            " maxTri=", maxTriPerMeshlet, " maxVtx=", maxVtxPerMeshlet,
-            " totalTri=", totalClusters * maxTriPerMeshlet, " totalVtx=", totalUniqueVtx,
-            " maxGeomIdx=", kMaxMeshletGeometryIndex,
-            " scratchSize=", sizeInfo.scratchSizeInBytes,
-            " clasArgs={addr=0x", std::hex, m_clasIndirectArgDataBuffer.GetGpuVirtualAddress(),
-            " stride=", std::dec, m_clasIndirectArgDataBuffer.GetElementBytes(),
-            " size=", m_clasIndirectArgDataBuffer.GetBytes(), "}",
-            " clasDests={addr=0x", std::hex, accels.clasPtrsBuffer.GetGpuVirtualAddress(),
-            " stride=", std::dec, accels.clasPtrsBuffer.GetElementBytes(),
-            " size=", accels.clasPtrsBuffer.GetBytes(), "}"));
-
-        // Log first CLAS arg for verification
-        if (!clasArgs.empty()) {
-            Logger::warn(str::format("RTX MegaGeo MESHLET CLAS-ARG[0]: template=0x", std::hex, clasArgs[0].clusterTemplate,
-                " vtxAddr=0x", clasArgs[0].vertexBuffer.startAddress,
-                " vtxStride=", std::dec, clasArgs[0].vertexBuffer.strideInBytes,
-                " clusterIdOff=", clasArgs[0].clusterIdOffset,
-                " geomIdxPacked=", clasArgs[0].geometryIndexOffsetPacked));
-        }
-
-        // No indirect count buffer: driver uses maxArgCount (= totalClusters) directly.
-        // This avoids barrier issues with tessellation counter buffer + writeBuffer/updateBuffer.
         cluster::OperationDesc instantiateClasDesc = {
             .params = instantiateClasParams,
             .scratchSizeInBytes = sizeInfo.scratchSizeInBytes,
@@ -691,39 +676,36 @@ void ClusterAccelBuilder::BuildAccelMeshlet(
             .outAccelerationStructuresOffsetInBytes = 0
         };
 
+        Logger::info(str::format("RTX MegaGeo MESHLET: CLAS Instantiate: totalClusters=", totalClusters,
+            " maxTriPerMeshlet=", maxTriPerMeshlet, " maxVtxPerMeshlet=", maxVtxPerMeshlet,
+            " maxTotalTriangleCount=", totalClusters * maxTriPerMeshlet,
+            " maxTotalVertexCount=", totalUniqueVtx));
+        Logger::info(str::format("RTX MegaGeo MESHLET: CLAS Instantiate: argsBuffer=0x", std::hex,
+            m_clasIndirectArgDataBuffer.GetGpuVirtualAddress(),
+            " argsStride=", std::dec, m_clasIndirectArgDataBuffer.GetElementBytes(),
+            " argsByteSize=", m_clasIndirectArgDataBuffer.GetBytes()));
+        Logger::info(str::format("RTX MegaGeo MESHLET: CLAS Instantiate: clasPtrsBuffer=0x", std::hex,
+            accels.clasPtrsBuffer.GetGpuVirtualAddress(),
+            " ptrsByteSize=", std::dec, accels.clasPtrsBuffer.GetBytes(),
+            " ptrsStride=", accels.clasPtrsBuffer.GetElementBytes()));
+        Logger::info(str::format("RTX MegaGeo MESHLET: CLAS Instantiate: scratchSize=", sizeInfo.scratchSizeInBytes,
+            " mode=ExplicitDestinations outAccelBuf=nullptr outSizesBuf=nullptr"));
+
         commandList->executeMultiIndirectClusterOperation(instantiateClasDesc);
+        Logger::info("RTX MegaGeo MESHLET: CLAS Instantiate completed");
     }
 
-    if (kMeshletDebugStage < 4) {
-        Logger::warn("RTX MegaGeo MESHLET DEBUG: Stage 3 — CLAS done, skipping BLAS");
-        stats.allocated.m_numClusters = totalClusters;
-        stats.allocated.m_numTriangles = 0;
-        for (const auto& sc : allSelectedClusters) {
-            const MeshletInstance& mi = instances[sc.instanceIdx];
-            stats.allocated.m_numTriangles += mi.templates->meshletTriangleCounts[sc.meshletIdx];
-        }
-        stats.desired = stats.allocated;
-        m_buildAccelFrameIndex++;
-        return;
-    }
-
-    // CLAS → BLAS barriers:
-    // 1. clasPtrsBuffer: CLAS instantiation wrote CLAS addresses here, BLAS build reads them
-    // 2. clasBuffer: CLAS instantiation wrote CLAS data here (via explicit destination addresses),
-    //    BLAS build reads the CLAS data through those addresses. Without this barrier, the BLAS
-    //    build could read stale/partial CLAS data.
+    // CLAS → BLAS barriers
     commandList->bufferBarrier(accels.clasPtrsBuffer, nvrhi::ResourceStates::AccelStructWrite,
         nvrhi::ResourceStates::ShaderResource | nvrhi::ResourceStates::AccelStructBuildInput);
     commandList->bufferBarrier(accels.clasBuffer, nvrhi::ResourceStates::AccelStructWrite,
         nvrhi::ResourceStates::AccelStructBuildInput);
 
     // =====================================================================
-    // Fill BLAS from CLAS args (per-instance)
+    // Fill BLAS from CLAS args (per-instance) — stays on CPU (tiny data)
     // =====================================================================
     {
         nvrhi::GpuVirtualAddress clasPtrsBaseAddress = accels.clasPtrsBuffer.GetGpuVirtualAddress();
-
-        // Fill per-instance BLAS args on CPU
         uint32_t indirectArgAlignedStride = (sizeof(cluster::IndirectArgs) + 15) & ~15;
         std::vector<uint8_t> blasArgsData(indirectArgAlignedStride * numInstances, 0);
 
@@ -731,8 +713,19 @@ void ClusterAccelBuilder::BuildAccelMeshlet(
             auto* arg = reinterpret_cast<cluster::IndirectArgs*>(
                 blasArgsData.data() + indirectArgAlignedStride * inst);
             arg->clusterCount = perInstanceClusterCount[inst];
-            arg->clusterReferencesStride = 8; // sizeof(VkDeviceAddress)
+            arg->clusterReferencesStride = 8;
             arg->clusterAddresses = clasPtrsBaseAddress + (uint64_t)perInstanceClusterOffset[inst] * sizeof(nvrhi::GpuVirtualAddress);
+        }
+
+        // DIAG: Log BLAS from CLAS args
+        Logger::info(str::format("RTX MegaGeo MESHLET: BLAS args: clasPtrsBaseAddress=0x", std::hex, clasPtrsBaseAddress, std::dec,
+            " indirectArgAlignedStride=", indirectArgAlignedStride, " numInstances=", numInstances));
+        for (uint32_t inst = 0; inst < numInstances; ++inst) {
+            auto* arg = reinterpret_cast<cluster::IndirectArgs*>(
+                blasArgsData.data() + indirectArgAlignedStride * inst);
+            Logger::info(str::format("RTX MegaGeo MESHLET:   blasArg[", inst, "] clusterCount=", arg->clusterCount,
+                " referencesStride=", arg->clusterReferencesStride,
+                " clusterAddresses=0x", std::hex, arg->clusterAddresses, std::dec));
         }
 
         commandList->writeBuffer(m_blasFromClasIndirectArgsBuffer.Get(), blasArgsData.data(), blasArgsData.size());
@@ -749,16 +742,6 @@ void ClusterAccelBuilder::BuildAccelMeshlet(
         cluster::OperationParams buildParams = m_createBlasParams;
         buildParams.maxArgCount = numInstances;
 
-        Logger::warn(str::format("RTX MegaGeo MESHLET BLAS-BUILD: numInstances=", numInstances,
-            " maxClasPerBlas=", buildParams.blas.maxClasPerBlasCount,
-            " maxTotalClas=", buildParams.blas.maxTotalClasCount,
-            " scratchSize=", m_createBlasSizeInfo.scratchSizeInBytes,
-            " resultMaxSize=", m_createBlasSizeInfo.resultMaxSizeInBytes,
-            " blasBuf={addr=0x", std::hex, accels.blasBuffer.GetGpuVirtualAddress(),
-            " size=", std::dec, accels.blasBuffer.GetBytes(), "}",
-            " blasPtrs={addr=0x", std::hex, accels.blasPtrsBuffer.GetGpuVirtualAddress(),
-            " size=", std::dec, accels.blasPtrsBuffer.GetBytes(), "}"));
-
         cluster::OperationDesc createBlasDesc = {
             .params = buildParams,
             .scratchSizeInBytes = m_createBlasSizeInfo.scratchSizeInBytes,
@@ -774,80 +757,66 @@ void ClusterAccelBuilder::BuildAccelMeshlet(
             .outAccelerationStructuresOffsetInBytes = 0,
         };
 
+        Logger::info(str::format("RTX MegaGeo MESHLET: BLAS Build: maxArgCount=", buildParams.maxArgCount,
+            " maxClasPerBlasCount=", buildParams.blas.maxClasPerBlasCount,
+            " maxTotalClasCount=", buildParams.blas.maxTotalClasCount));
+        Logger::info(str::format("RTX MegaGeo MESHLET: BLAS Build: argsBuffer=0x", std::hex,
+            m_blasFromClasIndirectArgsBuffer.GetGpuVirtualAddress(), std::dec,
+            " argsStride=", m_blasFromClasIndirectArgsBuffer.GetElementBytes(),
+            " argsByteSize=", m_blasFromClasIndirectArgsBuffer.GetBytes()));
+        Logger::info(str::format("RTX MegaGeo MESHLET: BLAS Build: blasPtrsBuffer=0x", std::hex,
+            accels.blasPtrsBuffer.GetGpuVirtualAddress(), std::dec,
+            " ptrsStride=", accels.blasPtrsBuffer.GetElementBytes(),
+            " ptrsByteSize=", accels.blasPtrsBuffer.GetBytes()));
+        Logger::info(str::format("RTX MegaGeo MESHLET: BLAS Build: blasBuffer=0x", std::hex,
+            accels.blasBuffer.GetGpuVirtualAddress(), std::dec,
+            " blasByteSize=", accels.blasBuffer.GetBytes()));
+        Logger::info(str::format("RTX MegaGeo MESHLET: BLAS Build: blasSizesBuffer=0x", std::hex,
+            accels.blasSizesBuffer.GetGpuVirtualAddress(), std::dec,
+            " sizesStride=", accels.blasSizesBuffer.GetElementBytes(),
+            " sizesByteSize=", accels.blasSizesBuffer.GetBytes()));
+        Logger::info(str::format("RTX MegaGeo MESHLET: BLAS Build: scratchSize=", m_createBlasSizeInfo.scratchSizeInBytes,
+            " mode=ImplicitDestinations"));
+
         commandList->executeMultiIndirectClusterOperation(createBlasDesc);
+        Logger::info("RTX MegaGeo MESHLET: BLAS Build completed");
     }
 
-    // Diagnostic: readback BLAS pointers and vertex data when real geometry loads
+    // DIAG: Readback blasPtrsBuffer after BLAS build to check if addresses are populated
     {
-        static uint32_t s_diagCount = 0;
-        static uint32_t s_lastClusterCount = 0;
-        // Reset counter when cluster count changes significantly (>50% difference = level transition)
-        uint32_t diff = (totalClusters > s_lastClusterCount) ? (totalClusters - s_lastClusterCount) : (s_lastClusterCount - totalClusters);
-        bool significantChange = (s_lastClusterCount == 0) || (diff > s_lastClusterCount / 2);
-        if (significantChange && totalClusters != s_lastClusterCount) {
-            Logger::warn(str::format("RTX MegaGeo DIAG: cluster count changed ", s_lastClusterCount, " -> ", totalClusters));
-            s_diagCount = 0;
-            s_lastClusterCount = totalClusters;
-        }
-        // Only readback first 2 frames after each significant level transition, and only for real geometry (>5 clusters)
-        if (s_diagCount < 2 && totalClusters > 5) {
-            s_diagCount++;
-
-            Logger::warn(str::format("RTX MegaGeo DIAG (frame ", s_diagCount, "): totalClusters=", totalClusters,
-                " numInstances=", numInstances, " totalVertices=", totalVertices));
-
-            // Readback BLAS pointers
+        static uint32_t s_blasDiagCount = 0;
+        if (s_blasDiagCount < 3) {
+            s_blasDiagCount++;
             std::vector<nvrhi::GpuVirtualAddress> blasAddrs = accels.blasPtrsBuffer.Download(commandList);
-            Logger::warn(str::format("  BLAS-PTRS: ", blasAddrs.size(), " entries (buffer elements=", accels.blasPtrsBuffer.GetNumElements(), ")"));
-            for (uint32_t i = 0; i < std::min((uint32_t)blasAddrs.size(), 10u); ++i) {
-                Logger::warn(str::format("  blasPtr[", i, "] = 0x", std::hex, blasAddrs[i], std::dec));
+            uint32_t nullCount = 0, nonNullCount = 0;
+            for (size_t i = 0; i < blasAddrs.size(); ++i) {
+                if (blasAddrs[i] == 0) nullCount++;
+                else nonNullCount++;
             }
-            // Count zero BLAS pointers
-            uint32_t zeroCount = 0;
-            for (auto addr : blasAddrs) { if (addr == 0) zeroCount++; }
-            Logger::warn(str::format("  BLAS zero-ptr count: ", zeroCount, " / ", blasAddrs.size()));
-
-            // Readback BLAS sizes
-            std::vector<uint32_t> blasSizes = accels.blasSizesBuffer.Download(commandList);
-            Logger::warn(str::format("  BLAS-SIZES: ", blasSizes.size(), " entries"));
-            for (uint32_t i = 0; i < std::min((uint32_t)blasSizes.size(), 10u); ++i) {
-                Logger::warn(str::format("  blasSize[", i, "] = ", blasSizes[i]));
+            Logger::info(str::format("RTX MegaGeo MESHLET DIAG: blasPtrsBuffer after BLAS build: total=", blasAddrs.size(),
+                " null=", nullCount, " nonNull=", nonNullCount));
+            for (size_t i = 0; i < std::min(blasAddrs.size(), (size_t)5); ++i) {
+                Logger::info(str::format("RTX MegaGeo MESHLET DIAG:   blasPtrs[", i, "] = 0x", std::hex, blasAddrs[i]));
             }
 
-            // Readback CLAS pointers (destination addresses)
+            // Also readback clasPtrsBuffer to check CLAS addresses
             std::vector<nvrhi::GpuVirtualAddress> clasAddrs = accels.clasPtrsBuffer.Download(commandList);
-            Logger::warn(str::format("  CLAS-PTRS: ", clasAddrs.size(), " entries"));
-            for (uint32_t i = 0; i < std::min((uint32_t)clasAddrs.size(), 10u); ++i) {
-                Logger::warn(str::format("  clasPtr[", i, "] = 0x", std::hex, clasAddrs[i], std::dec));
+            uint32_t clasNull = 0, clasNonNull = 0;
+            for (size_t i = 0; i < clasAddrs.size(); ++i) {
+                if (clasAddrs[i] == 0) clasNull++;
+                else clasNonNull++;
             }
-
-            // Readback first few vertex positions
-            Logger::warn(str::format("  CPU-VERTICES (first 10 of ", totalVertices, "):"));
-            for (uint32_t i = 0; i < std::min(totalVertices, 10u); ++i) {
-                Logger::warn(str::format("  vtx[", i, "] = (", vertexData[i*3+0], ", ", vertexData[i*3+1], ", ", vertexData[i*3+2], ")"));
-            }
-
-            // Log CLAS args details for first few clusters
-            Logger::warn("  CLAS instantiate args (first 5):");
-            for (uint32_t i = 0; i < std::min(totalClusters, 5u); ++i) {
-                const auto& sel = allSelectedClusters[i];
-                const MeshletInstance& mi = instances[sel.instanceIdx];
-                Logger::warn(str::format("  cluster[", i, "] instIdx=", sel.instanceIdx,
-                    " meshletIdx=", sel.meshletIdx,
-                    " triCount=", mi.templates->meshletTriangleCounts[sel.meshletIdx],
-                    " vtxCount=", mi.templates->meshletVertexCounts[sel.meshletIdx],
-                    " templateAddr=0x", std::hex, mi.templates->templateAddresses[sel.meshletIdx], std::dec));
+            Logger::info(str::format("RTX MegaGeo MESHLET DIAG: clasPtrsBuffer after CLAS instantiate: total=", clasAddrs.size(),
+                " null=", clasNull, " nonNull=", clasNonNull));
+            for (size_t i = 0; i < std::min(clasAddrs.size(), (size_t)5); ++i) {
+                Logger::info(str::format("RTX MegaGeo MESHLET DIAG:   clasPtrs[", i, "] = 0x", std::hex, clasAddrs[i]));
             }
         }
     }
 
     // Update stats
     stats.allocated.m_numClusters = totalClusters;
-    stats.allocated.m_numTriangles = 0;
-    for (const auto& sc : allSelectedClusters) {
-        const MeshletInstance& mi = instances[sc.instanceIdx];
-        stats.allocated.m_numTriangles += mi.templates->meshletTriangleCounts[sc.meshletIdx];
-    }
+    stats.allocated.m_numTriangles = totalTriangles;
     stats.desired = stats.allocated;
 
     m_buildAccelFrameIndex++;

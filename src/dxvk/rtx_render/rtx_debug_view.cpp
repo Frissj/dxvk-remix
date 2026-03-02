@@ -341,6 +341,12 @@ namespace dxvk {
         {DEBUG_VIEW_MEGAGEO_COLOR_BY_CLUSTER_UV,      "MegaGeo: Color by Cluster UV"},
         {DEBUG_VIEW_MEGAGEO_COLOR_BY_MICROTRI_AREA,   "MegaGeo: Color by MicroTri Area"},
         {DEBUG_VIEW_MEGAGEO_COLOR_BY_TOPOLOGY,        "MegaGeo: Color by Topology Quality"},
+        {DEBUG_VIEW_MEGAGEO_IS_CLUSTER_SURFACE,       "MegaGeo: Is Cluster Surface (R=cluster, G=clusterId, B=surfIdx)"},
+        {DEBUG_VIEW_MEGAGEO_RAY_VS_VERTEX_POS,        "MegaGeo: Ray vs Vertex Pos Mismatch (bright=CLAS wrong)"},
+        {DEBUG_VIEW_MEGAGEO_RAY_HIT_POSITION,         "MegaGeo: Ray Hit Position (actual CLAS intersection)"},
+        {DEBUG_VIEW_MEGAGEO_VERTEX_HIT_POSITION,      "MegaGeo: Vertex Hit Position (from vertex buffer)"},
+        {DEBUG_VIEW_MEGAGEO_LOCAL_VERTEX_POS,          "MegaGeo: Local Vertex Position (no objectToWorld)"},
+        {DEBUG_VIEW_MEGAGEO_RAY_VS_LOCAL_VERTEX,       "MegaGeo: Ray vs Local Vertex (isolate transform issue)"},
     } };
 
   // Note: this does a linear search through the debug view vector so do not use it in performance critical code

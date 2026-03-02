@@ -298,6 +298,42 @@ SurfaceInteraction surfaceInteractionCreateCluster<let GenerateTangents : bool>(
   surfaceInteraction.position = hitPosition;
   surfaceInteraction.positionError = max(surfaceInteraction.positionError, calculatePositionError(hitPosition));
 
+  // RTX Mega Geometry: Debug views for diagnosing CLAS geometry mismatch
+#if defined(RAY_TRACING_PRIMARY_RAY)
+  {
+    const vec3 rayHitPos = ray.origin + ray.direction * rayInteraction.hitDistance;
+    const vec3 posDiff = abs(hitPosition - rayHitPos);
+    const vec3 localHitPos = interpolateHitAttribute(localPositions, bary);
+    const vec3 localDiff = abs(localHitPos - rayHitPos);
+
+    if (cb.debugView == DEBUG_VIEW_MEGAGEO_RAY_VS_VERTEX_POS)
+    {
+      // Show mismatch scaled by 1000x — should be near-black if CLAS matches vertex data
+      storeInDebugView(getDispatchRaysIndex().xy, vec4(posDiff * 1000.0, 1.0));
+    }
+    else if (cb.debugView == DEBUG_VIEW_MEGAGEO_RAY_HIT_POSITION)
+    {
+      // Actual ray intersection point (from CLAS geometry)
+      storeInDebugView(getDispatchRaysIndex().xy, vec4(rayHitPos * 0.5 + 0.5, 1.0));
+    }
+    else if (cb.debugView == DEBUG_VIEW_MEGAGEO_VERTEX_HIT_POSITION)
+    {
+      // Hit position from vertex buffer + barycentrics (should match ray hit if CLAS correct)
+      storeInDebugView(getDispatchRaysIndex().xy, vec4(hitPosition * 0.5 + 0.5, 1.0));
+    }
+    else if (cb.debugView == DEBUG_VIEW_MEGAGEO_LOCAL_VERTEX_POS)
+    {
+      // Raw local vertex position — no objectToWorld transform
+      storeInDebugView(getDispatchRaysIndex().xy, vec4(localHitPos * 0.5 + 0.5, 1.0));
+    }
+    else if (cb.debugView == DEBUG_VIEW_MEGAGEO_RAY_VS_LOCAL_VERTEX)
+    {
+      // Compare ray hit vs local vertex (skip objectToWorld to isolate transform issue)
+      storeInDebugView(getDispatchRaysIndex().xy, vec4(localDiff * 1000.0, 1.0));
+    }
+  }
+#endif
+
   // Compute triangle normal
   const vec3 ab = positions[1] - positions[0];
   const vec3 ac = positions[2] - positions[0];

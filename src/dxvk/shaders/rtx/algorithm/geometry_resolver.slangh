@@ -1189,6 +1189,16 @@ void geometryResolverVertexOutputDebugView(
       storeInDebugView(pixelCoordinate, vec4(1.f));
     }
     break;
+  case DEBUG_VIEW_MEGAGEO_IS_CLUSTER_SURFACE:
+    // RTX Mega Geometry diagnostic: shows whether cluster path is active
+    // R = isClusterSurface (1.0=cluster, 0.0=traditional)
+    // G = clusterId / 256.0 (fractional for visualization)
+    // B = surfaceIndex / 256.0
+    storeInDebugView(pixelCoordinate, vec3(
+      surface.isClusterSurface ? 1.0 : 0.0,
+      float(rayInteraction.clusterId) / 256.0,
+      float(rayInteraction.surfaceIndex) / 256.0));
+    break;
   }
 }
 

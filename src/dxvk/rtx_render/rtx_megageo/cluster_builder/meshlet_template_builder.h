@@ -42,6 +42,14 @@ struct MeshletTemplateSet {
     std::vector<uint32_t> meshletTriangleCounts;  // triangle count per meshlet
     std::vector<uint32_t> meshletVertexCounts;    // vertex count per meshlet
 
+    // Persistent GPU buffers for GPU-driven per-frame fill (built once, read every frame)
+    nvrhi::BufferHandle expandedVerticesBuffer;   // Per-tri expanded float3 for ALL meshlets
+    nvrhi::BufferHandle expandedNormalsBuffer;    // Per-tri face normals for ALL meshlets
+
+    // Per-meshlet offsets into the expanded buffers (CPU-side)
+    std::vector<uint32_t> meshletExpandedVtxOffsets;  // vertex offset into expanded buffers per meshlet
+    uint32_t totalExpandedVertices = 0;               // total per-tri expanded vertices across all meshlets
+
     bool isBuilt = false;
 };
 

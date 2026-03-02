@@ -634,9 +634,28 @@ namespace dxvk {
         // CRITICAL: Must reassign every frame because m_reorderedSurfaces is cleared each frame.
         // Using a stale surfaceIndex from a previous frame would point to the wrong Surface entry,
         // causing the shader to read isClusterSurface=false and take the wrong geometry path.
-        instance->setSurfaceIndex(m_reorderedSurfaces.size());
+        uint32_t assignedSurfIdx = m_reorderedSurfaces.size();
+        instance->setSurfaceIndex(assignedSurfIdx);
         m_reorderedSurfaces.push_back(instance);
         m_reorderedSurfacesFirstIndexOffset.push_back(0);
+
+        {
+          static uint32_t s_clusterSubmitFrame = UINT32_MAX;
+          static uint32_t s_clusterSubmitCount = 0;
+          uint32_t curFrame = m_device->getCurrentFrameId();
+          if (curFrame != s_clusterSubmitFrame) { s_clusterSubmitFrame = curFrame; s_clusterSubmitCount = 0; }
+          if (s_clusterSubmitCount < 5) {
+            Logger::warn(str::format("RTX MegaGeo CLUSTER-SUBMIT[", s_clusterSubmitCount, "]: surfIdx=", assignedSurfIdx,
+              " isCluster=", instance->surface.isClusterSurface,
+              " megaGeoSurfId=", blasEntry->megaGeoSurfaceId,
+              " rtxmgInstIdx=", megaGeo->getInstanceIndexForSurface(blasEntry->megaGeoSurfaceId),
+              " instToObj=", (instance->surface.instancesToObject ? "yes" : "null"),
+              " isStatic=", instance->surface.isStatic,
+              " isEmissive=", instance->surface.isEmissive,
+              " isOpaque=", instance->surface.alphaState.isFullyOpaque));
+            s_clusterSubmitCount++;
+          }
+        }
 
         // Add directly to TLAS - the BLAS address will be patched on GPU later
         if (instance->surface.instancesToObject == nullptr) {
@@ -1117,6 +1136,18 @@ namespace dxvk {
         bool doPartialLog = (s_clusterAddBlasCount < 5);  // Then just first 5
 
         if (doFullLog || doPartialLog) {
+          uint32_t customIdx = blasInstance.instanceCustomIndex;
+          uint32_t surfIdx = customIdx & CUSTOM_INDEX_SURFACE_MASK;
+          bool hasClusterFlag = (customIdx & CUSTOM_INDEX_IS_CLUSTER_SURFACE) != 0;
+          uint32_t matType = (customIdx >> CUSTOM_INDEX_MATERIAL_TYPE_BIT) & 0x7;
+          uint32_t sbtOffset = blasInstance.instanceShaderBindingTableRecordOffset;
+          uint32_t mask = blasInstance.mask;
+          uint32_t flags = blasInstance.flags;
+          Logger::warn(str::format("RTX MegaGeo TLAS-INST[", s_clusterAddBlasCount, "]: customIdx=0x", std::hex, customIdx, std::dec,
+            " surfIdx=", surfIdx, " clusterFlag=", hasClusterFlag, " matType=", matType,
+            " sbtOffset=", sbtOffset, " mask=0x", std::hex, mask, std::dec, " flags=", flags,
+            " blasRef=", blasInstance.accelerationStructureReference,
+            " transform=", isIdentity ? "identity" : "non-identity"));
           if (!isIdentity) {
             Logger::warn(str::format("  row0=(", t[0][0], ", ", t[0][1], ", ", t[0][2], ", ", t[0][3], ")"));
             Logger::warn(str::format("  row1=(", t[1][0], ", ", t[1][1], ", ", t[1][2], ", ", t[1][3], ")"));
@@ -1450,7 +1481,7 @@ namespace dxvk {
             s_patchLastMappingCount = static_cast<uint32_t>(mappings.size());
           }
         }
-        if (s_patchDiagCount < 2 && mappings.size() > 5) {
+        if (s_patchDiagCount < 2 && mappings.size() > 0) {
           s_patchDiagCount++;
 
           // Barrier to make compute shader writes visible for transfer read
@@ -1671,12 +1702,34 @@ namespace dxvk {
 
     uint32_t clusterSurfaceCount = 0;
     uint32_t standardSurfaceCount = 0;
+    static uint32_t s_surfWriteFrame = 0;
+    uint32_t curSurfWriteFrame = m_device->getCurrentFrameId();
+    bool logSurfWrite = (curSurfWriteFrame != s_surfWriteFrame);
+    if (logSurfWrite) s_surfWriteFrame = curSurfWriteFrame;
+
     for (uint32_t i = 0; i < m_reorderedSurfaces.size(); ++i) {
       const auto& currentInstance = *m_reorderedSurfaces[i];
       RtSurface& currentSurface = m_reorderedSurfaces[i]->surface;
 
       if (currentSurface.isClusterSurface) {
         clusterSurfaceCount++;
+        if (logSurfWrite && clusterSurfaceCount <= 5) {
+          auto& o2w = currentSurface.objectToWorld;
+          bool isIdentity = (o2w[0][0] == 1.f && o2w[0][1] == 0.f && o2w[0][2] == 0.f && o2w[0][3] == 0.f &&
+                             o2w[1][0] == 0.f && o2w[1][1] == 1.f && o2w[1][2] == 0.f && o2w[1][3] == 0.f &&
+                             o2w[2][0] == 0.f && o2w[2][1] == 0.f && o2w[2][2] == 1.f && o2w[2][3] == 0.f);
+          Logger::warn(str::format("RTX MegaGeo SURF-WRITE[", i, "]: isCluster=1 posBufIdx=", currentSurface.positionBufferIndex,
+            " normBufIdx=", currentSurface.normalBufferIndex, " texBufIdx=", currentSurface.texcoordBufferIndex,
+            " idxBufIdx=", currentSurface.indexBufferIndex, " idxStride=", currentSurface.indexStride,
+            " posOff=", currentSurface.positionOffset, " posStride=", currentSurface.positionStride,
+            " firstIdx=", currentSurface.firstIndex, " isEmissive=", currentSurface.isEmissive,
+            " isStatic=", currentSurface.isStatic, " objToWorld=", isIdentity ? "identity" : "non-identity",
+            " surfaceIndexOfFirstInstance=", currentSurface.surfaceIndexOfFirstInstance,
+            " instancesToObject=", (currentSurface.instancesToObject ? "yes" : "null"),
+            " alphaTestType=", (int)currentSurface.alphaState.alphaTestType,
+            " blendType=", (int)currentSurface.alphaState.blendType,
+            " isFullyOpaque=", currentSurface.alphaState.isFullyOpaque));
+        }
       } else {
         standardSurfaceCount++;
       }
@@ -1697,6 +1750,12 @@ namespace dxvk {
 
     assert(dataOffset == surfacesGPUSize);
     assert(surfacesGPUData.size() == surfacesGPUSize);
+
+    if (logSurfWrite) {
+      Logger::warn(str::format("RTX MegaGeo SURF-SUMMARY: total=", m_reorderedSurfaces.size(),
+        " cluster=", clusterSurfaceCount, " standard=", standardSurfaceCount,
+        " gpuDataSize=", surfacesGPUData.size(), " dataOffset=", dataOffset));
+    }
 
     ctx->writeToBuffer(m_surfaceBuffer, 0, surfacesGPUData.size(), surfacesGPUData.data());
 

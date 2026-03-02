@@ -24,6 +24,7 @@
 #include "../../../dxvk_include.h"
 
 #include "../rtxmg_log.h"
+#undef RTXMG_LOG
 #if RTXMG_LOG_BUFFER
 #define RTXMG_LOG(msg) dxvk::Logger::info(msg)
 #else

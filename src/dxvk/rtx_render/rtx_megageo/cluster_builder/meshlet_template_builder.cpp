@@ -319,10 +319,165 @@ std::unique_ptr<MeshletTemplateSet> MeshletTemplateBuilder::build(
 
     result->instantiationSizes = result->instantiationSizesBuffer.Download(commandList);
 
+    // =====================================================================
+    // Step 8: Pre-compute persistent per-tri expanded vertices and normals
+    // These are uploaded once and read by GPU compute shader every frame.
+    // =====================================================================
+    {
+        static constexpr uint32_t kGpuFloat3Stride = 12;
+
+        // Compute per-meshlet expanded vertex offsets and total count
+        result->meshletExpandedVtxOffsets.resize(numMeshlets);
+        result->totalExpandedVertices = 0;
+        for (uint32_t m = 0; m < numMeshlets; ++m) {
+            result->meshletExpandedVtxOffsets[m] = result->totalExpandedVertices;
+            result->totalExpandedVertices += lodData.clusters[m].triangleCount * 3;
+        }
+
+        // Build per-tri expanded vertex positions
+        std::vector<float> expandedVertices(result->totalExpandedVertices * 3);
+        for (uint32_t m = 0; m < numMeshlets; ++m) {
+            const MeshletCluster& mc = lodData.clusters[m];
+            float* dst = expandedVertices.data() + result->meshletExpandedVtxOffsets[m] * 3;
+            for (uint32_t t = 0; t < mc.triangleCount; ++t) {
+                for (uint32_t vi = 0; vi < 3; ++vi) {
+                    uint32_t localIdx = mc.localTriangles[t * 3 + vi];
+                    uint32_t globalVtx = mc.localVertices[localIdx];
+                    uint32_t dstIdx = (t * 3 + vi) * 3;
+                    dst[dstIdx + 0] = lodData.vertexPositions[globalVtx * 3 + 0];
+                    dst[dstIdx + 1] = lodData.vertexPositions[globalVtx * 3 + 1];
+                    dst[dstIdx + 2] = lodData.vertexPositions[globalVtx * 3 + 2];
+                }
+            }
+        }
+
+        // Build per-tri face normals (same layout as expanded vertices)
+        std::vector<float> expandedNormals(result->totalExpandedVertices * 3, 0.0f);
+        for (uint32_t m = 0; m < numMeshlets; ++m) {
+            const MeshletCluster& mc = lodData.clusters[m];
+            float* nDst = expandedNormals.data() + result->meshletExpandedVtxOffsets[m] * 3;
+            for (uint32_t t = 0; t < mc.triangleCount; ++t) {
+                uint32_t i0 = mc.localTriangles[t * 3 + 0];
+                uint32_t i1 = mc.localTriangles[t * 3 + 1];
+                uint32_t i2 = mc.localTriangles[t * 3 + 2];
+                uint32_t g0 = mc.localVertices[i0];
+                uint32_t g1 = mc.localVertices[i1];
+                uint32_t g2 = mc.localVertices[i2];
+
+                float ax = lodData.vertexPositions[g1 * 3 + 0] - lodData.vertexPositions[g0 * 3 + 0];
+                float ay = lodData.vertexPositions[g1 * 3 + 1] - lodData.vertexPositions[g0 * 3 + 1];
+                float az = lodData.vertexPositions[g1 * 3 + 2] - lodData.vertexPositions[g0 * 3 + 2];
+                float bx = lodData.vertexPositions[g2 * 3 + 0] - lodData.vertexPositions[g0 * 3 + 0];
+                float by = lodData.vertexPositions[g2 * 3 + 1] - lodData.vertexPositions[g0 * 3 + 1];
+                float bz = lodData.vertexPositions[g2 * 3 + 2] - lodData.vertexPositions[g0 * 3 + 2];
+
+                float nx = ay * bz - az * by;
+                float ny = az * bx - ax * bz;
+                float nz = ax * by - ay * bx;
+                float len = std::sqrt(nx * nx + ny * ny + nz * nz);
+                if (len > 1e-8f) { nx /= len; ny /= len; nz /= len; }
+
+                // Write face normal to all 3 expanded vertex slots for this triangle
+                for (uint32_t vi = 0; vi < 3; ++vi) {
+                    uint32_t dstIdx = (t * 3 + vi) * 3;
+                    nDst[dstIdx + 0] = nx;
+                    nDst[dstIdx + 1] = ny;
+                    nDst[dstIdx + 2] = nz;
+                }
+            }
+        }
+
+        // Upload to persistent GPU buffers
+        size_t expandedByteSize = result->totalExpandedVertices * kGpuFloat3Stride;
+        size_t alignedExpandedByteSize = alignBufferSize4(expandedByteSize);
+
+        nvrhi::BufferDesc expandedVtxDesc = {
+            .byteSize = alignedExpandedByteSize,
+            .debugName = "MeshletPersistentExpandedVertices",
+            .structStride = kGpuFloat3Stride,
+            .canHaveRawViews = true,
+            .initialState = nvrhi::ResourceStates::ShaderResource,
+            .keepInitialState = true,
+        };
+        result->expandedVerticesBuffer = device->createBuffer(expandedVtxDesc);
+        if (!expandedVertices.empty()) {
+            commandList->writeBuffer(result->expandedVerticesBuffer, expandedVertices.data(), expandedByteSize);
+        }
+
+        nvrhi::BufferDesc expandedNormDesc = {
+            .byteSize = alignedExpandedByteSize,
+            .debugName = "MeshletPersistentExpandedNormals",
+            .structStride = kGpuFloat3Stride,
+            .canHaveRawViews = true,
+            .initialState = nvrhi::ResourceStates::ShaderResource,
+            .keepInitialState = true,
+        };
+        result->expandedNormalsBuffer = device->createBuffer(expandedNormDesc);
+        if (!expandedNormals.empty()) {
+            commandList->writeBuffer(result->expandedNormalsBuffer, expandedNormals.data(), expandedByteSize);
+        }
+
+        // Barrier: transfer → shader resource (GPU compute shader reads these)
+        commandList->bufferBarrier(result->expandedVerticesBuffer.Get(),
+            nvrhi::ResourceStates::CopyDest, nvrhi::ResourceStates::ShaderResource);
+        commandList->bufferBarrier(result->expandedNormalsBuffer.Get(),
+            nvrhi::ResourceStates::CopyDest, nvrhi::ResourceStates::ShaderResource);
+
+        Logger::info(str::format("MeshletTemplateBuilder: Pre-computed ",
+            result->totalExpandedVertices, " expanded vertices+normals (",
+            expandedByteSize * 2, " bytes total)"));
+    }
+
     result->isBuilt = true;
+
+    // DIAG: Log all GPU addresses at template build time for cross-frame stability checking
+    Logger::warn(str::format("MeshletTemplateBuilder ADDR-AT-BUILD: vertexBuffer=0x", std::hex,
+        result->vertexBuffer->getGpuVirtualAddress(),
+        " indexBuffer=0x", result->indexBuffer->getGpuVirtualAddress(),
+        " templateDataBuffer=0x", result->templateDataBuffer->getGpuVirtualAddress(), std::dec));
+    for (uint32_t i = 0; i < std::min(numMeshlets, 5u); ++i) {
+        Logger::warn(str::format("MeshletTemplateBuilder ADDR-AT-BUILD: templateAddr[", i, "]=0x", std::hex,
+            result->templateAddresses[i], std::dec,
+            " vtxOffset=", result->meshletVertexOffsets[i],
+            " vtxAddr=0x", std::hex,
+            result->vertexBuffer->getGpuVirtualAddress() + (uint64_t)result->meshletVertexOffsets[i] * 12,
+            std::dec));
+    }
 
     Logger::info(str::format("MeshletTemplateBuilder: Successfully built ", numMeshlets,
         " templates, totalData=", totalTemplateSize, " bytes"));
+
+    // DIAG: Readback template vertex buffer from GPU to verify data integrity
+    {
+        nvrhi::BufferDesc readbackDesc = {
+            .byteSize = vertexDataSize,
+            .debugName = "TemplateVtxReadback",
+            .cpuAccess = nvrhi::CpuAccessMode::Read,
+            .initialState = nvrhi::ResourceStates::CopyDest,
+            .keepInitialState = true,
+        };
+        nvrhi::BufferHandle readbackBuf = device->createBuffer(readbackDesc);
+        commandList->copyBuffer(readbackBuf.Get(), 0, result->vertexBuffer.Get(), 0, vertexDataSize);
+        commandList->close();
+        device->executeCommandList(commandList);
+        device->waitForIdle();
+        void* mapped = device->mapBuffer(readbackBuf.Get(), nvrhi::CpuAccessMode::Read);
+        if (mapped) {
+            const float* gpuVtx = static_cast<const float*>(mapped);
+            Logger::warn(str::format("MeshletTemplateBuilder GPU-VTX-READBACK (first 5 verts of ", totalVertices, "):"));
+            for (uint32_t i = 0; i < std::min(totalVertices, 5u); ++i) {
+                Logger::warn(str::format("  gpuVtx[", i, "] = (", gpuVtx[i*3+0], ", ", gpuVtx[i*3+1], ", ", gpuVtx[i*3+2], ")"));
+                // Compare with CPU data
+                if (gpuVtx[i*3+0] != allVertices[i*3+0] || gpuVtx[i*3+1] != allVertices[i*3+1] || gpuVtx[i*3+2] != allVertices[i*3+2]) {
+                    Logger::err(str::format("  *** TEMPLATE VTX MISMATCH at [", i, "]! CPU=(", allVertices[i*3+0], ", ", allVertices[i*3+1], ", ", allVertices[i*3+2], ")"));
+                }
+            }
+            device->unmapBuffer(readbackBuf.Get());
+        } else {
+            Logger::err("MeshletTemplateBuilder: GPU readback mapping failed!");
+        }
+        commandList->open();
+    }
 
     // Log first few instantiation sizes
     for (uint32_t i = 0; i < std::min(numMeshlets, 5u); ++i) {

@@ -5,16 +5,16 @@
 // All flags default to 0 (disabled) for performance.
 
 // cluster_builder
-#define RTXMG_LOG_CLUSTER_ACCEL_BUILDER    0  // cluster_accel_builder.cpp
+#define RTXMG_LOG_CLUSTER_ACCEL_BUILDER    1  // cluster_accel_builder.cpp
 
 // nvrhi_adapter
 #define RTXMG_LOG_DONUT_ADAPTER            0  // donut_adapter.cpp
-#define RTXMG_LOG_NVRHI_DXVK_COMMAND_LIST  0  // nvrhi_dxvk_command_list.cpp
+#define RTXMG_LOG_NVRHI_DXVK_COMMAND_LIST  1  // nvrhi_dxvk_command_list.cpp
 #define RTXMG_LOG_NVRHI_DXVK_DEVICE        0  // nvrhi_dxvk_device.cpp
 #define RTXMG_LOG_NVRHI_SCRATCH_MANAGER    0  // nvrhi_scratch_manager.cpp
 
 // Core
-#define RTXMG_LOG_RTX_MEGAGEO_BUILDER      0  // rtx_megageo_builder.cpp
+#define RTXMG_LOG_RTX_MEGAGEO_BUILDER      1  // rtx_megageo_builder.cpp
 
 // utils
-#define RTXMG_LOG_BUFFER                   0  // buffer.cpp
+#define RTXMG_LOG_BUFFER                   1  // buffer.cpp

@@ -985,11 +985,12 @@ namespace dxvk {
       if (m_downloadedBlasAddresses[i] != 0) nonZeroCount++;
     }
 
-    // Warn about any zero BLAS addresses (indicates a problem)
+    // Log ALL BLAS addresses for debugging
+    Logger::info(str::format("RTX MegaGeo: downloadBlasAddresses total=", blasAddresses.size(),
+        " nonZero=", nonZeroCount, " zero=", blasAddresses.size() - nonZeroCount));
     for (size_t i = 0; i < blasAddresses.size(); ++i) {
-      if (m_downloadedBlasAddresses[i] == 0) {
-        Logger::warn(str::format("RTX MegaGeo BLAS[", i, "] = 0 *** ZERO ***"));
-      }
+      Logger::info(str::format("RTX MegaGeo: BLAS[", i, "] = 0x", std::hex, m_downloadedBlasAddresses[i],
+          (m_downloadedBlasAddresses[i] == 0 ? " *** ZERO ***" : "")));
     }
 
     return nonZeroCount > 0;

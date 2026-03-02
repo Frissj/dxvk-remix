@@ -442,10 +442,11 @@ namespace dxvk {
 
     // NV-DXVK start: DLFG integration
     // enable DLFG extensions if available
+    // NOTE: nvPresentMetering disabled for NSight Graphics compatibility
     std::array devDlfgExtensions = {
       &devExtensions.khrMaintenance4,
       &devExtensions.extCalibratedTimestamps,
-      &devExtensions.nvPresentMetering,
+      //&devExtensions.nvPresentMetering,
     };
 
     m_deviceExtensions.enableExtensions(

@@ -2055,6 +2055,20 @@ namespace dxvk {
       positions[v * 3 + 2] = vertPtr[2];
     }
 
+    // DIAG: Log original game vertex positions for comparison with cluster pipeline output
+    {
+      Logger::warn(str::format("RTX MegaGeo ORIGINAL-GAME-VERTS: vertexCount=", vertexCount,
+          " indexCount=", originalGeom.indexCount,
+          " posStride=", positionStrideFloats, " floats"));
+      uint32_t logCount = std::min(vertexCount, 20u);
+      for (uint32_t v = 0; v < logCount; ++v) {
+        Logger::warn(str::format("  gameVtx[", v, "] = (", positions[v*3+0], ", ", positions[v*3+1], ", ", positions[v*3+2], ")"));
+      }
+      if (vertexCount > 20) {
+        Logger::warn(str::format("  ... (", vertexCount - 20, " more vertices)"));
+      }
+    }
+
     // Extract indices — convert to uint32 triangle list
     if (!bufferData.indexData) {
       Logger::err("RTX MegaGeo: No CPU-accessible index data for cluster mesh");
@@ -2112,6 +2126,20 @@ namespace dxvk {
     if (cleanIndices.size() < 3) {
       Logger::warn("RTX MegaGeo: No valid triangles for cluster mesh after filtering");
       return false;
+    }
+
+    // DIAG: Log first few triangles (index triplets + resolved positions)
+    {
+      uint32_t triLogCount = std::min((uint32_t)(cleanIndices.size() / 3), 10u);
+      Logger::warn(str::format("RTX MegaGeo ORIGINAL-GAME-TRIS: ", cleanIndices.size() / 3,
+          " clean triangles (from ", indices.size() / 3, " raw)"));
+      for (uint32_t t = 0; t < triLogCount; ++t) {
+        uint32_t i0 = cleanIndices[t*3+0], i1 = cleanIndices[t*3+1], i2 = cleanIndices[t*3+2];
+        Logger::warn(str::format("  tri[", t, "] idx=(", i0, ",", i1, ",", i2, ") v0=(",
+            positions[i0*3+0], ",", positions[i0*3+1], ",", positions[i0*3+2], ") v1=(",
+            positions[i1*3+0], ",", positions[i1*3+1], ",", positions[i1*3+2], ") v2=(",
+            positions[i2*3+0], ",", positions[i2*3+1], ",", positions[i2*3+2], ")"));
+      }
     }
 
     // Build TriangleMeshDesc

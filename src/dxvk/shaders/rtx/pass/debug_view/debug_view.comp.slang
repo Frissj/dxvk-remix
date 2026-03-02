@@ -627,6 +627,7 @@ vec4 loadInput(inout RNG randomState, ivec2 threadId)
   case DEBUG_VIEW_MEGAGEO_COLOR_BY_CLUSTER_UV:
   case DEBUG_VIEW_MEGAGEO_COLOR_BY_MICROTRI_AREA:
   case DEBUG_VIEW_MEGAGEO_COLOR_BY_TOPOLOGY:
+  case DEBUG_VIEW_MEGAGEO_IS_CLUSTER_SURFACE:
     // Pass through - values written during ray tracing
     value = DebugView[threadId];
     break;

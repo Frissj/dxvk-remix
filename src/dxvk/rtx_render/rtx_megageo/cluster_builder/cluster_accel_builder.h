@@ -132,4 +132,8 @@ protected:
 
     // Current frame index tracking
     uint32_t m_currentFrameIndex = 0;
+
+    // GPU-driven meshlet cluster fill pipeline
+    nvrhi::ComputePipelineHandle m_fillMeshletClustersPSO;
+    nvrhi::BindingLayoutHandle m_fillMeshletClustersBL;
 };

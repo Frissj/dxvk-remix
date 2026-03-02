@@ -1358,6 +1358,10 @@ namespace dxvk {
     static uint32_t s_diagCount = 0;
     static uint32_t s_nullCount = 0;
     static uint32_t s_validCount = 0;
+    static uint32_t s_bindLogFrame = UINT32_MAX;
+    uint32_t curBindFrame = m_device->getCurrentFrameId();
+    bool logBind = (curBindFrame != s_bindLogFrame);
+    if (logBind) s_bindLogFrame = curBindFrame;
     bool logDiag = ((s_diagCount++ % 100) == 0);
 
     if (megaGeoBuilder) {
@@ -1372,6 +1376,10 @@ namespace dxvk {
             bindResourceBuffer(BINDING_CLUSTER_SHADING_DATA_BUFFER,
                              DxvkBufferSlice(clusterShadingDataBuffer, 0, clusterShadingDataBuffer->info().size));
             clusterShadingDataBound = true;
+            if (logBind) {
+              Logger::warn(str::format("RTX MegaGeo BIND-DETAIL: shadingData size=", clusterShadingDataBuffer->info().size,
+                " clusterCount=", megaGeoBuilder->getClusterCount()));
+            }
           } else if (logDiag) {
             Logger::warn("RTX MegaGeo: clusterShadingData - getDxvkBuffer() returned null");
           }
@@ -1400,6 +1408,9 @@ namespace dxvk {
             bindResourceBuffer(BINDING_CLUSTER_VERTEX_POSITIONS_BUFFER,
                              DxvkBufferSlice(clusterVertexPositionsBuffer, 0, clusterVertexPositionsBuffer->info().size));
             clusterVertexPositionsBound = true;
+            if (logBind) {
+              Logger::warn(str::format("RTX MegaGeo BIND-DETAIL: vtxPos size=", clusterVertexPositionsBuffer->info().size));
+            }
           }
         }
       }
@@ -1414,6 +1425,9 @@ namespace dxvk {
             bindResourceBuffer(BINDING_CLUSTER_VERTEX_NORMALS_BUFFER,
                              DxvkBufferSlice(clusterVertexNormalsBuffer, 0, clusterVertexNormalsBuffer->info().size));
             clusterVertexNormalsBound = true;
+            if (logBind) {
+              Logger::warn(str::format("RTX MegaGeo BIND-DETAIL: vtxNorm size=", clusterVertexNormalsBuffer->info().size));
+            }
           }
         }
       }
@@ -1430,6 +1444,13 @@ namespace dxvk {
     }
     if (!clusterVertexNormalsBound) {
       bindResourceBuffer(BINDING_CLUSTER_VERTEX_NORMALS_BUFFER, DxvkBufferSlice(surfaceBuffer, 0, surfaceBuffer->info().size));
+    }
+
+    if (logBind) {
+      Logger::warn(str::format("RTX MegaGeo BIND: shadingData=", clusterShadingDataBound ? "REAL" : "PLACEHOLDER",
+        " vtxPos=", clusterVertexPositionsBound ? "REAL" : "PLACEHOLDER",
+        " vtxNorm=", clusterVertexNormalsBound ? "REAL" : "PLACEHOLDER",
+        " megaGeoBuilder=", megaGeoBuilder ? "valid" : "null"));
     }
 
   }

@@ -141,11 +141,32 @@ namespace dxvk {
       commitBarriers();
     }
 
+    // =================================================================================
+    // BYPASSING DXVK's updateBuffer - calling vkCmdUpdateBuffer directly
+    // =================================================================================
+    // Same fix as clearBufferUInt: we bypass DXVK's m_context->updateBuffer() because it
+    // adds DXVK's own barrier tracking (m_execBarriers at TRANSFER stage) on TOP of our
+    // NVRHI m_BufferStates tracking. That dual tracking causes DXVK to later emit spurious
+    // barriers that can reorder or invalidate our explicit barrier sequence.
+    //
+    // Additionally, DXVK's updateBuffer calls tryInvalidateDeviceLocalBuffer() which can
+    // REPLACE the VkBuffer allocation, changing its device address mid-operation.
+    //
+    // By calling vkCmdUpdateBuffer directly through the DxvkCommandList, we:
+    //   1. Still get the actual GPU write (vkCmdUpdateBuffer)
+    //   2. Still track the resource lifetime (trackResource for fence-based destruction)
+    //   3. Do NOT pollute DXVK's m_execBarriers with TRANSFER state
+    //   4. Do NOT trigger tryInvalidateDeviceLocalBuffer (no buffer replacement)
+    //   5. Our NVRHI m_BufferStates is the SOLE barrier tracker for this buffer
+    // =================================================================================
+    auto slice = dxvkBuffer->getSliceHandle(offset, size);
+    Rc<DxvkCommandList> cmdList = m_context->getCommandList();
+
     // vkCmdUpdateBuffer has a 64KB limit per call. Chunk large writes.
     static constexpr size_t kMaxUpdateSize = 65536;
     const uint8_t* src = static_cast<const uint8_t*>(data);
     size_t remaining = size;
-    size_t curOffset = offset;
+    VkDeviceSize curOffset = slice.offset;  // Use the slice's VkBuffer offset
 
     while (remaining > 0) {
       size_t chunkSize = std::min(remaining, kMaxUpdateSize);
@@ -153,8 +174,8 @@ namespace dxvk {
       size_t alignedChunk = (chunkSize + 3) & ~3;
 
       // Clamp if rounding up would overflow buffer
-      if (curOffset + alignedChunk > bufferSize) {
-        alignedChunk = chunkSize & ~3;
+      if ((curOffset - slice.offset) + alignedChunk > size) {
+        alignedChunk = chunkSize & ~size_t(3);
         if (alignedChunk == 0) break;
         chunkSize = alignedChunk;
       }
@@ -162,15 +183,17 @@ namespace dxvk {
       if (alignedChunk != chunkSize) {
         std::vector<uint8_t> alignedData(alignedChunk, 0);
         std::memcpy(alignedData.data(), src, chunkSize);
-        m_context->updateBuffer(dxvkBuffer, curOffset, alignedChunk, alignedData.data());
+        cmdList->cmdUpdateBuffer(DxvkCmdBuffer::ExecBuffer, slice.handle, curOffset, alignedChunk, alignedData.data());
       } else {
-        m_context->updateBuffer(dxvkBuffer, curOffset, chunkSize, src);
+        cmdList->cmdUpdateBuffer(DxvkCmdBuffer::ExecBuffer, slice.handle, curOffset, chunkSize, src);
       }
 
       src += chunkSize;
       curOffset += chunkSize;
       remaining -= chunkSize;
     }
+
+    cmdList->trackResource<DxvkAccess::Write>(dxvkBuffer);
   }
 
   void NvrhiDxvkCommandList::clearBufferUInt(
@@ -2159,52 +2182,9 @@ namespace dxvk {
                                " offset=", std::dec, scratchOffset,
                                " (requested=", desc.scratchSizeInBytes, ")"));
 
-      // Clear scratch buffer to zero to prevent the driver's internal compute shader
-      // from reading stale pointers. The scratch manager reuses memory between frames
-      // (resetWritePointers only resets the allocation offset, not the data). After a
-      // buffer resize, stale scratch data can contain GPU VAs pointing to freed buffers.
-      {
-        VkCommandBuffer cmdBuf = m_context->getCmdBuffer(DxvkCmdBuffer::ExecBuffer);
-        auto scratchSlice = scratchBuffer->getSliceHandle(scratchOffset, desc.scratchSizeInBytes);
-
-        // Barrier: previous scratch usage → transfer write
-        VkBufferMemoryBarrier preClear = {};
-        preClear.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-        preClear.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
-                                 VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
-        preClear.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        preClear.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        preClear.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        preClear.buffer = scratchSlice.handle;
-        preClear.offset = scratchSlice.offset;
-        preClear.size = scratchSlice.length;
-        m_device->getDxvkDevice()->vkd()->vkCmdPipelineBarrier(
-          cmdBuf,
-          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
-          VK_PIPELINE_STAGE_TRANSFER_BIT,
-          0, 0, nullptr, 1, &preClear, 0, nullptr);
-
-        // Fill scratch with zeros
-        m_device->getDxvkDevice()->vkd()->vkCmdFillBuffer(
-          cmdBuf, scratchSlice.handle, scratchSlice.offset, scratchSlice.length, 0);
-
-        // Barrier: transfer write → compute/AS build read/write
-        VkBufferMemoryBarrier postClear = {};
-        postClear.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-        postClear.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        postClear.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
-                                  VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
-        postClear.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        postClear.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        postClear.buffer = scratchSlice.handle;
-        postClear.offset = scratchSlice.offset;
-        postClear.size = scratchSlice.length;
-        m_device->getDxvkDevice()->vkd()->vkCmdPipelineBarrier(
-          cmdBuf,
-          VK_PIPELINE_STAGE_TRANSFER_BIT,
-          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
-          0, 0, nullptr, 1, &postClear, 0, nullptr);
-      }
+      // NOTE: Scratch zeroing REMOVED — sample does NOT zero scratch buffers.
+      // The driver's internal compute shader should handle scratch contents correctly
+      // without requiring pre-zeroed memory.
 
       // Track the buffer for command list lifetime
       m_context->getCommandList()->trackResource<DxvkAccess::Write>(scratchBuffer);

@@ -38,6 +38,7 @@
 #include <rtx_shaders/fill_blas_from_clas_args.h>
 #include <rtx_shaders/fill_instantiate_template_args.h>
 #include <rtx_shaders/patch_cluster_blas_addresses.h>
+#include <rtx_shaders/fill_meshlet_clusters.h>
 
 // HiZ constants
 #include "../hiz/hiz_buffer_constants.h"
@@ -185,6 +186,25 @@ static const dxvk::DxvkResourceSlot s_patchClusterBlasAddressesSlots[] = {
 };
 static const uint32_t s_patchClusterBlasAddressesSlotsCount = sizeof(s_patchClusterBlasAddressesSlots) / sizeof(s_patchClusterBlasAddressesSlots[0]);
 
+// Resource slots for fill_meshlet_clusters shader
+// CB at b0 (push constant), SRVs t0-t3, UAVs u0-u4
+static const dxvk::DxvkResourceSlot s_fillMeshletClustersSlots[] = {
+  // Constant buffer: b0 → slot 300 (push constant)
+  { 300, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER },   // g_Params (b0)
+  // SRVs: t0-t3 → slots 0-3
+  { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER },   // t_ClusterInfos (t0)
+  { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER },   // t_PersistentExpandedVertices (t1)
+  { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER },   // t_PersistentExpandedNormals (t2)
+  { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER },   // t_PersistentUniqueVertices (t3)
+  // UAVs: u0-u4 → slots 200-204
+  { 200, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_IMAGE_VIEW_TYPE_MAX_ENUM, VK_ACCESS_SHADER_WRITE_BIT },  // u_ClusterVertexPositions (u0)
+  { 201, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_IMAGE_VIEW_TYPE_MAX_ENUM, VK_ACCESS_SHADER_WRITE_BIT },  // u_ClusterVertexNormals (u1)
+  { 202, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_IMAGE_VIEW_TYPE_MAX_ENUM, VK_ACCESS_SHADER_WRITE_BIT },  // u_IndirectArgData (u2)
+  { 203, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_IMAGE_VIEW_TYPE_MAX_ENUM, VK_ACCESS_SHADER_WRITE_BIT },  // u_ClasAddresses (u3)
+  { 204, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_IMAGE_VIEW_TYPE_MAX_ENUM, VK_ACCESS_SHADER_WRITE_BIT },  // u_ClusterShadingData (u4)
+};
+static const uint32_t s_fillMeshletClustersSlotsCount = sizeof(s_fillMeshletClustersSlots) / sizeof(s_fillMeshletClustersSlots[0]);
+
 ShaderFactory::ShaderFactory(dxvk::RtxContext* ctx)
   : m_rtxContext(ctx)
 {
@@ -301,6 +321,13 @@ nvrhi::ShaderHandle ShaderFactory::CreateShader(
     resourceSlots = s_patchClusterBlasAddressesSlots;
     slotCount = s_patchClusterBlasAddressesSlotsCount;
     RTXMG_LOG("ShaderFactory: Loading pre-compiled patch_cluster_blas_addresses shader");
+  }
+  else if (pathStr.find("fill_meshlet_clusters") != std::string::npos) {
+    spirvCode = fill_meshlet_clusters;
+    spirvSize = sizeof(fill_meshlet_clusters);
+    resourceSlots = s_fillMeshletClustersSlots;
+    slotCount = s_fillMeshletClustersSlotsCount;
+    RTXMG_LOG("ShaderFactory: Loading pre-compiled fill_meshlet_clusters shader");
   }
   else {
     std::string msg = std::string("ShaderFactory: Unknown shader path: ") + path;

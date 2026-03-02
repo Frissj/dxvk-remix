@@ -283,6 +283,35 @@
 #define DEBUG_VIEW_MEGAGEO_COLOR_BY_MICROTRI_AREA 908
 #define DEBUG_VIEW_MEGAGEO_COLOR_BY_TOPOLOGY 909
 
+// RTX Mega Geometry: Cluster path diagnostic
+// R = isClusterSurface (1.0=cluster, 0.0=traditional)
+// G = clusterId / 256.0 (fractional for visualization)
+// B = surfaceIndex / 256.0
+#define DEBUG_VIEW_MEGAGEO_IS_CLUSTER_SURFACE 910
+
+// RTX Mega Geometry: Ray vs vertex position mismatch
+// Shows the difference between the actual ray hit position and the vertex-interpolated position
+// R = abs(difference.x) * 1000, G = abs(difference.y) * 1000, B = abs(difference.z) * 1000
+// If CLAS geometry matches vertex buffer, this should be near-black (< 0.001 error)
+// Bright colors indicate the CLAS acceleration structure has different geometry than vertex buffer
+#define DEBUG_VIEW_MEGAGEO_RAY_VS_VERTEX_POS 911
+
+// RTX Mega Geometry: Actual ray hit world position (for verifying CLAS intersection locations)
+// RGB = worldPosition * 0.5 + 0.5 (maps [-1,1] to [0,1] for visualization)
+#define DEBUG_VIEW_MEGAGEO_RAY_HIT_POSITION 912
+
+// RTX Mega Geometry: Vertex buffer hit position (for verifying vertex data in hit shader)
+// RGB = worldPosition * 0.5 + 0.5
+#define DEBUG_VIEW_MEGAGEO_VERTEX_HIT_POSITION 913
+
+// RTX Mega Geometry: Raw local vertex position (NO objectToWorld transform)
+// RGB = localPosition * 0.5 + 0.5 — checks if vertex buffer data itself is reasonable
+#define DEBUG_VIEW_MEGAGEO_LOCAL_VERTEX_POS 914
+
+// RTX Mega Geometry: Ray vs LOCAL vertex (skip objectToWorld to isolate transform issue)
+// If this is near-black but 911 is bright, objectToWorld is the problem
+#define DEBUG_VIEW_MEGAGEO_RAY_VS_LOCAL_VERTEX 915
+
 
 enum class CompositeDebugView : uint32_t {
   Disabled = 0,
