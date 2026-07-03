@@ -152,7 +152,12 @@ namespace dxvk {
   namespace {
     template<int RtInstanceSize> struct CheckRtInstanceSize {
       // The second line of the build error should contain the new size of RtInstance in the template argument, i.e. `dxvk::CheckRtInstanceSize<newSize>`
-      static_assert(RtInstanceSize == 768, "RtInstance size has changed.  Fix the copy constructor above this message, then update the expected size.");
+      // NV-DXVK: 768 -> 776. RTX Mega Geometry added isClusterLod / clusterGeometryId /
+      // isClusterTemplate to RtSurface (rtx_materials.h); RtSurface is the `surface`
+      // member, copied wholesale by copyInstanceDataFrom (`surface = src.surface`), so no
+      // copy-constructor change is needed. This guard only compiles in non-Debug builds,
+      // so the first release/debugoptimized build after the cluster work is where it fires.
+      static_assert(RtInstanceSize == 776, "RtInstance size has changed.  Fix the copy constructor above this message, then update the expected size.");
     };
     CheckRtInstanceSize<sizeof(RtInstance)> _rtInstanceSizeTest;
   }
