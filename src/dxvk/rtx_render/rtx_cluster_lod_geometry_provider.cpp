@@ -23,6 +23,7 @@
 #include "rtx_cluster_lod_geometry_provider.h"
 
 #include <algorithm>
+#include <chrono>
 #include <utility>
 
 #include "rtx_types.h"
@@ -33,6 +34,22 @@
 #include "../util/util_once.h"
 
 namespace dxvk {
+
+  namespace {
+
+    // chrono helpers (steady_clock: monotonic, ~41 ns per read - safe on the
+    // per-draw CS-thread path)
+    uint64_t elapsedUs(const std::chrono::steady_clock::time_point& since) {
+      return uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - since).count());
+    }
+
+    uint64_t nowUs() {
+      return uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+    }
+
+  }  // namespace
 
   // P4b topology identity (see the header comment). indexCount and topology are
   // included because non-indexed draws have no index content to hash - without
@@ -67,6 +84,29 @@ namespace dxvk {
   }
 
   void ClusterLodGeometryProvider::onDrawCallGeometry(const DrawCallState& drawCallState, uint64_t geometryHash, bool vertexDataUpdated) {
+    // chrono: record the CS-thread cost of this intake call on every exit path
+    // (declared FIRST so it destructs LAST, after any scoped lock below has
+    // released m_mutex - the destructor takes it again)
+    struct IntakeChrono {
+      ClusterLodGeometryProvider* self;
+      std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+      uint64_t snapshotUs = 0;
+      bool tookSnapshot = false;
+      ~IntakeChrono() {
+        const uint64_t us = elapsedUs(start);
+        std::unique_lock<std::mutex> lock(self->m_mutex);
+        Stats& stats = self->m_stats;
+        stats.intakeCalls++;
+        stats.intakeUsTotal += us;
+        stats.intakeUsMax = std::max(stats.intakeUsMax, us);
+        if (tookSnapshot) {
+          stats.snapshotCount++;
+          stats.snapshotUsTotal += snapshotUs;
+          stats.snapshotUsMax = std::max(stats.snapshotUsMax, snapshotUs);
+        }
+      }
+    } intakeChrono { this };
+
     const RasterGeometry& geometryData = drawCallState.getGeometryData();
 
     // P4b routing (plan 7.1): deforming geometry goes to Path B, keyed by the
@@ -117,8 +157,11 @@ namespace dxvk {
     // Snapshot outside the lock: this copies the geometry's CPU staging data. This is
     // the only window where that data is guaranteed alive, so the copy must happen
     // here on the submission thread (design rule: no GPU->CPU readbacks, ever).
+    const std::chrono::steady_clock::time_point snapshotStart = std::chrono::steady_clock::now();
     lodclusters_remix::GeometrySnapshot snapshot;
     const SnapshotResult snapshotResult = makeSnapshot(drawCallState, geometryHash, snapshot);
+    intakeChrono.snapshotUs = elapsedUs(snapshotStart);
+    intakeChrono.tookSnapshot = true;
     const bool eligible = snapshotResult == SnapshotResult::Eligible
                        || snapshotResult == SnapshotResult::EligibleConverted;
     snapshot.isDeforming = skinned;
@@ -162,6 +205,7 @@ namespace dxvk {
     m_stats.submitted++;
     m_stats.pending++;
     m_stats.pendingBytes += snapshot.approximateSizeBytes();
+    snapshot.queuedAtUs = nowUs();  // chrono: worker reports the queue wait
     m_queue.push_back(std::move(snapshot));
 
     lock.unlock();
@@ -407,6 +451,10 @@ namespace dxvk {
         m_stats.pendingBytes -= snapshot.approximateSizeBytes();
       }
 
+      // chrono: time spent waiting for the single worker - if this grows over
+      // a session, discovery outpaces processing (raise processing.threadsPct)
+      const double queuedMs = snapshot.queuedAtUs != 0 ? double(nowUs() - snapshot.queuedAtUs) * 1e-3 : 0.0;
+
       if (snapshot.isDeforming || snapshot.isMutating) {
         // P4b Path B: cluster templates (vk_animated_clusters). The manager's
         // handler runs the one-time registration on this worker thread: CPU
@@ -420,7 +468,9 @@ namespace dxvk {
           m_stats.deforming++;
         }
 
+        const std::chrono::steady_clock::time_point registrationStart = std::chrono::steady_clock::now();
         const bool registered = m_animatedHandler && m_animatedHandler(std::move(snapshot));
+        const double registrationMs = double(elapsedUs(registrationStart)) * 1e-3;
 
         {
           std::unique_lock<std::mutex> lock(m_mutex);
@@ -433,10 +483,12 @@ namespace dxvk {
 
         if (registered) {
           Logger::info(str::format("[ClusterLOD] ", name, ": ", skinned ? "skinned" : "mutating",
-                                   " geometry registered for Path B (cluster templates)"));
+                                   " geometry registered for Path B (cluster templates)",
+                                   " - queued ", queuedMs, " ms, registration ", registrationMs, " ms"));
         } else {
           Logger::info(str::format("[ClusterLOD] ", name, ": ", skinned ? "skinned" : "mutating",
-                                   " geometry NOT registered for Path B - stays classic"));
+                                   " geometry NOT registered for Path B - stays classic",
+                                   " (queued ", queuedMs, " ms, attempt ", registrationMs, " ms)"));
         }
         continue;
       }
@@ -476,7 +528,7 @@ namespace dxvk {
                                " totalTris ", stats.totalTriangles,
                                " cache ", stats.cacheFileSizeBytes, " bytes",
                                stats.loadedFromCache ? (stats.memoryMapped ? " (cache hit, mapped)" : " (cache hit)") : " (processed)",
-                               " in ", stats.processingMs, " ms"));
+                               " in ", stats.processingMs, " ms (queued ", queuedMs, " ms)"));
 
       if (m_verifyProvider && m_verifyProvider()) {
         std::string message;

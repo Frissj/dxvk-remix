@@ -21,6 +21,7 @@
 */
 #pragma once
 
+#include <algorithm>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -371,7 +372,15 @@ namespace dxvk {
     };
 
     bool ensureRenderSystem();
-    void buildGenerationIfDue(AccelManager& accelManager, InstanceManager& instanceManager);
+    // returns the milliseconds spent (0 when nothing was due) so onFrameBegin
+    // can report generation events separately from its steady per-frame cost
+    double buildGenerationIfDue(AccelManager& accelManager, InstanceManager& instanceManager);
+
+    // chrono: logs the accumulated per-frame CPU section times and the GPU
+    // section reports of both cluster systems, then resets the accumulators.
+    // Rides the periodic stats interval; silent while nothing dispatched
+    // (menus/loading record no cluster work).
+    void logFrameTimes();
 
     // ---- P4b Path B (cluster templates) ----
 
@@ -469,6 +478,35 @@ namespace dxvk {
     // line is only emitted when they changed
     uint32_t m_lastStatsLogFrame = 0;
     uint64_t m_lastLoggedStatsDigest = 0;
+
+    // ---- chrono: per-frame CPU section times, accumulated between periodic
+    //      logs (avg = steady cost, max = the hitches an avg hides) ----
+    struct SectionTimes {
+      double totalMs = 0.0;
+      double maxMs = 0.0;
+      uint32_t samples = 0;
+      void add(double ms) {
+        totalMs += ms;
+        maxMs = std::max(maxMs, ms);
+        samples++;
+      }
+      double avgMs() const { return samples > 0 ? totalMs / samples : 0.0; }
+    };
+    struct FrameTimes {
+      SectionTimes frameBegin;   // onFrameBegin minus generation events
+      SectionTimes classify;     // isClusterInstance total across the merge pass
+      SectionTimes dispatchA;    // dispatchBuild minus dispatchAnimated
+      SectionTimes hizFeed;      // HiZ depth handoff (excl. resize events)
+      SectionTimes lockWaitA;    // async-transfer submission-lock wait
+      SectionTimes recordA;      // ClusterRenderSystem::recordFrame
+      SectionTimes dispatchB;    // dispatchAnimated total
+      SectionTimes recordB;      // ClusterTemplateSystem::recordFrame
+    };
+    FrameTimes m_frameTimes;
+    // isClusterInstance is called per instance during mergeInstancesIntoBlas;
+    // accumulated here and folded into m_frameTimes.classify at the next
+    // onFrameBegin (one sample per frame)
+    double m_frameClassifyMs = 0.0;
   };
 
 }  // namespace dxvk

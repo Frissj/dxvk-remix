@@ -89,6 +89,18 @@ namespace dxvk {
       uint64_t skippedFormat = 0;        // non-float32 position format
       uint64_t skippedNoCpuData = 0;     // device-local-only vertex/index data (stays classic by design)
       uint64_t convertedTopology = 0;    // of submitted: strips/fans/non-indexed expanded to lists on the CPU
+
+      // chrono (CS-thread intake cost; lifetime totals). intake* covers EVERY
+      // onDrawCallGeometry call including the dedup fast path - the steady-state
+      // per-draw tax; snapshot* covers only the calls that copied geometry data.
+      // The manager's stats digest EXCLUDES these (they change every draw and
+      // must not force a periodic log while the counts are idle).
+      uint64_t intakeCalls = 0;
+      uint64_t intakeUsTotal = 0;
+      uint64_t intakeUsMax = 0;
+      uint64_t snapshotCount = 0;
+      uint64_t snapshotUsTotal = 0;
+      uint64_t snapshotUsMax = 0;
     };
 
     Stats getStats() const;

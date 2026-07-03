@@ -61,6 +61,8 @@
 #include <vector>
 
 #include <nvvk/check_error.hpp>
+#include <nvutils/profiler.hpp>
+#include <nvvk/profiler_vk.hpp>
 
 #include "../resources.hpp"
 #include "../lodclusters_remix.h"
@@ -68,6 +70,10 @@
 #include "shaderio_animated_host.h"
 
 namespace lodclusters_remix {
+
+// defined in lodclusters_remix_render.cpp: shared chrono-report formatting of
+// one profiler timeline snapshot ('\n'-separated section lines, milliseconds)
+bool formatProfilerReportUtf8(const nvutils::ProfilerTimeline* timeline, std::string& outReport);
 
 namespace {
 
@@ -133,6 +139,13 @@ struct ClusterTemplateSystem::Impl
   VkBuildAccelerationStructureFlagsKHR clusterBlasFlags         = 0;
 
   Resources res;
+
+  // chrono: per-frame GPU/CPU section timers around the Path B build phases
+  // (same nvpro profiler Path A's renderer records into; read out through
+  // getProfilerReportUtf8)
+  nvutils::ProfilerManager   profilerManager;
+  nvutils::ProfilerTimeline* profilerTimeline = nullptr;
+  nvvk::ProfilerGpuTimer     profilerGpuTimer;
 
   // cluster_blas_instances.comp (prebuilt SPIR-V, sample's compute pipeline)
   shaderc::SpvCompilationResult blasInstancesShader;
@@ -601,6 +614,14 @@ bool ClusterTemplateSystem::init(const RenderDeviceInfo& deviceInfo, const Anima
       impl.readbackHostBuffer, sizeof(AnimatedReadback) * Impl::kRingSlots, VK_BUFFER_USAGE_2_TRANSFER_DST_BIT,
       VMA_MEMORY_USAGE_AUTO_PREFER_HOST, VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT));
 
+  // chrono: GPU section timers for the per-frame recordFrame phases (Path A
+  // parity: ClusterRenderSystem's init creates the identical setup)
+  nvutils::ProfilerTimeline::CreateInfo timelineInfo;
+  timelineInfo.name     = "clusterlod-animated";
+  impl.profilerTimeline = impl.profilerManager.createTimeline(timelineInfo);
+  impl.profilerGpuTimer.init(impl.profilerTimeline, deviceInfo.device, deviceInfo.physicalDevice,
+                             int(deviceInfo.graphicsQueueFamilyIndex), false);
+
   impl.initialized = true;
 
   LOGI("ClusterTemplateSystem: initialized (%s, cluster %u/%u)\n", config.useTemplates ? "templates" : "direct builds",
@@ -673,6 +694,13 @@ void ClusterTemplateSystem::deinit()
   {
     vkDestroyPipelineLayout(impl.res.m_device, impl.computePipelineLayout, nullptr);
     impl.computePipelineLayout = VK_NULL_HANDLE;
+  }
+
+  impl.profilerGpuTimer.deinit();
+  if(impl.profilerTimeline)
+  {
+    impl.profilerManager.destroyTimeline(impl.profilerTimeline);
+    impl.profilerTimeline = nullptr;
   }
 
   impl.res.deinit();
@@ -1325,6 +1353,10 @@ bool ClusterTemplateSystem::recordFrame(VkCommandBuffer                         
     return false;
   }
 
+  // chrono: advance the profiler frame, then bracket every phase below (Path A
+  // parity - its renderer sections the same way in render())
+  impl.profilerTimeline->frameAdvance();
+
   const uint32_t     ringIndex = impl.frameCounter % Impl::kRingSlots;
   const nvvk::Buffer& ring     = impl.ringBuffers[ringIndex];
   uint8_t*            mapping  = ring.mapping;
@@ -1332,6 +1364,9 @@ bool ClusterTemplateSystem::recordFrame(VkCommandBuffer                         
   // ---- per-frame input fill (sample: initRayTracingTemplateInstantiations /
   //      initRayTracingClusters fill loops; per-frame here because Remix's
   //      skinned output buffers ping-pong every frame) ----
+
+  // chrono (CPU-only section: the ring fill runs before any GPU commands)
+  const nvutils::ProfilerTimeline::FrameSectionID inputFillSection = impl.profilerTimeline->frameBeginSection("Anim Input Fill");
 
   auto* dstAddresses = reinterpret_cast<uint64_t*>(mapping + impl.ringDstAddressesOffset);
   auto* blasInfos = reinterpret_cast<VkClusterAccelerationStructureBuildClustersBottomLevelInfoNV*>(mapping + impl.ringBlasInfosOffset);
@@ -1426,6 +1461,8 @@ bool ClusterTemplateSystem::recordFrame(VkCommandBuffer                         
   // CPU-known TlasInstance fields
   std::memcpy(mapping + impl.ringTlasOffset, tlasInstances, sizeof(VkAccelerationStructureInstanceKHR) * slotCount);
 
+  impl.profilerTimeline->frameEndSection(inputFillSection);
+
   //////////////////////////////////////////////////////////////////////////
   // command recording (sample: updateRayTracingScene sequence + barriers)
 
@@ -1451,6 +1488,7 @@ bool ClusterTemplateSystem::recordFrame(VkCommandBuffer                         
   // run template instantiation or clas build (sample: updateRayTracingClusters,
   // explicit destinations into the persistent per-pose CLAS memory)
   {
+    auto timerSection = impl.profilerGpuTimer.cmdFrameSection(cmd, "Anim Clas Instantiate");
     VkClusterAccelerationStructureCommandsInfoNV cmdInfo = {VK_STRUCTURE_TYPE_CLUSTER_ACCELERATION_STRUCTURE_COMMANDS_INFO_NV};
     VkClusterAccelerationStructureInputInfoNV inputs = {VK_STRUCTURE_TYPE_CLUSTER_ACCELERATION_STRUCTURE_INPUT_INFO_NV};
 
@@ -1492,6 +1530,8 @@ bool ClusterTemplateSystem::recordFrame(VkCommandBuffer                         
   // run blas build (sample: updateRayTracingBlas - implicit destinations, the
   // generated blas addresses feed the patch kernel)
   {
+    auto timerSection = impl.profilerGpuTimer.cmdFrameSection(cmd, "Anim Blas Build");
+
     VkClusterAccelerationStructureCommandsInfoNV cmdInfo = {VK_STRUCTURE_TYPE_CLUSTER_ACCELERATION_STRUCTURE_COMMANDS_INFO_NV};
     VkClusterAccelerationStructureInputInfoNV inputs = {VK_STRUCTURE_TYPE_CLUSTER_ACCELERATION_STRUCTURE_INPUT_INFO_NV};
 
@@ -1537,6 +1577,8 @@ bool ClusterTemplateSystem::recordFrame(VkCommandBuffer                         
   // (sample: updateRayTracingScene's cluster_blas_instances dispatches; the
   // "static" branch resolves slot -> pose through renderInstances.geometryID)
   {
+    auto timerSection = impl.profilerGpuTimer.cmdFrameSection(cmd, "Anim Slot Patch");
+
     animatedclusters::shaderio::ClusterBlasConstants blasConstants = {};
 
     blasConstants.instanceCount = slotCount;
@@ -1648,6 +1690,19 @@ bool ClusterTemplateSystem::getStats(AnimatedStats& outStats) const
   }
 
   return true;
+}
+
+bool ClusterTemplateSystem::getProfilerReportUtf8(std::string& outReport) const
+{
+  const Impl& impl = *m_impl;
+
+  if(!impl.initialized || !impl.anyFrameRecorded)
+  {
+    outReport.clear();
+    return false;
+  }
+
+  return formatProfilerReportUtf8(impl.profilerTimeline, outReport);
 }
 
 }  // namespace lodclusters_remix

@@ -79,6 +79,11 @@ namespace lodclusters_remix {
     // it stays stable while a mesh deforms). Keys the template sets.
     uint64_t topologyKey = 0;
 
+    // chrono: steady-clock microseconds at enqueue time - the worker reports
+    // how long the snapshot waited in the processing queue (a growing wait
+    // means discovery outpaces the single processing worker)
+    uint64_t queuedAtUs = 0;
+
     size_t approximateSizeBytes() const {
       return indices.size() * sizeof(uint32_t)
         + (positions.size() + normals.size() + texcoords0.size() + tangents.size()) * sizeof(float);
@@ -495,6 +500,12 @@ namespace lodclusters_remix {
     // delayed statistics (a few frames old); false while nothing rendered yet
     bool getFrameStats(FrameStats& outStats) const;
 
+    // chrono report of the per-frame GPU/CPU section timers NVIDIA's renderer
+    // records around every kernel phase (Traversal Run, Blas Build, streaming,
+    // HiZ, ...): one line per section ('\n'-separated), values averaged over
+    // the profiler's last frames. False while nothing was timed yet.
+    bool getProfilerReportUtf8(std::string& outReport) const;
+
   private:
     struct Impl;
     std::unique_ptr<Impl> m_impl;
@@ -647,6 +658,12 @@ namespace lodclusters_remix {
     uint64_t getClusterTableAddress() const;
 
     bool getStats(AnimatedStats& outStats) const;
+
+    // chrono report of the per-frame GPU/CPU section timers around the Path B
+    // build phases (input fill, CLAS instantiation, BLAS build, slot patch):
+    // one line per section ('\n'-separated), values averaged over the
+    // profiler's last frames. False while nothing was timed yet.
+    bool getProfilerReportUtf8(std::string& outReport) const;
 
   private:
     struct Impl;

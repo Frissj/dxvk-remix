@@ -27,6 +27,7 @@
 // the C++20 lodclusters library.
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 
@@ -817,6 +818,60 @@ bool ClusterRenderSystem::getFrameStats(FrameStats& outStats) const
   }
 
   return true;
+}
+
+// shared with the Path B report (see renderer_raytrace_clusters.cpp): formats
+// one profiler timeline snapshot as '\n'-separated section lines. Values come
+// out of nvutils::ProfilerTimeline in microseconds; reported in milliseconds.
+bool formatProfilerReportUtf8(const nvutils::ProfilerTimeline* timeline, std::string& outReport)
+{
+  outReport.clear();
+
+  if(timeline == nullptr)
+  {
+    return false;
+  }
+
+  nvutils::ProfilerTimeline::Snapshot snapshot;
+  timeline->getFrameSnapshot(snapshot);
+
+  char line[256];
+  for(size_t i = 0; i < snapshot.timerInfos.size(); i++)
+  {
+    const nvutils::ProfilerTimeline::TimerInfo& info = snapshot.timerInfos[i];
+    if(info.numAveraged == 0)
+    {
+      continue;
+    }
+
+    // level indents nested sections under their parent (e.g. streaming
+    // sub-phases under "Streaming"); gpu max exposes hitchy sections that a
+    // clean average would hide
+    snprintf(line, sizeof(line), "%*s%s: cpu %.3f ms, gpu %.3f ms (gpu max %.3f, avg of %u)",
+             int(info.level) * 2, "", snapshot.timerNames[i].c_str(),
+             info.cpu.average * 1e-3, info.gpu.average * 1e-3, info.gpu.absMaxValue * 1e-3, info.numAveraged);
+
+    if(!outReport.empty())
+    {
+      outReport += '\n';
+    }
+    outReport += line;
+  }
+
+  return !outReport.empty();
+}
+
+bool ClusterRenderSystem::getProfilerReportUtf8(std::string& outReport) const
+{
+  const Impl& impl = *m_impl;
+
+  if(!impl.initialized)
+  {
+    outReport.clear();
+    return false;
+  }
+
+  return formatProfilerReportUtf8(impl.profilerTimeline, outReport);
 }
 
 }  // namespace lodclusters_remix

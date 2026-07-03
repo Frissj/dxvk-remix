@@ -21,6 +21,8 @@
 */
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 
@@ -150,6 +152,11 @@ namespace dxvk {
       return result;
     }
 
+    // chrono helper: milliseconds since a steady_clock start point
+    double elapsedMs(const std::chrono::steady_clock::time_point& since) {
+      return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - since).count();
+    }
+
   }  // namespace
 
   ClusterLodManager::ClusterLodManager(DxvkDevice* device)
@@ -176,6 +183,7 @@ namespace dxvk {
 
   ClusterLodManager::~ClusterLodManager() {
     logStatistics();
+    logFrameTimes();
 
     // join the provider worker BEFORE tearing down the systems its handler uses
     m_provider = nullptr;
@@ -259,14 +267,29 @@ namespace dxvk {
       return false;
     }
 
+    // chrono: split the registration into its three costs - the CPU
+    // clusterization (meshopt, lock-free), the wait for Remix's submission
+    // lock (contends with the render threads) and the GPU template build
+    // (temp submissions + fence waits inside)
+    const std::chrono::steady_clock::time_point clusterizeStart = std::chrono::steady_clock::now();
     const uint64_t token = m_templateSystem->clusterizeGeometry(snapshot);
+    const double clusterizeMs = elapsedMs(clusterizeStart);
     if (token == 0) {
       return false;
     }
 
+    const std::chrono::steady_clock::time_point lockStart = std::chrono::steady_clock::now();
     m_device->lockSubmission();
+    const double lockWaitMs = elapsedMs(lockStart);
+
+    const std::chrono::steady_clock::time_point buildStart = std::chrono::steady_clock::now();
     const bool built = m_templateSystem->buildGeometryTemplates(token);
+    const double buildMs = elapsedMs(buildStart);
     m_device->unlockSubmission();
+
+    Logger::info(str::format("[ClusterLOD] ", snapshot.name, ": Path B chrono: clusterize ", clusterizeMs,
+                             " ms, submission-lock wait ", lockWaitMs,
+                             " ms, template build ", buildMs, " ms"));
 
     return built;
   }
@@ -299,9 +322,11 @@ namespace dxvk {
 
     auto templateSystem = std::make_unique<lodclusters_remix::ClusterTemplateSystem>();
 
+    const std::chrono::steady_clock::time_point initStart = std::chrono::steady_clock::now();
     m_device->lockSubmission();
     const bool initialized = templateSystem->init(deviceInfo, buildAnimatedConfig());
     m_device->unlockSubmission();
+    const double initMs = elapsedMs(initStart);
 
     if (!initialized) {
       Logger::err("[ClusterLOD] cluster template system initialization FAILED - deforming geometry stays classic");
@@ -311,7 +336,7 @@ namespace dxvk {
 
     m_templateSystem = std::move(templateSystem);
 
-    Logger::info("[ClusterLOD] cluster template system initialized (Path B: deforming geometry)");
+    Logger::info(str::format("[ClusterLOD] cluster template system initialized (Path B: deforming geometry) in ", initMs, " ms"));
     return true;
   }
 
@@ -321,6 +346,16 @@ namespace dxvk {
     }
 
     const ClusterLodGeometryProvider::Stats stats = m_provider->getStats();
+
+    // chrono: CS-thread intake tax (every draw pays intake; only first-sight
+    // draws pay a snapshot copy). Lifetime avg/max.
+    if (stats.intakeCalls > 0) {
+      Logger::info(str::format("[ClusterLOD] intake chrono: ", stats.intakeCalls,
+                               " calls, avg ", stats.intakeUsTotal / stats.intakeCalls,
+                               " us, max ", stats.intakeUsMax, " us; snapshots ", stats.snapshotCount,
+                               ", avg ", stats.snapshotCount > 0 ? double(stats.snapshotUsTotal) * 1e-3 / double(stats.snapshotCount) : 0.0,
+                               " ms, max ", double(stats.snapshotUsMax) * 1e-3, " ms"));
+    }
 
     Logger::info(str::format("[ClusterLOD] stats: submitted ", stats.submitted,
                              " (topology-converted ", stats.convertedTopology, ")",
@@ -398,6 +433,59 @@ namespace dxvk {
     }
   }
 
+  void ClusterLodManager::logFrameTimes() {
+    const FrameTimes& times = m_frameTimes;
+
+    // nothing dispatched since the last report: menus/loading frames record no
+    // cluster work - stay silent instead of logging zero lines
+    if (times.dispatchA.samples == 0 && times.dispatchB.samples == 0) {
+      m_frameTimes = FrameTimes();
+      return;
+    }
+
+    // avg = steady per-frame cost, max = the hitch a frame paid at least once
+    auto avgMax = [](const SectionTimes& section) {
+      char buffer[64];
+      snprintf(buffer, sizeof(buffer), "%.3f/%.3f ms (%u)", section.avgMs(), section.maxMs, section.samples);
+      return std::string(buffer);
+    };
+
+    Logger::info(str::format("[ClusterLOD] frame cpu chrono avg/max (frames) since last report:",
+                             " onFrameBegin ", avgMax(times.frameBegin),
+                             ", classify ", avgMax(times.classify),
+                             ", dispatchA ", avgMax(times.dispatchA),
+                             " [hizFeed ", avgMax(times.hizFeed),
+                             ", asyncLockWait ", avgMax(times.lockWaitA),
+                             ", record ", avgMax(times.recordA),
+                             "], dispatchB ", avgMax(times.dispatchB),
+                             " [record ", avgMax(times.recordB), "]"));
+
+    // GPU section timers NVIDIA's kernels are bracketed with (Path A: traversal,
+    // BLAS build, streaming, HiZ; Path B: instantiate, BLAS build, slot patch) -
+    // the per-section GPU cost is THE optimization signal
+    auto logReport = [](const char* label, const std::string& report) {
+      size_t pos = 0;
+      while (pos < report.size()) {
+        size_t end = report.find('\n', pos);
+        if (end == std::string::npos) {
+          end = report.size();
+        }
+        Logger::info(str::format("[ClusterLOD] gpu chrono ", label, "| ", report.substr(pos, end - pos)));
+        pos = end + 1;
+      }
+    };
+
+    std::string report;
+    if (m_renderSystem != nullptr && m_renderSystem->getProfilerReportUtf8(report)) {
+      logReport("A", report);
+    }
+    if (m_templateSystemMT != nullptr && m_templateSystemMT->getProfilerReportUtf8(report)) {
+      logReport("B", report);
+    }
+
+    m_frameTimes = FrameTimes();
+  }
+
   bool ClusterLodManager::ensureRenderSystem() {
     if (m_renderSystem != nullptr) {
       return true;
@@ -461,9 +549,11 @@ namespace dxvk {
 
     // the library submits (dummy HiZ transition) during init; Vulkan queues need
     // external synchronization against dxvk's submission thread
+    const std::chrono::steady_clock::time_point initStart = std::chrono::steady_clock::now();
     m_device->lockSubmission();
     const bool initialized = m_renderSystem->init(deviceInfo, renderConfig);
     m_device->unlockSubmission();
+    const double initMs = elapsedMs(initStart);
 
     if (!initialized) {
       Logger::err("[ClusterLOD] cluster render system initialization FAILED - rendering stays classic");
@@ -479,11 +569,11 @@ namespace dxvk {
     m_cullingActive = renderConfig.useCulling;
 
     Logger::info(str::format("[ClusterLOD] cluster render system initialized (",
-                             m_streamingActive ? "streaming" : "preloaded", ")"));
+                             m_streamingActive ? "streaming" : "preloaded", ") in ", initMs, " ms"));
     return true;
   }
 
-  void ClusterLodManager::buildGenerationIfDue(AccelManager& accelManager, InstanceManager& instanceManager) {
+  double ClusterLodManager::buildGenerationIfDue(AccelManager& accelManager, InstanceManager& instanceManager) {
     // capacity growth request from last frame's overflow
     uint32_t requestedCapacity = m_renderSystem->getMaxRenderInstances();
     if (m_frameOverflowCount > 0) {
@@ -493,15 +583,20 @@ namespace dxvk {
     const bool needsCapacityGrowth = requestedCapacity > m_renderSystem->getMaxRenderInstances();
 
     if (m_pendingGeometryHashes.empty() && !(needsCapacityGrowth && !m_residentGeometryHashes.empty())) {
-      return;
+      return 0.0;
     }
 
     // batch generation updates
     const uint32_t currentFrame = m_device->getCurrentFrameId();
     const uint32_t cooldown = uint32_t(std::max(1, ClusterLodOptions::Render::generationCooldownFrames()));
     if (m_generationCount > 0 && currentFrame - m_lastGenerationFrame < cooldown) {
-      return;
+      return 0.0;
     }
+
+    // chrono: generation events are the frame hitches of the cluster pipeline
+    // (appends should stay O(new); rebuilds device-idle) - every event logs
+    // its wall time + how long acquiring the submission lock took
+    const std::chrono::steady_clock::time_point generationStart = std::chrono::steady_clock::now();
 
     const lodclusters_remix::ProcessorConfig processorConfig = buildProcessorConfig();
     const std::string configDigest = lodclusters_remix::getConfigCacheDigestUtf8(processorConfig);
@@ -518,7 +613,9 @@ namespace dxvk {
         pendingFiles.push_back(lodclusters_remix::getGeometryCacheFileUtf8(hash, processorConfig));
       }
 
+      const std::chrono::steady_clock::time_point appendLockStart = std::chrono::steady_clock::now();
       m_device->lockSubmission();
+      const double appendLockWaitMs = elapsedMs(appendLockStart);
       const lodclusters_remix::ClusterRenderSystem::AppendResult appendResult =
         m_renderSystem->appendToGeneration(pendingFiles, m_pendingGeometryHashes);
       m_device->unlockSubmission();
@@ -533,7 +630,8 @@ namespace dxvk {
                                         m_pendingGeometryHashes.begin(), m_pendingGeometryHashes.end());
 
         Logger::info(str::format("[ClusterLOD] render generation ", m_generationCount, " grew by ",
-                                 m_pendingGeometryHashes.size(), " geometries (", infos.size(), " total)"));
+                                 m_pendingGeometryHashes.size(), " geometries (", infos.size(), " total)",
+                                 " in ", elapsedMs(generationStart), " ms (lock wait ", appendLockWaitMs, " ms)"));
 
         m_pendingGeometryHashes.clear();
         m_lastGenerationFrame = currentFrame;
@@ -543,7 +641,7 @@ namespace dxvk {
         // reuse last frame's TLAS instance list (risk R8)
         accelManager.invalidateBucketCache();
         instanceManager.notifySceneChanged();
-        return;
+        return elapsedMs(generationStart);
       }
 
       if (appendResult == lodclusters_remix::ClusterRenderSystem::AppendResult::Failed) {
@@ -551,10 +649,11 @@ namespace dxvk {
         // Drop the batch so a bad file cannot wedge the pipeline - those
         // geometries stay on the classic path.
         Logger::err(str::format("[ClusterLOD] appending ", m_pendingGeometryHashes.size(),
-                                " geometries FAILED - they stay on the classic path"));
+                                " geometries FAILED - they stay on the classic path (",
+                                elapsedMs(generationStart), " ms)"));
         m_pendingGeometryHashes.clear();
         m_lastGenerationFrame = currentFrame;
-        return;
+        return elapsedMs(generationStart);
       }
 
       // AppendResult::NeedsRebuild: fall through to the full rebuild below.
@@ -574,7 +673,9 @@ namespace dxvk {
       cacheFiles.push_back(lodclusters_remix::getGeometryCacheFileUtf8(hash, processorConfig));
     }
 
+    const std::chrono::steady_clock::time_point rebuildLockStart = std::chrono::steady_clock::now();
     m_device->lockSubmission();
+    const double rebuildLockWaitMs = elapsedMs(rebuildLockStart);
     const bool built = m_renderSystem->buildGeneration(cacheFiles, m_residentGeometryHashes, requestedCapacity);
     m_device->unlockSubmission();
 
@@ -587,8 +688,9 @@ namespace dxvk {
       // isClusterInstance rejects everything while no generation exists; retried
       // when the next processed geometry arrives
       Logger::err(str::format("[ClusterLOD] render generation build FAILED (", m_residentGeometryHashes.size(),
-                              " geometries) - instances stay on the classic path"));
-      return;
+                              " geometries) - instances stay on the classic path (",
+                              elapsedMs(generationStart), " ms)"));
+      return elapsedMs(generationStart);
     }
 
     m_generationConfigDigest = configDigest;
@@ -608,7 +710,10 @@ namespace dxvk {
 
     Logger::info(str::format("[ClusterLOD] render generation ", m_generationCount, " active: ",
                              infos.size(), " geometries, instance capacity ",
-                             m_renderSystem->getMaxRenderInstances()));
+                             m_renderSystem->getMaxRenderInstances(),
+                             ", full rebuild in ", elapsedMs(generationStart),
+                             " ms (lock wait ", rebuildLockWaitMs, " ms, device-idle swap)"));
+    return elapsedMs(generationStart);
   }
 
   void ClusterLodManager::onFrameBegin(Rc<DxvkContext> ctx, AccelManager& accelManager, InstanceManager& instanceManager) {
@@ -631,6 +736,13 @@ namespace dxvk {
       return;
     }
 
+    // chrono: previous frame's isClusterInstance total (accumulated across the
+    // merge pass, one sample per frame) + this function's own cost (generation
+    // events excluded - they log their own wall time above)
+    m_frameTimes.classify.add(m_frameClassifyMs);
+    m_frameClassifyMs = 0.0;
+    const std::chrono::steady_clock::time_point frameBeginStart = std::chrono::steady_clock::now();
+
     // ---- P4b Path B frame tick ----
     {
       // publish the worker-created template system to the main thread
@@ -646,12 +758,25 @@ namespace dxvk {
     if (m_provider != nullptr
         && ClusterLodOptions::logStatsIntervalFrames() > 0
         && currentFrame - m_lastStatsLogFrame >= uint32_t(ClusterLodOptions::logStatsIntervalFrames())) {
-      const ClusterLodGeometryProvider::Stats stats = m_provider->getStats();
-      const uint64_t digest = XXH64(&stats, sizeof(stats), 0);
+      // chrono fields change on every draw and must not force a log while the
+      // actual counts are idle - digest the counters only
+      ClusterLodGeometryProvider::Stats digestStats = m_provider->getStats();
+      digestStats.intakeCalls = 0;
+      digestStats.intakeUsTotal = 0;
+      digestStats.intakeUsMax = 0;
+      digestStats.snapshotCount = 0;
+      digestStats.snapshotUsTotal = 0;
+      digestStats.snapshotUsMax = 0;
+      const uint64_t digest = XXH64(&digestStats, sizeof(digestStats), 0);
       if (digest != m_lastLoggedStatsDigest) {
         logStatistics();
         m_lastLoggedStatsDigest = digest;
       }
+
+      // chrono: per-frame CPU/GPU section report; silent while nothing
+      // dispatched (menus/loading), so this only speaks during gameplay
+      logFrameTimes();
+
       m_lastStatsLogFrame = currentFrame;
     }
 
@@ -695,7 +820,9 @@ namespace dxvk {
       m_pendingGeometryHashes.push_back(hash);
     }
 
-    buildGenerationIfDue(accelManager, instanceManager);
+    const double generationMs = buildGenerationIfDue(accelManager, instanceManager);
+
+    m_frameTimes.frameBegin.add(elapsedMs(frameBeginStart) - generationMs);
   }
 
   bool ClusterLodManager::needsFullMergePass() const {
@@ -709,6 +836,15 @@ namespace dxvk {
     if (!ClusterLodOptions::enable()) {
       return false;
     }
+
+    // chrono: called once per instance from mergeInstancesIntoBlas' full pass -
+    // the sum lands in m_frameTimes.classify at the next onFrameBegin. RAII so
+    // every return path (incl. the Path B branch) is counted.
+    struct ClassifyChrono {
+      double& accumMs;
+      std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+      ~ClassifyChrono() { accumMs += elapsedMs(start); }
+    } classifyChrono { m_frameClassifyMs };
 
     const BlasEntry* blasEntry = instance->getBlas();
     if (blasEntry == nullptr) {
@@ -918,12 +1054,22 @@ namespace dxvk {
 
     // ---- P4b Path B (independent of a Path A generation) ----
     if (pathBActive) {
+      const std::chrono::steady_clock::time_point dispatchBStart = std::chrono::steady_clock::now();
       dispatchAnimated(ctx, accelManager, ctx->getCommandList()->getCmdBuffer(DxvkCmdBuffer::ExecBuffer));
+      m_frameTimes.dispatchB.add(elapsedMs(dispatchBStart));
     }
 
     if (!pathAActive) {
       return;
     }
+
+    // chrono: Path A's CPU record cost (input fill, HiZ feed, recordFrame,
+    // region copies), counted on every exit path below
+    struct DispatchChrono {
+      SectionTimes& bucket;
+      std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+      ~DispatchChrono() { bucket.add(elapsedMs(start)); }
+    } dispatchChrono { m_frameTimes.dispatchA };
 
     // flat kernel-array order: [Opaque region][Unordered region]
     std::vector<lodclusters_remix::InstanceInput> instanceInputs(count);
@@ -1009,6 +1155,8 @@ namespace dxvk {
     // variants are baked then, and kernels compiled WITH culling must keep
     // receiving fresh HiZ regardless of later live edits to the option
     if (m_cullingActive) {
+      const std::chrono::steady_clock::time_point hizStart = std::chrono::steady_clock::now();
+
       const Resources::Resource& primaryDepth =
         m_device->getCommon()->getResources().getRaytracingOutput().m_primaryDepth;
 
@@ -1018,9 +1166,13 @@ namespace dxvk {
         // resize takes a device-idle wait inside the library; Vulkan queues
         // need external synchronization against dxvk's submission thread
         if (m_renderSystem->hizResolutionDiffers(depthExtent.width, depthExtent.height)) {
+          const std::chrono::steady_clock::time_point resizeStart = std::chrono::steady_clock::now();
           m_device->lockSubmission();
           m_renderSystem->updateHizResolution(depthExtent.width, depthExtent.height);
           m_device->unlockSubmission();
+          // chrono: device-idle event - shows up as a one-frame hitch
+          Logger::info(str::format("[ClusterLOD] HiZ resize to ", depthExtent.width, "x", depthExtent.height,
+                                   " took ", elapsedMs(resizeStart), " ms (device idle)"));
           // recreated resources invalidate the seen-set (handles may recycle)
           m_hizDepthImagesSeen.clear();
         }
@@ -1043,6 +1195,8 @@ namespace dxvk {
           ctx->getCommandList()->trackResource<DxvkAccess::None>(primaryDepth.view);
         }
       }
+
+      m_frameTimes.hizFeed.add(elapsedMs(hizStart));
     }
 
     VkCommandBuffer cmd = ctx->getCommandList()->getCmdBuffer(DxvkCmdBuffer::ExecBuffer);
@@ -1053,14 +1207,18 @@ namespace dxvk {
     // so park it for the duration (RTXIO's non-dedicated-queue precedent).
     const bool lockForAsyncTransfer = m_streamingActive && m_asyncTransferActive;
     if (lockForAsyncTransfer) {
+      const std::chrono::steady_clock::time_point lockStart = std::chrono::steady_clock::now();
       m_device->lockSubmission();
+      m_frameTimes.lockWaitA.add(elapsedMs(lockStart));
     }
 
     // traversal -> CLAS/BLAS builds -> instance_assign_blas (patched TlasInstances
     // land in the renderer's staging buffer, blasReference resolved); streaming
     // mode also records request handling, uploads and scene patches
+    const std::chrono::steady_clock::time_point recordStart = std::chrono::steady_clock::now();
     lodclusters_remix::FrameSubmitSync submitSync;
     m_renderSystem->recordFrame(cmd, frameParams, instanceInputs.data(), tlasInstances.data(), count, &submitSync);
+    m_frameTimes.recordA.add(elapsedMs(recordStart));
 
     if (lockForAsyncTransfer) {
       m_device->unlockSubmission();
@@ -1162,8 +1320,10 @@ namespace dxvk {
       }
     }
 
+    const std::chrono::steady_clock::time_point recordStart = std::chrono::steady_clock::now();
     const bool recorded = m_templateSystemMT->recordFrame(cmd, poses.data(), poseCount, slotPoseIndex.data(),
                                                           tlasInstances.data(), countB);
+    m_frameTimes.recordB.add(elapsedMs(recordStart));
 
     const Rc<DxvkBuffer>& instanceBuffer = accelManager.getVkInstanceBuffer();
     if (instanceBuffer == nullptr) {
