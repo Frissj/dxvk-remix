@@ -416,6 +416,23 @@ struct RaytraceArgs {
   float wboitDepthWeightTuning;
   uint wboitEnabled;
 
+  // NV-DXVK: RTX Mega Geometry cluster LOD.
+  // Device address (BDA) of the active render generation's shaderio::Geometry
+  // table, split into two uints to avoid any C++/shader uint64 alignment
+  // mismatch; 0 while no generation is active. Cluster-surface hits resolve
+  // their vertex data through this (see cluster_geometry.slangh).
+  uint clusterGeometriesTableAddressLo;
+  uint clusterGeometriesTableAddressHi;
+
+  // NV-DXVK: RTX Mega Geometry Path B (P4b, deforming geometry).
+  // Device address (BDA) of the global animated cluster table: one uint64 per
+  // cluster holding the device address of the cluster's triangles inside its
+  // geometry's cluster-ordered uint32 index topology. The ray's ClusterID
+  // indexes it; hits against template BLASes remap their cluster-local
+  // primitiveIndex to the original triangle through it. 0 while inactive.
+  uint animatedClusterTableAddressLo;
+  uint animatedClusterTableAddressHi;
+
   // NOTE: Add structs to the top section of RaytraceArgs, not the bottom.
   // NOTE: bool does not work in debug builds, use uint instead.
 };

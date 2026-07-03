@@ -21,6 +21,9 @@
 */
 #pragma once
 
+// NV-DXVK: RTX Mega Geometry - ClusterIDNV capture for cluster BLAS hits
+#include "rtx/utility/cluster_id.slangh"
+
 // Ray Constants
 
 // Note: Sign bit of hit distance on Ray Interactions used to indicate no hit.
@@ -40,6 +43,10 @@ struct RayHitInfo
   uint primitiveIndex;
   uint customIndex;
   uint geometryIndex;
+  // NV-DXVK: RTX Mega Geometry - ClusterIDNV of the hit (CLUSTER_ID_INVALID for
+  // hits against classic, non-cluster BLASes). For cluster hits primitiveIndex
+  // is cluster-local.
+  uint clusterId;
   bool hasHit;
   bool frontHit;
 };
@@ -61,12 +68,14 @@ variableName.barycentricCoordinates = barycentricsToUint(barycentricCoordinates)
 variableName.primitiveIndex = PrimitiveIndex();                                   \
 variableName.customIndex = InstanceID();                                          \
 variableName.geometryIndex = GeometryIndex();                                     \
+variableName.clusterId = getHitClusterIdNV();                                     \
 variableName.hasHit = true;                                                       \
 variableName.frontHit = HitKind() == HIT_KIND_TRIANGLE_FRONT_FACE;
 
 #define RAY_HIT_INFO_CREATE_TRACE_RAY_MISS(variableName) \
 RayHitInfo variableName;                                 \
-variableName.hasHit = false;
+variableName.hasHit = false;                             \
+variableName.clusterId = CLUSTER_ID_INVALID;
 
 #define RAY_HIT_INFO_CREATE_RAY_QUERY_CANDIDATE(variableName, rayQuery)                             \
 variableName.hasHit = true;                                                                         \
@@ -75,6 +84,7 @@ variableName.barycentricCoordinates = barycentricsToUint(rayQuery.CandidateTrian
 variableName.primitiveIndex = rayQuery.CandidatePrimitiveIndex();                                   \
 variableName.customIndex = rayQuery.CandidateInstanceID();                                          \
 variableName.geometryIndex = rayQuery.CandidateGeometryIndex();                                     \
+variableName.clusterId = rayQueryGetCandidateClusterIdNV(rayQuery);                                 \
 variableName.frontHit = rayQuery.CandidateTriangleFrontFace();
 
 #define RAY_HIT_INFO_CREATE_RAY_QUERY_COMMITTED(variableName, rayQuery)                             \
@@ -85,4 +95,5 @@ variableName.barycentricCoordinates = barycentricsToUint(rayQuery.CommittedTrian
 variableName.primitiveIndex = rayQuery.CommittedPrimitiveIndex();                                   \
 variableName.customIndex = rayQuery.CommittedInstanceID();                                          \
 variableName.geometryIndex = rayQuery.CommittedGeometryIndex();                                     \
+variableName.clusterId = variableName.hasHit ? rayQueryGetCommittedClusterIdNV(rayQuery) : CLUSTER_ID_INVALID; \
 variableName.frontHit = rayQuery.CommittedTriangleFrontFace();

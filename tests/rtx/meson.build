@@ -4,7 +4,10 @@ subdir('unit')
 if target_machine.cpu() != 'armv8'
 
 dxvkrt_test_root = meson.global_source_root().replace('\\', '/') + '/tests/rtx/dxvk_rt_testing/'
-if fs.is_dir('dxvk_rt_testing')
+# NV-DXVK: check for the build file, not just the directory - test runs create
+# dxvk_rt_testing/apics/ as an output location, which would otherwise flip this
+# branch on and break meson regeneration when the internal repo is not cloned.
+if fs.is_file('dxvk_rt_testing/meson.build')
   subdir('dxvk_rt_testing')
 endif
 

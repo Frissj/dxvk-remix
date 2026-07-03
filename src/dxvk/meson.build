@@ -200,6 +200,10 @@ dxvk_src = files([
   'rtx_render/rtx_camera.h',
   'rtx_render/rtx_camera_manager.cpp',
   'rtx_render/rtx_camera_manager.h',
+  'rtx_render/rtx_cluster_lod_geometry_provider.cpp',
+  'rtx_render/rtx_cluster_lod_geometry_provider.h',
+  'rtx_render/rtx_cluster_lod_manager.cpp',
+  'rtx_render/rtx_cluster_lod_manager.h',
   'rtx_render/rtx_composite.cpp',
   'rtx_render/rtx_composite.h',
   'rtx_render/rtx_context.cpp',
@@ -497,6 +501,127 @@ rtx_shaders = custom_target(
   command: [ python_interpreter ] + rtx_shaders_command_arguments
 )
 
+# NV-DXVK start: RTX Mega Geometry (cluster LOD) library
+# Ported from nvpro-samples/vk_lod_clusters + vk_animated_clusters with the
+# vendored nvpro_core2 nvvk/nvutils layer. Built as a separate static library
+# because the NVIDIA code requires C++20 (std::span) while dxvk builds C++17.
+# The interface exposed to the rest of rtx_render is C++17-clean.
+lodclusters_src = files([
+  # vk_lod_clusters host code (Path A: static geometry, continuous LOD)
+  'rtx_render/lodclusters/scene.cpp',
+  'rtx_render/lodclusters/scene_remix_input.cpp',
+  'rtx_render/lodclusters/lodclusters_remix.cpp',
+  'rtx_render/lodclusters/scene_cluster_lod.cpp',
+  'rtx_render/lodclusters/scene_cluster_compression.cpp',
+  'rtx_render/lodclusters/scene_cache.cpp',
+  'rtx_render/lodclusters/scene_preloaded.cpp',
+  'rtx_render/lodclusters/scene_streaming.cpp',
+  'rtx_render/lodclusters/scene_streaming_utils.cpp',
+  'rtx_render/lodclusters/meshopt_clusterlod.cpp',
+  'rtx_render/lodclusters/resources.cpp',
+  'rtx_render/lodclusters/nvhiz_vk.cpp',
+  'rtx_render/lodclusters/lodclusters_shader_table.cpp',
+  # P2: preloaded rendering path
+  'rtx_render/lodclusters/renderer.cpp',
+  'rtx_render/lodclusters/renderer_raytrace_clusters_lod.cpp',
+  'rtx_render/lodclusters/lodclusters_remix_render.cpp',
+  # P4b: Path B (vk_animated_clusters cluster templates for deforming geometry)
+  'rtx_render/lodclusters/animated/scene.cpp',
+  'rtx_render/lodclusters/animated/renderer_raytrace_clusters.cpp',
+
+  # vendored nvpro_core2 layer (verbatim)
+  'rtx_render/lodclusters/nvpro_shims/nvutils/file_mapping.cpp',
+  'rtx_render/lodclusters/nvpro_shims/nvutils/file_operations.cpp',
+  'rtx_render/lodclusters/nvpro_shims/nvutils/id_pool.cpp',
+  'rtx_render/lodclusters/nvpro_shims/nvutils/logger.cpp',
+  'rtx_render/lodclusters/nvpro_shims/nvutils/parallel_work.cpp',
+  'rtx_render/lodclusters/nvpro_shims/nvutils/profiler.cpp',
+  'rtx_render/lodclusters/nvpro_shims/nvutils/timers.cpp',
+  'rtx_render/lodclusters/nvpro_shims/nvvk/acceleration_structures.cpp',
+  'rtx_render/lodclusters/nvpro_shims/nvvk/barriers.cpp',
+  'rtx_render/lodclusters/nvpro_shims/nvvk/buffer_suballocator.cpp',
+  'rtx_render/lodclusters/nvpro_shims/nvvk/check_error.cpp',
+  'rtx_render/lodclusters/nvpro_shims/nvvk/commands.cpp',
+  'rtx_render/lodclusters/nvpro_shims/nvvk/command_pools.cpp',
+  'rtx_render/lodclusters/nvpro_shims/nvvk/descriptors.cpp',
+  'rtx_render/lodclusters/nvpro_shims/nvvk/helpers.cpp',
+  'rtx_render/lodclusters/nvpro_shims/nvvk/physical_device.cpp',
+  'rtx_render/lodclusters/nvpro_shims/nvvk/profiler_vk.cpp',
+  'rtx_render/lodclusters/nvpro_shims/nvvk/resource_allocator.cpp',
+  'rtx_render/lodclusters/nvpro_shims/nvvk/sampler_pool.cpp',
+  'rtx_render/lodclusters/nvpro_shims/nvvk/sbt_generator.cpp',
+  'rtx_render/lodclusters/nvpro_shims/nvvk/semaphore.cpp',
+  'rtx_render/lodclusters/nvpro_shims/nvvk/staging.cpp',
+  'rtx_render/lodclusters/nvpro_shims/offsetallocator/offsetAllocator.cpp',
+  'rtx_render/lodclusters/nvpro_shims/vma_impl.cpp',
+  'rtx_render/lodclusters/nvpro_shims/volk/volk.cpp',
+
+  # vendored vulkan_radix_sort (instance sorting)
+  'rtx_render/lodclusters/thirdparty/vulkan_radix_sort/src/vk_radix_sort.cc',
+
+  # vendored meshoptimizer (pinned to the clusterlod fork's base commit)
+  '../../submodules/meshoptimizer/src/allocator.cpp',
+  '../../submodules/meshoptimizer/src/clusterizer.cpp',
+  '../../submodules/meshoptimizer/src/indexanalyzer.cpp',
+  '../../submodules/meshoptimizer/src/indexcodec.cpp',
+  '../../submodules/meshoptimizer/src/indexgenerator.cpp',
+  '../../submodules/meshoptimizer/src/overdrawoptimizer.cpp',
+  '../../submodules/meshoptimizer/src/partition.cpp',
+  '../../submodules/meshoptimizer/src/quantization.cpp',
+  '../../submodules/meshoptimizer/src/rasterizer.cpp',
+  '../../submodules/meshoptimizer/src/simplifier.cpp',
+  '../../submodules/meshoptimizer/src/spatialorder.cpp',
+  '../../submodules/meshoptimizer/src/stripifier.cpp',
+  '../../submodules/meshoptimizer/src/vcacheoptimizer.cpp',
+  '../../submodules/meshoptimizer/src/vertexcodec.cpp',
+  '../../submodules/meshoptimizer/src/vertexfilter.cpp',
+  '../../submodules/meshoptimizer/src/vfetchoptimizer.cpp',
+])
+
+lodclusters_include_path = include_directories(
+  'rtx_render/lodclusters',
+  'rtx_render/lodclusters/nvpro_shims',
+  'rtx_render/lodclusters/nvpro_shims/volk',
+  'rtx_render/lodclusters/nvpro_shims/vma',
+  'rtx_render/lodclusters/thirdparty/vulkan_radix_sort/include',
+  'shaders/rtx/pass/lodclusters',
+  '../../submodules/glm',
+  '../../submodules/meshoptimizer/src',
+)
+
+if dxvk_is_ninja
+  lodclusters_cpp_std = 'vc++20'
+else
+  lodclusters_cpp_std = 'c++20'
+endif
+
+lodclusters_args = [
+  '-DVK_NO_PROTOTYPES',
+  '-DUSE_DLSS=0',
+  '-DFMT_HEADER_ONLY',
+  '-DVMA_STATIC_VULKAN_FUNCTIONS=0',
+  '-DVMA_DYNAMIC_VULKAN_FUNCTIONS=1',
+  # NV-DXVK: isolate volk's Vulkan globals in `namespace volk` (C++ linkage) so
+  # they don't shadow dxvk core's real vulkan-1 imports when linked into
+  # d3d9.dll. volk.h emits `using namespace volk;` so ported code's unqualified
+  # vk* calls still resolve, while struct-member designators (VmaVulkanFunctions)
+  # are untouched. Requires volk compiled as C++ (volk.cpp). Must be defined for
+  # EVERY TU that includes volk.h - all live in this target.
+  '-DVOLK_NAMESPACE',
+]
+
+lodclusters_lib = static_library('lodclusters', lodclusters_src, [rtx_shaders],
+  # lodclusters_include_path must come FIRST: dxvk_include_path contains the
+  # repo's legacy glm copy (include/glm, pre-0.9.9 - no glm::qualifier/vec<L,T,Q>),
+  # while the NVIDIA code requires the modern vendored submodules/glm. If the
+  # legacy copy resolves first the two versions mix and the build explodes.
+  include_directories : [ lodclusters_include_path, dxvk_include_path ],
+  override_options    : ['cpp_std='+lodclusters_cpp_std, 'werror=false'],
+  cpp_args            : lodclusters_args,
+  c_args              : ['-DVK_NO_PROTOTYPES'],
+)
+# NV-DXVK end
+
 dxvk_embedded_data_files = files([
   '../../external/fonts/NVIDIASans/NVIDIASansMd.ttf',
   '../../external/fonts/NVIDIASans/NVIDIASansBd.ttf',
@@ -536,5 +661,10 @@ dxvk_lib = static_library('dxvk', dxvk_src, dxvk_version, [generated_dxvk_shader
   )
 
 dxvk_dep = declare_dependency(
-  link_with           : [ dxvk_lib ],
+  # NV-DXVK start: RTX Mega Geometry (cluster LOD) library
+  link_with           : [ dxvk_lib, lodclusters_lib ],
+  # mincore.lib: QueryUnbiasedInterruptTimePrecise used by the vendored
+  # nvutils::PerformanceTimer (nvpro_shims/nvutils/timers.cpp)
+  link_args           : dxvk_is_msvc ? [ 'mincore.lib' ] : [ '-lmincore' ],
+  # NV-DXVK end
   include_directories : [ dxvk_include_path ])

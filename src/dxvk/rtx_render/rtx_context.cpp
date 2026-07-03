@@ -32,6 +32,7 @@
 #include "rtx_options.h"
 #include "rtx_bindless_resource_manager.h"
 #include "rtx_opacity_micromap_manager.h"
+#include "rtx_cluster_lod_manager.h"
 #include "rtx_asset_replacer.h"
 #include "rtx_terrain_baker.h"
 #include "rtx_texture_manager.h"
@@ -1375,6 +1376,22 @@ namespace dxvk {
     constants.wboitEnergyLossCompensation = RtxOptions::wboitEnergyLossCompensation();
     constants.wboitDepthWeightTuning = RtxOptions::wboitDepthWeightTuning();
     constants.wboitEnabled = RtxOptions::wboitEnabled();
+
+    // NV-DXVK start: RTX Mega Geometry cluster LOD - geometry table for hit-side cluster fetch
+    {
+      const ClusterLodManager* clusterLodManager = getSceneManager().getClusterLodManager();
+      const uint64_t clusterGeometriesTableAddress =
+        clusterLodManager != nullptr ? clusterLodManager->getGeometriesTableAddress() : 0;
+      constants.clusterGeometriesTableAddressLo = uint32_t(clusterGeometriesTableAddress);
+      constants.clusterGeometriesTableAddressHi = uint32_t(clusterGeometriesTableAddress >> 32);
+
+      // P4b Path B: animated cluster table for the hit-side primitive remap
+      const uint64_t animatedClusterTableAddress =
+        clusterLodManager != nullptr ? clusterLodManager->getAnimatedClusterTableAddress() : 0;
+      constants.animatedClusterTableAddressLo = uint32_t(animatedClusterTableAddress);
+      constants.animatedClusterTableAddressHi = uint32_t(animatedClusterTableAddress >> 32);
+    }
+    // NV-DXVK end
 
     constants.eyeArgs.enableEyes = RtxOptions::Eye::enable();
     constants.eyeArgs.normalBendingEyeball = RtxOptions::Eye::eyeballSphereOffset();

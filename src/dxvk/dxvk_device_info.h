@@ -28,6 +28,9 @@ namespace dxvk {
     VkPhysicalDeviceFloatControlsPropertiesKHR                khrShaderFloatControls;
     VkPhysicalDeviceOpacityMicromapPropertiesEXT              extOpacityMicromapProperties;
     VkPhysicalDeviceRayTracingInvocationReorderPropertiesNV   nvRayTracingInvocationReorderProperties;
+    // NV-DXVK start: RTX Mega Geometry (cluster acceleration structures)
+    VkPhysicalDeviceClusterAccelerationStructurePropertiesNV  nvClusterAccelerationStructureProperties;
+    // NV-DXVK end
   };
 
 
@@ -60,6 +63,10 @@ namespace dxvk {
 
     // NV-DXVK start: opacity micromap
     VkPhysicalDeviceSynchronization2FeaturesKHR               khrSynchronization2;
+    // NV-DXVK end
+
+    // NV-DXVK start: RTX Mega Geometry (cluster acceleration structures)
+    VkPhysicalDeviceClusterAccelerationStructureFeaturesNV    nvClusterAccelerationStructureFeatures;
     // NV-DXVK end
   };
 

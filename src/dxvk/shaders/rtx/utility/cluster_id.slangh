@@ -1,0 +1,71 @@
+/*
+* Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+#pragma once
+
+// RTX Mega Geometry: ClusterID access for hits against
+// VK_NV_cluster_acceleration_structure cluster BLASes.
+//
+// The repo's slang (2025.10.4) ships NATIVE cluster intrinsics in its core
+// module: RayQuery::CommittedClusterID() / CandidateClusterID() and the
+// global GetClusterID() for ray tracing pipeline hit stages (verified by
+// smoke compile + spirv-val: emits OpRayQueryGetClusterIdNV / the
+// ClusterIDNV builtin with capability RayTracingClusterAccelerationStructureNV
+// and OpExtension SPV_NV_cluster_acceleration_structure). Hits against
+// classic (non-cluster) BLASes return CLUSTER_ID_INVALID (the spec's
+// gl_ClusterIDNoneNV == -1), which is what downstream code branches on.
+//
+// CLUSTER_LOD_SHADER_SUPPORT: referencing these intrinsics declares the
+// RayTracingClusterAccelerationStructureNV SPIR-V capability in every shader
+// binary that includes this file. Drivers without
+// VK_NV_cluster_acceleration_structure reject such modules, so builds
+// targeting non-NVIDIA/old-driver hardware must set this to 0 until the
+// affected passes get a shader-variant axis (P5 production hardening,
+// INTEGRATION_PLAN.txt).
+#ifndef CLUSTER_LOD_SHADER_SUPPORT
+#define CLUSTER_LOD_SHADER_SUPPORT 1
+#endif
+
+#ifndef CLUSTER_ID_INVALID
+#define CLUSTER_ID_INVALID 0xFFFFFFFFu
+#endif
+
+#if CLUSTER_LOD_SHADER_SUPPORT
+
+// Function-like macros (not functions) so any RayQuery<FLAGS> instantiation
+// works unchanged at every RAY_HIT_INFO_CREATE_* expansion site.
+
+// ray query: committed intersection
+#define rayQueryGetCommittedClusterIdNV(rayQuery) uint(rayQuery.CommittedClusterID())
+
+// ray query: candidate intersection
+#define rayQueryGetCandidateClusterIdNV(rayQuery) uint(rayQuery.CandidateClusterID())
+
+// ray tracing pipeline hit stages: the ClusterIDNV builtin (gl_ClusterIDNV)
+#define getHitClusterIdNV() uint(GetClusterID())
+
+#else  // !CLUSTER_LOD_SHADER_SUPPORT
+
+#define rayQueryGetCommittedClusterIdNV(rayQuery) (CLUSTER_ID_INVALID)
+#define rayQueryGetCandidateClusterIdNV(rayQuery) (CLUSTER_ID_INVALID)
+#define getHitClusterIdNV() (CLUSTER_ID_INVALID)
+
+#endif

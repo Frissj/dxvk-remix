@@ -471,7 +471,12 @@ void integratePathVertex(
   {
 #endif // SURFACE_MATERIAL_RESOLVE_TYPE_RAY_PORTAL
 
-    if (NEE_CACHE_ENABLE && cb.neeCacheArgs.enable && isNeeEnabledOnBounce && any(emissiveLight > 0))
+    // NV-DXVK: cluster LOD and cluster-template (P4b) surfaces are excluded
+    // from the NEE cache - their primitiveIndex is cluster-local and their
+    // surface has no primitive-ID prefix-sum range, so triangle candidates
+    // would reference wrong geometry.
+    if (NEE_CACHE_ENABLE && cb.neeCacheArgs.enable && isNeeEnabledOnBounce && any(emissiveLight > 0)
+        && !surface.isClusterLod && !surface.isClusterTemplate)
     {
       NEECell cell = NEECache.getCell(pathState.neeCacheCellOffset);
 

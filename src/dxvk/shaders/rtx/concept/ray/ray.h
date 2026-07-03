@@ -84,6 +84,11 @@ struct RayInteraction : MinimalRayInteraction
   uint barycentricCoordinates = 0u;
   uint primitiveIndex = 0u;
 
+  // NV-DXVK: RTX Mega Geometry - ClusterIDNV of the hit; CLUSTER_ID_INVALID
+  // (0xFFFFFFFF, gl_ClusterIDNoneNV) for hits against classic BLASes. For
+  // cluster hits primitiveIndex is cluster-local.
+  uint clusterId = 0xFFFFFFFFu;
+
   // Packed surface index + flags (saves 8 bytes vs. separate fields).
   // Bit layout mirrors the customInstanceIndex encoding with an extra frontHit bit:
   //   Bits  0..20 : surfaceIndex  (CUSTOM_INDEX_SURFACE_MASK)

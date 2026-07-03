@@ -343,6 +343,10 @@ namespace dxvk {
     DxvkExt khrSynchronization2               = { VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME,                  DxvkExtMode::Optional };
     DxvkExt extOpacityMicromap                = { VK_EXT_OPACITY_MICROMAP_EXTENSION_NAME,                   DxvkExtMode::Optional };
 
+    // NV-DXVK start: RTX Mega Geometry (cluster acceleration structures)
+    DxvkExt nvClusterAccelerationStructure    = { VK_NV_CLUSTER_ACCELERATION_STRUCTURE_EXTENSION_NAME,      DxvkExtMode::Optional };
+    // NV-DXVK end
+
     // NV-DXVK start: Integrate Reflex
     DxvkExt nvLowLatency                      = { "VK_NV_low_latency",                                      DxvkExtMode::Optional };
     // NV-DXVK end

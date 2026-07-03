@@ -287,6 +287,14 @@
 #define DEBUG_VIEW_SPARSE_RENDERING_DIRECT_ACTIVE_THREADS 910
 #define DEBUG_VIEW_SPARSE_RENDERING_INDIRECT_ACTIVE_THREADS 911
 
+// NV-DXVK: RTX Mega Geometry cluster LOD visualization (hash-colored like the
+// vk_lod_clusters sample's visualize modes; classic surfaces show black)
+#define DEBUG_VIEW_CLUSTER_LOD_CLUSTER_ID 920
+#define DEBUG_VIEW_CLUSTER_LOD_GROUP 921
+#define DEBUG_VIEW_CLUSTER_LOD_LEVEL 922
+#define DEBUG_VIEW_CLUSTER_LOD_TRIANGLE 923
+#define DEBUG_VIEW_CLUSTER_LOD_BLAS 924
+
 enum class CompositeDebugView : uint32_t {
   Disabled = 0,
   FinalRenderWithMaterialProperties,

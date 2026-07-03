@@ -22,6 +22,14 @@
 
 test_unit_deps = [ dxvk_deps, dxvk_extradep, util_dep, tracy_dep ]
 
+# NV-DXVK start: tests that link dxvk_lib directly (bypassing dxvk_dep) need the
+# RTX Mega Geometry cluster LOD library too - libdxvk.a's cluster manager and
+# geometry provider reference it - plus mincore.lib for the vendored
+# nvutils::PerformanceTimer, mirroring dxvk_dep's wiring in src/dxvk/meson.build.
+test_dxvk_link_libs = [ d3d9_dll, dxvk_lib, lodclusters_lib ]
+test_dxvk_link_args = dxvk_is_msvc ? [ 'mincore.lib' ] : [ '-lmincore' ]
+# NV-DXVK end
+
 test_env = environment({'MALLOC_PERTURB_': '0'})
 
 # include remix deps on the search path
@@ -66,23 +74,23 @@ exe = executable('test_graph_documentation',  files('test_graph_documentation.cp
 test('test_graph_documentation', exe, env: test_env, priority : -50, args: d3d9_dll.full_path())
 tests += exe
 
-exe = executable('test_graph_usd_parser',  files('graph/test_component.h', 'graph/test_flexible_component.h', 'graph/test_flexible_component.cpp', 'test_graph_usd_parser.cpp'), 
-  include_directories : test_include_path, dependencies : [ test_unit_deps, d3d9_dep ], link_with: [ d3d9_dll, dxvk_lib ] , win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
+exe = executable('test_graph_usd_parser',  files('graph/test_component.h', 'graph/test_flexible_component.h', 'graph/test_flexible_component.cpp', 'test_graph_usd_parser.cpp'),
+  include_directories : test_include_path, dependencies : [ test_unit_deps, d3d9_dep ], link_with: test_dxvk_link_libs, link_args: test_dxvk_link_args , win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
 test('test_graph_usd_parser', exe, env: test_env)
 tests += exe
 
-exe = executable('test_transform_components',  files('test_transform_components.cpp'), 
-  include_directories : test_include_path, dependencies : [ d3d9_dep, test_unit_deps ], link_with: [ d3d9_dll, dxvk_lib ] , win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
+exe = executable('test_transform_components',  files('test_transform_components.cpp'),
+  include_directories : test_include_path, dependencies : [ d3d9_dep, test_unit_deps ], link_with: test_dxvk_link_libs, link_args: test_dxvk_link_args , win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
 test('test_transform_components', exe, env: test_env)
 tests += exe
 
-exe = executable('test_rtx_option',  files('test_rtx_option.cpp'), 
-  include_directories : test_include_path, dependencies : [ d3d9_dep, test_unit_deps ], link_with: [ d3d9_dll, dxvk_lib ] , win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
+exe = executable('test_rtx_option',  files('test_rtx_option.cpp'),
+  include_directories : test_include_path, dependencies : [ d3d9_dep, test_unit_deps ], link_with: test_dxvk_link_libs, link_args: test_dxvk_link_args , win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
 test('test_rtx_option', exe, env: test_env)
 tests += exe
 
-exe = executable('test_option_layer_export',  files('test_option_layer_export.cpp'), 
-  include_directories : test_include_path, dependencies : [ d3d9_dep, test_unit_deps ], link_with: [ d3d9_dll, dxvk_lib ] , win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
+exe = executable('test_option_layer_export',  files('test_option_layer_export.cpp'),
+  include_directories : test_include_path, dependencies : [ d3d9_dep, test_unit_deps ], link_with: test_dxvk_link_libs, link_args: test_dxvk_link_args , win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
 test('test_option_layer_export', exe, env: test_env)
 tests += exe
 

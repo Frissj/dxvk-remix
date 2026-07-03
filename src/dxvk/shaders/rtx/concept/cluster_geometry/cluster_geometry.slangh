@@ -1,0 +1,257 @@
+/*
+* Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+#pragma once
+
+// RTX Mega Geometry: hit-side cluster vertex fetch.
+//
+// 1:1 Slang port of the vk_lod_clusters sample's hit-shader fetch logic
+// (render_raytrace_clusters.rchit.glsl + shaderio_scene.h Cluster_get* +
+// attribute_encoding.h): ClusterID -> resident cluster address -> Cluster
+// header decode -> per-triangle uint8 indices, vec3 positions, oct-encoded
+// normals (+ tangent angle bits) and vec2 texcoords, all read through buffer
+// device addresses (the preloaded cluster data of the active render
+// generation, see ClusterLodManager). Preloaded cluster data is always
+// decompressed on upload, matching the sample's rchit assumptions.
+//
+// The byte offsets below mirror shaderio_scene.h with scalar layout:
+//   shaderio::Geometry (128 bytes, of which):
+//     [104] uint64 preloadedClusters   -> uint64 clusterAddress[clusterID]
+//   shaderio::Cluster (16 bytes):
+//     [0] u8 triangleCountMinusOne [1] u8 vertexCountMinusOne
+//     [2] u8 lodLevel              [3] u8 groupChildIndex
+//     [4] u8 attributeBits         [5] u8 localMaterialID
+//     [6] u8 stateBits             [7] u8 reserved
+//     [8] u32 vertices (byte offset relative to cluster)
+//     [12] u32 triangles (byte offset relative to cluster)
+// Static asserts on the C++ side of those headers guarantee the layout.
+
+#include "rtx/utility/cluster_id.slangh"
+
+#define CLUSTER_GEOMETRY_SIZEOF_SHADERIO_GEOMETRY 128
+#define CLUSTER_GEOMETRY_OFFSETOF_PRELOADED_CLUSTERS 104
+
+// Buffer-device-address loads via slang pointers (PhysicalStorageBuffer;
+// natural alignment - all cluster data offsets respect it by construction).
+// Note: this slang has no vk::RawBufferLoad.
+
+uint clusterGeometryLoadU8(uint64_t address)
+{
+  return uint(*(Ptr<uint8_t>(address)));
+}
+
+uint clusterGeometryLoadU32(uint64_t address)
+{
+  return *(Ptr<uint>(address));
+}
+
+uint64_t clusterGeometryLoadU64(uint64_t address)
+{
+  return *(Ptr<uint64_t>(address));
+}
+
+float clusterGeometryLoadF32(uint64_t address)
+{
+  return *(Ptr<float>(address));
+}
+
+// shaderio_scene.h cluster attribute bits
+#define CLUSTER_GEOMETRY_ATTRIBUTE_VERTEX_NORMAL 1
+#define CLUSTER_GEOMETRY_ATTRIBUTE_VERTEX_TANGENT 2
+#define CLUSTER_GEOMETRY_ATTRIBUTE_VERTEX_TEX_0 4
+#define CLUSTER_GEOMETRY_ATTRIBUTE_VERTEX_TEX_1 8
+
+// attribute_encoding.h
+#define CLUSTER_GEOMETRY_ATTRENC_NORMAL_BITS 22
+#define CLUSTER_GEOMETRY_ATTRENC_TANGENT_BITS 10
+
+// Decoded shaderio::Cluster header plus its base address.
+struct ClusterGeometry
+{
+  uint64_t clusterAddress = 0;
+
+  uint16_t triangleCount = 0;
+  uint16_t vertexCount = 0;
+  uint8_t lodLevel = 0;
+  uint8_t groupChildIndex = 0;
+  uint8_t attributeBits = 0;
+  uint8_t stateBits = 0;
+
+  // byte offsets relative to clusterAddress
+  uint verticesOffset = 0;
+  uint trianglesOffset = 0;
+
+  property bool isValid
+  {
+    get { return clusterAddress != 0; }
+  }
+
+  property bool hasNormals
+  {
+    get { return (attributeBits & CLUSTER_GEOMETRY_ATTRIBUTE_VERTEX_NORMAL) != 0; }
+  }
+
+  property bool hasTexcoords0
+  {
+    get { return (attributeBits & CLUSTER_GEOMETRY_ATTRIBUTE_VERTEX_TEX_0) != 0; }
+  }
+};
+
+// Resolves geometryId (cluster geometry table index, from the Surface) and
+// clusterId (ClusterIDNV, geometry-local in the preloaded path) to the cluster
+// header. geometriesTableAddress comes from the raytrace args (0 while no
+// cluster render generation is active).
+ClusterGeometry clusterGeometryCreate(uint64_t geometriesTableAddress, uint geometryId, uint clusterId)
+{
+  ClusterGeometry clusterGeometry;
+
+  if (geometriesTableAddress == 0 || clusterId == CLUSTER_ID_INVALID)
+  {
+    return clusterGeometry;
+  }
+
+  // Geometry table entry -> preloaded cluster address array -> cluster
+  const uint64_t geometryAddress =
+    geometriesTableAddress + uint64_t(geometryId) * CLUSTER_GEOMETRY_SIZEOF_SHADERIO_GEOMETRY;
+
+  const uint64_t preloadedClusters =
+    clusterGeometryLoadU64(geometryAddress + CLUSTER_GEOMETRY_OFFSETOF_PRELOADED_CLUSTERS);
+
+  if (preloadedClusters == 0)
+  {
+    return clusterGeometry;
+  }
+
+  const uint64_t clusterAddress = clusterGeometryLoadU64(preloadedClusters + uint64_t(clusterId) * 8);
+
+  // shaderio::Cluster header (16 bytes)
+  const uint headerWord0 = clusterGeometryLoadU32(clusterAddress + 0);
+  const uint headerWord1 = clusterGeometryLoadU32(clusterAddress + 4);
+
+  clusterGeometry.clusterAddress = clusterAddress;
+  clusterGeometry.triangleCount = uint16_t((headerWord0 & 0xFFu) + 1u);
+  clusterGeometry.vertexCount = uint16_t(((headerWord0 >> 8) & 0xFFu) + 1u);
+  clusterGeometry.lodLevel = uint8_t((headerWord0 >> 16) & 0xFFu);
+  clusterGeometry.groupChildIndex = uint8_t((headerWord0 >> 24) & 0xFFu);
+  clusterGeometry.attributeBits = uint8_t(headerWord1 & 0xFFu);
+  clusterGeometry.stateBits = uint8_t((headerWord1 >> 16) & 0xFFu);
+  clusterGeometry.verticesOffset = clusterGeometryLoadU32(clusterAddress + 8);
+  clusterGeometry.trianglesOffset = clusterGeometryLoadU32(clusterAddress + 12);
+
+  return clusterGeometry;
+}
+
+// Cluster-local uint8 triangle indices (Cluster_getTriangleIndices)
+uint3 clusterGeometryGetTriangleIndices(ClusterGeometry clusterGeometry, uint primitiveIndex)
+{
+  const uint64_t indicesAddress =
+    clusterGeometry.clusterAddress + clusterGeometry.trianglesOffset + uint64_t(primitiveIndex) * 3;
+
+  // three consecutive uint8 (1-byte alignment)
+  return uint3(
+    clusterGeometryLoadU8(indicesAddress + 0),
+    clusterGeometryLoadU8(indicesAddress + 1),
+    clusterGeometryLoadU8(indicesAddress + 2));
+}
+
+// vec3 object-space position (Cluster_getVertexPositions)
+vec3 clusterGeometryGetPosition(ClusterGeometry clusterGeometry, uint vertexIndex)
+{
+  const uint64_t positionAddress =
+    clusterGeometry.clusterAddress + clusterGeometry.verticesOffset + uint64_t(vertexIndex) * 12;
+
+  return vec3(
+    clusterGeometryLoadF32(positionAddress + 0),
+    clusterGeometryLoadF32(positionAddress + 4),
+    clusterGeometryLoadF32(positionAddress + 8));
+}
+
+// packed normal(+tangent) attribute word (Cluster_getVertexNormals)
+uint clusterGeometryGetPackedNormal(ClusterGeometry clusterGeometry, uint vertexIndex)
+{
+  const uint64_t normalsAddress = clusterGeometry.clusterAddress + clusterGeometry.verticesOffset
+    + uint64_t(clusterGeometry.vertexCount) * 12 + uint64_t(vertexIndex) * 4;
+
+  return clusterGeometryLoadU32(normalsAddress);
+}
+
+// vec2 texcoord 0 (Cluster_getVertexTexCoords: after positions and, when
+// present, the packed normal/tangent word; 8-byte aligned)
+vec2 clusterGeometryGetTexcoord0(ClusterGeometry clusterGeometry, uint vertexIndex)
+{
+  const uint elementsPerVertex = clusterGeometry.hasNormals ? 4u : 3u;
+
+  uint64_t texcoordsAddress = clusterGeometry.clusterAddress
+    + ((uint64_t(clusterGeometry.verticesOffset) + uint64_t(elementsPerVertex) * 4 * clusterGeometry.vertexCount + 7) & ~uint64_t(7));
+
+  texcoordsAddress += uint64_t(vertexIndex) * 8;
+
+  return vec2(
+    clusterGeometryLoadF32(texcoordsAddress + 0),
+    clusterGeometryLoadF32(texcoordsAddress + 4));
+}
+
+//////////////////////////////////////////////////////////////////////////
+// RTX Mega Geometry Path B (P4b, vk_animated_clusters): hits against
+// per-frame cluster-template BLASes keep the CLASSIC vertex fetch (their
+// surface's buffer indices reference the live skinned/updated buffers,
+// previous-frame positions included) - only the cluster-local primitiveIndex
+// must be remapped to the original triangle. The template's baked ClusterID
+// indexes the global animated cluster table: one uint64 per cluster holding
+// the device address of the cluster's first triangle inside its geometry's
+// cluster-ordered uint32 index topology (three uints per triangle).
+
+// Returns the original (global) uint32 vertex indices of a template-cluster
+// hit. tableAddress comes from the raytrace args (0 while Path B inactive).
+uint3 clusterTemplateGetTriangleIndices(uint64_t tableAddress, uint clusterId, uint primitiveIndex)
+{
+  if (tableAddress == 0 || clusterId == CLUSTER_ID_INVALID)
+  {
+    return uint3(0, 0, 0);
+  }
+
+  const uint64_t trianglesAddress = clusterGeometryLoadU64(tableAddress + uint64_t(clusterId) * 8);
+  const uint64_t indicesAddress = trianglesAddress + uint64_t(primitiveIndex) * 12;
+
+  return uint3(
+    clusterGeometryLoadU32(indicesAddress + 0),
+    clusterGeometryLoadU32(indicesAddress + 4),
+    clusterGeometryLoadU32(indicesAddress + 8));
+}
+
+// attribute_encoding.h oct_to_vec + normal_unpack (1:1 port)
+vec3 clusterGeometryDecodeNormal(uint packedNormal)
+{
+  const uint mask = (1u << (CLUSTER_GEOMETRY_ATTRENC_NORMAL_BITS / 2)) - 1u;
+
+  const uint2 packedVector = uint2(packedNormal, packedNormal >> 11) & mask;
+  const vec2 e = (vec2(packedVector) / float(mask)) * 2.0f - 1.0f;
+
+  // oct_to_vec
+  vec3 v = vec3(e.x, e.y, 1.0f - abs(e.x) - abs(e.y));
+  if (v.z < 0.0f)
+  {
+    const vec2 octSign = vec2(e.x >= 0.0f ? 1.0f : -1.0f, e.y >= 0.0f ? 1.0f : -1.0f);
+    v.x = (1.0f - abs(e.y)) * octSign.x;
+    v.y = (1.0f - abs(e.x)) * octSign.y;
+  }
+  return normalize(v);
+}

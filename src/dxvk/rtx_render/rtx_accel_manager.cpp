@@ -30,6 +30,7 @@
 #include "rtx_scene_manager.h"
 #include "rtx_accel_manager.h"
 #include "rtx_point_instancer_system.h"
+#include "rtx_cluster_lod_manager.h"
 
 #include "../d3d9/d3d9_state.h"
 #include "rtx_matrix_helpers.h"
@@ -87,6 +88,24 @@ namespace dxvk {
     m_cachedBuckets.clear();
     m_instanceBucketIndex.clear();
     m_lastProcessedGeneration = UINT64_MAX;
+  }
+
+  // NV-DXVK: cluster LOD support (RTX Mega Geometry)
+  void AccelManager::invalidateBucketCache() {
+    m_cachedBuckets.clear();
+    m_instanceBucketIndex.clear();
+    m_lastProcessedGeneration = UINT64_MAX;
+  }
+
+  size_t AccelManager::getClusterRegionByteOffset(size_t tlasType) const {
+    // layout per type: [normal instances][PointInstancer slots][cluster slots]
+    size_t offset = 0;
+    for (size_t n = 0; n < tlasType; ++n) {
+      offset += m_mergedInstances[n].size() + m_pointInstancerSlotsPerType[n] + m_clusterSlotsPerType[n];
+    }
+    offset += m_mergedInstances[tlasType].size() + m_pointInstancerSlotsPerType[tlasType];
+
+    return offset * sizeof(VkAccelerationStructureInstanceKHR);
   }
 
   void AccelManager::garbageCollection() {
@@ -427,16 +446,23 @@ namespace dxvk {
     execBarriers.recordCommands(cb);
   }
 
-  void AccelManager::mergeInstancesIntoBlas(Rc<DxvkContext> ctx, 
-                                            DxvkBarrierSet& execBarriers, 
+  void AccelManager::mergeInstancesIntoBlas(Rc<DxvkContext> ctx,
+                                            DxvkBarrierSet& execBarriers,
                                             const std::vector<TextureRef>& textures,
                                             const CameraManager& cameraManager,
                                             InstanceManager& instanceManager,
-                                            OpacityMicromapManager* opacityMicromapManager) {
+                                            OpacityMicromapManager* opacityMicromapManager,
+                                            ClusterLodManager* clusterLodManager) {
     ScopedGpuProfileZone(ctx, "buildBLAS");
 
     auto& instances = instanceManager.getInstanceTable();
     const uint32_t currentFrame = m_device->getCurrentFrameId();
+
+    // NV-DXVK: while cluster LOD instances render, the full pass must run every
+    // frame: the per-frame cluster slot lists are rebuilt here and the LOD
+    // traversal outcome changes with the camera even when the scene is static
+    // (risk R8; the F6 idle-frame reuse optimization restores a fast path later).
+    const bool clusterLodActive = clusterLodManager != nullptr && clusterLodManager->needsFullMergePass();
 
     // --- Full-skip fast path ---
     // If no scene changes occurred since the last build, we can reuse all cached
@@ -447,7 +473,7 @@ namespace dxvk {
     // processing every frame without bumping m_sceneGeneration.
     {
       const uint64_t currentGeneration = instanceManager.getSceneGeneration();
-      const bool sceneUnchanged = (currentGeneration == m_lastProcessedGeneration);
+      const bool sceneUnchanged = (currentGeneration == m_lastProcessedGeneration) && !clusterLodActive;
 
       if (sceneUnchanged && !m_ommBindPending && !m_reorderedSurfaces.empty()) {
         m_sceneUnchangedThisFrame = true;
@@ -601,6 +627,7 @@ namespace dxvk {
     m_pointInstancerBatches.clear();
     m_activeDynamicBlases.clear();
     memset(m_pointInstancerSlotsPerType, 0, sizeof(m_pointInstancerSlotsPerType));
+    memset(m_clusterSlotsPerType, 0, sizeof(m_clusterSlotsPerType));
     for (auto& mergedInst : m_mergedInstances) {
       mergedInst.clear();
     }
@@ -678,6 +705,49 @@ namespace dxvk {
       // Find the blas entry for this instance early so we can check the dynamic/merged cache.
       BlasEntry* blasEntry = instance->getBlas();
       assert(blasEntry);
+
+      // NV-DXVK start: cluster LOD path (RTX Mega Geometry)
+      // Instances whose geometry is resident in the active cluster render
+      // generation skip the classic BLAS routing entirely. They get a surface
+      // like any other instance plus one reserved TLAS slot in their type's
+      // cluster region; the slot's content (with the per-frame cluster BLAS
+      // address) is written by ClusterLodManager::dispatchBuild before buildTlas.
+      uint32_t clusterGeometryId = 0;
+      if (clusterLodActive && clusterLodManager->isClusterInstance(instance, clusterGeometryId)) {
+        const uint32_t surfaceIndex = uint32_t(m_reorderedSurfaces.size());
+
+        VkAccelerationStructureInstanceKHR blasInstance = instance->getVkInstance();
+        blasInstance.instanceCustomIndex =
+          (blasInstance.instanceCustomIndex & ~uint32_t(CUSTOM_INDEX_SURFACE_MASK)) |
+          (surfaceIndex & uint32_t(CUSTOM_INDEX_SURFACE_MASK));
+
+        if (instance->isObjectToWorldMirrored()) {
+          blasInstance.flags ^= VK_GEOMETRY_INSTANCE_TRIANGLE_FLIP_FACING_BIT_KHR;
+        }
+
+        // same TLAS routing as addBlas
+        const bool isUnordered = instance->usesUnorderedApproximations() && RtxOptions::enableSeparateUnorderedApproximations();
+        const size_t tlasType = isUnordered ? Tlas::Unordered : Tlas::Opaque;
+        const bool isSssDuplicate = !isUnordered && instance->isSubsurface();
+
+        m_clusterSlotsPerType[tlasType]++;
+        if (isSssDuplicate) {
+          m_clusterSlotsPerType[Tlas::SSS]++;
+        }
+
+        clusterLodManager->recordClusterInstance(instance, clusterGeometryId, tlasType, isSssDuplicate, blasInstance);
+
+        m_reorderedSurfaces.push_back(instance);
+        m_reorderedSurfacesFirstIndexOffset.push_back(0);
+        instance->setSurfaceIndex(surfaceIndex);
+        instance->clearBlasDirty();
+        continue;
+      } else {
+        // hit-side routing flags must not persist when an instance flips back to classic
+        instance->surface.isClusterLod = false;
+        instance->surface.isClusterTemplate = false;
+      }
+      // NV-DXVK end
 
       // On the incremental path, skip instances that belong to a clean cached bucket.
       // Their surfaces and TLAS instances will be restored from cache after the loop.
@@ -1440,9 +1510,10 @@ namespace dxvk {
     info.access = VK_ACCESS_TRANSFER_WRITE_BIT;
     info.size = 0;
 
-    // Vk instance buffer: normal instances + reserved PointInstancer slots per type
+    // Vk instance buffer: normal instances + reserved PointInstancer and cluster
+    // LOD slots per type
     for (int t = 0; t < Tlas::Count; ++t) {
-      info.size += m_mergedInstances[t].size() + m_pointInstancerSlotsPerType[t];
+      info.size += m_mergedInstances[t].size() + m_pointInstancerSlotsPerType[t] + m_clusterSlotsPerType[t];
     }
     info.size = align(info.size * sizeof(VkAccelerationStructureInstanceKHR), kBufferAlignment);
 
@@ -1452,15 +1523,18 @@ namespace dxvk {
     }
 
     // Write only the CPU-populated (normal) instance data.  PointInstancer
-    // regions are left for the GPU culling shader to fill directly.
+    // regions are left for the GPU culling shader to fill directly; cluster
+    // regions receive their patched TlasInstances via transfer copies in
+    // ClusterLodManager::dispatchBuild.
     size_t offset = 0;
     for (int t = 0; t < Tlas::Count; ++t) {
       if (!m_mergedInstances[t].empty()) {
         const size_t size = m_mergedInstances[t].size() * sizeof(VkAccelerationStructureInstanceKHR);
         ctx->writeToBuffer(m_vkInstanceBuffer, offset, size, m_mergedInstances[t].data());
       }
-      // Advance past both normal and PointInstancer regions for this TLAS type
-      offset += (m_mergedInstances[t].size() + m_pointInstancerSlotsPerType[t]) * sizeof(VkAccelerationStructureInstanceKHR);
+      // Advance past the normal, PointInstancer and cluster regions for this TLAS type
+      offset += (m_mergedInstances[t].size() + m_pointInstancerSlotsPerType[t] + m_clusterSlotsPerType[t])
+        * sizeof(VkAccelerationStructureInstanceKHR);
     }
 
     // Vk billboard buffer
@@ -1482,11 +1556,11 @@ namespace dxvk {
     }
 
     // Compute the byte offset for each TLAS type within m_vkInstanceBuffer.
-    // Layout per type: [normal instances][PointInstancer instances]
+    // Layout per type: [normal instances][PointInstancer instances][cluster instances]
     size_t typeBaseOffset[Tlas::Count] = {};
     for (size_t n = 1; n < Tlas::Count; ++n) {
       typeBaseOffset[n] = typeBaseOffset[n - 1]
-                        + (m_mergedInstances[n - 1].size() + m_pointInstancerSlotsPerType[n - 1])
+                        + (m_mergedInstances[n - 1].size() + m_pointInstancerSlotsPerType[n - 1] + m_clusterSlotsPerType[n - 1])
                         * sizeof(VkAccelerationStructureInstanceKHR);
     }
 
@@ -1832,7 +1906,8 @@ namespace dxvk {
     internalBuildTlas<Tlas::Opaque>(ctx, totalScratchSize);
     internalBuildTlas<Tlas::Unordered>(ctx, totalScratchSize);
     // Only build TLAS for SSS when necessary
-    const bool isBuildSssTlas = RtxOptions::SubsurfaceScattering::enableDiffusionProfile() && (m_mergedInstances[Tlas::SSS].size() + m_pointInstancerSlotsPerType[Tlas::SSS]) > 0;
+    const bool isBuildSssTlas = RtxOptions::SubsurfaceScattering::enableDiffusionProfile()
+      && (m_mergedInstances[Tlas::SSS].size() + m_pointInstancerSlotsPerType[Tlas::SSS] + m_clusterSlotsPerType[Tlas::SSS]) > 0;
     if (isBuildSssTlas) {
       internalBuildTlas<Tlas::SSS>(ctx, totalScratchSize);
     }
@@ -1866,9 +1941,10 @@ namespace dxvk {
     instancesVk.arrayOfPointers = VK_FALSE;
     instancesVk.data.deviceAddress = m_vkInstanceBuffer->getDeviceAddress();
 
-    // Rewind address to tlas start (normal + PointInstancer slots per preceding type)
+    // Rewind address to tlas start (normal + PointInstancer + cluster slots per preceding type)
     for (size_t n = 0; n < type; ++n) {
-      instancesVk.data.deviceAddress += (m_mergedInstances[n].size() + m_pointInstancerSlotsPerType[n]) * sizeof(VkAccelerationStructureInstanceKHR);
+      instancesVk.data.deviceAddress += (m_mergedInstances[n].size() + m_pointInstancerSlotsPerType[n] + m_clusterSlotsPerType[n])
+        * sizeof(VkAccelerationStructureInstanceKHR);
     }
 
     // Put the above into a VkAccelerationStructureGeometryKHR. We need to put the
@@ -1885,7 +1961,7 @@ namespace dxvk {
     buildInfo.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
     buildInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
 
-    const uint32_t numInstances = uint32_t(m_mergedInstances[type].size() + m_pointInstancerSlotsPerType[type]);
+    const uint32_t numInstances = uint32_t(m_mergedInstances[type].size() + m_pointInstancerSlotsPerType[type] + m_clusterSlotsPerType[type]);
     VkAccelerationStructureBuildSizesInfoKHR sizeInfo { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR };
     vkd->vkGetAccelerationStructureBuildSizesKHR(vkd->device(), VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &buildInfo, &numInstances, &sizeInfo);
 

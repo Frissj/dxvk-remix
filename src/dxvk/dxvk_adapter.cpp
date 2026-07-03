@@ -343,7 +343,7 @@ namespace dxvk {
           DxvkDeviceFeatures  enabledFeatures) {
     DxvkDeviceExtensions devExtensions;
 
-    std::array<DxvkExt*, 43> devExtensionList = {{
+    std::array<DxvkExt*, 44> devExtensionList = {{
       &devExtensions.amdMemoryOverallocationBehaviour,
       &devExtensions.amdShaderFragmentMask,
       &devExtensions.ext4444Formats,
@@ -382,6 +382,9 @@ namespace dxvk {
       &devExtensions.nvRayTracingInvocationReorder,
       &devExtensions.khrSynchronization2,
       &devExtensions.extOpacityMicromap,
+      // NV-DXVK start: RTX Mega Geometry (cluster acceleration structures)
+      &devExtensions.nvClusterAccelerationStructure,
+      // NV-DXVK end
       &devExtensions.nvLowLatency,
       &devExtensions.nvxBinaryImport,
       &devExtensions.nvxImageViewHandle,
@@ -611,6 +614,19 @@ namespace dxvk {
       enabledFeatures.khrSynchronization2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES_KHR;
       enabledFeatures.khrSynchronization2.pNext = std::exchange(enabledFeatures.core.pNext, &enabledFeatures.khrSynchronization2);
       enabledFeatures.khrSynchronization2.synchronization2 = VK_TRUE;
+    }
+    // NV-DXVK end
+
+    // NV-DXVK start: RTX Mega Geometry (cluster acceleration structures)
+    if (devExtensions.nvClusterAccelerationStructure) {
+      enabledFeatures.nvClusterAccelerationStructureFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CLUSTER_ACCELERATION_STRUCTURE_FEATURES_NV;
+      enabledFeatures.nvClusterAccelerationStructureFeatures.pNext = std::exchange(enabledFeatures.core.pNext, &enabledFeatures.nvClusterAccelerationStructureFeatures);
+      enabledFeatures.nvClusterAccelerationStructureFeatures.clusterAccelerationStructure =
+        m_deviceFeatures.nvClusterAccelerationStructureFeatures.clusterAccelerationStructure;
+
+      // The cluster LOD traversal kernels require 64-bit buffer atomics for their
+      // producer/consumer queues and streaming address encoding.
+      enabledFeatures.vulkan12Features.shaderBufferInt64Atomics = m_deviceFeatures.vulkan12Features.shaderBufferInt64Atomics;
     }
     // NV-DXVK end
 
@@ -1027,6 +1043,13 @@ namespace dxvk {
       m_deviceInfo.nvRayTracingInvocationReorderProperties.pNext = std::exchange(m_deviceInfo.core.pNext, &m_deviceInfo.nvRayTracingInvocationReorderProperties);
     }
 
+    // NV-DXVK start: RTX Mega Geometry (cluster acceleration structures)
+    if (m_deviceExtensions.supports(VK_NV_CLUSTER_ACCELERATION_STRUCTURE_EXTENSION_NAME)) {
+      m_deviceInfo.nvClusterAccelerationStructureProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CLUSTER_ACCELERATION_STRUCTURE_PROPERTIES_NV;
+      m_deviceInfo.nvClusterAccelerationStructureProperties.pNext = std::exchange(m_deviceInfo.core.pNext, &m_deviceInfo.nvClusterAccelerationStructureProperties);
+    }
+    // NV-DXVK end
+
     // Query full device properties for all enabled extensions
     m_vki->vkGetPhysicalDeviceProperties2(m_handle, &m_deviceInfo.core);
     
@@ -1129,6 +1152,13 @@ namespace dxvk {
       m_deviceFeatures.extShaderAtomicFloat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT;
       m_deviceFeatures.extShaderAtomicFloat.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.extShaderAtomicFloat);
     }
+
+    // NV-DXVK start: RTX Mega Geometry (cluster acceleration structures)
+    if (m_deviceExtensions.supports(VK_NV_CLUSTER_ACCELERATION_STRUCTURE_EXTENSION_NAME)) {
+      m_deviceFeatures.nvClusterAccelerationStructureFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CLUSTER_ACCELERATION_STRUCTURE_FEATURES_NV;
+      m_deviceFeatures.nvClusterAccelerationStructureFeatures.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.nvClusterAccelerationStructureFeatures);
+    }
+    // NV-DXVK end
 
     m_vki->vkGetPhysicalDeviceFeatures2(m_handle, &m_deviceFeatures.core);
   }

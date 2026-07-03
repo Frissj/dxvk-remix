@@ -970,6 +970,9 @@ if dxvk_is_ninja or dxvk_is_woa_ec
   endif
 endif # dxvk_is_ninja
 
-if fs.is_dir('nv-private')
+# NV-DXVK: check for the build file, not just the directory - nv-private may hold
+# binary-only drops (e.g. hdremix runtime DLLs) without the internal source repo,
+# which would otherwise break meson regeneration.
+if fs.is_file('nv-private/meson.build')
   subdir('nv-private')
 endif

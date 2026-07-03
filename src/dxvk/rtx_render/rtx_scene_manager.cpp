@@ -26,6 +26,9 @@
 #include "rtx_asset_replacer.h"
 #include "rtx_scene_manager.h"
 #include "rtx_opacity_micromap_manager.h"
+// NV-DXVK start: RTX Mega Geometry cluster LOD
+#include "rtx_cluster_lod_manager.h"
+// NV-DXVK end
 #include "dxvk_device.h"
 #include "dxvk_context.h"
 #include "dxvk_buffer.h"
@@ -177,6 +180,11 @@ namespace dxvk {
     if (m_opacityMicromapManager.get()) {
       m_opacityMicromapManager->logStatistics();
     }
+    // NV-DXVK start: RTX Mega Geometry cluster LOD
+    if (m_clusterLodManager.get()) {
+      m_clusterLodManager->logStatistics();
+    }
+    // NV-DXVK end
   }
 
   Vector3 SceneManager::getSceneUp() {
@@ -1366,6 +1374,16 @@ namespace dxvk {
     // Update the input state, so we always have a reference to the original draw call state
     pBlas->frameLastTouched = m_device->getCurrentFrameId();
 
+    // NV-DXVK start: RTX Mega Geometry cluster LOD geometry intake
+    // This is the CPU-snapshot window: the draw call's staging copies (the same data
+    // Remix's geometry hashing read) are still alive, and the geometry hash is final.
+    // kUpdateBVH on an existing BlasEntry = its vertex data mutated in place - the
+    // P4b Path B (cluster templates) routing signal for non-skinned deforming meshes.
+    if (m_clusterLodManager != nullptr) {
+      m_clusterLodManager->onDrawCallGeometry(drawCallState, result == ObjectCacheState::kUpdateBVH);
+    }
+    // NV-DXVK end
+
     // Generate smooth normals for geometry that is flagged via the SmoothNormals texture category.
     // This is useful for older D3D9 games where geometry may lack smooth normals, especially
     // when using the VertexShader Capture mechanism. The smooth normals are computed on the GPU
@@ -2178,6 +2196,15 @@ namespace dxvk {
       Logger::info("[RTX] Opacity Micromap: disabled");
     }
 
+    // NV-DXVK start: RTX Mega Geometry cluster LOD
+    // Lazily create the cluster LOD manager on the first enabled frame. It is kept
+    // alive when the option is turned back off (intake is gated per draw inside
+    // onDrawCallGeometry; the background worker holds the processed caches).
+    if (ClusterLodOptions::enable() && m_clusterLodManager == nullptr) {
+      m_clusterLodManager = std::make_unique<ClusterLodManager>(m_device);
+    }
+    // NV-DXVK end
+
     RtxParticleSystemManager& particles = m_device->getCommon()->metaParticleSystem();
     particles.simulate(ctx.ptr());
 
@@ -2185,7 +2212,15 @@ namespace dxvk {
     m_instanceManager.createViewModelInstances(ctx, m_cameraManager, m_rayPortalManager);
     m_instanceManager.createPlayerModelVirtualInstances(ctx, m_cameraManager, m_rayPortalManager);
 
-    m_accelManager.mergeInstancesIntoBlas(ctx, execBarriers, textureManager.getTextureTable(), m_cameraManager, m_instanceManager, m_opacityMicromapManager.get());
+    // NV-DXVK start: RTX Mega Geometry cluster LOD
+    // Drains completed background processing, performs render-generation swaps
+    // and resets the per-frame cluster slot state before instances are routed.
+    if (m_clusterLodManager != nullptr) {
+      m_clusterLodManager->onFrameBegin(ctx, m_accelManager, m_instanceManager);
+    }
+    // NV-DXVK end
+
+    m_accelManager.mergeInstancesIntoBlas(ctx, execBarriers, textureManager.getTextureTable(), m_cameraManager, m_instanceManager, m_opacityMicromapManager.get(), m_clusterLodManager.get());
 
     // Call on the other managers to prepare their GPU data for the current scene
     m_accelManager.prepareSceneData(ctx, execBarriers, m_instanceManager);
@@ -2275,6 +2310,16 @@ namespace dxvk {
     // surface and material data from templates. Must run after prepareSceneData
     // (which uploads placeholders) and before buildTlas.
     m_accelManager.dispatchPointInstancerCulling(ctx, m_cameraManager, m_surfaceMaterialBuffer);
+
+    // NV-DXVK start: RTX Mega Geometry cluster LOD
+    // Records the per-frame cluster build (LOD traversal, CLAS/BLAS builds,
+    // instance_assign_blas) and copies the patched TlasInstances into the
+    // reserved cluster regions of the instance buffer. Must run after
+    // prepareSceneData (instance buffer allocated) and before buildTlas.
+    if (m_clusterLodManager != nullptr) {
+      m_clusterLodManager->dispatchBuild(ctx, m_cameraManager, m_accelManager);
+    }
+    // NV-DXVK end
 
     // Build the TLAS
     m_accelManager.buildTlas(ctx);

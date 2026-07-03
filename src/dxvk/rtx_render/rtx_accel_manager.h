@@ -145,9 +145,12 @@ public:
 
   // Merges the RtInstance's into a set of BLAS. Some of the BLAS will contain multiple geometries/instances,
   // and some other BLAS will be dedicated to instances with static geometries.
+  // Instances the ClusterLodManager claims (cluster LOD path) skip the classic
+  // BLAS routing and get TLAS slots reserved in per-type cluster regions instead.
   void mergeInstancesIntoBlas(Rc<DxvkContext> ctx, class DxvkBarrierSet& execBarriers,
-                              const std::vector<TextureRef>& textures, const CameraManager& cameraManager, 
-                              InstanceManager& instanceManager, OpacityMicromapManager* opacityMicromapManager);
+                              const std::vector<TextureRef>& textures, const CameraManager& cameraManager,
+                              InstanceManager& instanceManager, OpacityMicromapManager* opacityMicromapManager,
+                              class ClusterLodManager* clusterLodManager);
 
   // Dispatches GPU compute culling for all PointInstancer batches recorded during
   // mergeInstancesIntoBlas. Must be called after prepareSceneData (placeholders uploaded)
@@ -171,6 +174,20 @@ public:
 
   void removeInstanceFromBucketCache(RtInstance* instance);
   void invalidateOpacityMicromapBindings() { m_ommBindPending = true; }
+
+  // NV-DXVK: cluster LOD support (RTX Mega Geometry).
+  // Drops all cached buckets so the next mergeInstancesIntoBlas runs a full pass;
+  // used when instances flip between the classic and cluster paths (generation swap).
+  void invalidateBucketCache();
+
+  // Instance buffer accessors for the ClusterLodManager's TLAS-slot patching
+  // (the patched cluster TlasInstances are transfer-copied into the reserved
+  // per-type cluster regions between instance_assign_blas and buildTlas).
+  const Rc<DxvkBuffer>& getVkInstanceBuffer() const { return m_vkInstanceBuffer; }
+
+  // Byte offset of the given TLAS type's cluster region within m_vkInstanceBuffer.
+  // Layout per type: [normal instances][PointInstancer slots][cluster slots].
+  size_t getClusterRegionByteOffset(size_t tlasType) const;
 
 private:
   struct SurfaceInfo {
@@ -229,6 +246,11 @@ private:
   // instances in each TLAS type.  These slots are NOT stored in m_mergedInstances —
   // the GPU culling shader fills them directly in the instance buffer.
   uint32_t m_pointInstancerSlotsPerType[Tlas::Count] = {};
+
+  // NV-DXVK: slots reserved for cluster LOD instances in each TLAS type. Like the
+  // PointInstancer slots these are not in m_mergedInstances - the patched cluster
+  // TlasInstances are transfer-copied in by ClusterLodManager::dispatchBuild.
+  uint32_t m_clusterSlotsPerType[Tlas::Count] = {};
 
   // --- Incremental BLAS build caching ---
   // Scene generation from InstanceManager when the BLAS was last built.

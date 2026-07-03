@@ -1,0 +1,242 @@
+// NV-DXVK: build-time shader variants for RTX Remix (see compile_shaders.py)
+//!variant-matrix stream_update_scene
+//!> common SUBGROUP_SIZE=32 USE_16BIT_DISPATCH=0 USE_RENDER_STATS=1 USE_MEMORY_STATS=1 USE_SW_RASTER=0 USE_TWO_PASS_CULLING=0 HAS_ALPHA_TEST=1 USE_TWO_SIDED=1 USE_FORCED_TWO_SIDED=0 USE_STREAMING=1
+//!> axis raster - TARGETS_RASTERIZATION=0
+//!> axis raster raster TARGETS_RASTERIZATION=1
+//!> axis caching - USE_BLAS_CACHING=0
+//!> axis caching cache USE_BLAS_CACHING=1
+//!> axis clustersize - CLUSTER_VERTEX_COUNT=128 CLUSTER_TRIANGLE_COUNT=128
+//!> axis clustersize c64 CLUSTER_VERTEX_COUNT=64 CLUSTER_TRIANGLE_COUNT=64
+//!end-variants
+
+/*
+* Copyright (c) 2024-2026, NVIDIA CORPORATION.  All rights reserved.
+*
+* Licensed under the Apache License, Version 2.0 (the "License");
+* you may not use this file except in compliance with the License.
+* You may obtain a copy of the License at
+*
+*     http://www.apache.org/licenses/LICENSE-2.0
+*
+* Unless required by applicable law or agreed to in writing, software
+* distributed under the License is distributed on an "AS IS" BASIS,
+* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+* See the License for the specific language governing permissions and
+* limitations under the License.
+*
+* SPDX-FileCopyrightText: Copyright (c) 2024-2026, NVIDIA CORPORATION.
+* SPDX-License-Identifier: Apache-2.0
+*/
+
+/*
+  
+  Shader Description
+  ==================
+  
+  This compute shader handles updating the scene.
+  Previous requests to load/unload have been completed and
+  are provided for patching the scene.
+  
+  Effectively we are manipulating the geometries' 
+  `streamingGroupAddresses` array that points to the resident
+  memory location of a group (or tags it invalid).
+  
+  Furthermore when ray tracing is required we prepare building
+  new CLAS for the loaded groups' clusters.
+  
+  After building is completed we run the `stream_move_new_clas.comp.glsl`
+  to move them from temporary to final location.
+
+  A thread represents a single patch operation, which takes care of
+  one group.
+*/
+
+#version 460
+
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_buffer_reference2 : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_shader_atomic_int64 : enable
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_vote : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+#include "shaderio.h"
+
+////////////////////////////////////////////
+
+layout(scalar, binding = BINDINGS_READBACK_SSBO, set = 0) buffer readbackBuffer
+{
+  Readback readback;
+};
+
+layout(scalar, binding = BINDINGS_GEOMETRIES_SSBO, set = 0) buffer geometryBuffer
+{
+  Geometry geometries[];
+};
+
+layout(scalar, binding = BINDINGS_STREAMING_UBO, set = 0) uniform streamingBuffer
+{
+  SceneStreaming streaming;
+};
+layout(scalar, binding = BINDINGS_STREAMING_SSBO, set = 0) buffer streamingBufferRW
+{
+  SceneStreaming streamingRW;
+};
+
+////////////////////////////////////////////
+
+layout(local_size_x=STREAM_UPDATE_SCENE_WORKGROUP) in;
+
+////////////////////////////////////////////
+
+void main()
+{
+  // can load pre-emptively given the array is guaranteed to be sized as multiple of STREAM_UPDATE_SCENE_WORKGROUP
+  
+  uint threadID = getGlobalInvocationIndex(gl_GlobalInvocationID);  
+
+  // works for both load and unload
+  StreamingPatch spatch = streaming.update.patches.d[threadID];
+  
+  if (threadID < streaming.update.patchGroupsCount)
+  {
+    uint oldResidentID = 0;
+    if (threadID < streaming.update.patchUnloadGroupsCount)
+    {
+      Group group = Group_in(geometries[spatch.geometryID].streamingGroupAddresses.d[spatch.groupID]).d;
+      oldResidentID = group.residentID;
+    }
+    
+    geometries[spatch.geometryID].streamingGroupAddresses.d[spatch.groupID] = spatch.groupAddress;
+    
+    if (threadID < streaming.update.patchUnloadGroupsCount)
+    {
+    #if STREAMING_DEBUG_ADDRESSES
+      streaming.resident.groups.d[oldResidentID].group = Group_in(STREAMING_INVALID_ADDRESS_START);
+    #endif      
+    }
+    else
+    {
+      uint loadGroupIndex = threadID - streaming.update.patchUnloadGroupsCount;
+      Group_in groupRef = Group_in(spatch.groupAddress);
+      Group group = Group_in(groupRef).d;
+
+      uint groupResidentID  = spatch.groupResidentID;
+      groupRef.d.residentID = spatch.groupResidentID;
+      groupRef.d.clusterResidentID = spatch.clusterResidentID;
+    
+      StreamingGroup residentGroup;
+      residentGroup.geometryID   = spatch.geometryID;
+      residentGroup.lodLevel     = spatch.lodLevel;
+      residentGroup.age          = uint16_t(0);
+      residentGroup.group        = groupRef;
+    #if STREAMING_DEBUG_ADDRESSES
+      if (uint64_t(streaming.resident.groups.d[groupResidentID].group) < STREAMING_INVALID_ADDRESS_START)
+        streamingRW.request.errorUpdate = groupResidentID;
+    #endif
+      
+      // update description in residency table
+      streaming.resident.groups.d[groupResidentID] = residentGroup;
+
+      // retain original groupID, used for unloading
+      streaming.resident.groupIDs.d[groupResidentID] = spatch.groupID;
+
+      // insert ourselves into the list of all active groups
+      streaming.resident.activeGroups.d[streaming.update.loadActiveGroupsOffset + loadGroupIndex] = groupResidentID;
+      
+      // We might have a bit of divergence here, but shouldn't be a mission critical issue
+      
+      // All new groups need to build new clusters.
+      // These are built into scratch space first, and then moved to final locations.
+      
+      uint newBuildOffset = spatch.clasBuildOffset;
+      for (uint c = 0; c < spatch.clusterCount; c++)
+      {
+        uint clusterResidentID = spatch.clusterResidentID + c;
+        
+        Cluster_in clusterRef = Cluster_in(spatch.groupAddress + Group_size + Cluster_size * c);
+        streaming.resident.clusters.d[clusterResidentID] = uint64_t(clusterRef);
+        
+      #if TARGETS_RAY_TRACING
+        Cluster cluster = clusterRef.d;
+      
+        ClasBuildInfo buildInfo;
+        buildInfo.clusterID    = clusterResidentID;
+        buildInfo.clusterFlags = 0;
+        
+        buildInfo.packed = 0;
+        buildInfo.packed |= PACKED_FLAG(ClasBuildInfo_packed_triangleCount, cluster.triangleCountMinusOne+1);
+        buildInfo.packed |= PACKED_FLAG(ClasBuildInfo_packed_vertexCount, cluster.vertexCountMinusOne+1);
+        buildInfo.packed |= PACKED_FLAG(ClasBuildInfo_packed_indexType, 1);
+        buildInfo.packed |= PACKED_FLAG(ClasBuildInfo_packed_positionTruncateBitCount, streaming.clasPositionTruncateBits);
+        
+        buildInfo.baseGeometryIndexAndFlags = 0;
+
+        bool useGeometryIndices = (cluster.stateBits & CLUSTER_STATE_ALPHAMASKED_MIXED) != 0 || 
+                                  (cluster.stateBits & CLUSTER_STATE_TWOSIDED_MIXED) != 0;
+        
+        buildInfo.indexBufferStride                 = uint16_t(1);
+        buildInfo.vertexBufferStride                = uint16_t(4 * 3);
+        buildInfo.geometryIndexAndFlagsBufferStride = uint16_t(0);
+        buildInfo.opacityMicromapIndexBufferStride  = uint16_t(0);
+        
+        buildInfo.vertexBuffer = uint64_t(Cluster_getVertexPositions(Cluster_in(clusterRef)));
+        buildInfo.indexBuffer  = uint64_t(Cluster_getTriangleIndices(Cluster_in(clusterRef)));
+        
+        buildInfo.geometryIndexAndFlagsBuffer = 0;
+        buildInfo.opacityMicromapArray        = 0;
+        buildInfo.opacityMicromapIndexBuffer  = 0;
+
+      #if HAS_ALPHA_TEST
+        if (useGeometryIndices)
+        {
+          uint base = atomicAdd(streamingRW.update.newClasGeometryIndicesTaskCounter, 1);
+
+          uint64_t geometryIndicesBuffer = uint64_t(streaming.update.newClasGeometryIndices) + uint64_t(base * CLUSTER_TRIANGLE_COUNT * 4);
+
+          buildInfo.baseGeometryIndexAndFlags           = 0u;
+          buildInfo.geometryIndexAndFlagsBufferStride   = uint16_t(4);
+          buildInfo.geometryIndexAndFlagsBuffer = geometryIndicesBuffer;
+
+          // we hijack the first values of geometry indices array to store a reference to the cluster,
+          // so that the `stream_update_clas_geometry_indices.comp.glsl` kernel can fill the per-triangle
+          // information accordingly.
+          uint64s_inout clusterInfos = uint64s_inout(geometryIndicesBuffer);
+          clusterInfos.d[0] = uint64_t(clusterRef);
+        }
+        else
+      #endif
+        {
+          buildInfo.baseGeometryIndexAndFlags = (cluster.stateBits & CLUSTER_STATE_ALPHAMASKED) != 0 ? 1 : ClasGeometryFlag_OPAQUE_BIT_NV;
+          buildInfo.baseGeometryIndexAndFlags |= (cluster.stateBits & CLUSTER_STATE_TWOSIDED) != 0 ? ClasGeometryFlag_CULL_DISABLE_BIT_NV : 0;
+        }
+
+        streaming.update.newClasBuilds.d[newBuildOffset + c]      = buildInfo;
+        streaming.update.newClasResidentIDs.d[newBuildOffset + c] = clusterResidentID;
+      #endif
+      }
+    }
+  }
+#if 1  // relevant to USE_BLAS_CACHING
+  if (threadID < streaming.update.patchCachedBlasCount)
+  {
+    StreamingGeometryPatch sgpatch = streaming.update.geometryPatches.d[threadID];
+    uint cachedBlasLodLevel        = sgpatch.cachedBlasLodLevel;
+    uint geometryID                = sgpatch.geometryID;
+    geometries[geometryID].cachedBlasLodLevel = uint8_t(cachedBlasLodLevel);
+    geometries[geometryID].cachedBlasAddress  = sgpatch.cachedBlasAddress;
+  }
+#endif
+}
+

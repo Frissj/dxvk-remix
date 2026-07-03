@@ -61,6 +61,9 @@ struct AssetReplacement;
 struct AssetReplacer;
 class OpacityMicromapManager;
 class TerrainBaker;
+// NV-DXVK start: RTX Mega Geometry cluster LOD
+class ClusterLodManager;
+// NV-DXVK end
 
 // The resource cache can be *searched* by other users
 class ResourceCache {
@@ -172,6 +175,9 @@ public:
   const RayPortalManager& getRayPortalManager() const { return m_rayPortalManager; }
   const BindlessResourceManager& getBindlessResourceManager() const { return m_bindlessResourceManager; }
   OpacityMicromapManager* getOpacityMicromapManager() const { return m_opacityMicromapManager.get(); }
+  // NV-DXVK start: RTX Mega Geometry cluster LOD
+  ClusterLodManager* getClusterLodManager() const { return m_clusterLodManager.get(); }
+  // NV-DXVK end
   LightManager& getLightManager() { return m_lightManager; }
   GraphManager& getGraphManager() { return m_graphManager; }
   std::unique_ptr<AssetReplacer>& getAssetReplacer() { return m_pReplacer; }
@@ -363,6 +369,9 @@ private:
   RayPortalManager m_rayPortalManager;
   BindlessResourceManager m_bindlessResourceManager;
   std::unique_ptr<OpacityMicromapManager> m_opacityMicromapManager;
+  // NV-DXVK start: RTX Mega Geometry cluster LOD
+  std::unique_ptr<ClusterLodManager> m_clusterLodManager;
+  // NV-DXVK end
 
   DrawCallCache m_drawCallCache;
 

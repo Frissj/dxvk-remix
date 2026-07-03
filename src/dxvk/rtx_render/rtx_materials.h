@@ -118,6 +118,15 @@ struct RtSurface {
     uint16_t flags0 = 0;
     flags0 |= normalFormat == VK_FORMAT_R32_UINT ? 1 : 0;
     flags0 |= isVertexColorBakedLighting ? (1 << 1) : 0;
+    // NV-DXVK: RTX Mega Geometry - this surface's instance renders through a
+    // cluster BLAS; hit-side vertex fetch goes through the cluster geometry
+    // table (see surface_interaction.slangh) instead of the buffer indices.
+    flags0 |= isClusterLod ? (1 << 2) : 0;
+    // NV-DXVK: RTX Mega Geometry Path B (P4b) - this surface's instance
+    // renders through a per-frame cluster-template BLAS; the classic buffer
+    // fetch stays fully valid (skinned/live buffers), only the cluster-local
+    // primitiveIndex is remapped through the animated cluster table.
+    flags0 |= isClusterTemplate ? (1 << 3) : 0;
     // NOTE: Spare flags bits here
 
     writeGPUHelper(data, offset, flags0);
@@ -130,7 +139,14 @@ struct RtSurface {
 
     writeGPUHelper(data, offset, packedHash);
 
-    writeGPUHelper(data, offset, positionOffset);
+    // NV-DXVK: cluster LOD surfaces alias positionOffset (data1.x) with the
+    // geometry's index into the cluster geometry table; their vertex data is
+    // fetched from cluster memory (BDA), never through positionOffset.
+    if (isClusterLod) {
+      writeGPUHelper(data, offset, clusterGeometryId);
+    } else {
+      writeGPUHelper(data, offset, positionOffset);
+    }
     writeGPUHelper(data, offset, normalOffset);
     writeGPUHelper(data, offset, texcoordOffset);
     writeGPUHelper(data, offset, color0Offset);
@@ -326,6 +342,19 @@ struct RtSurface {
   uint32_t color0Stride = 0;
 
   uint32_t surfaceMaterialIndex = kSurfaceInvalidSurfaceMaterialIndex;
+
+  // NV-DXVK: RTX Mega Geometry - set while the instance renders through a
+  // cluster BLAS (see ClusterLodManager). clusterGeometryId indexes the
+  // cluster geometry table of the active render generation.
+  bool isClusterLod = false;
+  uint32_t clusterGeometryId = 0;
+
+  // NV-DXVK: RTX Mega Geometry Path B (P4b) - set while the instance renders
+  // through a per-frame cluster-template BLAS (deforming geometry). Unlike
+  // isClusterLod, all classic buffer fields stay valid; the hit side only
+  // remaps the cluster-local primitiveIndex through the animated cluster
+  // table (raytrace_args) using the ray's ClusterID.
+  bool isClusterTemplate = false;
 
   bool isEmissive = false;
   bool isMatte = false;

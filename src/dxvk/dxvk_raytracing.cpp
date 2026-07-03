@@ -311,7 +311,22 @@ namespace dxvk {
     rayPipelineInfo.layout = m_layout->pipelineLayout();
     rayPipelineInfo.basePipelineIndex = -1;
     rayPipelineInfo.flags = m_shaders.pipelineFlags;
-    
+
+    // NV-DXVK start: RTX Mega Geometry (cluster acceleration structures)
+    // Per VUID-vkCmdTraceRaysKHR-allowClusterAccelerationStructure-10578, any ray tracing
+    // pipeline that may trace against a TLAS containing cluster BLASes must have been
+    // created with this flag. Enable it on all RT pipelines whenever the device feature
+    // is available so cluster-built geometry is traceable everywhere.
+    VkRayTracingPipelineClusterAccelerationStructureCreateInfoNV pipelineClusters {
+      VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CLUSTER_ACCELERATION_STRUCTURE_CREATE_INFO_NV };
+    if (m_pipeMgr->m_device->features().nvClusterAccelerationStructureFeatures.clusterAccelerationStructure) {
+      pipelineClusters.allowClusterAccelerationStructure = VK_TRUE;
+      // VkRayTracingPipelineCreateInfoKHR::pNext is const void*, the NV struct's is void*
+      pipelineClusters.pNext = const_cast<void*>(rayPipelineInfo.pNext);
+      rayPipelineInfo.pNext = &pipelineClusters;
+    }
+    // NV-DXVK end
+
     auto& rtProperties = m_pipeMgr->m_device->properties().khrDeviceRayTracingPipelineProperties;
     THROW_IF_FALSE(rtProperties.maxRayRecursionDepth >= rayPipelineInfo.maxPipelineRayRecursionDepth);
 

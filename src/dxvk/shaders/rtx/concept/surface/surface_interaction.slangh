@@ -26,6 +26,7 @@
 #include "rtx/utility/packing.slangh"
 #include "rtx/concept/ray/ray.h"
 #include "rtx/concept/surface/eye.slangh"
+#include "rtx/concept/cluster_geometry/cluster_geometry.slangh"
 #include "rtx/pass/common_bindings.slangh"
 #include "rtx/utility/debug_view_indices.h"
 
@@ -229,6 +230,44 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
   Surface surface, RayInteraction rayInteraction, Ray ray,
   bool usePreviousPositions = false, uint footprintMode = kFootprintFromRayDirection)
 {
+  // NV-DXVK: RTX Mega Geometry - hits against cluster BLASes fetch their vertex
+  // data from cluster memory (BDA) instead of the geometry buffer table; the
+  // ray's ClusterID and the surface's cluster geometry table index resolve the
+  // cluster (cluster-local primitiveIndex indexes its uint8 triangle list).
+  // Only the raw attribute fetches below branch; all derived logic (normal
+  // sanitization/bending, texgen, spritesheets, tangent generation, gradients)
+  // is shared with the classic path.
+  const bool isClusterHit = surface.isClusterLod && rayInteraction.clusterId != CLUSTER_ID_INVALID;
+
+  // NV-DXVK: RTX Mega Geometry Path B (P4b) - hits against per-frame
+  // cluster-template BLASes (deforming geometry). The surface's classic
+  // buffer indices stay fully valid (current + previous skinned buffers -
+  // motion vectors ride the standard previousPositionBufferIndex path, risk
+  // R14); only the vertex INDICES are remapped: cluster-local primitiveIndex
+  // -> original triangle, through the animated cluster table via ClusterID.
+  const bool isTemplateHit = surface.isClusterTemplate && rayInteraction.clusterId != CLUSTER_ID_INVALID;
+
+  ClusterGeometry clusterGeometry;
+  uint3 clusterIndices = uint3(0, 0, 0);
+
+  if (isClusterHit)
+  {
+    const uint64_t clusterGeometriesTableAddress =
+      (uint64_t(cb.clusterGeometriesTableAddressHi) << 32) | uint64_t(cb.clusterGeometriesTableAddressLo);
+
+    clusterGeometry = clusterGeometryCreate(
+      clusterGeometriesTableAddress, surface.clusterGeometryId, rayInteraction.clusterId);
+    clusterIndices = clusterGeometryGetTriangleIndices(clusterGeometry, rayInteraction.primitiveIndex);
+  }
+  else if (isTemplateHit)
+  {
+    const uint64_t animatedClusterTableAddress =
+      (uint64_t(cb.animatedClusterTableAddressHi) << 32) | uint64_t(cb.animatedClusterTableAddressLo);
+
+    clusterIndices = clusterTemplateGetTriangleIndices(
+      animatedClusterTableAddress, rayInteraction.clusterId, rayInteraction.primitiveIndex);
+  }
+
   // Compute vertex indicies
 
   uint idx[3];
@@ -237,7 +276,12 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
   {
     const uint indexIndex = rayInteraction.primitiveIndex * 3 + i + surface.firstIndex;
 
-    if (surface.indexBufferIndex != BINDING_INDEX_INVALID)
+    if (isClusterHit || isTemplateHit)
+    {
+      // cluster-local (Path A) / remapped original (Path B) vertex indices
+      idx[i] = clusterIndices[i];
+    }
+    else if (surface.indexBufferIndex != BINDING_INDEX_INVALID)
     {
       const uint indexBufferIndex = surface.indexBufferIndex;
 
@@ -260,7 +304,16 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
 
   vec3 positions[3];
 
-  if (usePreviousPositions && !surface.isStatic && surface.previousPositionBufferIndex != BINDING_INDEX_INVALID)
+  if (isClusterHit)
+  {
+    // clusters are rigid: current and previous object-space positions are
+    // identical (motion comes from prevObjectToWorld below)
+    for (uint i = 0; i < 3; i++)
+    {
+      positions[i] = clusterGeometryGetPosition(clusterGeometry, idx[i]);
+    }
+  }
+  else if (usePreviousPositions && !surface.isStatic && surface.previousPositionBufferIndex != BINDING_INDEX_INVALID)
   {
     for (uint i = 0; i < 3; i++)
     {
@@ -361,7 +414,11 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
   const bool triangleNormalSameDirection = dot(triangleNormal, rayInteraction.viewDirection) >= 0.0f;
   const vec3 flippedTriangleNormal = triangleNormalSameDirection ? triangleNormal : -triangleNormal;
 
-  if (surface.normalBufferIndex == BINDING_INDEX_INVALID)
+  const bool hasVertexNormals = isClusterHit
+    ? clusterGeometry.hasNormals
+    : surface.normalBufferIndex != BINDING_INDEX_INVALID;
+
+  if (!hasVertexNormals)
   {
     surfaceInteraction.geometryNormal = flippedTriangleNormal;
   }
@@ -373,11 +430,16 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
     {
       const uint currentIndex = idx[i];
 
-      const uint normalBufferIndex = surface.normalBufferIndex;
-      const uint normalElementIndex = (currentIndex * uint(surface.normalStride) + surface.normalOffset) / 4;
-
-      if (surface.normalsEncoded)
+      if (isClusterHit)
       {
+        // oct-encoded cluster vertex normal (attribute_encoding.h)
+        normals[i] = clusterGeometryDecodeNormal(clusterGeometryGetPackedNormal(clusterGeometry, currentIndex));
+      }
+      else if (surface.normalsEncoded)
+      {
+        const uint normalBufferIndex = surface.normalBufferIndex;
+        const uint normalElementIndex = (currentIndex * uint(surface.normalStride) + surface.normalOffset) / 4;
+
         const uint encodedNormal = floatBitsToUint(BUFFER_ARRAY(geometries, normalBufferIndex, normalElementIndex));
         const vec3 decodedNormal = unsignedOctahedralToSphereDirection(vec2(
           unorm16ToF32(uint16_t(encodedNormal >> 0)),
@@ -388,6 +450,9 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
       }
       else
       {
+        const uint normalBufferIndex = surface.normalBufferIndex;
+        const uint normalElementIndex = (currentIndex * uint(surface.normalStride) + surface.normalOffset) / 4;
+
         normals[i].x = BUFFER_ARRAY(geometries, normalBufferIndex, normalElementIndex + 0);
         normals[i].y = BUFFER_ARRAY(geometries, normalBufferIndex, normalElementIndex + 1);
         normals[i].z = BUFFER_ARRAY(geometries, normalBufferIndex, normalElementIndex + 2);
@@ -450,7 +515,9 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
   {
     vec3 prevObjectPosition = interpolateHitAttribute(positions, bary);
 
-    if (surface.previousPositionBufferIndex != BINDING_INDEX_INVALID)
+    // NV-DXVK: cluster hits reuse the current object-space positions (rigid
+    // clusters); motion comes from prevObjectToWorld alone
+    if (!isClusterHit && surface.previousPositionBufferIndex != BINDING_INDEX_INVALID)
     {
       vec3 prevPositions[3];
 
@@ -480,7 +547,11 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
 
   // Compute texture coordinates
 
-  if (surface.texcoordBufferIndex != BINDING_INDEX_INVALID || surface.texcoordGenerationMode != uint(TexGenMode::None))
+  const bool hasVertexTexcoords = isClusterHit
+    ? clusterGeometry.hasTexcoords0
+    : surface.texcoordBufferIndex != BINDING_INDEX_INVALID;
+
+  if (hasVertexTexcoords || surface.texcoordGenerationMode != uint(TexGenMode::None))
   {
     // Note: This can be potentially extended to vec3 or vec4 if we ever want to support more than 2 texture transform elements
     // (potentially useful for say cubemap sampling, but Remix has little use to actually render cubemaps properly outside
@@ -502,13 +573,23 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
       else if (surface.texcoordGenerationMode == uint(TexGenMode::ViewNormals))
       {
         const uint currentIndex = idx[i];
-        const uint normalBufferIndex = surface.normalBufferIndex;
-        const uint normalElementIndex = (currentIndex * uint(surface.normalStride) + surface.normalOffset) / 4;
 
         float3 normal;
-        normal.x = BUFFER_ARRAY(geometries, normalBufferIndex, normalElementIndex + 0);
-        normal.y = BUFFER_ARRAY(geometries, normalBufferIndex, normalElementIndex + 1);
-        normal.z = BUFFER_ARRAY(geometries, normalBufferIndex, normalElementIndex + 2);
+        if (isClusterHit)
+        {
+          normal = clusterGeometry.hasNormals
+            ? clusterGeometryDecodeNormal(clusterGeometryGetPackedNormal(clusterGeometry, currentIndex))
+            : triangleNormal;
+        }
+        else
+        {
+          const uint normalBufferIndex = surface.normalBufferIndex;
+          const uint normalElementIndex = (currentIndex * uint(surface.normalStride) + surface.normalOffset) / 4;
+
+          normal.x = BUFFER_ARRAY(geometries, normalBufferIndex, normalElementIndex + 0);
+          normal.y = BUFFER_ARRAY(geometries, normalBufferIndex, normalElementIndex + 1);
+          normal.z = BUFFER_ARRAY(geometries, normalBufferIndex, normalElementIndex + 2);
+        }
 
         normal = normalize(mul(surface.normalObjectToWorld, normal));
 
@@ -521,13 +602,22 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
       else
       {
         const uint currentIndex = idx[i];
-        uint texcoordBufferIndex = surface.texcoordBufferIndex;
-        const uint texcoordElementIndex = (currentIndex * uint(surface.texcoordStride) + surface.texcoordOffset) / 4;
 
-        const vec2 loadedTextureCoordinate = vec2(
-          BUFFER_ARRAY(geometries, texcoordBufferIndex, texcoordElementIndex + 0),
-          BUFFER_ARRAY(geometries, texcoordBufferIndex, texcoordElementIndex + 1)
-        );
+        vec2 loadedTextureCoordinate;
+        if (isClusterHit)
+        {
+          loadedTextureCoordinate = clusterGeometryGetTexcoord0(clusterGeometry, currentIndex);
+        }
+        else
+        {
+          uint texcoordBufferIndex = surface.texcoordBufferIndex;
+          const uint texcoordElementIndex = (currentIndex * uint(surface.texcoordStride) + surface.texcoordOffset) / 4;
+
+          loadedTextureCoordinate = vec2(
+            BUFFER_ARRAY(geometries, texcoordBufferIndex, texcoordElementIndex + 0),
+            BUFFER_ARRAY(geometries, texcoordBufferIndex, texcoordElementIndex + 1)
+          );
+        }
 
         // Todo: This will likely need to load more than a vec2 of texture coordinates too if we ever support anything more complex.
         // A value of 1 is added to every component beyond what is loaded, though it really should be a value of 0 up to the texture
@@ -706,7 +796,10 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
 
   // Compute vertex colors
 
-  if (surface.color0BufferIndex != BINDING_INDEX_INVALID &&
+  // NV-DXVK: clusters carry no color attribute (NVIDIA's cluster format has
+  // none); cluster hits use the neutral vertex color
+  if (!isClusterHit &&
+     surface.color0BufferIndex != BINDING_INDEX_INVALID &&
      // Baked terrain has vertex colors already baked in, so default to neutral vertex color of 1.
      // They won't get reapplied later anyway
      !isBakedTerrain)

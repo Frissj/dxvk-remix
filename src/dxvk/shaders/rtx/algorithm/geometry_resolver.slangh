@@ -627,6 +627,86 @@ void geometryResolverVertexOutputDebugView(
     storeInDebugView(pixelCoordinate, r5g6b5ToColor(surface.hashPacked)); // visualize directly as colour (note the hash is compressed into a 16bit using XOR)
 
     break;
+  // NV-DXVK start: RTX Mega Geometry cluster LOD visualization (mirrors the
+  // vk_lod_clusters sample's cluster/group/lod/triangle/blas visualize modes;
+  // classic, non-cluster surfaces show black)
+  case DEBUG_VIEW_CLUSTER_LOD_CLUSTER_ID:
+    if (surface.isClusterLod && rayInteraction.clusterId != CLUSTER_ID_INVALID)
+    {
+      storeInDebugView(pixelCoordinate, r5g6b5ToColor(uint16_t(uintHash(rayInteraction.clusterId ^ (surface.clusterGeometryId << 16)))));
+    }
+    else if (surface.isClusterTemplate && rayInteraction.clusterId != CLUSTER_ID_INVALID)
+    {
+      // P4b Path B: template ClusterIDs are globally unique (animated cluster
+      // table indices) - hash directly
+      storeInDebugView(pixelCoordinate, r5g6b5ToColor(uint16_t(uintHash(rayInteraction.clusterId))));
+    }
+    else
+    {
+      storeInDebugView(pixelCoordinate, vec3(0.0));
+    }
+
+    break;
+  case DEBUG_VIEW_CLUSTER_LOD_GROUP:
+  case DEBUG_VIEW_CLUSTER_LOD_LEVEL:
+    if (surface.isClusterLod && rayInteraction.clusterId != CLUSTER_ID_INVALID)
+    {
+      const uint64_t clusterGeometriesTableAddress =
+        (uint64_t(cb.clusterGeometriesTableAddressHi) << 32) | uint64_t(cb.clusterGeometriesTableAddressLo);
+      const ClusterGeometry clusterGeometry = clusterGeometryCreate(
+        clusterGeometriesTableAddress, surface.clusterGeometryId, rayInteraction.clusterId);
+
+      if (cb.debugView == DEBUG_VIEW_CLUSTER_LOD_LEVEL)
+      {
+        // LOD level as a green->red gradient (low LOD level = high detail = green)
+        const float lodLevelNormalized = saturate(float(clusterGeometry.lodLevel) / 8.0f);
+        storeInDebugView(pixelCoordinate, vec3(lodLevelNormalized, 1.0f - lodLevelNormalized, 0.0f));
+      }
+      else
+      {
+        // group = cluster base address (cluster - groupChildIndex * sizeof(Cluster) - sizeof(Group)),
+        // hash-colored like the sample's VISUALIZE_GROUP
+        const uint64_t groupAddress = clusterGeometry.clusterAddress - uint64_t(clusterGeometry.groupChildIndex) * 16 - 32;
+        storeInDebugView(pixelCoordinate, r5g6b5ToColor(uint16_t(uintHash(uint(groupAddress) ^ uint(groupAddress >> 32)))));
+      }
+    }
+    else
+    {
+      storeInDebugView(pixelCoordinate, vec3(0.0));
+    }
+
+    break;
+  case DEBUG_VIEW_CLUSTER_LOD_TRIANGLE:
+    if ((surface.isClusterLod || surface.isClusterTemplate) && rayInteraction.clusterId != CLUSTER_ID_INVALID)
+    {
+      storeInDebugView(pixelCoordinate, r5g6b5ToColor(uint16_t(uintHash(rayInteraction.clusterId * 256 + rayInteraction.primitiveIndex))));
+    }
+    else
+    {
+      storeInDebugView(pixelCoordinate, vec3(0.0));
+    }
+
+    break;
+  case DEBUG_VIEW_CLUSTER_LOD_BLAS:
+    if (surface.isClusterLod)
+    {
+      // per-frame cluster BLASes are per render instance/geometry; color by the
+      // cluster geometry table index
+      storeInDebugView(pixelCoordinate, r5g6b5ToColor(uint16_t(uintHash(surface.clusterGeometryId))));
+    }
+    else if (surface.isClusterTemplate)
+    {
+      // P4b Path B: one BLAS per pose (BlasEntry) - the per-geometry identity
+      // (packed hash) is the closest per-surface discriminator available
+      storeInDebugView(pixelCoordinate, r5g6b5ToColor(uint16_t(uintHash(uint(surface.hashPacked) | 0x10000u))));
+    }
+    else
+    {
+      storeInDebugView(pixelCoordinate, vec3(0.0));
+    }
+
+    break;
+  // NV-DXVK end
   case DEBUG_VIEW_CUSTOM_INDEX:
 
     if (rayInteraction.isViewModel)

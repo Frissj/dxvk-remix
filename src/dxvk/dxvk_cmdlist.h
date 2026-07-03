@@ -22,6 +22,8 @@
 #pragma once
 
 #include <limits>
+// NV-DXVK: additional wait/signal semaphore lists
+#include <vector>
 
 #include "dxvk_bind_mask.h"
 #include "dxvk_buffer.h"
@@ -59,17 +61,22 @@ namespace dxvk {
    * only, array sizes are based on need.
    */
   struct DxvkQueueSubmission {
+    // NV-DXVK: array sizes grown 3 -> 8 for the cluster LOD streaming
+    // semaphores (which coexist with DLFG, external-swapchain and SDMA
+    // wait/signal entries in the same submission)
     uint32_t              waitCount;
-    VkSemaphore           waitSync[3];
-    VkPipelineStageFlags  waitMask[3];
+    VkSemaphore           waitSync[8];
+    VkPipelineStageFlags  waitMask[8];
     uint32_t              wakeCount;
-    VkSemaphore           wakeSync[3];
+    VkSemaphore           wakeSync[8];
     uint32_t              cmdBufferCount;
     VkCommandBuffer       cmdBuffers[4];
 
     // NV-DXVK: DLFG integration
-    uint64_t              waitValue[3] = { uint64_t(-1), uint64_t(-1), uint64_t(-1) };
-    uint64_t              wakeValue[3] = { uint64_t(-1), uint64_t(-1), uint64_t(-1) };
+    uint64_t              waitValue[8] = { uint64_t(-1), uint64_t(-1), uint64_t(-1), uint64_t(-1),
+                                           uint64_t(-1), uint64_t(-1), uint64_t(-1), uint64_t(-1) };
+    uint64_t              wakeValue[8] = { uint64_t(-1), uint64_t(-1), uint64_t(-1), uint64_t(-1),
+                                           uint64_t(-1), uint64_t(-1), uint64_t(-1), uint64_t(-1) };
     // NV-DXVK end
   };
 
@@ -945,10 +952,15 @@ namespace dxvk {
       const DxvkQueueSubmission&  info);
 
     // NV-DXVK start: DLFG integration
-    VkSemaphore m_additionalWaitSemaphore = nullptr;
-    uint64_t m_additionalWaitSemaphoreValue = uint64_t(-1);
-    VkSemaphore m_additionalSignalSemaphore = nullptr;
-    uint64_t m_additionalSignalSemaphoreValue = uint64_t(-1);
+    // NV-DXVK: multiple additional wait/signal semaphores. The single-slot
+    // design collided once more than one subsystem (DLFG, external swapchain,
+    // cluster LOD streaming) attached a semaphore to the same command list.
+    struct AdditionalSemaphore {
+      VkSemaphore semaphore = VK_NULL_HANDLE;
+      uint64_t value = uint64_t(-1);
+    };
+    std::vector<AdditionalSemaphore> m_additionalWaitSemaphores;
+    std::vector<AdditionalSemaphore> m_additionalSignalSemaphores;
     // NV-DXVK end
   };
   

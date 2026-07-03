@@ -311,6 +311,34 @@ struct Surface
     set { data0b.z = newValue ? packedFlagSet(data0b.z, 1 << 1) : packedFlagUnset(data0b.z, 1 << 1); }
   }
 
+  // NV-DXVK: RTX Mega Geometry - this surface's instance renders through a
+  // cluster BLAS; vertex data is fetched from cluster memory (see
+  // cluster_geometry.slangh) instead of the geometry buffer indices.
+  property bool isClusterLod
+  {
+    get { return packedFlagGet(data0b.z, 1 << 2); }
+    set { data0b.z = newValue ? packedFlagSet(data0b.z, 1 << 2) : packedFlagUnset(data0b.z, 1 << 2); }
+  }
+
+  // NV-DXVK: RTX Mega Geometry Path B (P4b) - this surface's instance renders
+  // through a per-frame cluster-template BLAS (deforming geometry). The
+  // classic buffer fetch stays fully valid (current + previous skinned
+  // buffers); only the cluster-local primitiveIndex is remapped through the
+  // animated cluster table via the ray's ClusterID.
+  property bool isClusterTemplate
+  {
+    get { return packedFlagGet(data0b.z, 1 << 3); }
+    set { data0b.z = newValue ? packedFlagSet(data0b.z, 1 << 3) : packedFlagUnset(data0b.z, 1 << 3); }
+  }
+
+  // NV-DXVK: cluster surfaces alias positionOffset (data1.x) with the index
+  // into the cluster geometry table (only valid when isClusterLod).
+  property uint clusterGeometryId
+  {
+    get { return data1.x; }
+    set { data1.x = newValue; }
+  }
+
   property uint16_t hashPacked
   {
     get { return data0b.w; }

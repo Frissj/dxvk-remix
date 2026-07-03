@@ -198,15 +198,30 @@ def createBasicTask(inputFile, destFile, targetName, depFile):
     task.outputs = [destFile, depFile]
     return task
 
-def createGlslangTask(inputFile):
-    shaderName = getShaderName(inputFile)
-    destExtension = '.spv' if args.binary else '.h'
-    destFile = os.path.join(args.output, shaderName + destExtension)
-    depFile = os.path.join(args.output, shaderName + ".d")
-    task = createBasicTask(inputFile, destFile, destFile, depFile)
-    variableName = '' if args.binary else f'--vn {shaderName}'
+def createGlslangTask(inputFile, variantSpec):
+    inputName, inputType = os.path.splitext(getShaderName(inputFile))
+    if inputType == "":
+        # See parseShaderVariants: recover the stage for raw GLSL inputs.
+        realType = os.path.splitext(os.path.basename(inputFile))[1]
+        if realType in shaderTypeSuffixes:
+            inputName, inputType = getShaderName(inputFile), realType
+    variantName, variantType = os.path.splitext(variantSpec[0])
 
-    command = f'{args.glslang} {glslangFlags} {includePaths} -V {variableName} -o {destFile} ' \
+    variantDefines = ' '.join([f'-D{x}' for x in variantSpec[1:]])
+    destExtension = '.spv' if args.binary else '.h'
+    destFile = os.path.join(args.output, variantName + destExtension)
+    depFile = os.path.join(args.output, variantName + ".d")
+    task = createBasicTask(inputFile, destFile, destFile, depFile)
+    variableName = '' if args.binary else f'--vn {variantName}'
+
+    if variantName != inputName:
+        task.customName = f'{os.path.basename(inputFile)} ({variantName})'
+
+    # A variant may override the shader stage; glslang otherwise infers it from
+    # the input file extension, so only pass -S when they differ.
+    stageOverride = f'-S {variantType[1:]} ' if variantType != inputType else ''
+
+    command = f'{args.glslang} {glslangFlags} {includePaths} {stageOverride}{variantDefines} -V {variableName} -o {destFile} ' \
             + f'--depfile {depFile} {inputFile}'
     task.commands = [command]
     return task
@@ -230,7 +245,7 @@ def createSlangTask(inputFile, variantSpec):
         task.customName = f'{os.path.basename(inputFile)} ({variantName})'
 
     command1 = f'{args.slangc} -entry main -target spirv -zero-initialize -emit-spirv-directly -verbose-paths {includePaths} ' \
-            + f'-depfile {depFile} {inputFile} -D__SLANG__ {variantDefines} ' \
+            + f'-depfile {depFile} {inputFile} -D__SLANG__=1 {variantDefines} ' \
             + f'-matrix-layout-column-major ' \
             + f'-Wno-30081 '
 
@@ -486,6 +501,15 @@ def parseShaderVariants(inputFile):
     lineno = 0
     inputWithType = getShaderName(inputFile)
     inputName, inputType = os.path.splitext(inputWithType)
+    if inputType == "":
+        # Raw GLSL shaders (e.g. "foo.comp") carry their stage as the file
+        # extension itself, which getShaderName strips. Recover it so variant
+        # declarations and matrices work the same as for "foo.comp.slang".
+        realType = os.path.splitext(os.path.basename(inputFile))[1]
+        if realType in shaderTypeSuffixes:
+            inputName = inputWithType
+            inputType = realType
+            inputWithType = inputName + inputType
     endvariantsFound = False
     matrix = None
     with open(inputFile, "r") as file:
@@ -604,6 +628,10 @@ for root, dirs, files in os.walk(args.input):
     for name in files:
         task = None
         inputFile = os.path.join(root, name)
+        if name.endswith(".h.slang"):
+            # nvpro_core2-convention include-only header (e.g. sky_io.h.slang):
+            # consumed via #include from other shaders, never compiled standalone.
+            continue
         if name.endswith(".comp") \
         or name.endswith(".vert") \
         or name.endswith(".geom") \
@@ -613,9 +641,19 @@ for root, dirs, files in os.walk(args.input):
         or name.endswith(".rahit") \
         or name.endswith(".rmiss") \
         or name.endswith(".rint"):
-            task = createGlslangTask(inputFile)
-            if task.needsBuild():
-                tasks.append(task)
+            # GLSL shaders support the same //!variant declarations as slang
+            # shaders. Files without declarations yield a single default
+            # variant with no extra defines (previous behavior).
+            variants = parseShaderVariants(inputFile)
+
+            if len(variants) == 0:
+                # Couldn't parse the variant specifications, exit with an error code
+                sys.exit(2)
+
+            for variantSpec in variants:
+                task = createGlslangTask(inputFile, variantSpec)
+                if task.needsBuild():
+                    tasks.append(task)
 
         elif name.endswith(".slang"):
             variants = parseShaderVariants(inputFile)

@@ -81,15 +81,13 @@ namespace dxvk {
 
   // NV-DXVK start: DLFG integration
   void DxvkCommandList::addWaitSemaphore(VkSemaphore waitSemaphore, uint64_t waitSemaphoreValue) {
-    assert(!m_additionalWaitSemaphore);
-    m_additionalWaitSemaphore = waitSemaphore;
-    m_additionalWaitSemaphoreValue = waitSemaphoreValue;
+    assert(waitSemaphore);
+    m_additionalWaitSemaphores.push_back({ waitSemaphore, waitSemaphoreValue });
   }
 
   void DxvkCommandList::addSignalSemaphore(VkSemaphore signalSemaphore, uint64_t signalSemaphoreValue) {
-    assert(!m_additionalSignalSemaphore);
-    m_additionalSignalSemaphore = signalSemaphore;
-    m_additionalSignalSemaphoreValue = signalSemaphoreValue;
+    assert(signalSemaphore);
+    m_additionalSignalSemaphores.push_back({ signalSemaphore, signalSemaphoreValue });
   }
   // NV-DXVK end
 
@@ -141,25 +139,22 @@ namespace dxvk {
     }
 
     // NV-DXVK start: DLFG integration
-    if (m_additionalWaitSemaphore) {
+    for (const AdditionalSemaphore& wait : m_additionalWaitSemaphores) {
       assert(info.waitCount < (sizeof(info.waitSync) / sizeof(info.waitSync[0])));
-      info.waitSync[info.waitCount] = m_additionalWaitSemaphore;
+      info.waitSync[info.waitCount] = wait.semaphore;
       info.waitMask[info.waitCount] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-      info.waitValue[info.waitCount] = m_additionalWaitSemaphoreValue;
+      info.waitValue[info.waitCount] = wait.value;
       info.waitCount += 1;
-
-      m_additionalWaitSemaphore = nullptr;
-      m_additionalWaitSemaphoreValue = uint64_t(-1);
     }
-    if (m_additionalSignalSemaphore) {
+    m_additionalWaitSemaphores.clear();
+
+    for (const AdditionalSemaphore& signal : m_additionalSignalSemaphores) {
       assert(info.wakeCount < (sizeof(info.wakeSync) / sizeof(info.wakeSync[0])));
-      info.wakeSync[info.wakeCount] = m_additionalSignalSemaphore;
-      info.wakeValue[info.wakeCount] = m_additionalSignalSemaphoreValue;
+      info.wakeSync[info.wakeCount] = signal.semaphore;
+      info.wakeValue[info.wakeCount] = signal.value;
       info.wakeCount += 1;
-
-      m_additionalSignalSemaphore = nullptr;
-      m_additionalSignalSemaphoreValue = uint64_t(-1);
     }
+    m_additionalSignalSemaphores.clear();
     // NV-DXVK end
 
     return submitToQueue(graphics.queueHandle, m_fence, info);
@@ -233,6 +228,12 @@ namespace dxvk {
     // Less important stuff
     m_signalTracker.reset();
     m_statCounters.reset();
+
+    // NV-DXVK: a command list recycled without a submit must not carry
+    // stale additional semaphores into its next use
+    m_additionalWaitSemaphores.clear();
+    m_additionalSignalSemaphores.clear();
+    // NV-DXVK end
   }
 
 

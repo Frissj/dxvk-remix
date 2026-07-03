@@ -1,0 +1,77 @@
+// NV-DXVK: build-time shader variants for RTX Remix (see compile_shaders.py)
+//!variant remix_depth_flip.comp REMIX_DEPTH_FLIP=1
+//!end-variants
+
+/*
+* Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+
+/*
+  RTX Remix glue kernel (P4, authored - not part of the NVIDIA samples).
+
+  NVIDIA's cluster culling kernels (culling.glsl intersectHiz) and the nvhiz
+  far-mip builder assume the reversed-Z convention the vk_lod_clusters viewer
+  renders with (near = 1, far = 0; glm::perspectiveRH_ZO with swapped planes).
+  Remix's primary depth buffer stores the game's post-projection z/w in the
+  game's own convention - standard-Z (near = 0, far = 1) for virtually all
+  D3D9 titles.
+
+  This pass rewrites Remix's previous-frame primary depth into the cluster
+  system's own HiZ source image in reversed-Z, so every NVIDIA kernel
+  downstream stays byte-identical. The matching cull matrices get the same
+  z' = w - z flip on the host (see lodclusters_remix_render.cpp).
+*/
+
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D inDepth;
+layout(binding = 1, r32f) uniform writeonly image2D outDepth;
+
+layout(push_constant) uniform PushData
+{
+  ivec2 resolution;
+  // 1 = source is the game's standard direction (near = 0, far = 1) and gets
+  //     flipped to reversed-Z; 0 = source is already reversed-Z, copy through
+  uint flipDepth;
+}
+push;
+
+void main()
+{
+  ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+  if(coord.x >= push.resolution.x || coord.y >= push.resolution.y)
+  {
+    return;
+  }
+
+  float depth = texelFetch(inDepth, coord, 0).r;
+
+  // invalid values map to the far plane so unwritten regions never occlude
+  if(isnan(depth))
+  {
+    depth = push.flipDepth != 0 ? 1.0 : 0.0;
+  }
+  depth = clamp(depth, 0.0, 1.0);
+
+  imageStore(outDepth, coord, vec4(push.flipDepth != 0 ? 1.0 - depth : depth, 0, 0, 0));
+}

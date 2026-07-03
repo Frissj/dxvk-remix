@@ -253,10 +253,23 @@ namespace dxvk {
     if (res != VK_SUCCESS) {
       return res;
     }
-    
+
     // Reset present status since we recreated the swapchain. This ensures we try to acquire
     // during the next present instead of returning a stale error value.
     m_lastPresentStatus = VK_SUCCESS;
+
+    // NV-DXVK start: the base presenter reports VK_SUCCESS WITHOUT creating a
+    // swap chain when the window surface is zero-sized (minimized window or a
+    // transient 0x0 during a display-mode change; see Presenter::
+    // recreateSwapChain). m_info is zeroed in that case, so creating
+    // backbuffers from it would call vkCreateImage with a 0x0 extent and
+    // VK_FORMAT_UNDEFINED and crash. D3D9SwapChainEx::Present already skips
+    // presentation and retries the recreation while !hasSwapChain(), matching
+    // the non-DLFG presenter's behavior - do the same here.
+    if (!hasSwapChain()) {
+      return res;
+    }
+    // NV-DXVK end
 
     createBackbuffers();
     return res;
