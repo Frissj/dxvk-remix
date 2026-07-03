@@ -3197,6 +3197,12 @@ void DxsoCompiler::emitControlFlowGenericLoop(
 
             shouldProj = m_module.opIEqual(m_module.defBoolType(), shouldProj, m_module.constu32(1));
 
+            // OpSelect with a vector result requires a matching bool vector condition
+            // in SPIR-V < 1.4 - replicate the scalar
+            uint32_t bvec4_t = m_module.defVectorType(m_module.defBoolType(), 4);
+            std::array<uint32_t, 4> shouldProjIndices = { shouldProj, shouldProj, shouldProj, shouldProj };
+            shouldProj = m_module.opCompositeConstruct(bvec4_t, shouldProjIndices.size(), shouldProjIndices.data());
+
             albedoOpacity = m_module.opSelect(typeId, shouldProj, albedoOpacity, nonProjAlbedoOpacity);
           }
 
@@ -3854,19 +3860,11 @@ void DxsoCompiler::emitControlFlowGenericLoop(
       // Transform the normal
       normal0 = m_module.opMatrixTimesVector(vec3typeId, normalTransformId, normal0);
 
-      // Expand to vec4
-      {
-        std::array<uint32_t, 4> normalIndices = {
-          m_module.opCompositeExtract(floatTypeId, normal0, 1, &indices[0]),
-          m_module.opCompositeExtract(floatTypeId, normal0, 1, &indices[1]),
-          m_module.opCompositeExtract(floatTypeId, normal0, 1, &indices[2]),
-          m_module.opCompositeExtract(floatTypeId, normal0, 1, &indices[2]),
-        };
-        normal0 = m_module.opCompositeConstruct(vec4TypeId, normalIndices.size(), normalIndices.data());
-      }
-
-      // Ensure normal0 is vec3 here
-      emitVertexCaptureWrite(vertexIndex, CapturedVertexMembers::Normal0, normal0, getVectorTypeId({ DxsoScalarType::Float32, 3 }));
+      // normal0 is vec3 here - matching the CapturedVertex.normal0 member. (An
+      // earlier vec4 expansion made OpStore's object type mismatch the vec3
+      // member pointer - invalid SPIR-V that also silently corrupted the
+      // captured normals.)
+      emitVertexCaptureWrite(vertexIndex, CapturedVertexMembers::Normal0, normal0, vec3typeId);
     }
 
     // COLOR0 packed to D3D9 ARGB 0xAARRGGBB @ member 3
@@ -3935,8 +3933,13 @@ void DxsoCompiler::emitControlFlowGenericLoop(
       m_module.setDebugName(useCustom, "custom_vertex_transform_enabled");
       m_module.decorateSpecId(useCustom, getSpecId(D3D9SpecConstantId::CustomVertexTransformEnabled));
 
-      // Explicit select (result vec4, scalar bool condition)
-      const uint32_t chosenPos = m_module.opSelect(vec4TypeId, useCustom, projPosId, oldPos);
+      // OpSelect with a vector result requires a matching bool vector condition
+      // in SPIR-V < 1.4 - replicate the scalar spec-bool
+      const uint32_t bvec4TypeId = m_module.defVectorType(m_module.defBoolType(), 4);
+      const std::array<uint32_t, 4> useCustomIndices = { useCustom, useCustom, useCustom, useCustom };
+      const uint32_t useCustom4 = m_module.opCompositeConstruct(bvec4TypeId, useCustomIndices.size(), useCustomIndices.data());
+
+      const uint32_t chosenPos = m_module.opSelect(vec4TypeId, useCustom4, projPosId, oldPos);
       m_module.opStore(m_vs.oPos.id, chosenPos);
     }
 
@@ -3959,8 +3962,13 @@ void DxsoCompiler::emitControlFlowGenericLoop(
       m_module.setDebugName(jitterOn, "clip_space_jitter_enabled");
       m_module.decorateSpecId(jitterOn, getSpecId(D3D9SpecConstantId::ClipSpaceJitterEnabled));
 
-      // Explicit select
-      const uint32_t finalPos = m_module.opSelect(vec4TypeId, jitterOn, jittered, pos0);
+      // OpSelect with a vector result requires a matching bool vector condition
+      // in SPIR-V < 1.4 - replicate the scalar spec-bool
+      const uint32_t bvec4TypeId = m_module.defVectorType(m_module.defBoolType(), 4);
+      const std::array<uint32_t, 4> jitterOnIndices = { jitterOn, jitterOn, jitterOn, jitterOn };
+      const uint32_t jitterOn4 = m_module.opCompositeConstruct(bvec4TypeId, jitterOnIndices.size(), jitterOnIndices.data());
+
+      const uint32_t finalPos = m_module.opSelect(vec4TypeId, jitterOn4, jittered, pos0);
       m_module.opStore(m_vs.oPos.id, finalPos);
     }
   }

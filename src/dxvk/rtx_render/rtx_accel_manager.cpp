@@ -1908,7 +1908,12 @@ namespace dxvk {
     // Only build TLAS for SSS when necessary
     const bool isBuildSssTlas = RtxOptions::SubsurfaceScattering::enableDiffusionProfile()
       && (m_mergedInstances[Tlas::SSS].size() + m_pointInstancerSlotsPerType[Tlas::SSS] + m_clusterSlotsPerType[Tlas::SSS]) > 0;
-    if (isBuildSssTlas) {
+    if (isBuildSssTlas
+        // bindCommonRayTracingResources binds the SSS TLAS unconditionally every
+        // frame, so when it is never populated build it once, empty, to give the
+        // descriptor a valid handle - a null one is only legal with nullDescriptor
+        // (VUID-VkWriteDescriptorSetAccelerationStructureKHR-pAccelerationStructures-03580)
+        || m_device->getCommon()->getResources().getTLAS(Tlas::SSS).accelStructure == nullptr) {
       internalBuildTlas<Tlas::SSS>(ctx, totalScratchSize);
     }
 

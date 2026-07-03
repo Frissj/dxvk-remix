@@ -213,10 +213,33 @@ namespace dxvk {
     // the ported kernels are compiled with SUBGROUP_SIZE 32 (NV hardware)
     const bool hasSubgroup32 = device->properties().coreSubgroup.subgroupSize == 32;
 
-    return hasExtension && hasFeature && hasSubgroup32;
+    // kernel requirements: 64-bit integer arithmetic + buffer atomics; the HiZ
+    // builder additionally samples depth through a MIN-reduction sampler
+    const bool hasShaderInt64 = device->features().core.features.shaderInt64
+                             && device->features().vulkan12Features.shaderBufferInt64Atomics;
+    const bool hasMinmaxSampler = device->features().vulkan12Features.samplerFilterMinmax;
+
+    // the ported pipeline creation chains VkShaderModuleCreateInfo into the stage
+    // info with module = VK_NULL_HANDLE, which maintenance5 legalizes
+    const bool hasMaintenance5 = device->features().khrMaintenance5Features.maintenance5;
+
+    return hasExtension && hasFeature && hasSubgroup32 && hasShaderInt64 && hasMinmaxSampler && hasMaintenance5;
   }
 
   void ClusterLodManager::onDrawCallGeometry(const DrawCallState& drawCallState, bool vertexDataUpdated) {
+    // Whatever happens below, drop the pre-capture staging hold on the way out:
+    // the snapshot (if one is taken) copies the data, and holding longer would
+    // pin the staging memory for the lifetime of the BlasEntry's DrawCallState
+    // copy, which shares this hold.
+    struct HoldRelease {
+      const std::shared_ptr<PreCaptureVertexData>& hold;
+      ~HoldRelease() {
+        if (hold != nullptr) {
+          hold->release();
+        }
+      }
+    } holdRelease { drawCallState.preCaptureVertexData };
+
     if (!ClusterLodOptions::enable()) {
       return;
     }
@@ -307,6 +330,7 @@ namespace dxvk {
     const ClusterLodGeometryProvider::Stats stats = m_provider->getStats();
 
     Logger::info(str::format("[ClusterLOD] stats: submitted ", stats.submitted,
+                             " (topology-converted ", stats.convertedTopology, ")",
                              ", pending ", stats.pending,
                              " (", stats.pendingBytes / (1024 * 1024), " MiB)",
                              ", processed ", stats.processed,
@@ -316,6 +340,10 @@ namespace dxvk {
                              " (Path B ready ", stats.animatedReady,
                              ", failed ", stats.animatedFailed, ")",
                              ", ineligible ", stats.ineligible,
+                             " (topology ", stats.skippedTopology,
+                             ", tooSmall ", stats.skippedTooSmall,
+                             ", format ", stats.skippedFormat,
+                             ", noCpuData ", stats.skippedNoCpuData, ")",
                              ", verified ", stats.verified,
                              ", verify failures ", stats.verifyFailed,
                              ", clusters ", stats.totalClusters,
@@ -615,6 +643,21 @@ namespace dxvk {
     }
 
     const uint32_t currentFrame = m_device->getCurrentFrameId();
+
+    // Periodic stats so the log always carries the intake/skip counts - the
+    // per-geometry skip messages are ONCE-per-reason and cannot show totals.
+    // Only prints when the counters actually changed since the last line.
+    if (m_provider != nullptr
+        && ClusterLodOptions::logStatsIntervalFrames() > 0
+        && currentFrame - m_lastStatsLogFrame >= uint32_t(ClusterLodOptions::logStatsIntervalFrames())) {
+      const ClusterLodGeometryProvider::Stats stats = m_provider->getStats();
+      const uint64_t digest = XXH64(&stats, sizeof(stats), 0);
+      if (digest != m_lastLoggedStatsDigest) {
+        logStatistics();
+        m_lastLoggedStatsDigest = digest;
+      }
+      m_lastStatsLogFrame = currentFrame;
+    }
 
     if (m_templateSystemMT != nullptr) {
       m_templateSystemMT->beginFrame(currentFrame);

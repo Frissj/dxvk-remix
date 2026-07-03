@@ -14,6 +14,7 @@
 #include "d3d9_rtx_utils.h"
 #include "d3d9_texture.h"
 #include "../dxvk/rtx_render/rtx_terrain_baker.h"
+#include "../dxvk/rtx_render/rtx_cluster_lod_manager.h"
 
 #include <cassert>
 #include <cstring>
@@ -181,6 +182,18 @@ namespace dxvk {
     const D3D9CommonShader* vertexShader = d3d9State().vertexShader.ptr() != nullptr ? d3d9State().vertexShader->GetCommonShader() : nullptr;
 
     RasterGeometry& geoData = m_activeDrawCallState.geometryData;
+
+    // NV-DXVK start: RTX Mega Geometry pre-capture vertex data hold
+    // The capture slice assigned below is GPU-written - it has no CPU mapping,
+    // ever. Preserve the CPU-visible input staging buffers (the same bytes
+    // computeHash reads) so the cluster-LOD intake can snapshot the geometry
+    // (pre-capture CPU snapshot route; the hold pins their staging memory
+    // until the intake consumes it).
+    if (ClusterLodOptions::enable()) {
+      m_activeDrawCallState.preCaptureVertexData = std::make_shared<PreCaptureVertexData>(
+        geoData.positionBuffer, geoData.normalBuffer, geoData.texcoordBuffer, geoData.color0Buffer);
+    }
+    // NV-DXVK end
 
     // Known stride for vertex capture buffers
     const uint32_t stride = sizeof(CapturedVertex);
@@ -675,6 +688,12 @@ namespace dxvk {
 
     m_activeDrawCallState.categories = 0;
     m_activeDrawCallState.materialData = {};
+    // NV-DXVK start: RTX Mega Geometry pre-capture vertex data hold
+    // Defensive per-draw reset: a draw rejected after prepareVertexCapture set
+    // the hold must not leak it into the next draw's state (submit moves the
+    // state out, but rejected draws never submit).
+    m_activeDrawCallState.preCaptureVertexData = nullptr;
+    // NV-DXVK end
 
     // Fetch all the legacy state (colour modes, alpha test, etc...)
     setLegacyMaterialState(m_parent, m_parent->m_alphaSwizzleRTs & (1 << kRenderTargetIndex), m_activeDrawCallState.materialData);

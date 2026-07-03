@@ -80,6 +80,14 @@ namespace dxvk {
       uint64_t pendingBytes = 0;     // CPU memory held by queued snapshots
       uint64_t totalClusters = 0;    // sum over processed geometries
       uint64_t totalTriangles = 0;   // sum over processed geometries (all lods)
+
+      // per-reason breakdown of `ineligible` (each skip reason logs its first
+      // occurrence in detail; these carry the counts for all later ones)
+      uint64_t skippedTopology = 0;      // point/line topologies (not triangles at all)
+      uint64_t skippedTooSmall = 0;      // fewer than one triangle, or all triangles degenerate
+      uint64_t skippedFormat = 0;        // non-float32 position format
+      uint64_t skippedNoCpuData = 0;     // device-local-only vertex/index data (stays classic by design)
+      uint64_t convertedTopology = 0;    // of submitted: strips/fans/non-indexed expanded to lists on the CPU
     };
 
     Stats getStats() const;
@@ -90,11 +98,19 @@ namespace dxvk {
     std::vector<uint64_t> drainReadyGeometries();
 
   private:
-    // returns false if the draw call cannot be snapshotted (no CPU-visible data,
-    // unsupported topology/formats)
-    static bool makeSnapshot(const DrawCallState& drawCallState,
-                             uint64_t geometryHash,
-                             lodclusters_remix::GeometrySnapshot& outSnapshot);
+    // why a draw call could not be snapshotted (mapped onto the Stats counters)
+    enum class SnapshotResult {
+      Eligible,
+      EligibleConverted,  // eligible via CPU strip/fan/non-indexed -> triangle-list expansion
+      SkipTopology,
+      SkipTooSmall,
+      SkipFormat,
+      SkipNoCpuData,
+    };
+
+    static SnapshotResult makeSnapshot(const DrawCallState& drawCallState,
+                                       uint64_t geometryHash,
+                                       lodclusters_remix::GeometrySnapshot& outSnapshot);
 
     void workerLoop();
 

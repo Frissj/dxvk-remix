@@ -67,11 +67,11 @@ namespace dxvk {
         {DEBUG_VIEW_PRIMITIVE_INDEX_HASH, "Primitive Index Hash"},
         {DEBUG_VIEW_GEOMETRY_HASH, "Geometry Hash"},
         // NV-DXVK start: RTX Mega Geometry cluster LOD visualization
-        {DEBUG_VIEW_CLUSTER_LOD_CLUSTER_ID, "Cluster LOD: Cluster ID", "Hash-colors each cluster of RTX Mega Geometry cluster-LOD instances; classic surfaces show black."},
-        {DEBUG_VIEW_CLUSTER_LOD_GROUP, "Cluster LOD: Group", "Hash-colors each cluster group (the LOD/streaming unit); classic surfaces show black."},
-        {DEBUG_VIEW_CLUSTER_LOD_LEVEL, "Cluster LOD: LOD Level", "Green = highest detail (LOD 0) to red = lowest detail; classic surfaces show black."},
-        {DEBUG_VIEW_CLUSTER_LOD_TRIANGLE, "Cluster LOD: Triangle", "Hash-colors each cluster-local triangle; classic surfaces show black."},
-        {DEBUG_VIEW_CLUSTER_LOD_BLAS, "Cluster LOD: BLAS", "Hash-colors by cluster geometry (per-frame cluster BLAS granularity); classic surfaces show black."},
+        {DEBUG_VIEW_CLUSTER_LOD_CLUSTER_ID, "Cluster LOD: Cluster ID", "Hash-colors each cluster of RTX Mega Geometry cluster-LOD instances. Classic surfaces show dark gray; MAGENTA marks a cluster surface whose ray returned no ClusterID (intrinsic/BLAS mismatch)."},
+        {DEBUG_VIEW_CLUSTER_LOD_GROUP, "Cluster LOD: Group", "Hash-colors each cluster group (the LOD/streaming unit). Classic surfaces show dark gray; MAGENTA = cluster surface without a ClusterID."},
+        {DEBUG_VIEW_CLUSTER_LOD_LEVEL, "Cluster LOD: LOD Level", "Green = highest detail (LOD 0) to red = lowest detail. Classic surfaces show dark gray; MAGENTA = cluster surface without a ClusterID."},
+        {DEBUG_VIEW_CLUSTER_LOD_TRIANGLE, "Cluster LOD: Triangle", "Hash-colors each cluster-local triangle. Classic surfaces show dark gray; MAGENTA = cluster surface without a ClusterID."},
+        {DEBUG_VIEW_CLUSTER_LOD_BLAS, "Cluster LOD: BLAS", "Hash-colors by cluster geometry (per-frame cluster BLAS granularity); classic surfaces show dark gray."},
         // NV-DXVK end
         {DEBUG_VIEW_CUSTOM_INDEX, "Custom Index"},
         {DEBUG_VIEW_BARYCENTRICS, "Barycentric Coordinates"},

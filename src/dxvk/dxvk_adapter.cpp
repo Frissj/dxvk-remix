@@ -343,7 +343,7 @@ namespace dxvk {
           DxvkDeviceFeatures  enabledFeatures) {
     DxvkDeviceExtensions devExtensions;
 
-    std::array<DxvkExt*, 44> devExtensionList = {{
+    std::array<DxvkExt*, 45> devExtensionList = {{
       &devExtensions.amdMemoryOverallocationBehaviour,
       &devExtensions.amdShaderFragmentMask,
       &devExtensions.ext4444Formats,
@@ -384,6 +384,7 @@ namespace dxvk {
       &devExtensions.extOpacityMicromap,
       // NV-DXVK start: RTX Mega Geometry (cluster acceleration structures)
       &devExtensions.nvClusterAccelerationStructure,
+      &devExtensions.khrMaintenance5,
       // NV-DXVK end
       &devExtensions.nvLowLatency,
       &devExtensions.nvxBinaryImport,
@@ -627,6 +628,24 @@ namespace dxvk {
       // The cluster LOD traversal kernels require 64-bit buffer atomics for their
       // producer/consumer queues and streaming address encoding.
       enabledFeatures.vulkan12Features.shaderBufferInt64Atomics = m_deviceFeatures.vulkan12Features.shaderBufferInt64Atomics;
+
+      // The kernels also do 64-bit integer arithmetic on buffer device addresses
+      // (SPIR-V Int64 capability), which needs the core feature bit - the atomics
+      // feature above does not imply it (VUID-VkShaderModuleCreateInfo-pCode-08740).
+      enabledFeatures.core.features.shaderInt64 = m_deviceFeatures.core.features.shaderInt64;
+
+      // The HiZ occlusion pyramid (NVHizVK) samples depth through a
+      // VK_SAMPLER_REDUCTION_MODE_MIN sampler (VUID-VkSamplerCreateInfo-pNext-06726).
+      enabledFeatures.vulkan12Features.samplerFilterMinmax = m_deviceFeatures.vulkan12Features.samplerFilterMinmax;
+    }
+
+    // The ported NVIDIA kernels create their pipelines with VkShaderModuleCreateInfo
+    // chained into the stage info (module = VK_NULL_HANDLE) - valid only with the
+    // maintenance5 feature enabled (VUID-VkPipelineShaderStageCreateInfo-stage-08771).
+    if (devExtensions.khrMaintenance5) {
+      enabledFeatures.khrMaintenance5Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR;
+      enabledFeatures.khrMaintenance5Features.pNext = std::exchange(enabledFeatures.core.pNext, &enabledFeatures.khrMaintenance5Features);
+      enabledFeatures.khrMaintenance5Features.maintenance5 = m_deviceFeatures.khrMaintenance5Features.maintenance5;
     }
     // NV-DXVK end
 
@@ -1157,6 +1176,11 @@ namespace dxvk {
     if (m_deviceExtensions.supports(VK_NV_CLUSTER_ACCELERATION_STRUCTURE_EXTENSION_NAME)) {
       m_deviceFeatures.nvClusterAccelerationStructureFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CLUSTER_ACCELERATION_STRUCTURE_FEATURES_NV;
       m_deviceFeatures.nvClusterAccelerationStructureFeatures.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.nvClusterAccelerationStructureFeatures);
+    }
+
+    if (m_deviceExtensions.supports(VK_KHR_MAINTENANCE_5_EXTENSION_NAME)) {
+      m_deviceFeatures.khrMaintenance5Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR;
+      m_deviceFeatures.khrMaintenance5Features.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.khrMaintenance5Features);
     }
     // NV-DXVK end
 

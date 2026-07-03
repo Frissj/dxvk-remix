@@ -36,13 +36,18 @@ namespace dxvk {
 
   namespace {
 
-    // P4b: topology-stable Path B identity - indices content hash + vertex
-    // count. Unlike the asset hash it excludes positions, so it survives
-    // skinning bind poses being identical across characters AND per-frame
-    // CPU vertex rewrites.
+    // P4b: topology-stable Path B identity - indices content hash + counts +
+    // primitive topology. Unlike the asset hash it excludes positions, so it
+    // survives skinning bind poses being identical across characters AND
+    // per-frame CPU vertex rewrites. indexCount and topology are included
+    // because non-indexed draws have no index content to hash - without them
+    // any two non-indexed meshes with the same vertex count would collide
+    // into one topology identity.
     uint64_t makeTopologyKey(const RasterGeometry& geometryData) {
       const XXH64_hash_t indicesHash = geometryData.hashes[HashComponents::Indices];
-      return XXH64(&indicesHash, sizeof(indicesHash), geometryData.vertexCount);
+      const uint64_t key = XXH64(&indicesHash, sizeof(indicesHash), geometryData.vertexCount);
+      const uint64_t streamSeed = (uint64_t(geometryData.topology) << 32) | geometryData.indexCount;
+      return XXH64(&key, sizeof(key), streamSeed);
     }
 
   }  // namespace
@@ -112,7 +117,9 @@ namespace dxvk {
     // the only window where that data is guaranteed alive, so the copy must happen
     // here on the submission thread (design rule: no GPU->CPU readbacks, ever).
     lodclusters_remix::GeometrySnapshot snapshot;
-    const bool eligible = makeSnapshot(drawCallState, geometryHash, snapshot);
+    const SnapshotResult snapshotResult = makeSnapshot(drawCallState, geometryHash, snapshot);
+    const bool eligible = snapshotResult == SnapshotResult::Eligible
+                       || snapshotResult == SnapshotResult::EligibleConverted;
     snapshot.isDeforming = skinned;
     snapshot.isMutating = deforming && !skinned;
     snapshot.topologyKey = topologyKey;
@@ -137,7 +144,18 @@ namespace dxvk {
 
     if (!eligible) {
       m_stats.ineligible++;
+      switch (snapshotResult) {
+        case SnapshotResult::SkipTopology:  m_stats.skippedTopology++; break;
+        case SnapshotResult::SkipTooSmall:  m_stats.skippedTooSmall++; break;
+        case SnapshotResult::SkipFormat:    m_stats.skippedFormat++; break;
+        case SnapshotResult::SkipNoCpuData: m_stats.skippedNoCpuData++; break;
+        default: break;
+      }
       return;
+    }
+
+    if (snapshotResult == SnapshotResult::EligibleConverted) {
+      m_stats.convertedTopology++;
     }
 
     m_stats.submitted++;
@@ -159,47 +177,72 @@ namespace dxvk {
     return std::exchange(m_readyHashes, {});
   }
 
-  bool ClusterLodGeometryProvider::makeSnapshot(const DrawCallState& drawCallState,
-                                                uint64_t geometryHash,
-                                                lodclusters_remix::GeometrySnapshot& outSnapshot) {
+  ClusterLodGeometryProvider::SnapshotResult ClusterLodGeometryProvider::makeSnapshot(
+      const DrawCallState& drawCallState,
+      uint64_t geometryHash,
+      lodclusters_remix::GeometrySnapshot& outSnapshot) {
     const RasterGeometry& geometryData = drawCallState.getGeometryData();
 
-    // triangle-list, indexed geometry only - the same constraint the classic RT path
-    // enforces via isTopologyRaytraceReady before geometry reaches the BLAS builders
-    if (geometryData.topology != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST) {
-      ONCE(Logger::info(str::format("[ClusterLOD] geometry 0x", std::hex, geometryHash, " skipped: non-triangle-list topology ", std::dec, geometryData.topology)));
-      return false;
+    // Vertex-captured draws (programmable-VS games): the RasterGeometry's vertex
+    // buffers point at the GPU-only capture slice by the time the intake runs.
+    // The CPU-visible INPUT data - the same staging copies the geometry hash was
+    // computed from - travels in the pre-capture hold, so snapshot from there.
+    // The index buffer is never replaced by capture and is read from the
+    // geometry directly either way.
+    const PreCaptureVertexData* preCapture = drawCallState.preCaptureVertexData.get();
+    const RasterBuffer& positionBuffer = preCapture != nullptr ? preCapture->positionBuffer : geometryData.positionBuffer;
+    const RasterBuffer& normalBuffer   = preCapture != nullptr ? preCapture->normalBuffer   : geometryData.normalBuffer;
+    const RasterBuffer& texcoordBuffer = preCapture != nullptr ? preCapture->texcoordBuffer : geometryData.texcoordBuffer;
+
+    // Accept the same triangle topologies the classic RT path accepts. Native lists
+    // pass through; strips, fans and non-indexed draws are expanded to an indexed
+    // triangle list on the CPU below - the exact conversion the classic path runs
+    // on the GPU (gen_tri_list_index_buffer) because the BVH builders cannot consume
+    // them either. The strip/fan index data is CPU-visible whenever list index data
+    // is, so this involves no readback.
+    const VkPrimitiveTopology topology = geometryData.topology;
+    if (topology != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
+        && topology != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP
+        && topology != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN) {
+      ONCE(Logger::info(str::format("[ClusterLOD] geometry 0x", std::hex, geometryHash, " skipped: non-triangle topology ", std::dec, topology, " (count of all such skips is in the stats log)")));
+      return SnapshotResult::SkipTopology;
     }
 
-    if (!geometryData.usesIndices() || geometryData.indexCount < 3 || geometryData.vertexCount < 3) {
-      ONCE(Logger::info(str::format("[ClusterLOD] geometry 0x", std::hex, geometryHash, " skipped: no indices or too few vertices")));
-      return false;
+    // primitive stream length: index count when indexed, vertex count otherwise
+    // (same rules as RtxGeometryUtils::getOptimalTriangleListSize/generateTriangleList,
+    // including a defined-but-empty index buffer counting as non-indexed)
+    const bool usesIndices = geometryData.usesIndices() && geometryData.indexCount > 0;
+    const uint32_t vertexCount = geometryData.vertexCount;
+    const uint32_t primCount = usesIndices ? geometryData.indexCount : vertexCount;
+    const uint32_t triangleCount = (topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
+      ? primCount / 3
+      : (primCount >= 3 ? primCount - 2 : 0);
+
+    if (triangleCount == 0 || vertexCount < 3) {
+      ONCE(Logger::info(str::format("[ClusterLOD] geometry 0x", std::hex, geometryHash, " skipped: too few vertices/primitives (count of all such skips is in the stats log)")));
+      return SnapshotResult::SkipTooSmall;
     }
 
-    if (!geometryData.positionBuffer.defined()) {
-      return false;
+    if (!positionBuffer.defined()) {
+      return SnapshotResult::SkipNoCpuData;
     }
 
-    const VkFormat positionFormat = geometryData.positionBuffer.vertexFormat();
+    const VkFormat positionFormat = positionBuffer.vertexFormat();
     if (positionFormat != VK_FORMAT_R32G32B32_SFLOAT && positionFormat != VK_FORMAT_R32G32B32A32_SFLOAT) {
-      ONCE(Logger::info(str::format("[ClusterLOD] geometry 0x", std::hex, geometryHash, " skipped: unsupported position format ", std::dec, positionFormat)));
-      return false;
+      ONCE(Logger::info(str::format("[ClusterLOD] geometry 0x", std::hex, geometryHash, " skipped: unsupported position format ", std::dec, positionFormat, " (count of all such skips is in the stats log)")));
+      return SnapshotResult::SkipFormat;
     }
 
     // CPU-visible data required. Device-local-only sources (no mapPtr) stay on the
     // classic path and are surfaced in the log rather than silently read back.
-    const void* indexPtr = geometryData.indexBuffer.mapPtr();
+    const void* indexPtr = usesIndices ? geometryData.indexBuffer.mapPtr() : nullptr;
     const uint8_t* positionPtr =
-      (const uint8_t*) geometryData.positionBuffer.mapPtr((size_t) geometryData.positionBuffer.offsetFromSlice());
+      (const uint8_t*) positionBuffer.mapPtr((size_t) positionBuffer.offsetFromSlice());
 
-    if (indexPtr == nullptr || positionPtr == nullptr) {
-      ONCE(Logger::warn(str::format("[ClusterLOD] geometry 0x", std::hex, geometryHash, " skipped: no CPU-visible vertex/index data (stays classic)")));
-      return false;
+    if ((usesIndices && indexPtr == nullptr) || positionPtr == nullptr) {
+      ONCE(Logger::warn(str::format("[ClusterLOD] geometry 0x", std::hex, geometryHash, " skipped: no CPU-visible vertex/index data (stays classic; count of all such skips is in the stats log)")));
+      return SnapshotResult::SkipNoCpuData;
     }
-
-    const uint32_t indexCount = geometryData.indexCount;
-    const uint32_t vertexCount = geometryData.vertexCount;
-    const uint32_t triangleCount = indexCount / 3;
 
     outSnapshot = {};
     outSnapshot.name = str::format("draw_", std::hex, geometryHash);
@@ -213,35 +256,73 @@ namespace dxvk {
     // needs. Routed away from the LOD pipeline.
     outSnapshot.isDeforming = drawCallState.getSkinningState().numBones > 0 && geometryData.numBonesPerVertex > 0;
 
-    // indices: staged copies are rebased to 0 (D3D9Rtx::copyIndices subtracts the min
-    // index), truncate only in the defensive out-of-range case below
-    outSnapshot.indices.resize(triangleCount * size_t(3));
-
-    uint32_t maxIndex = 0;
-    if (geometryData.indexBuffer.indexType() == VK_INDEX_TYPE_UINT16) {
-      const uint16_t* src = (const uint16_t*) indexPtr;
-      for (uint32_t i = 0; i < triangleCount * 3; i++) {
-        const uint32_t value = src[i];
-        outSnapshot.indices[i] = value;
-        maxIndex = std::max(maxIndex, value);
-      }
-    } else {
-      const uint32_t* src = (const uint32_t*) indexPtr;
-      for (uint32_t i = 0; i < triangleCount * 3; i++) {
-        const uint32_t value = src[i];
-        outSnapshot.indices[i] = value;
-        maxIndex = std::max(maxIndex, value);
+    // Indices: staged copies are rebased to 0 (D3D9Rtx::copyIndices subtracts the min
+    // index). Strip/fan/non-indexed streams are expanded per triangle with the same
+    // index derivation as generateIndices() in gen_tri_list_index_buffer.h. One
+    // deliberate difference: the classic path must preserve the triangle COUNT (it
+    // fills a pre-sized GPU buffer), so it collapses degenerate and out-of-range
+    // triangles to a point; the snapshot has no such constraint, so those triangles
+    // are dropped and the clusterizer gets clean input.
+    const uint16_t* src16 = nullptr;
+    const uint32_t* src32 = nullptr;
+    if (usesIndices) {
+      if (geometryData.indexBuffer.indexType() == VK_INDEX_TYPE_UINT16) {
+        src16 = (const uint16_t*) indexPtr;
+      } else {
+        src32 = (const uint32_t*) indexPtr;
       }
     }
+    // non-indexed draws use the identity mapping (vertex i is index i)
+    const auto loadIndex = [&](uint32_t i) -> uint32_t {
+      return src16 ? src16[i] : (src32 ? src32[i] : i);
+    };
 
-    if (maxIndex >= vertexCount) {
-      ONCE(Logger::warn(str::format("[ClusterLOD] geometry 0x", std::hex, geometryHash, " skipped: index range exceeds vertex count")));
-      return false;
+    outSnapshot.indices.reserve(size_t(triangleCount) * 3);
+
+    for (uint32_t t = 0; t < triangleCount; t++) {
+      uint32_t i0, i1, i2;
+      switch (topology) {
+      case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP:
+        // alternate winding correction, identical to gen_tri_list_index_buffer.h
+        i0 = t;
+        i1 = t + 1 + (t & 1);
+        i2 = t + 2 - (t & 1);
+        break;
+      case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN:
+        i0 = 0;
+        i1 = t + 1;
+        i2 = t + 2;
+        break;
+      default:  // VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
+        i0 = t * 3 + 0;
+        i1 = t * 3 + 1;
+        i2 = t * 3 + 2;
+        break;
+      }
+
+      const uint32_t idx0 = loadIndex(i0);
+      const uint32_t idx1 = loadIndex(i1);
+      const uint32_t idx2 = loadIndex(i2);
+
+      // degenerate (strips/fans connect adjacent primitives through them), or invalid
+      if (idx0 == idx1 || idx0 == idx2 || idx1 == idx2 ||
+          idx0 >= vertexCount || idx1 >= vertexCount || idx2 >= vertexCount) {
+        continue;
+      }
+
+      outSnapshot.indices.push_back(idx0);
+      outSnapshot.indices.push_back(idx1);
+      outSnapshot.indices.push_back(idx2);
+    }
+
+    if (outSnapshot.indices.empty()) {
+      ONCE(Logger::warn(str::format("[ClusterLOD] geometry 0x", std::hex, geometryHash, " skipped: all triangles degenerate or out of range (count of all such skips is in the stats log)")));
+      return SnapshotResult::SkipTooSmall;
     }
 
     // positions -> tightly packed vec3
     {
-      const size_t strideBytes = geometryData.positionBuffer.stride();
+      const size_t strideBytes = positionBuffer.stride();
 
       outSnapshot.positions.resize(size_t(vertexCount) * 3);
       for (uint32_t v = 0; v < vertexCount; v++) {
@@ -254,14 +335,14 @@ namespace dxvk {
 
     // normals -> tightly packed vec3 (float formats only; packed R32_UINT normals from
     // vertex capture cannot be read as floats and are treated as absent)
-    if (geometryData.normalBuffer.defined()) {
-      const VkFormat normalFormat = geometryData.normalBuffer.vertexFormat();
+    if (normalBuffer.defined()) {
+      const VkFormat normalFormat = normalBuffer.vertexFormat();
       if (normalFormat == VK_FORMAT_R32G32B32_SFLOAT || normalFormat == VK_FORMAT_R32G32B32A32_SFLOAT) {
         const uint8_t* normalPtr =
-          (const uint8_t*) geometryData.normalBuffer.mapPtr((size_t) geometryData.normalBuffer.offsetFromSlice());
+          (const uint8_t*) normalBuffer.mapPtr((size_t) normalBuffer.offsetFromSlice());
 
         if (normalPtr != nullptr) {
-          const size_t strideBytes = geometryData.normalBuffer.stride();
+          const size_t strideBytes = normalBuffer.stride();
 
           outSnapshot.normals.resize(size_t(vertexCount) * 3);
           for (uint32_t v = 0; v < vertexCount; v++) {
@@ -277,15 +358,15 @@ namespace dxvk {
     }
 
     // texcoords -> tightly packed vec2 (same float32-only rule as GeometryBufferData)
-    if (geometryData.texcoordBuffer.defined()) {
-      const VkFormat texcoordFormat = geometryData.texcoordBuffer.vertexFormat();
+    if (texcoordBuffer.defined()) {
+      const VkFormat texcoordFormat = texcoordBuffer.vertexFormat();
       if (texcoordFormat == VK_FORMAT_R32G32_SFLOAT || texcoordFormat == VK_FORMAT_R32G32B32_SFLOAT
           || texcoordFormat == VK_FORMAT_R32G32B32A32_SFLOAT) {
         const uint8_t* texcoordPtr =
-          (const uint8_t*) geometryData.texcoordBuffer.mapPtr((size_t) geometryData.texcoordBuffer.offsetFromSlice());
+          (const uint8_t*) texcoordBuffer.mapPtr((size_t) texcoordBuffer.offsetFromSlice());
 
         if (texcoordPtr != nullptr) {
-          const size_t strideBytes = geometryData.texcoordBuffer.stride();
+          const size_t strideBytes = texcoordBuffer.stride();
 
           outSnapshot.texcoords0.resize(size_t(vertexCount) * 2);
           for (uint32_t v = 0; v < vertexCount; v++) {
@@ -301,7 +382,9 @@ namespace dxvk {
     outSnapshot.twoSided = geometryData.cullMode == VK_CULL_MODE_NONE;
     outSnapshot.alphaMasked = drawCallState.getMaterialData().alphaTestEnabled;
 
-    return true;
+    return (topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST && usesIndices)
+      ? SnapshotResult::Eligible
+      : SnapshotResult::EligibleConverted;
   }
 
   void ClusterLodGeometryProvider::workerLoop() {

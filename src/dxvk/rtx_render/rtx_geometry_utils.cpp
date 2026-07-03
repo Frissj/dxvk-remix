@@ -916,13 +916,29 @@ namespace dxvk {
     if (useGPU) {
       ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_OUTPUT, DxvkBufferSlice(output.buffer));
 
-      ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_POSITION_INPUT, input.positionBuffer);
+      // Storage-buffer descriptors require offsets aligned to
+      // minStorageBufferOffsetAlignment, but D3D9 vertex streams may start at any
+      // dword offset inside their buffer (VUID-VkWriteDescriptorSet-descriptorType-00328).
+      // Rebase each slice down to an aligned offset and carry the remainder in the
+      // shader's per-attribute dword offset, which the interleaver already indexes through.
+      const VkDeviceSize storageAlignment =
+        ctx->getDevice()->properties().core.properties.limits.minStorageBufferOffsetAlignment;
+      const auto bindStorageAligned = [&ctx, storageAlignment](uint32_t slot, const RasterBuffer& src, uint32_t& offsetDwords) {
+        const VkDeviceSize sliceOffset = src.offset();
+        const VkDeviceSize alignedOffset = sliceOffset & ~(storageAlignment - 1);
+        const VkDeviceSize deltaBytes = sliceOffset - alignedOffset;
+        assert(deltaBytes % 4 == 0);
+        offsetDwords += uint32_t(deltaBytes / 4);
+        ctx->bindResourceBuffer(slot, DxvkBufferSlice(src.buffer(), alignedOffset, src.length() + deltaBytes));
+      };
+
+      bindStorageAligned(INTERLEAVE_GEOMETRY_BINDING_POSITION_INPUT, input.positionBuffer, args.positionOffset);
       if (args.hasNormals)
-        ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_NORMAL_INPUT, input.normalBuffer);
+        bindStorageAligned(INTERLEAVE_GEOMETRY_BINDING_NORMAL_INPUT, input.normalBuffer, args.normalOffset);
       if (args.hasTexcoord)
-        ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_TEXCOORD_INPUT, input.texcoordBuffer);
+        bindStorageAligned(INTERLEAVE_GEOMETRY_BINDING_TEXCOORD_INPUT, input.texcoordBuffer, args.texcoordOffset);
       if (args.hasColor0)
-        ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_COLOR0_INPUT, input.color0Buffer);
+        bindStorageAligned(INTERLEAVE_GEOMETRY_BINDING_COLOR0_INPUT, input.color0Buffer, args.color0Offset);
 
       ctx->setPushConstantBank(DxvkPushConstantBank::RTX);
 

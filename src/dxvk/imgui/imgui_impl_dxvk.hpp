@@ -302,8 +302,12 @@ namespace ImGui_ImplDxvk {
       const ImDrawList* cmd_list = draw_data->CmdLists[n];
       const size_t listVtxBytes = cmd_list->VtxBuffer.Size * sizeof(ImDrawVert);
       const size_t listIdxBytes = cmd_list->IdxBuffer.Size * sizeof(ImDrawIdx);
-      ctx->updateBuffer(g->buffers.vb, vbOffset, listVtxBytes, cmd_list->VtxBuffer.Data);
-      ctx->updateBuffer(g->buffers.ib, ibOffset, listIdxBytes, cmd_list->IdxBuffer.Data);
+      // writeToBuffer, not updateBuffer: busy GUI frames exceed vkCmdUpdateBuffer's
+      // 64 KiB limit (VUID-vkCmdUpdateBuffer-dataSize-00037); it stages large uploads
+      if (listVtxBytes > 0)
+        ctx->writeToBuffer(g->buffers.vb, vbOffset, listVtxBytes, cmd_list->VtxBuffer.Data);
+      if (listIdxBytes > 0)
+        ctx->writeToBuffer(g->buffers.ib, ibOffset, listIdxBytes, cmd_list->IdxBuffer.Data);
 
       vbOffset += listVtxBytes;
       ibOffset += listIdxBytes;

@@ -58,6 +58,12 @@ namespace dxvk {
                "Debug: after processing a geometry, re-load its .nvsngeo cache entry twice (system RAM and\n"
                "memory-mapped) and verify both against the freshly processed statistics.");
 
+    RTX_OPTION("rtx.clusterLod", int, logStatsIntervalFrames, 600,
+               "Logs the [ClusterLOD] stats lines (intake/skip/processing counts and render/streaming state)\n"
+               "every N frames whenever the counts changed since the last log, so the log always carries\n"
+               "totals - the per-geometry skip messages only print their first occurrence per reason.\n"
+               "0 disables periodic logging (taking a screenshot capture still logs the stats).");
+
     // lodclusters::SceneConfig mirror
     struct SceneConfig {
       friend class ClusterLodManager;
@@ -457,6 +463,12 @@ namespace dxvk {
     std::vector<SssDuplicate> m_sssDuplicates;
     uint32_t m_frameOverflowCount = 0;
     uint32_t m_peakInstanceCount = 0;
+
+    // periodic stats logging (rtx.clusterLod.logStatsIntervalFrames): last
+    // frame a stats line was considered, and the counters it printed - a new
+    // line is only emitted when they changed
+    uint32_t m_lastStatsLogFrame = 0;
+    uint64_t m_lastLoggedStatsDigest = 0;
   };
 
 }  // namespace dxvk

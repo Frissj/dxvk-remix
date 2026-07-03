@@ -628,8 +628,11 @@ void geometryResolverVertexOutputDebugView(
 
     break;
   // NV-DXVK start: RTX Mega Geometry cluster LOD visualization (mirrors the
-  // vk_lod_clusters sample's cluster/group/lod/triangle/blas visualize modes;
-  // classic, non-cluster surfaces show black)
+  // vk_lod_clusters sample's cluster/group/lod/triangle/blas visualize modes).
+  // Three-state output for diagnosability: hash colors = cluster hit resolved,
+  // MAGENTA = hit landed on a cluster surface but the ClusterID intrinsic
+  // returned invalid (intrinsic/BLAS mismatch), dark gray = classic surface
+  // (proves the view itself is running).
   case DEBUG_VIEW_CLUSTER_LOD_CLUSTER_ID:
     if (surface.isClusterLod && rayInteraction.clusterId != CLUSTER_ID_INVALID)
     {
@@ -641,9 +644,15 @@ void geometryResolverVertexOutputDebugView(
       // table indices) - hash directly
       storeInDebugView(pixelCoordinate, r5g6b5ToColor(uint16_t(uintHash(rayInteraction.clusterId))));
     }
+    else if (surface.isClusterLod || surface.isClusterTemplate)
+    {
+      // cluster surface, but no ClusterID from the ray - the intrinsic or the
+      // BLAS the ray hit is not a cluster BLAS
+      storeInDebugView(pixelCoordinate, vec3(1.0, 0.0, 1.0));
+    }
     else
     {
-      storeInDebugView(pixelCoordinate, vec3(0.0));
+      storeInDebugView(pixelCoordinate, vec3(0.05));
     }
 
     break;
@@ -670,9 +679,14 @@ void geometryResolverVertexOutputDebugView(
         storeInDebugView(pixelCoordinate, r5g6b5ToColor(uint16_t(uintHash(uint(groupAddress) ^ uint(groupAddress >> 32)))));
       }
     }
+    else if (surface.isClusterLod)
+    {
+      // cluster surface without a ClusterID from the ray
+      storeInDebugView(pixelCoordinate, vec3(1.0, 0.0, 1.0));
+    }
     else
     {
-      storeInDebugView(pixelCoordinate, vec3(0.0));
+      storeInDebugView(pixelCoordinate, vec3(0.05));
     }
 
     break;
@@ -681,9 +695,14 @@ void geometryResolverVertexOutputDebugView(
     {
       storeInDebugView(pixelCoordinate, r5g6b5ToColor(uint16_t(uintHash(rayInteraction.clusterId * 256 + rayInteraction.primitiveIndex))));
     }
+    else if (surface.isClusterLod || surface.isClusterTemplate)
+    {
+      // cluster surface without a ClusterID from the ray
+      storeInDebugView(pixelCoordinate, vec3(1.0, 0.0, 1.0));
+    }
     else
     {
-      storeInDebugView(pixelCoordinate, vec3(0.0));
+      storeInDebugView(pixelCoordinate, vec3(0.05));
     }
 
     break;
@@ -702,7 +721,7 @@ void geometryResolverVertexOutputDebugView(
     }
     else
     {
-      storeInDebugView(pixelCoordinate, vec3(0.0));
+      storeInDebugView(pixelCoordinate, vec3(0.05));
     }
 
     break;

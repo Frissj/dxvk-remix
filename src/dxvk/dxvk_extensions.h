@@ -345,6 +345,9 @@ namespace dxvk {
 
     // NV-DXVK start: RTX Mega Geometry (cluster acceleration structures)
     DxvkExt nvClusterAccelerationStructure    = { VK_NV_CLUSTER_ACCELERATION_STRUCTURE_EXTENSION_NAME,      DxvkExtMode::Optional };
+    // maintenance5 legalizes the ported NVIDIA kernels' pipeline creation pattern
+    // (VkShaderModuleCreateInfo chained into the stage, module = VK_NULL_HANDLE)
+    DxvkExt khrMaintenance5                   = { VK_KHR_MAINTENANCE_5_EXTENSION_NAME,                       DxvkExtMode::Optional };
     // NV-DXVK end
 
     // NV-DXVK start: Integrate Reflex

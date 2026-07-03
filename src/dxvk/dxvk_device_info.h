@@ -67,6 +67,7 @@ namespace dxvk {
 
     // NV-DXVK start: RTX Mega Geometry (cluster acceleration structures)
     VkPhysicalDeviceClusterAccelerationStructureFeaturesNV    nvClusterAccelerationStructureFeatures;
+    VkPhysicalDeviceMaintenance5FeaturesKHR                   khrMaintenance5Features;
     // NV-DXVK end
   };
 

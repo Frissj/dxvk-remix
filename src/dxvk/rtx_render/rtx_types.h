@@ -651,6 +651,63 @@ using CategoryFlags = Flags<InstanceCategories>;
 
 #define DECAL_CATEGORY_FLAGS InstanceCategories::DecalStatic, InstanceCategories::DecalDynamic, InstanceCategories::DecalSingleOffset, InstanceCategories::DecalNoOffset
 
+// NV-DXVK start: RTX Mega Geometry pre-capture vertex data hold
+// For programmable-VS draws, D3D9Rtx::prepareVertexCapture replaces the draw's
+// vertex buffers with a GPU-written capture slice. The cluster-LOD geometry
+// snapshot needs the CPU-visible INPUT data instead - the same staging copies
+// the geometry hash reads. This hold preserves those buffers together with an
+// acquire() on their memory: once the capture slice replaces them nothing else
+// references the staging copies, so without the acquire the staging allocator
+// could recycle the memory before the CS-thread snapshot reads it.
+// ClusterLodManager::onDrawCallGeometry releases the hold as soon as the
+// snapshot is taken (holding longer would pin staging memory for the lifetime
+// of the BlasEntry's DrawCallState copy); the destructor is the backstop for
+// draws that never reach the intake.
+struct PreCaptureVertexData {
+  RasterBuffer positionBuffer;
+  RasterBuffer normalBuffer;
+  RasterBuffer texcoordBuffer;
+  RasterBuffer color0Buffer;
+
+  PreCaptureVertexData(const RasterBuffer& position,
+                       const RasterBuffer& normal,
+                       const RasterBuffer& texcoord,
+                       const RasterBuffer& color0)
+    : positionBuffer(position)
+    , normalBuffer(normal)
+    , texcoordBuffer(texcoord)
+    , color0Buffer(color0) {
+    forEachBuffer([](RasterBuffer& buffer) { buffer.buffer()->acquire(DxvkAccess::Read); });
+  }
+
+  ~PreCaptureVertexData() {
+    release();
+  }
+
+  PreCaptureVertexData(const PreCaptureVertexData&) = delete;
+  PreCaptureVertexData& operator=(const PreCaptureVertexData&) = delete;
+
+  // idempotent: drops the staging acquires and the buffer references
+  void release() {
+    forEachBuffer([](RasterBuffer& buffer) { buffer.buffer()->release(DxvkAccess::Read); });
+    positionBuffer = RasterBuffer();
+    normalBuffer = RasterBuffer();
+    texcoordBuffer = RasterBuffer();
+    color0Buffer = RasterBuffer();
+  }
+
+private:
+  template<typename Fn>
+  void forEachBuffer(Fn fn) {
+    for (RasterBuffer* buffer : { &positionBuffer, &normalBuffer, &texcoordBuffer, &color0Buffer }) {
+      if (buffer->defined()) {
+        fn(*buffer);
+      }
+    }
+  }
+};
+// NV-DXVK end
+
 struct DrawCallState {
   DrawCallState() = default;
   DrawCallState(const DrawCallState& _input) = default;
@@ -740,6 +797,12 @@ struct DrawCallState {
 
   bool isDrawingToRaytracedRenderTarget = false;
   bool isUsingRaytracedRenderTarget = false;
+
+  // NV-DXVK start: RTX Mega Geometry pre-capture vertex data hold
+  // Set by prepareVertexCapture for programmable-VS draws (see the struct's
+  // comment); consumed and released by the cluster-LOD geometry intake.
+  std::shared_ptr<PreCaptureVertexData> preCaptureVertexData;
+  // NV-DXVK end
 
   // Set when the Sky category was assigned by skyAutoDetect heuristic
   // (as opposed to explicit methods like skyBoxTextures/skyBoxGeometries/skyMinZThreshold).
