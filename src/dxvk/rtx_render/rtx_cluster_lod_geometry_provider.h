@@ -36,6 +36,7 @@
 namespace dxvk {
 
   struct DrawCallState;
+  struct RasterGeometry;
 
   // RTX Mega Geometry: CPU-snapshot intake for the cluster LOD pipeline.
   //
@@ -96,6 +97,14 @@ namespace dxvk {
     // completed since the last drain; each has a valid .nvsngeo cache file on
     // disk and is ready to join the next render generation.
     std::vector<uint64_t> drainReadyGeometries();
+
+    // P4b: topology-stable Path B identity - indices content hash + counts +
+    // primitive topology. Unlike the asset hash it excludes positions, so it
+    // survives skinning bind poses being identical across characters AND
+    // per-frame vertex changes. The SINGLE definition shared by the intake
+    // (snapshot registration) and ClusterLodManager (render-time instance
+    // lookup) - both sides MUST derive identical keys.
+    static uint64_t makeTopologyKey(const RasterGeometry& geometryData);
 
   private:
     // why a draw call could not be snapshotted (mapped onto the Stats counters)

@@ -117,13 +117,6 @@ namespace dxvk {
     // through opaquely)
     constexpr uint32_t kPathBTag = 0x80000000u;
 
-    // P4b: topology-stable Path B identity - MUST match the provider's
-    // makeTopologyKey (indices content hash + vertex count)
-    uint64_t makeTopologyKey(const RasterGeometry& geometryData) {
-      const XXH64_hash_t indicesHash = geometryData.hashes[HashComponents::Indices];
-      return XXH64(&indicesHash, sizeof(indicesHash), geometryData.vertexCount);
-    }
-
     lodclusters_remix::AnimatedConfig buildAnimatedConfig() {
       lodclusters_remix::AnimatedConfig config;
 
@@ -371,6 +364,9 @@ namespace dxvk {
       if (m_renderSystem->getFrameStats(frameStats)) {
         Logger::info(str::format("[ClusterLOD] render: generation ", m_generationCount,
                                  ", geometries ", m_geometryIdByHash.size(),
+                                 ", slots opaque ", m_slots[Tlas::Opaque].size(),
+                                 " unordered ", m_slots[Tlas::Unordered].size(),
+                                 " pathB ", m_slotsB[Tlas::Opaque].size() + m_slotsB[Tlas::Unordered].size(),
                                  ", renderClusters ", frameStats.numRenderClusters,
                                  ", blasBuilds ", frameStats.numBlasBuilds,
                                  ", blasBytes ", frameStats.blasActualSizeBytes,
@@ -721,16 +717,22 @@ namespace dxvk {
 
     // ---- P4b Path B routing (plan 7.1) ----
     // Deforming geometry must never take Path A (its static CLAS would render
-    // the bind pose / stale positions): skinned meshes always, and meshes
-    // whose vertex data updated in place this frame (CPU mutation; their
-    // churning asset hash also misses the Path A tables by construction).
+    // the bind pose / stale positions): skinned meshes always, meshes whose
+    // vertex data updated in place this frame (CPU mutation; their churning
+    // asset hash also misses the Path A tables by construction), and
+    // vertex-captured draws - their rendered mesh is the GPU capture buffer
+    // content whose model->world transform exists only in the game's shader
+    // constants, so the input-space Path A clusters would render untransformed
+    // (user decision 2026-07-03: captured -> Path B; the pose reads the
+    // capture-derived modifiedGeometryData, matching classic by construction).
     const RasterGeometry& geometryData = blasEntry->input.getGeometryData();
     const bool skinned = blasEntry->input.getSkinningState().numBones > 0 && geometryData.numBonesPerVertex > 0;
+    const bool captured = blasEntry->input.preCaptureVertexData != nullptr;
     const uint32_t currentFrame = m_device->getCurrentFrameId();
     const bool updatedInPlace = blasEntry->frameLastUpdated == currentFrame
                              && blasEntry->frameLastUpdated != blasEntry->frameCreated;
 
-    if (skinned || updatedInPlace) {
+    if (skinned || captured || updatedInPlace) {
       return isClusterTemplateInstance(instance, blasEntry, outGeometryId);
     }
 
@@ -767,7 +769,7 @@ namespace dxvk {
 
     const RasterGeometry& geometryData = blasEntry->input.getGeometryData();
 
-    const auto foundGeometry = m_animatedGeometryByKey.find(makeTopologyKey(geometryData));
+    const auto foundGeometry = m_animatedGeometryByKey.find(ClusterLodGeometryProvider::makeTopologyKey(geometryData));
     if (foundGeometry == m_animatedGeometryByKey.end()) {
       // registration still running (or failed) - classic until ready
       return false;
@@ -942,6 +944,17 @@ namespace dxvk {
         tlasInstances[flatIndex] = m_slotInstanceData[tlasType][i];
       }
     }
+
+    // one-time proof of what the reserved TLAS slots carry before the GPU patch:
+    // mask 0 = invisible to every ray, blas 0 = rays pass through until
+    // instance_assign_blas patches the slot
+    ONCE(Logger::info(str::format("[ClusterLOD] first cluster dispatch: slots opaque ", numOpaque,
+                                  ", unordered ", numUnordered,
+                                  "; slot0 mask 0x", std::hex, uint32_t(tlasInstances[0].mask),
+                                  ", customIndex 0x", uint32_t(tlasInstances[0].instanceCustomIndex),
+                                  ", flags 0x", uint32_t(tlasInstances[0].flags),
+                                  ", lowDetailBlas 0x", tlasInstances[0].accelerationStructureReference,
+                                  std::dec, ", geometryId ", m_slots[numOpaque > 0 ? Tlas::Opaque : Tlas::Unordered][0].geometryId)));
 
     // per-frame traversal parameters from the main camera
     const RtCamera& camera = cameraManager.getMainCamera();

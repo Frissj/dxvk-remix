@@ -583,8 +583,11 @@ void Scene::processGeometry(ProcessingInfo& processingInfo, size_t geometryIndex
       // comparison we actually want to use the original vertex count
       geometryStorage.lodInfo.inputTriangleCount       = geometryStorage.triangles.size();
       geometryStorage.lodInfo.inputVertexCount         = geometryStorage.vertexPositions.size();
-      geometryStorage.lodInfo.inputTriangleIndicesHash = 0;
-      geometryStorage.lodInfo.inputVerticesHash        = 0;
+      // NV-DXVK: keep the content hashes the input path filled instead of zeroing
+      // them. Remix's mesh input (scene_remix_input) provides stable content hashes
+      // for cache validation and checkCache memcmps the whole lodInfo - zeroing here
+      // made every saved cache mismatch its own reload forever. The glTF path never
+      // sets these fields, so it keeps its original 0 == 0 behavior either way.
 
       size_t originalVertexCount = geometryStorage.vertexPositions.size();
 

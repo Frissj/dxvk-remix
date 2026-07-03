@@ -652,7 +652,10 @@ void geometryResolverVertexOutputDebugView(
     }
     else
     {
-      storeInDebugView(pixelCoordinate, vec3(0.05));
+      // classic surface: visible checkerboard so an inactive-looking view is
+      // distinguishable from a dead one (same idiom as DEBUG_VIEW_VIEW_MODEL)
+      const bool checker = (((pixelCoordinate.x >> 3) & 1) ^ ((pixelCoordinate.y >> 3) & 1)) != 0;
+      storeInDebugView(pixelCoordinate, vec3(checker ? 0.5 : 0.25));
     }
 
     break;
@@ -679,6 +682,20 @@ void geometryResolverVertexOutputDebugView(
         storeInDebugView(pixelCoordinate, r5g6b5ToColor(uint16_t(uintHash(uint(groupAddress) ^ uint(groupAddress >> 32)))));
       }
     }
+    else if (surface.isClusterTemplate)
+    {
+      // Path B templates have no LOD DAG: no groups (the clusterization unit is
+      // the whole geometry - hash-color it) and no LOD levels (templates always
+      // render source detail = LOD 0 = green)
+      if (cb.debugView == DEBUG_VIEW_CLUSTER_LOD_LEVEL)
+      {
+        storeInDebugView(pixelCoordinate, vec3(0.0, 1.0, 0.0));
+      }
+      else
+      {
+        storeInDebugView(pixelCoordinate, r5g6b5ToColor(uint16_t(uintHash(uint(surface.hashPacked) | 0x20000u))));
+      }
+    }
     else if (surface.isClusterLod)
     {
       // cluster surface without a ClusterID from the ray
@@ -686,7 +703,10 @@ void geometryResolverVertexOutputDebugView(
     }
     else
     {
-      storeInDebugView(pixelCoordinate, vec3(0.05));
+      // classic surface: visible checkerboard so an inactive-looking view is
+      // distinguishable from a dead one (same idiom as DEBUG_VIEW_VIEW_MODEL)
+      const bool checker = (((pixelCoordinate.x >> 3) & 1) ^ ((pixelCoordinate.y >> 3) & 1)) != 0;
+      storeInDebugView(pixelCoordinate, vec3(checker ? 0.5 : 0.25));
     }
 
     break;
@@ -702,7 +722,10 @@ void geometryResolverVertexOutputDebugView(
     }
     else
     {
-      storeInDebugView(pixelCoordinate, vec3(0.05));
+      // classic surface: visible checkerboard so an inactive-looking view is
+      // distinguishable from a dead one (same idiom as DEBUG_VIEW_VIEW_MODEL)
+      const bool checker = (((pixelCoordinate.x >> 3) & 1) ^ ((pixelCoordinate.y >> 3) & 1)) != 0;
+      storeInDebugView(pixelCoordinate, vec3(checker ? 0.5 : 0.25));
     }
 
     break;
@@ -721,7 +744,10 @@ void geometryResolverVertexOutputDebugView(
     }
     else
     {
-      storeInDebugView(pixelCoordinate, vec3(0.05));
+      // classic surface: visible checkerboard so an inactive-looking view is
+      // distinguishable from a dead one (same idiom as DEBUG_VIEW_VIEW_MODEL)
+      const bool checker = (((pixelCoordinate.x >> 3) & 1) ^ ((pixelCoordinate.y >> 3) & 1)) != 0;
+      storeInDebugView(pixelCoordinate, vec3(checker ? 0.5 : 0.25));
     }
 
     break;

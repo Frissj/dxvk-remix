@@ -34,23 +34,16 @@
 
 namespace dxvk {
 
-  namespace {
-
-    // P4b: topology-stable Path B identity - indices content hash + counts +
-    // primitive topology. Unlike the asset hash it excludes positions, so it
-    // survives skinning bind poses being identical across characters AND
-    // per-frame CPU vertex rewrites. indexCount and topology are included
-    // because non-indexed draws have no index content to hash - without them
-    // any two non-indexed meshes with the same vertex count would collide
-    // into one topology identity.
-    uint64_t makeTopologyKey(const RasterGeometry& geometryData) {
-      const XXH64_hash_t indicesHash = geometryData.hashes[HashComponents::Indices];
-      const uint64_t key = XXH64(&indicesHash, sizeof(indicesHash), geometryData.vertexCount);
-      const uint64_t streamSeed = (uint64_t(geometryData.topology) << 32) | geometryData.indexCount;
-      return XXH64(&key, sizeof(key), streamSeed);
-    }
-
-  }  // namespace
+  // P4b topology identity (see the header comment). indexCount and topology are
+  // included because non-indexed draws have no index content to hash - without
+  // them any two non-indexed meshes with the same vertex count would collide
+  // into one topology identity.
+  uint64_t ClusterLodGeometryProvider::makeTopologyKey(const RasterGeometry& geometryData) {
+    const XXH64_hash_t indicesHash = geometryData.hashes[HashComponents::Indices];
+    const uint64_t key = XXH64(&indicesHash, sizeof(indicesHash), geometryData.vertexCount);
+    const uint64_t streamSeed = (uint64_t(geometryData.topology) << 32) | geometryData.indexCount;
+    return XXH64(&key, sizeof(key), streamSeed);
+  }
 
   ClusterLodGeometryProvider::ClusterLodGeometryProvider(ConfigProvider configProvider, VerifyProvider verifyProvider, AnimatedHandler animatedHandler)
     : m_configProvider(std::move(configProvider))
@@ -79,11 +72,19 @@ namespace dxvk {
     // P4b routing (plan 7.1): deforming geometry goes to Path B, keyed by the
     // topology-stable key instead of the (position-including) asset hash.
     //  - skinned: bones on the draw; the CPU data IS the bind pose Path B needs
+    //  - captured: vertex-captured draws (programmable-VS games) - the rendered
+    //    mesh is the GPU capture buffer content, whose model->world transform
+    //    exists only in the game's shader constants; the CPU input snapshot
+    //    cannot be placed in that space, so Path A (static clusters in input
+    //    space) would render it untransformed. Path B instantiates CLAS from
+    //    the live capture-derived buffers, matching classic rendering by
+    //    construction (user decision 2026-07-03).
     //  - mutating: an existing BlasEntry's vertex data changed in place
     //    (kUpdateBVH) - its asset hash churns every frame, so it can never be
     //    a Path A geometry; its topology is stable and clusterizes once
     const bool skinned = drawCallState.getSkinningState().numBones > 0 && geometryData.numBonesPerVertex > 0;
-    const bool deforming = skinned || vertexDataUpdated;
+    const bool captured = drawCallState.preCaptureVertexData != nullptr;
+    const bool deforming = skinned || captured || vertexDataUpdated;
     const uint64_t topologyKey = makeTopologyKey(geometryData);
 
     // fast path: identity already known (snapshotted, queued, processed or ineligible)
@@ -131,9 +132,9 @@ namespace dxvk {
       if (!m_knownTopologyKeys.insert(topologyKey).second) {
         return;
       }
-      if (skinned) {
-        // a skinned mesh's asset hash is stable (bind-pose input) - keep the
-        // cheap hash fast path for its later draws
+      if (skinned || captured) {
+        // skinned and vertex-captured meshes have stable asset hashes (input
+        // data) - keep the cheap hash fast path for their later draws
         m_knownHashes.insert(geometryHash);
       }
     } else {

@@ -190,6 +190,11 @@ struct ClusterTemplateSystem::Impl
     uint64_t                             topologyKey = 0;
     std::string                          name;
     bool                                 opaque = true;
+    // REMIX: mutating/captured snapshots carry reference positions that are NOT
+    // in the space the live vertex buffers use (capture space / per-frame CPU
+    // rewrites), so their bind-pose cluster bboxes must not become
+    // instantiationBoundingBoxLimits - a wrong-space limit clips real geometry.
+    bool                                 useBboxLimit = true;
     animatedclusters::Scene              scene;
     animatedclusters::Scene::Geometry    geometry;
   };
@@ -687,6 +692,9 @@ uint64_t ClusterTemplateSystem::clusterizeGeometry(const GeometrySnapshot& snaps
   pending->topologyKey = snapshot.topologyKey;
   pending->name        = snapshot.name;
   pending->opaque      = !snapshot.alphaMasked;
+  // skinned bind poses are in the live buffers' space; mutating/captured
+  // snapshots are not (see PendingGeometry::useBboxLimit)
+  pending->useBboxLimit = !snapshot.isMutating;
 
   animatedclusters::Scene::Geometry& geometry = pending->geometry;
   geometry.numTriangles                       = uint32_t(snapshot.indices.size() / 3);
@@ -923,7 +931,9 @@ bool ClusterTemplateSystem::buildGeometryTemplates(uint64_t token)
         templateInfo.positionTruncateBitCount = impl.config.positionTruncateBits;
 
         templateInfo.instantiationBoundingBoxLimit =
-            impl.config.templateBboxBloatPercentage < 0 ? 0 : bboxesBuffer.address + sizeof(TemplateBbox) * c;
+            (impl.config.templateBboxBloatPercentage < 0 || !pending->useBboxLimit) ?
+                0 :
+                bboxesBuffer.address + sizeof(TemplateBbox) * c;
       }
 
       // actual count of current geometry
