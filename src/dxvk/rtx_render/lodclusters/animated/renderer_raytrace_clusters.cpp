@@ -128,6 +128,19 @@ struct ClusterTemplateSystem::Impl
 {
   using Resources = lodclusters::Resources;
 
+  // Frames-in-flight depth for the per-frame resource rings. The ray trace of a
+  // frame keeps reading this frame's CLAS + cluster BLAS while the next frames
+  // already re-instantiate/rebuild them, so every per-frame-written GPU resource
+  // the trace CONSUMES (the per-pose CLAS destinations and the implicit BLAS
+  // pool) is cycled across this many physical buffers - frame N writes slot
+  // N % kRingSlots, so it never overwrites the slot a still-in-flight earlier
+  // frame is tracing. The AS memory is raw VMA that dxvk does not frame-track
+  // (risk R17), so without this the overwrite races the previous frame's trace -
+  // invisible at debug's ~2 FPS (GPU idle between frames), visible as deforming
+  // objects lagging/jittering once the release build lets frames overlap. Must
+  // be >= Remix's frames in flight; 4 covers dxvk's pipelining.
+  static constexpr uint32_t kRingSlots = 4;
+
   bool initialized = false;
 
   RenderDeviceInfo deviceInfo;
@@ -228,7 +241,10 @@ struct ClusterTemplateSystem::Impl
   struct PoseSet
   {
     uint32_t     geometryIndex = ~0u;
-    nvvk::Buffer clasBuffer;  // persistent explicit CLAS destinations
+    // persistent explicit CLAS destinations, one per frame-in-flight slot (see
+    // kRingSlots): the trace reads slot N%kRingSlots while frame N+1 writes the
+    // next slot, so a pose's geometry is never overwritten mid-trace
+    nvvk::Buffer clasBuffers[kRingSlots];
     bool         active = false;
   };
   std::vector<PoseSet>  poseSets;
@@ -255,7 +271,10 @@ struct ClusterTemplateSystem::Impl
   nvvk::Buffer blasAddressesBuffer;  // u64 per pose (built BLAS addresses)
   nvvk::Buffer blasSizesBuffer;      // u32 per pose (built BLAS sizes, stats)
   nvvk::Buffer tlasInstancesBuffer;  // VkAccelerationStructureInstanceKHR per slot
-  nvvk::Buffer blasImplicitBuffer;   // implicit-destination BLAS pool
+  // implicit-destination BLAS pool, one per frame-in-flight slot (kRingSlots):
+  // the TLAS of frame N references BLASes in slot N%kRingSlots which the trace
+  // dereferences, so frame N+1 must build into a different slot (risk R17)
+  nvvk::Buffer blasImplicitBuffers[kRingSlots];
   nvvk::Buffer scratchBuffer;
   VkDeviceSize scratchSize = 0;
 
@@ -264,9 +283,8 @@ struct ClusterTemplateSystem::Impl
 
   // host-visible per-frame input ring: instantiation/build infos, CLAS dst
   // addresses, BLAS build infos, RenderInstances (slot -> pose index) and the
-  // TlasInstance staging. 4 slots cover Remix's frames in flight (same
-  // reasoning as the P2 staging ring).
-  static constexpr uint32_t kRingSlots = 4;
+  // TlasInstance staging. kRingSlots (declared at the top of Impl) covers
+  // Remix's frames in flight (same reasoning as the P2 staging ring).
   nvvk::Buffer ringBuffers[kRingSlots];
   size_t       ringSrcInfosOffset       = 0;
   size_t       ringDstAddressesOffset   = 0;
@@ -402,10 +420,15 @@ struct ClusterTemplateSystem::Impl
                                 VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT
                                     | VK_BUFFER_USAGE_2_TRANSFER_DST_BIT | VK_BUFFER_USAGE_2_TRANSFER_SRC_BIT));
 
-    deferDestroy(blasImplicitBuffer);
-    NVVK_CHECK(res.createBuffer(blasImplicitBuffer, blasPoolSize,
-                                VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT
-                                    | VK_BUFFER_USAGE_2_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR));
+    // one implicit BLAS pool per frame-in-flight slot (see kRingSlots): the
+    // trace reads the previous frames' BLASes, so each frame builds into its own
+    for(nvvk::Buffer& blasPool : blasImplicitBuffers)
+    {
+      deferDestroy(blasPool);
+      NVVK_CHECK(res.createBuffer(blasPool, blasPoolSize,
+                                  VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT
+                                      | VK_BUFFER_USAGE_2_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR));
+    }
 
     deferDestroy(scratchBuffer);
     scratchSize = newScratchSize;
@@ -666,7 +689,10 @@ void ClusterTemplateSystem::deinit()
 
   for(auto& poseSet : impl.poseSets)
   {
-    impl.res.m_allocator.destroyBuffer(poseSet.clasBuffer);
+    for(nvvk::Buffer& clasBuffer : poseSet.clasBuffers)
+    {
+      impl.res.m_allocator.destroyBuffer(clasBuffer);
+    }
   }
   impl.poseSets.clear();
   impl.poseSetFreeList.clear();
@@ -676,7 +702,10 @@ void ClusterTemplateSystem::deinit()
   impl.res.m_allocator.destroyBuffer(impl.blasAddressesBuffer);
   impl.res.m_allocator.destroyBuffer(impl.blasSizesBuffer);
   impl.res.m_allocator.destroyBuffer(impl.tlasInstancesBuffer);
-  impl.res.m_allocator.destroyBuffer(impl.blasImplicitBuffer);
+  for(nvvk::Buffer& blasPool : impl.blasImplicitBuffers)
+  {
+    impl.res.m_allocator.destroyBuffer(blasPool);
+  }
   impl.res.m_allocator.destroyBuffer(impl.scratchBuffer);
   impl.res.m_allocator.destroyBuffer(impl.readbackBuffer);
   impl.res.m_allocator.destroyBuffer(impl.readbackHostBuffer);
@@ -1238,17 +1267,29 @@ uint32_t ClusterTemplateSystem::createPoseSet(uint32_t geometryIndex)
                                     VkDeviceSize(geometry.sumInstantiationSizes) :
                                     impl.singleExplicitClusterSize * geometry.numClusters;
 
-  nvvk::Buffer clasBuffer;
-  // sample: per-render-instance clusterBuffer usage
-  if(impl.res.createBuffer(clasBuffer, clasSize,
-                           VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT
-                               | VK_BUFFER_USAGE_2_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR
-                               | VK_BUFFER_USAGE_2_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR)
-         != VK_SUCCESS
-     || !clasBuffer.buffer)
+  // one CLAS destination buffer per frame-in-flight slot (sample:
+  // per-render-instance clusterBuffer usage, here cycled to avoid the
+  // cross-frame overwrite race - see kRingSlots). All-or-nothing: on any
+  // failure destroy the ones already made so we never leave a partial pose.
+  nvvk::Buffer clasBuffers[Impl::kRingSlots];
+  uint64_t     poseClasBytes = 0;
+  for(uint32_t slot = 0; slot < Impl::kRingSlots; slot++)
   {
-    LOGW("ClusterTemplateSystem: pose CLAS allocation failed (%s)\n", lodclusters::formatMemorySize(clasSize).c_str());
-    return ~0u;
+    if(impl.res.createBuffer(clasBuffers[slot], clasSize,
+                             VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT
+                                 | VK_BUFFER_USAGE_2_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR
+                                 | VK_BUFFER_USAGE_2_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR)
+           != VK_SUCCESS
+       || !clasBuffers[slot].buffer)
+    {
+      LOGW("ClusterTemplateSystem: pose CLAS allocation failed (%s)\n", lodclusters::formatMemorySize(clasSize).c_str());
+      for(uint32_t made = 0; made < slot; made++)
+      {
+        impl.res.m_allocator.destroyBuffer(clasBuffers[made]);
+      }
+      return ~0u;
+    }
+    poseClasBytes += clasBuffers[slot].bufferSize;
   }
 
   uint32_t poseSetId;
@@ -1265,11 +1306,14 @@ uint32_t ClusterTemplateSystem::createPoseSet(uint32_t geometryIndex)
 
   Impl::PoseSet& poseSet = impl.poseSets[poseSetId];
   poseSet.geometryIndex  = geometryIndex;
-  poseSet.clasBuffer     = clasBuffer;
-  poseSet.active         = true;
+  for(uint32_t slot = 0; slot < Impl::kRingSlots; slot++)
+  {
+    poseSet.clasBuffers[slot] = clasBuffers[slot];
+  }
+  poseSet.active = true;
 
   impl.activePoseSets++;
-  impl.poseClasBytes += clasBuffer.bufferSize;
+  impl.poseClasBytes += poseClasBytes;
 
   return poseSetId;
 }
@@ -1285,10 +1329,13 @@ void ClusterTemplateSystem::releasePoseSet(uint32_t poseSetId)
 
   Impl::PoseSet& poseSet = impl.poseSets[poseSetId];
 
-  impl.poseClasBytes -= poseSet.clasBuffer.bufferSize;
+  for(nvvk::Buffer& clasBuffer : poseSet.clasBuffers)
+  {
+    impl.poseClasBytes -= clasBuffer.bufferSize;
+    impl.deferDestroy(clasBuffer);  // in-flight frames may still trace it
+  }
   impl.activePoseSets--;
 
-  impl.deferDestroy(poseSet.clasBuffer);
   poseSet.geometryIndex = ~0u;
   poseSet.active        = false;
 
@@ -1382,7 +1429,9 @@ bool ClusterTemplateSystem::recordFrame(VkCommandBuffer                         
     const Impl::PoseSet&      poseSet  = impl.poseSets[pose.poseSetId];
     const Impl::GeometryData& geometry = *impl.geometries[poseSet.geometryIndex];
 
-    const uint64_t clasBase = poseSet.clasBuffer.address;
+    // this frame's ring slot - a different physical CLAS buffer than the slots
+    // still being traced by earlier in-flight frames
+    const uint64_t clasBase = poseSet.clasBuffers[ringIndex].address;
 
     if(impl.config.useTemplates)
     {
@@ -1560,7 +1609,8 @@ bool ClusterTemplateSystem::recordFrame(VkCommandBuffer                         
     cmdInfo.srcInfosArray.stride = sizeof(VkClusterAccelerationStructureBuildClustersBottomLevelInfoNV);
 
     // in implicit mode we provide one big chunk from which outputs are sub-allocated
-    cmdInfo.dstImplicitData = impl.blasImplicitBuffer.address;
+    // (this frame's ring slot, distinct from the pools earlier frames are tracing)
+    cmdInfo.dstImplicitData = impl.blasImplicitBuffers[ringIndex].address;
 
     cmdInfo.scratchData = impl.scratchBuffer.address;
     cmdInfo.input       = inputs;
@@ -1672,7 +1722,7 @@ bool ClusterTemplateSystem::getStats(AnimatedStats& outStats) const
   outStats.templateBytes        = templateBytes;
   outStats.geometryBytes        = geometryBytes + sizeof(uint64_t) * impl.clusterTableCapacity;
   outStats.clasBytes            = impl.poseClasBytes;
-  outStats.blasReservedBytes    = impl.blasImplicitBuffer.bufferSize;
+  outStats.blasReservedBytes    = impl.blasImplicitBuffers[0].bufferSize * Impl::kRingSlots;
   outStats.operationsBytes      = impl.scratchBuffer.bufferSize + impl.dstSizesBuffer.bufferSize
                                   + impl.blasAddressesBuffer.bufferSize + impl.blasSizesBuffer.bufferSize
                                   + impl.tlasInstancesBuffer.bufferSize
