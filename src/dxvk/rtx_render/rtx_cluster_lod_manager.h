@@ -328,12 +328,13 @@ namespace dxvk {
                  "or when AS memory matters more than frame time (clusters ~ half a classic BLAS on huge\n"
                  "meshes). Skipped when the geometry's .nvsngeo cache already exists; interim pose sets age\n"
                  "out via the normal 60-frame pose GC after the flip.");
-      RTX_OPTION("rtx.clusterLod.animated", bool, diagnoseNullRecords, true,
+      RTX_OPTION("rtx.clusterLod.animated", bool, diagnoseNullRecords, false,
                  "Diagnostic (2026-07-04): plumbs a tiny GPU probe buffer into the template hit path so the\n"
                  "shader records the last frame + clusterId it ever read a NULL cluster-table record (the\n"
                  "device-loss root cause). Verifies the visibility defer - with the fix the probe must never\n"
                  "advance. Logs '[TemplateVis] NULL RECORD ...' if it does, plus periodic '[TemplateVis]\n"
-                 "deferGate' lines showing holds/flips. Cheap; leave on until the fix is soaked.");
+                 "deferGate' lines showing holds/flips. Soaked clean 2026-07-04 (streaming-table fix run:\n"
+                 "no NULL RECORD, no device loss) - default off; re-enable if the crash class reappears.");
     };
 
     // 7.7 rigid-capture promotion (P4c).
