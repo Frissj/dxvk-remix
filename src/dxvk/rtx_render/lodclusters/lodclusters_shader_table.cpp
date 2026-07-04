@@ -77,6 +77,8 @@
 #include <rtx_shaders/stream_allocator_load_groups.h>
 // P4: Remix-authored HiZ source conversion (game depth -> reversed-Z)
 #include <rtx_shaders/remix_depth_flip.h>
+// P4c: Remix-authored rigid-capture promotion solve/gate/patch (plan 7.7)
+#include <rtx_shaders/promotion_solve.h>
 
 namespace lodclusters {
 
@@ -261,6 +263,7 @@ SINGLE_ENTRY(stream_allocator_setup_insertion)
 SINGLE_ENTRY(stream_allocator_unload_groups)
 SINGLE_ENTRY(stream_allocator_load_groups)
 SINGLE_ENTRY(remix_depth_flip)
+SINGLE_ENTRY(promotion_solve)
 #undef SINGLE_ENTRY
 
 // -- File registry -------------------------------------------------------------
@@ -303,6 +306,7 @@ constexpr ShaderFileTable kShaderFiles[] = {
   FILE_SINGLE(stream_allocator_unload_groups, "stream_allocator_unload_groups.comp.glsl"),
   FILE_SINGLE(stream_allocator_load_groups, "stream_allocator_load_groups.comp.glsl"),
   FILE_SINGLE(remix_depth_flip, "remix_depth_flip.comp.glsl"),
+  FILE_SINGLE(promotion_solve, "promotion_solve.comp.glsl"),
 };
 
 #undef FILE_MATRIX

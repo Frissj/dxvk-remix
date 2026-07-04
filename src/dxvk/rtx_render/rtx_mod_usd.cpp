@@ -32,6 +32,7 @@
 #include "rtx_utils.h"
 #include "rtx_asset_data_manager.h"
 #include "rtx_texture_manager.h"
+#include "rtx_scene_manager.h"
 
 #include "../../lssusd/usd_include_begin.h"
 #include <pxr/base/gf/matrix4f.h>
@@ -1506,6 +1507,14 @@ bool UsdMod::Impl::processMesh(const pxr::UsdPrim& prim, Args& args) {
 
   const size_t vertexDataSize = processedMesh->GetNumVertices() * processedMesh->GetVertexStride();
 
+  // NV-DXVK start: RTX Mega Geometry - content hash of the interleaved vertex data.
+  // Replaces the session-unique counter hash below: replacement geometry identity
+  // must be stable across sessions and hot-reloads so the cluster-LOD .nvsngeo
+  // cache can key and validate against it (plan 7.1a); identical content
+  // legitimately dedups instead of getting distinct per-session identities.
+  const XXH64_hash_t vertexDataHash = XXH64(processedMesh->GetVertexData().data(), vertexDataSize, kEmptyHash);
+  // NV-DXVK end
+
   // Allocate the instance buffer and copy its contents from host to device memory
   DxvkBufferCreateInfo info;
   info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
@@ -1550,7 +1559,7 @@ bool UsdMod::Impl::processMesh(const pxr::UsdPrim& prim, Args& args) {
       break;
     case lss::UsdMeshImporter::Texcoords:
       geometryData.texcoordBuffer = RasterBuffer(vertexSlice, element.offset, processedMesh->GetVertexStride(), VK_FORMAT_R32G32_SFLOAT);
-      geometryData.hashes[HashComponents::VertexTexcoord] = getNextGeomHash();
+      geometryData.hashes[HashComponents::VertexTexcoord] = vertexDataHash;
       break;
     case lss::UsdMeshImporter::Colors:
       geometryData.color0Buffer = RasterBuffer(vertexSlice, element.offset, processedMesh->GetVertexStride(), VK_FORMAT_B8G8R8A8_UNORM);
@@ -1617,8 +1626,20 @@ bool UsdMod::Impl::processMesh(const pxr::UsdPrim& prim, Args& args) {
       newGeomData.indexBuffer = RasterBuffer(indexSlice, 0, sizeof(uint32_t), VK_INDEX_TYPE_UINT32);
       newGeomData.indexCount = submesh.GetNumIndices();
       // Set these as hashed so that the geometryData acts like it's static.
-      newGeomData.hashes[HashComponents::Indices] = newGeomData.hashes[HashComponents::VertexPosition] = getNextGeomHash();
+      // Content hashes, not session counters: stable across sessions/hot-reloads
+      // for cluster-LOD cache keying (plan 7.1a); the vertex hash is shared by
+      // all submeshes because they genuinely share the vertex buffer.
+      newGeomData.hashes[HashComponents::Indices] = XXH64(submesh.indexBuffer.data(), indexDataSize, kEmptyHash);
+      newGeomData.hashes[HashComponents::VertexPosition] = vertexDataHash;
       newGeomData.hashes.precombine();
+
+      // NV-DXVK start: RTX Mega Geometry load-time intake (plan 7.1a) - start
+      // cluster processing NOW, during the load window, seconds before the
+      // first draw. The CPU data is alive (static meshes keep host-visible
+      // staging for their whole lifetime; dynamic/skinned ones are skipped
+      // inside and take the draw-time Path B route).
+      args.context->getDevice()->getCommon()->getSceneManager().onReplacementMeshLoaded(newGeomData);
+      // NV-DXVK end
     }
   }
 

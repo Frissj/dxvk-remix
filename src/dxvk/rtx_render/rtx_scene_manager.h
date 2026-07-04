@@ -152,6 +152,12 @@ public:
   bool areAllReplacementsLoaded() const;
   std::vector<Mod::State> getReplacementStates() const;
 
+  // NV-DXVK: RTX Mega Geometry load-time intake (plan 7.1a) - asset loaders
+  // hand over finalized replacement geometry while its CPU data is alive so
+  // cluster processing runs during the load window, not from first draw.
+  // Safe from loader threads.
+  void onReplacementMeshLoaded(const RasterGeometry& geometryData);
+
   RtxGlobals& getGlobals() { return m_globals; }
 
   Rc<DxvkBuffer> getSurfaceMaterialBuffer() { return m_surfaceMaterialBuffer; }

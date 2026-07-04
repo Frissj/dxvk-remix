@@ -173,8 +173,31 @@ namespace dxvk {
 
   void SceneManager::initialize(Rc<DxvkContext> ctx) {
     ScopedCpuProfileZone();
+
+    // NV-DXVK start: RTX Mega Geometry - create the cluster manager BEFORE
+    // replacements load so the load-time intake (plan 7.1a) can process
+    // replacement meshes during the load window, seconds before their first
+    // draw (first-frame guarantee). The prepareSceneData lazy-create remains
+    // for the option being enabled mid-session.
+    if (ClusterLodOptions::enable() && m_clusterLodManager == nullptr) {
+      m_clusterLodManager = std::make_unique<ClusterLodManager>(m_device);
+    }
+    // NV-DXVK end
+
     m_pReplacer->initialize(ctx);
   }
+
+  // NV-DXVK start: RTX Mega Geometry load-time intake (plan 7.1a) - called by
+  // the asset loaders when a replacement mesh's geometry is finalized (its CPU
+  // data is alive: static meshes keep host-visible staging for their whole
+  // lifetime). Safe from loader threads: the provider queue is mutex-protected
+  // and the manager pointer is stable after initialize().
+  void SceneManager::onReplacementMeshLoaded(const RasterGeometry& geometryData) {
+    if (m_clusterLodManager != nullptr) {
+      m_clusterLodManager->onReplacementGeometryLoaded(geometryData);
+    }
+  }
+  // NV-DXVK end
 
   void SceneManager::logStatistics() {
     if (m_opacityMicromapManager.get()) {
@@ -909,6 +932,12 @@ namespace dxvk {
       transforms.texgenMode = TexGenMode::None;
 
       newDrawCallState->overrideGeometryData(&replacement.geometry->data);
+      // NV-DXVK start: RTX Mega Geometry - the pre-capture hold describes the ORIGINAL
+      // draw's vertex data, never the replacement's. Inheriting it routes the replacement
+      // to Path B as "captured" and makes the cluster snapshot read the wrong mesh's
+      // buffers under the replacement's vertex count (plan 7.1a, 2026-07-04).
+      newDrawCallState->preCaptureVertexData.reset();
+      // NV-DXVK end
       newDrawCallState->modifyCategoryFlags() = replacement.categories.applyCategoryFlags(newDrawCallState->getCategoryFlags());
       return newDrawCallState;
     }

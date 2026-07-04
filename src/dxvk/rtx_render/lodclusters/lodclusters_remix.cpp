@@ -26,10 +26,14 @@
 
 #include <chrono>
 #include <cinttypes>
+#include <cmath>
 #include <filesystem>
+#include <mutex>
+#include <thread>
 
 #include <nvutils/logger.hpp>
 #include <nvutils/file_operations.hpp>
+#include <nvutils/parallel_work.hpp>
 
 #include "lodclusters_remix.h"
 #include "scene.hpp"
@@ -92,7 +96,11 @@ lodclusters::SceneLoaderConfig toLoaderConfig(const ProcessorConfig& config)
 {
   lodclusters::SceneLoaderConfig loaderConfig = {};
 
-  loaderConfig.processingThreadsPct = config.processingThreadsPct;
+  // pool sized once from the pct; 0 = "use the pool as-is" so NVIDIA's
+  // per-geometry ProcessingInfo::init/deinit pool resets never run (they cost
+  // ~20 ms per geometry - see configureProcessingThreadPool)
+  configureProcessingThreadPool(config.processingThreadsPct);
+  loaderConfig.processingThreadsPct = 0.0f;
   loaderConfig.autoSaveCache        = config.autoSaveCache;
   loaderConfig.autoLoadCache        = config.autoLoadCache;
   loaderConfig.memoryMappedCache    = config.memoryMappedCache;
@@ -221,6 +229,15 @@ std::string getGeometryCacheFileUtf8(uint64_t geometryHash, const ProcessorConfi
   return nvutils::utf8FromPath(path);
 }
 
+bool geometryCacheFileExists(uint64_t geometryHash, const ProcessorConfig& config)
+{
+  std::filesystem::path path = cacheBasePath(geometryHash, config);
+  path += ".nvsngeo";
+
+  std::error_code ec;
+  return std::filesystem::exists(path, ec);
+}
+
 std::string getConfigCacheDigestUtf8(const ProcessorConfig& config)
 {
   return configCacheDigestName(config);
@@ -247,6 +264,26 @@ void installLogSink(LogSink sink)
     }
     sink(sinkLevel, message.c_str());
   });
+}
+
+void configureProcessingThreadPool(float threadsPct)
+{
+  static std::mutex s_mutex;
+  std::lock_guard<std::mutex> lock(s_mutex);
+
+  const uint32_t hwThreads = std::max(1u, std::thread::hardware_concurrency());
+
+  uint32_t target = hwThreads;
+  if(threadsPct > 0.0f && threadsPct < 1.0f)
+  {
+    target = std::min(hwThreads, std::max(1u, uint32_t(ceilf(float(hwThreads) * threadsPct))));
+  }
+
+  auto& pool = nvutils::get_thread_pool();
+  if(pool.get_thread_count() != target)
+  {
+    pool.reset(target);
+  }
 }
 
 struct GeometryProcessor::Impl

@@ -1,0 +1,448 @@
+// NV-DXVK: build-time shader variants for RTX Remix (see compile_shaders.py)
+//!variant promotion_solve.comp PROMOTION_SOLVE=1
+//!end-variants
+
+/*
+* Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+
+/*
+  RTX Remix glue kernel (P4c, authored - not part of the NVIDIA samples).
+
+  RIGID-CAPTURE PROMOTION (plan 7.7): treats the game's vertex shader as a
+  black box and recovers, per instance per frame, the affine map M that
+  carries the CPU input-space snapshot onto the GPU vertex-capture output.
+  Low residual => the mesh is (this frame) a rigid transform of its input
+  data => the input-space Path A LOD clusters render it correctly with
+  worldMatrix = M, which this kernel patches directly into the frame's
+  shaderio::RenderInstance / VkAccelerationStructureInstanceKHR arrays
+  between their upload and the first consuming kernel.
+
+  The closed-form solve uses a CPU-precomputed centered Gram pseudoinverse
+  (see plan 7.7 spec): rows [A_r | t_r] = Ginv * b_r with
+  b_r = sum(refH * cap_r), refH = (refCentered, 1); decentered translation
+  t' = t - A*centroid. Residual is checked on a disjoint validation sample
+  set; MODE_GATE additionally sweeps EVERY vertex (a mostly-rigid mesh with
+  a VS-animated patch must not promote - risk R20).
+
+  Descriptor-free: all inputs via push constants + buffer device addresses.
+*/
+
+#version 460
+
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 64) in;
+
+#define PROMO_MODE_SOLVE 0
+#define PROMO_MODE_GATE  1
+
+#define PROMO_FLAG_RIGID   1u
+#define PROMO_FLAG_DEMOTED 4u
+
+#define PROMO_SOLVE_SAMPLES      64
+#define PROMO_VALIDATION_SAMPLES 32
+
+// ---- data layouts (mirrored by lodclusters_remix.h / the provider's
+//      precompute - keep in exact sync with the plan 7.7 spec) ----
+
+struct PromoSample
+{
+  uint  index;      // vertex index into the capture buffer
+  float refX;       // input-space position, CENTERED (p - centroid)
+  float refY;
+  float refZ;
+};
+
+layout(buffer_reference, buffer_reference_align = 4, scalar) buffer ProbeBlob
+{
+  uint  sampleCount;      // <= PROMO_SOLVE_SAMPLES
+  uint  validationCount;  // <= PROMO_VALIDATION_SAMPLES
+  uint  vertexCount;      // full-mesh gate range
+  uint  _pad0;
+  vec3  centroidPos;
+  float radius;           // residuals are relative to this
+  float gInv[16];         // row-major 4x4 Gram pseudoinverse (doubles on CPU)
+  PromoSample samples[];  // [sampleCount] solve + [validationCount] validation
+                          // + full ref positions appended as PromoSample
+                          // {index = i} for the gate sweep
+};
+
+struct PromoEntry
+{
+  uint64_t probeVa;
+  uint64_t captureVa;
+  uint     captureStrideBytes;
+  uint     stateSlot;
+  uint     patchSlot;  // 0xFFFFFFFF = probe-only (no patch)
+  uint     mode;
+  uint     vertexCount;  // gate dispatch sizing (mode 1; kernel bounds on probe)
+  uint     pad0;
+};
+
+layout(buffer_reference, buffer_reference_align = 8, scalar) buffer PromoEntries
+{
+  PromoEntry entries[];
+};
+
+// SoA promo state: matrices (96 B / slot - M then prevM, row-major 3x4 each)
+layout(buffer_reference, buffer_reference_align = 4, scalar) buffer PromoMatrices
+{
+  float m[];  // slot * 24 + [0,12) = M rows, [12,24) = prevM rows
+};
+
+// status (32 B / slot) - the part read back to the CPU
+struct PromoStatus
+{
+  float residualRel;
+  uint  gateResidualBits;  // ordered-uint float (atomicMax)
+  uint  rigidStreak;
+  uint  flags;
+  uint  lastFrame;
+  uint  _pad0;
+  uint  _pad1;
+  uint  _pad2;
+};
+
+layout(buffer_reference, buffer_reference_align = 4, scalar) buffer PromoStatuses
+{
+  PromoStatus s[];
+};
+
+layout(buffer_reference, buffer_reference_align = 4, scalar) buffer RawFloats
+{
+  float f[];
+};
+
+layout(buffer_reference, buffer_reference_align = 4, scalar) buffer RawUints
+{
+  uint u[];
+};
+
+layout(push_constant, scalar) uniform PushData
+{
+  uint64_t entriesVa;
+  uint64_t matricesVa;
+  uint64_t statusVa;
+  uint64_t renderInstancesVa;
+  uint64_t tlasInstancesVa;
+  uint     entryCount;
+  uint     frameId;
+  uint     riStrideBytes;          // sizeof(shaderio::RenderInstance)
+  uint     riWorldMatrixOffset;    // glm::mat4x3, column-major, 12 floats
+  uint     riWorldMatrixIOffset;   // glm::mat4x3, column-major, 12 floats
+  uint     riFlipWindingOffset;    // dword holding flipWinding|twoSided|multiMaterial|opaqueStatus bytes
+  float    residualEpsilon;        // relative to probe radius
+  uint     gateEntryIndex;         // MODE_GATE: which entry this dispatch runs
+}
+push;
+
+// ---- shared reduction storage ----
+shared float s_b[64][12];      // per-thread partial b vectors (3 rows x 4)
+shared float s_dev[64];        // validation deviations
+shared float s_M[12];          // solved rows [A|t'] (row-major 3x4)
+shared bool  s_rigid;
+
+vec3 loadCapture(uint64_t captureVa, uint strideBytes, uint index)
+{
+  RawFloats capture = RawFloats(captureVa + uint64_t(strideBytes) * uint64_t(index));
+  return vec3(capture.f[0], capture.f[1], capture.f[2]);
+}
+
+void main()
+{
+  const uint threadId = gl_LocalInvocationID.x;
+
+  PromoEntries entriesBuf = PromoEntries(push.entriesVa);
+  const uint entryIndex = (push.gateEntryIndex != 0xFFFFFFFFu) ? push.gateEntryIndex : gl_WorkGroupID.x;
+  if(entryIndex >= push.entryCount)
+  {
+    return;
+  }
+  const PromoEntry entry = entriesBuf.entries[entryIndex];
+
+  // the batched solve dispatch covers every entry by group index - gate
+  // entries run through their own per-entry dispatches (gateEntryIndex set)
+  if(push.gateEntryIndex == 0xFFFFFFFFu && entry.mode != PROMO_MODE_SOLVE)
+  {
+    return;
+  }
+
+  ProbeBlob     probe    = ProbeBlob(entry.probeVa);
+  PromoStatuses statuses = PromoStatuses(push.statusVa);
+
+  // ======================================================================
+  // MODE_GATE: full-mesh residual sweep with the already-solved M (grid of
+  // groups over vertexCount; probe stores the full ref positions after the
+  // solve + validation samples)
+  // ======================================================================
+  if(entry.mode == PROMO_MODE_GATE)
+  {
+    PromoMatrices matrices = PromoMatrices(push.matricesVa);
+    const uint mBase = entry.stateSlot * 24;
+
+    // rows of M (last good solve)
+    vec4 r0 = vec4(matrices.m[mBase + 0], matrices.m[mBase + 1], matrices.m[mBase + 2], matrices.m[mBase + 3]);
+    vec4 r1 = vec4(matrices.m[mBase + 4], matrices.m[mBase + 5], matrices.m[mBase + 6], matrices.m[mBase + 7]);
+    vec4 r2 = vec4(matrices.m[mBase + 8], matrices.m[mBase + 9], matrices.m[mBase + 10], matrices.m[mBase + 11]);
+
+    const uint fullBase = probe.sampleCount + probe.validationCount;
+    const uint vertex   = gl_WorkGroupID.x * 64u + threadId;
+    if(vertex >= probe.vertexCount)
+    {
+      return;
+    }
+
+    // full ref positions are stored CENTERED like the samples, index = vertex.
+    // The matrices buffer holds the DECENTERED M (it maps ORIGINAL input-space
+    // positions - see the decenter step in MODE_SOLVE), so the centroid must be
+    // folded back in before comparing. Applying decentered M directly to
+    // centered positions offsets every fitted point by -A*centroid, which
+    // failed every gate on meshes away from the origin (residual ~ |A*c|/
+    // radius; observed 0.4-96 on 100% of gates, 2026-07-04 run). Fold the
+    // centroid into the translation (A*pc + (A*c + t')) instead of adding it
+    // to the position, preserving the centered offset's fp32 precision (R19).
+    const PromoSample refSample = probe.samples[fullBase + vertex];
+    const vec3 pc   = vec3(refSample.refX, refSample.refY, refSample.refZ);
+    const vec3 cGate = probe.centroidPos;
+    const vec3 cap  = loadCapture(entry.captureVa, entry.captureStrideBytes, refSample.index);
+
+    const vec3 tCentered = vec3(dot(r0.xyz, cGate) + r0.w,
+                                dot(r1.xyz, cGate) + r1.w,
+                                dot(r2.xyz, cGate) + r2.w);
+    const vec3 fitted = vec3(dot(r0.xyz, pc), dot(r1.xyz, pc), dot(r2.xyz, pc)) + tCentered;
+    const float devRel = length(fitted - cap) / max(probe.radius, 1e-6);
+
+    atomicMax(statuses.s[entry.stateSlot].gateResidualBits, floatBitsToUint(devRel));
+    return;
+  }
+
+  // ======================================================================
+  // MODE_SOLVE: one 64-thread group per entry
+  // ======================================================================
+
+  // ---- partial b vectors: b_r = sum(refH * cap_r) over the solve samples ----
+  for(uint k = 0; k < 12; k++)
+  {
+    s_b[threadId][k] = 0.0;
+  }
+
+  if(threadId < probe.sampleCount)
+  {
+    const PromoSample smp = probe.samples[threadId];
+    const vec4 refH = vec4(smp.refX, smp.refY, smp.refZ, 1.0);
+    const vec3 cap  = loadCapture(entry.captureVa, entry.captureStrideBytes, smp.index);
+
+    for(uint r = 0; r < 3; r++)
+    {
+      const float capR = cap[r];
+      s_b[threadId][r * 4 + 0] = refH.x * capR;
+      s_b[threadId][r * 4 + 1] = refH.y * capR;
+      s_b[threadId][r * 4 + 2] = refH.z * capR;
+      s_b[threadId][r * 4 + 3] = refH.w * capR;
+    }
+  }
+
+  barrier();
+
+  // ---- thread 0: reduce, solve rows via the precomputed pseudoinverse ----
+  if(threadId == 0)
+  {
+    float b[12];
+    for(uint k = 0; k < 12; k++)
+    {
+      float acc = 0.0;
+      for(uint t = 0; t < 64; t++)
+      {
+        acc += s_b[t][k];
+      }
+      b[k] = acc;
+    }
+
+    // row r of [A|t]: (Ginv * b_r) - Ginv is row-major 4x4
+    for(uint r = 0; r < 3; r++)
+    {
+      for(uint c = 0; c < 4; c++)
+      {
+        s_M[r * 4 + c] = probe.gInv[c * 4 + 0] * b[r * 4 + 0]
+                       + probe.gInv[c * 4 + 1] * b[r * 4 + 1]
+                       + probe.gInv[c * 4 + 2] * b[r * 4 + 2]
+                       + probe.gInv[c * 4 + 3] * b[r * 4 + 3];
+      }
+    }
+  }
+
+  barrier();
+
+  // ---- validation residual on the disjoint sample set ----
+  s_dev[threadId] = 0.0;
+  if(threadId < probe.validationCount)
+  {
+    const PromoSample smp = probe.samples[probe.sampleCount + threadId];
+    const vec4 refH = vec4(smp.refX, smp.refY, smp.refZ, 1.0);
+    const vec3 cap  = loadCapture(entry.captureVa, entry.captureStrideBytes, smp.index);
+
+    const vec3 fitted = vec3(dot(vec4(s_M[0], s_M[1], s_M[2], s_M[3]), refH),
+                             dot(vec4(s_M[4], s_M[5], s_M[6], s_M[7]), refH),
+                             dot(vec4(s_M[8], s_M[9], s_M[10], s_M[11]), refH));
+    s_dev[threadId] = length(fitted - cap);
+  }
+
+  barrier();
+
+  if(threadId != 0)
+  {
+    return;
+  }
+
+  float maxDev = 0.0;
+  for(uint t = 0; t < PROMO_VALIDATION_SAMPLES; t++)
+  {
+    maxDev = max(maxDev, s_dev[t]);
+  }
+  const float residualRel = maxDev / max(probe.radius, 1e-6);
+  const bool  rigid       = residualRel <= push.residualEpsilon;
+
+  // ---- decenter: the solve ran on (p - centroid); world translation is
+  //      t' = t - A * centroid ----
+  const vec3 c = probe.centroidPos;
+  float M[12];
+  for(uint k = 0; k < 12; k++)
+  {
+    M[k] = s_M[k];
+  }
+  M[3]  -= M[0] * c.x + M[1] * c.y + M[2] * c.z;
+  M[7]  -= M[4] * c.x + M[5] * c.y + M[6] * c.z;
+  M[11] -= M[8] * c.x + M[9] * c.y + M[10] * c.z;
+
+  // ---- state update ----
+  PromoMatrices matrices = PromoMatrices(push.matricesVa);
+  const uint mBase = entry.stateSlot * 24;
+
+  PromoStatus status = statuses.s[entry.stateSlot];
+  const bool contiguous = (status.lastFrame + 1u == push.frameId);
+
+  // prevM = last frame's M when the probe ran last frame too; on gaps the
+  // motion is unknowable - report zero motion instead of garbage
+  for(uint k = 0; k < 12; k++)
+  {
+    const float prev = contiguous ? matrices.m[mBase + k] : M[k];
+    matrices.m[mBase + 12 + k] = prev;
+    matrices.m[mBase + k]      = M[k];
+  }
+
+  status.residualRel = residualRel;
+  status.rigidStreak = rigid ? (contiguous ? status.rigidStreak + 1u : 1u) : 0u;
+  status.lastFrame   = push.frameId;
+  status.flags       = (status.flags & ~(PROMO_FLAG_RIGID | PROMO_FLAG_DEMOTED))
+                     | (rigid ? PROMO_FLAG_RIGID : PROMO_FLAG_DEMOTED);
+  statuses.s[entry.stateSlot] = status;
+
+  // ---- patch a promoted instance's slot: ALWAYS write when assigned - a
+  //      non-rigid frame keeps the last good M (bounded staleness, the CPU
+  //      demotes within the readback lag) ----
+  if(entry.patchSlot == 0xFFFFFFFFu)
+  {
+    return;
+  }
+
+  float P[12];
+  for(uint k = 0; k < 12; k++)
+  {
+    P[k] = rigid ? M[k] : matrices.m[mBase + 12 + k];
+  }
+
+  // shaderio::RenderInstance.worldMatrix / worldMatrixI: glm::mat4x3,
+  // column-major (12 floats: col0.xyz col1.xyz col2.xyz col3.xyz)
+  {
+    RawFloats wm = RawFloats(push.renderInstancesVa + uint64_t(entry.patchSlot) * uint64_t(push.riStrideBytes)
+                             + uint64_t(push.riWorldMatrixOffset));
+    wm.f[0] = P[0]; wm.f[1] = P[4]; wm.f[2] = P[8];    // col 0
+    wm.f[3] = P[1]; wm.f[4] = P[5]; wm.f[5] = P[9];    // col 1
+    wm.f[6] = P[2]; wm.f[7] = P[6]; wm.f[8] = P[10];   // col 2
+    wm.f[9] = P[3]; wm.f[10] = P[7]; wm.f[11] = P[11]; // col 3 = translation
+
+    // inverse (affine): I3 = inverse(A), It = -I3 * t
+    const float det = P[0] * (P[5] * P[10] - P[6] * P[9])
+                    - P[1] * (P[4] * P[10] - P[6] * P[8])
+                    + P[2] * (P[4] * P[9] - P[5] * P[8]);
+    const float invDet = abs(det) > 1e-20 ? 1.0 / det : 0.0;
+
+    float I[9];
+    I[0] = (P[5] * P[10] - P[6] * P[9]) * invDet;
+    I[1] = (P[2] * P[9] - P[1] * P[10]) * invDet;
+    I[2] = (P[1] * P[6] - P[2] * P[5]) * invDet;
+    I[3] = (P[6] * P[8] - P[4] * P[10]) * invDet;
+    I[4] = (P[0] * P[10] - P[2] * P[8]) * invDet;
+    I[5] = (P[2] * P[4] - P[0] * P[6]) * invDet;
+    I[6] = (P[4] * P[9] - P[5] * P[8]) * invDet;
+    I[7] = (P[1] * P[8] - P[0] * P[9]) * invDet;
+    I[8] = (P[0] * P[5] - P[1] * P[4]) * invDet;
+
+    const vec3 it = -vec3(I[0] * P[3] + I[1] * P[7] + I[2] * P[11],
+                          I[3] * P[3] + I[4] * P[7] + I[5] * P[11],
+                          I[6] * P[3] + I[7] * P[7] + I[8] * P[11]);
+
+    RawFloats wmi = RawFloats(push.renderInstancesVa + uint64_t(entry.patchSlot) * uint64_t(push.riStrideBytes)
+                              + uint64_t(push.riWorldMatrixIOffset));
+    wmi.f[0] = I[0]; wmi.f[1] = I[3]; wmi.f[2] = I[6];
+    wmi.f[3] = I[1]; wmi.f[4] = I[4]; wmi.f[5] = I[7];
+    wmi.f[6] = I[2]; wmi.f[7] = I[5]; wmi.f[8] = I[8];
+    wmi.f[9] = it.x; wmi.f[10] = it.y; wmi.f[11] = it.z;
+
+    // ---- winding: M replaces the CPU transform wholesale, so the CPU-staged
+    //      flipWinding (computed from the CPU matrix, which is garbage for
+    //      captured draws) is recomputed from det(A). A mirrored M flips
+    //      triangle facing; without this, mirrored captured props render
+    //      backface-culled/inverted (former V1 limitation).
+    const bool mirrored = det < 0.0;
+    {
+      RawUints riPacked = RawUints(push.renderInstancesVa + uint64_t(entry.patchSlot) * uint64_t(push.riStrideBytes)
+                                   + uint64_t(push.riFlipWindingOffset));
+      uint packed = riPacked.u[0];
+      const bool twoSided = ((packed >> 8) & 0xFFu) != 0u;  // byte 1 = twoSided
+      packed = (packed & ~0xFFu) | ((!twoSided && mirrored) ? 1u : 0u);
+      riPacked.u[0] = packed;
+    }
+    if(mirrored)
+    {
+      // VkAccelerationStructureInstanceKHR: dword at +52 packs
+      // instanceShaderBindingTableRecordOffset:24 | flags:8. XOR the
+      // TRIANGLE_FLIP_FACING bit (0x2) relative to the CPU-staged baseline -
+      // the baseline was computed with an unmirrored transform, and the CPU
+      // restages the dword every frame, so one XOR per frame is exact.
+      RawUints tlasFlags = RawUints(push.tlasInstancesVa + uint64_t(entry.patchSlot) * 64ul + 52ul);
+      tlasFlags.u[0] ^= (2u << 24);
+    }
+  }
+
+  // VkAccelerationStructureInstanceKHR.transform: ROW-major 3x4 at offset 0,
+  // stride 64
+  {
+    RawFloats tlas = RawFloats(push.tlasInstancesVa + uint64_t(entry.patchSlot) * 64ul);
+    for(uint k = 0; k < 12; k++)
+    {
+      tlas.f[k] = P[k];
+    }
+  }
+}

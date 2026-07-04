@@ -239,6 +239,12 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
   // is shared with the classic path.
   const bool isClusterHit = surface.isClusterLod && rayInteraction.clusterId != CLUSTER_ID_INVALID;
 
+  // NV-DXVK: RTX Mega Geometry P4c rigid-capture promotion (plan 7.7).
+  // PROMOTED captured instances pack (promo state slot + 1) into the high bits
+  // of clusterGeometryId: bits [30:18] slot+1, bits [17:0] geometry table
+  // index. 0 in the high bits = an ordinary (CPU-transformed) cluster surface.
+  const uint promoStateSlotPlusOne = isClusterHit ? ((surface.clusterGeometryId >> 18) & 0x1FFF) : 0;
+
   // NV-DXVK: RTX Mega Geometry Path B (P4b) - hits against per-frame
   // cluster-template BLASes (deforming geometry). The surface's classic
   // buffer indices stay fully valid (current + previous skinned buffers -
@@ -256,7 +262,7 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
       (uint64_t(cb.clusterGeometriesTableAddressHi) << 32) | uint64_t(cb.clusterGeometriesTableAddressLo);
 
     clusterGeometry = clusterGeometryCreate(
-      clusterGeometriesTableAddress, surface.clusterGeometryId, rayInteraction.clusterId);
+      clusterGeometriesTableAddress, surface.clusterGeometryId & 0x3FFFF, rayInteraction.clusterId);
     clusterIndices = clusterGeometryGetTriangleIndices(clusterGeometry, rayInteraction.primitiveIndex);
   }
   else if (isTemplateHit)
@@ -360,7 +366,56 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
 
   vec3 worldPositions[3];
 
-  if (usePreviousPositions && !surface.isStatic)
+  // NV-DXVK: RTX Mega Geometry P4c rigid-capture promotion (plan 7.7).
+  // PROMOTED instances' transforms exist only on the GPU (the promotion kernel
+  // solves them from the vertex-capture output every frame) - the surface's
+  // CPU-written objectToWorld/prevObjectToWorld/normalObjectToWorld are
+  // meaningless for them. Matrices array: 96 B per slot, row-major 3x4 M at
+  // +0, prevM at +48.
+  const bool isPromotedHit =
+    promoStateSlotPlusOne != 0 && (cb.promotionStateAddressLo | cb.promotionStateAddressHi) != 0;
+
+  // normal transform for promoted hits = inverse-transpose of M's 3x3 =
+  // cofactor rows (the det scale/sign washes out in the renormalize + facing
+  // re-sign below). Always derived from the CURRENT M - classic parity:
+  // normalObjectToWorld is current-frame even on the previous-position pass.
+  vec3 promoNormalRow0 = vec3(0.0f);
+  vec3 promoNormalRow1 = vec3(0.0f);
+  vec3 promoNormalRow2 = vec3(0.0f);
+
+  if (isPromotedHit)
+  {
+    const uint64_t promotionStateAddress =
+      (uint64_t(cb.promotionStateAddressHi) << 32) | uint64_t(cb.promotionStateAddressLo);
+    const uint64_t rowsAddress = promotionStateAddress + uint64_t(promoStateSlotPlusOne - 1) * 96;
+
+    const float4 promoCurRow0 = *(Ptr<float4>(rowsAddress + 0));
+    const float4 promoCurRow1 = *(Ptr<float4>(rowsAddress + 16));
+    const float4 promoCurRow2 = *(Ptr<float4>(rowsAddress + 32));
+
+    promoNormalRow0 = cross(promoCurRow1.xyz, promoCurRow2.xyz);
+    promoNormalRow1 = cross(promoCurRow2.xyz, promoCurRow0.xyz);
+    promoNormalRow2 = cross(promoCurRow0.xyz, promoCurRow1.xyz);
+
+    float4 promoRow0 = promoCurRow0;
+    float4 promoRow1 = promoCurRow1;
+    float4 promoRow2 = promoCurRow2;
+    if (usePreviousPositions && !surface.isStatic)
+    {
+      promoRow0 = *(Ptr<float4>(rowsAddress + 48));
+      promoRow1 = *(Ptr<float4>(rowsAddress + 64));
+      promoRow2 = *(Ptr<float4>(rowsAddress + 80));
+    }
+
+    for (uint i = 0; i < 3; i++)
+    {
+      const vec4 objectPosition = vec4(positions[i], 1.0f);
+      worldPositions[i] = vec3(dot(promoRow0, objectPosition),
+                               dot(promoRow1, objectPosition),
+                               dot(promoRow2, objectPosition));
+    }
+  }
+  else if (usePreviousPositions && !surface.isStatic)
   {
     worldPositions[0] = mul(surface.prevObjectToWorld, vec4(positions[0], 1.0f));
     worldPositions[1] = mul(surface.prevObjectToWorld, vec4(positions[1], 1.0f));
@@ -475,9 +530,21 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
     normals[2] = sanitize(normals[2], triangleNormal);
 
     // Note: Second normalization required as vector may be scaled through a normal transformation
-    normals[0] = safeNormalize(mul(surface.normalObjectToWorld, normals[0]), triangleNormal);
-    normals[1] = safeNormalize(mul(surface.normalObjectToWorld, normals[1]), triangleNormal);
-    normals[2] = safeNormalize(mul(surface.normalObjectToWorld, normals[2]), triangleNormal);
+    // NV-DXVK (P4c): promoted instances' normal matrix is derived from the
+    // GPU-solved M (cofactor rows above); the CPU normalObjectToWorld carries
+    // the meaningless CPU transform for them (former V1 limitation).
+    if (isPromotedHit)
+    {
+      normals[0] = safeNormalize(vec3(dot(promoNormalRow0, normals[0]), dot(promoNormalRow1, normals[0]), dot(promoNormalRow2, normals[0])), triangleNormal);
+      normals[1] = safeNormalize(vec3(dot(promoNormalRow0, normals[1]), dot(promoNormalRow1, normals[1]), dot(promoNormalRow2, normals[1])), triangleNormal);
+      normals[2] = safeNormalize(vec3(dot(promoNormalRow0, normals[2]), dot(promoNormalRow1, normals[2]), dot(promoNormalRow2, normals[2])), triangleNormal);
+    }
+    else
+    {
+      normals[0] = safeNormalize(mul(surface.normalObjectToWorld, normals[0]), triangleNormal);
+      normals[1] = safeNormalize(mul(surface.normalObjectToWorld, normals[1]), triangleNormal);
+      normals[2] = safeNormalize(mul(surface.normalObjectToWorld, normals[2]), triangleNormal);
+    }
 
     // Really the only reason to flip this normal is for double-sided geometry.  Do not flip based on view vector!
     normals[0] *= dot(normals[0], flippedTriangleNormal) >= float16_t(0.0) ? 1 : -1;
@@ -591,7 +658,15 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
           normal.z = BUFFER_ARRAY(geometries, normalBufferIndex, normalElementIndex + 2);
         }
 
-        normal = normalize(mul(surface.normalObjectToWorld, normal));
+        // NV-DXVK (P4c): promoted instances use the M-derived normal rows
+        if (isPromotedHit)
+        {
+          normal = normalize(vec3(dot(promoNormalRow0, normal), dot(promoNormalRow1, normal), dot(promoNormalRow2, normal)));
+        }
+        else
+        {
+          normal = normalize(mul(surface.normalObjectToWorld, normal));
+        }
 
         const float4 viewPos = mul(cb.camera.worldToView, float4(normal, 0.f));
 

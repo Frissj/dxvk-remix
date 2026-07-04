@@ -433,6 +433,16 @@ struct RaytraceArgs {
   uint animatedClusterTableAddressLo;
   uint animatedClusterTableAddressHi;
 
+  // NV-DXVK: RTX Mega Geometry P4c rigid-capture promotion (plan 7.7).
+  // Device address (BDA) of the promotion matrices array: 96 bytes per state
+  // slot, row-major 3x4 M at +0 and prevM at +48, GPU-solved per frame.
+  // PROMOTED cluster surfaces carry (stateSlot+1) in the high bits of
+  // surface.clusterGeometryId and fetch their object->world transforms here -
+  // the CPU-side surface matrices are meaningless for captured instances.
+  // 0 while promotion is inactive.
+  uint promotionStateAddressLo;
+  uint promotionStateAddressHi;
+
   // NOTE: Add structs to the top section of RaytraceArgs, not the bottom.
   // NOTE: bool does not work in debug builds, use uint instead.
 };

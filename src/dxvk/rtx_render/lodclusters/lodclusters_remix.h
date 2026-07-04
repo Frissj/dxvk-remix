@@ -28,6 +28,7 @@
 // ABI-identical on both sides) cross the boundary.
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -74,6 +75,17 @@ namespace lodclusters_remix {
     // consume the live GPU buffer.
     bool isMutating = false;
 
+    // P4c (plan 7.7): true for vertex-captured, non-skinned, NON-mutating
+    // snapshots - the rigid-capture promotion candidates. They register Path B
+    // templates AND run the LOD pipeline at first sight so the .nvsngeo cache
+    // and generation residency are ready when the promotion verdict lands.
+    // Mutating meshes are excluded: their frozen snapshot goes stale by
+    // definition (they can never promote), and their asset-rule hash is
+    // STABLE across mutation states while the snapshot content hashes change,
+    // so Path A processing produced a fresh cache-mismatch + overwrite of the
+    // same .nvsngeo every session (observed 2026-07-04 17:30:48, x3).
+    bool isCaptured = false;
+
     // P4b: topology-stable identity for Path B (combines the indices hash and
     // the vertex count; unlike geometryHash it does NOT include positions, so
     // it stays stable while a mesh deforms). Keys the template sets.
@@ -116,10 +128,18 @@ namespace lodclusters_remix {
 
     // SceneLoaderConfig
     float processingThreadsPct = 0.5f;
+    // P4c item 7: provider worker threads draining the intake queue in
+    // parallel (0 = auto: hardware threads / 4, clamped to [1, 4])
+    uint32_t processingWorkerCount = 0;
     bool autoSaveCache = true;
     bool autoLoadCache = true;
     bool memoryMappedCache = false;
     uint64_t forcePreprocessMiB = 2048;
+
+    // P4c routing (plan 7.7): whether captured (isCaptured) snapshots also run
+    // the LOD pipeline at first sight - promotion's process-at-first-sight
+    // policy, carried here so the worker reads one config source
+    bool processCapturedGeometry = true;
 
     // provider cache policy: one <geometryHash>.nvsngeo per geometry, grouped in a
     // per-config-digest subdirectory so config changes never load stale clusters
@@ -154,9 +174,24 @@ namespace lodclusters_remix {
   // the given sink and disables its debug-break-on-error behavior. Call once.
   void installLogSink(LogSink sink);
 
+  // Sizes the shared nvutils processing thread pool from the pct - idempotent,
+  // thread-safe, reapplies only when the resolved thread count changes (so a
+  // runtime option change costs one reset, not one per geometry). Callers then
+  // pass processingThreadsPct = 0 ("use the pool as-is") into per-geometry
+  // processing configs: NVIDIA's ProcessingInfo::init/deinit otherwise reset
+  // the ENTIRE pool down and back up around every geometry - two full thread
+  // teardown/spawn cycles, the measured ~20 ms fixed floor per registration
+  // (2026-07-04).
+  void configureProcessingThreadPool(float threadsPct);
+
   // UTF-8 path of the .nvsngeo cache file a processed geometry hash resolves to
   // under the given config (same layout GeometryProcessor writes).
   std::string getGeometryCacheFileUtf8(uint64_t geometryHash, const ProcessorConfig& config);
+
+  // Whether that .nvsngeo already exists on disk. Used by the P4c interim-
+  // template skip: on a cache hit Path A lands within the cache-hit cooldown,
+  // so interim templates would be pure waste.
+  bool geometryCacheFileExists(uint64_t geometryHash, const ProcessorConfig& config);
 
   // P2.5: the SceneConfig digest (cache subdirectory name) the given config
   // resolves to. A render generation may only be appended to with cache files
@@ -340,6 +375,40 @@ namespace lodclusters_remix {
     uint32_t sharingEnabledLevels = 8;
     uint32_t cachingAgeThreshold = 16;
     uint32_t cachingEnabledLevels = 8;
+
+    // ---- P4c rigid-capture promotion (plan 7.7 spec) ----
+    // Per-frame promotion work items. The render system stages them, runs the
+    // promotion_solve kernel between the instance upload and the first
+    // consuming kernel (solve M from probe vs capture, update state, patch
+    // promoted slots' RenderInstance.worldMatrix/TlasInstance transform), and
+    // copies the compact per-slot states into the host readback ring.
+    const struct PromotionEntry* promotionEntries = nullptr;
+    uint32_t promotionEntryCount = 0;
+    float promotionResidualEpsilon = 0.005f;
+  };
+
+  // P4c: one promotion work item (40 bytes, mirrored by promotion_solve.comp
+  // with scalar layout - keep field order/size in exact sync).
+  struct PromotionEntry {
+    uint64_t probeVa = 0;             // probe blob (template-system owned)
+    uint64_t captureVa = 0;           // instance's live position buffer
+    uint32_t captureStrideBytes = 0;
+    uint32_t stateSlot = 0;           // persistent promo state slot
+    uint32_t patchSlot = 0xFFFFFFFFu; // RenderInstance/TlasInstance index; ~0 = probe-only
+    uint32_t mode = 0;                // 0 = solve (+patch), 1 = full-mesh gate
+    uint32_t vertexCount = 0;         // gate dispatch sizing (mode 1)
+    uint32_t pad0 = 0;
+  };
+  static_assert(sizeof(PromotionEntry) == 40, "kernel mirrors this layout");
+
+  // P4c: compact per-slot state the manager reads back (3-frame lag);
+  // converted from the kernel's 32-byte PromoStatus.
+  struct PromotionStateView {
+    float residualRel = 0.0f;         // sparse validation residual, last solve
+    float gateResidualRel = 0.0f;     // full-mesh sweep max residual
+    uint32_t rigidStreak = 0;
+    uint32_t flags = 0;               // bit0 rigid, bit2 demoted (last solve non-rigid)
+    uint32_t lastFrame = 0;           // renderer frameIndex of the last solve
   };
 
   // P3: semaphores the caller must attach to the queue submission that
@@ -497,6 +566,22 @@ namespace lodclusters_remix {
     // Remix's hit-side cluster fetch (raytrace_args)
     uint64_t getGeometriesTableAddress() const;
 
+    // ---- P4c rigid-capture promotion (plan 7.7 spec) ----
+
+    // fixed number of persistent promotion state slots (system scope -
+    // survives generation swaps); slot ids are managed by the caller
+    static constexpr uint32_t kPromotionSlotCapacity = 8192;
+
+    // device address of the promotion state array (128 B per slot), for the
+    // hit side's prevM motion-vector fetch (raytrace_args)
+    uint64_t getPromotionStateAddress() const;
+
+    // Drains the newest complete host readback of the per-slot promotion
+    // states (written by recordFrame with a ring of 4, read here with the
+    // frame lag baked in). Returns false while nothing has been read back
+    // yet. outStates must hold kPromotionSlotCapacity entries.
+    bool readPromotionStates(PromotionStateView* outStates);
+
     // delayed statistics (a few frames old); false while nothing rendered yet
     bool getFrameStats(FrameStats& outStats) const;
 
@@ -589,6 +674,14 @@ namespace lodclusters_remix {
     bool init(const RenderDeviceInfo& deviceInfo, const AnimatedConfig& config);
     void deinit();
 
+    // P4c: installs submission-lock callbacks on the system's Resources. Once
+    // set, temp submissions lock ONLY around their raw vkQueueSubmit - fence
+    // waits run unlocked, so per-geometry registrations no longer block the
+    // render threads' submissions for the GPU duration of a template build.
+    // Pass nullptrs to restore the external-lock contract (used around deinit,
+    // which the manager runs while already holding the lock).
+    void setSubmitLockCallbacks(std::function<void()> lockFn, std::function<void()> unlockFn);
+
     // ---- background worker (one thread at a time) ----
 
     // CPU-only: clusterizes the snapshot's topology (meshopt, bind-pose
@@ -599,9 +692,22 @@ namespace lodclusters_remix {
     // GPU part of the registration: uploads the cluster-ordered index
     // topology, builds + compacts the cluster templates (or, in direct build
     // mode, only queries the worst-case CLAS sizes) and appends the cluster
-    // table records. Submits temporary command buffers and waits for them -
-    // the caller MUST hold Remix's queue submission lock.
+    // table records. Submits temporary command buffers and waits for them.
+    // Queue synchronization: either the caller holds Remix's submission lock,
+    // or setSubmitLockCallbacks is installed (preferred - see above).
     bool buildGeometryTemplates(uint64_t token);
+
+    // P4c (plan 7.7): uploads a promotion probe blob (device-local, BDA) and
+    // returns its device address; 0 on failure. Worker thread - same queue
+    // synchronization contract as buildGeometryTemplates.
+    uint64_t uploadPromotionProbe(const void* data, size_t bytes);
+
+    // P4c: deferred-frees one probe blob once its geometry's verdict is
+    // terminal (REJECTED - nothing references it again). Main thread; the
+    // actual destroy waits out the in-flight frames (trash queue). Probes of
+    // PROMOTED geometries stay resident - the periodic full-mesh sweeps (risk
+    // R20) read their full-reference tails.
+    void freePromotionProbe(uint64_t probeVa);
 
     // ---- main thread ----
 

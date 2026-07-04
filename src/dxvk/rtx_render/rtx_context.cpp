@@ -1390,6 +1390,12 @@ namespace dxvk {
         clusterLodManager != nullptr ? clusterLodManager->getAnimatedClusterTableAddress() : 0;
       constants.animatedClusterTableAddressLo = uint32_t(animatedClusterTableAddress);
       constants.animatedClusterTableAddressHi = uint32_t(animatedClusterTableAddress >> 32);
+
+      // P4c rigid-capture promotion: GPU-solved M/prevM for promoted surfaces
+      const uint64_t promotionStateAddress =
+        clusterLodManager != nullptr ? clusterLodManager->getPromotionStateAddress() : 0;
+      constants.promotionStateAddressLo = uint32_t(promotionStateAddress);
+      constants.promotionStateAddressHi = uint32_t(promotionStateAddress >> 32);
     }
     // NV-DXVK end
 

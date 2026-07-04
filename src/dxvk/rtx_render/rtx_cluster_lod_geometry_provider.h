@@ -43,9 +43,10 @@ namespace dxvk {
   // Runs on Remix's draw-submission path (CS thread): the first time a geometry hash
   // is seen, the draw call's CPU-visible geometry data (the same staging copies Remix's
   // geometry hashing reads - guaranteed alive in this window, never a GPU readback) is
-  // snapshotted and queued. A single background worker feeds the snapshots through
-  // NVIDIA's cluster LOD processing (lodclusters::Scene) and the per-geometry-hash
-  // .nvsngeo disk cache.
+  // snapshotted and queued. A pool of background workers (P4c item 7) feeds the
+  // snapshots through NVIDIA's cluster LOD processing (lodclusters::Scene) and the
+  // per-geometry-hash .nvsngeo disk cache; template-system/GPU work is serialized
+  // across the pool (that system is single-caller by design).
   class ClusterLodGeometryProvider {
   public:
     using ConfigProvider = std::function<lodclusters_remix::ProcessorConfig()>;
@@ -53,9 +54,16 @@ namespace dxvk {
     // P4b: worker-thread handler for Path B (deforming/mutating) snapshots -
     // ClusterLodManager runs the cluster-template registration (CPU
     // clusterization + GPU template build) inside it. Returns success.
-    using AnimatedHandler = std::function<bool(lodclusters_remix::GeometrySnapshot&&)>;
+    // Const ref (P4c): static snapshots register interim templates FIRST and
+    // then continue into Path A processing with the same snapshot.
+    using AnimatedHandler = std::function<bool(const lodclusters_remix::GeometrySnapshot&)>;
+    // P4c (plan 7.7): worker-thread handler invoked after a CAPTURED
+    // snapshot's Path A processing succeeded - the manager builds + uploads
+    // the rigid-capture promotion probe from it (CPU data still alive).
+    using CapturedProcessedHandler = std::function<void(const lodclusters_remix::GeometrySnapshot&)>;
 
-    ClusterLodGeometryProvider(ConfigProvider configProvider, VerifyProvider verifyProvider, AnimatedHandler animatedHandler);
+    ClusterLodGeometryProvider(ConfigProvider configProvider, VerifyProvider verifyProvider,
+                               AnimatedHandler animatedHandler, CapturedProcessedHandler capturedProcessedHandler);
     ~ClusterLodGeometryProvider();
 
     ClusterLodGeometryProvider(const ClusterLodGeometryProvider&) = delete;
@@ -65,6 +73,14 @@ namespace dxvk {
     // (Path A) or of its topology key (Path B: skinned draws, or an existing
     // BlasEntry whose vertex data updated in place - vertexDataUpdated).
     void onDrawCallGeometry(const DrawCallState& drawCallState, uint64_t geometryHash, bool vertexDataUpdated);
+
+    // Loader threads (P4c, plan 7.1a): load-time intake for replacement
+    // meshes. Snapshots directly from the replacement's buffers (static
+    // meshes keep host-visible staging for their whole lifetime); dynamic
+    // (skinned) replacements are device-local and skip here - they take the
+    // draw-time Path B route. Keyed by the same pure geometry hash the
+    // draw-time intake derives.
+    void onReplacementGeometry(const RasterGeometry& geometryData, uint64_t geometryHash);
 
     struct Stats {
       uint64_t submitted = 0;        // unique geometries snapshotted + queued
@@ -105,10 +121,19 @@ namespace dxvk {
 
     Stats getStats() const;
 
+    // P4c: whether a ready geometry was served from its .nvsngeo cache - cache
+    // hits take the manager's cooldown fast lane (7.7 first-frame guarantee:
+    // a cache load costs milliseconds, so batching it behind the full
+    // generationCooldownFrames would delay the flip for no amortization win).
+    struct ReadyGeometry {
+      uint64_t hash;
+      bool fromCache;
+    };
+
     // Main thread (P2). Returns the geometry hashes whose cluster processing
     // completed since the last drain; each has a valid .nvsngeo cache file on
     // disk and is ready to join the next render generation.
-    std::vector<uint64_t> drainReadyGeometries();
+    std::vector<ReadyGeometry> drainReadyGeometries();
 
     // P4b: topology-stable Path B identity - indices content hash + counts +
     // primitive topology. Unlike the asset hash it excludes positions, so it
@@ -133,11 +158,18 @@ namespace dxvk {
                                        uint64_t geometryHash,
                                        lodclusters_remix::GeometrySnapshot& outSnapshot);
 
+    // load-time variant (P4c): the simple replacement shape only - indexed
+    // uint32 triangle list, float3 positions, host-visible staging
+    static SnapshotResult makeReplacementSnapshot(const RasterGeometry& geometryData,
+                                                  uint64_t geometryHash,
+                                                  lodclusters_remix::GeometrySnapshot& outSnapshot);
+
     void workerLoop();
 
     ConfigProvider m_configProvider;
     VerifyProvider m_verifyProvider;
     AnimatedHandler m_animatedHandler;
+    CapturedProcessedHandler m_capturedProcessedHandler;
 
     lodclusters_remix::GeometryProcessor m_processor;
 
@@ -150,12 +182,20 @@ namespace dxvk {
     // hashes must never enter the Path A pipeline or the known-hash set.
     std::unordered_set<uint64_t> m_knownTopologyKeys;
     std::unordered_set<uint64_t> m_mutatingTopologyKeys;
-    std::vector<uint64_t> m_readyHashes;
+    std::vector<ReadyGeometry> m_readyGeometries;
     bool m_stopping = false;
 
     Stats m_stats;
 
-    dxvk::thread m_workerThread;
+    // P4c item 7: N workers drain the queue in parallel - the LOD DAG build +
+    // .nvsngeo save (the dominant per-geometry cost) is pure CPU/disk and
+    // per-hash independent (dedup upstream guarantees no two workers ever see
+    // the same hash). Everything that touches the cluster-template system or
+    // the GPU (Path B registration, interim templates, promotion probe
+    // build/upload) is single-caller by that system's design and stays
+    // serialized across workers via m_templateSerialMutex.
+    std::mutex m_templateSerialMutex;
+    std::vector<dxvk::thread> m_workerThreads;
   };
 
 }  // namespace dxvk

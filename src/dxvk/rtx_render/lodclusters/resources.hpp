@@ -32,6 +32,7 @@
 
 #pragma once
 
+#include <functional>
 #include <span>
 
 #if __INTELLISENSE__
@@ -478,6 +479,15 @@ public:
   static constexpr VkPipelineStageFlags2 s_supportedShaderStages =
       VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_PRE_RASTERIZATION_SHADERS_BIT
       | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+
+  // NV-DXVK P4c: optional submission-lock callbacks. When set, tempSyncSubmit
+  // takes them ONLY around its raw vkQueueSubmit2 - the fence wait runs
+  // unlocked, so a caller no longer blocks dxvk's render-thread submissions
+  // for the GPU duration of its temp work. When unset, callers must
+  // externally synchronize queue access (the original P2 contract, still
+  // used by the render system's generation builds).
+  std::function<void()> submitLockFn;
+  std::function<void()> submitUnlockFn;
 
   VkDevice         m_device          = {};
   VkPhysicalDevice m_physicalDevice  = {};

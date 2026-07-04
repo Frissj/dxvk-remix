@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <thread>
 #include <utility>
 
 #include "rtx_types.h"
@@ -62,14 +63,28 @@ namespace dxvk {
     return XXH64(&key, sizeof(key), streamSeed);
   }
 
-  ClusterLodGeometryProvider::ClusterLodGeometryProvider(ConfigProvider configProvider, VerifyProvider verifyProvider, AnimatedHandler animatedHandler)
+  ClusterLodGeometryProvider::ClusterLodGeometryProvider(ConfigProvider configProvider, VerifyProvider verifyProvider,
+                                                         AnimatedHandler animatedHandler, CapturedProcessedHandler capturedProcessedHandler)
     : m_configProvider(std::move(configProvider))
     , m_verifyProvider(std::move(verifyProvider))
     , m_animatedHandler(std::move(animatedHandler))
-    , m_workerThread([this] {
-        env::setThreadName("rtx-cluster-lod-process");
+    , m_capturedProcessedHandler(std::move(capturedProcessedHandler)) {
+    // P4c item 7: parallel queue drain. The single worker measured 3.4 s queue
+    // waits during discovery floods (2026-07-04 17:30 log) once batch 5 sent
+    // all captured geometry through the LOD pipeline.
+    uint32_t workerCount = m_configProvider().processingWorkerCount;
+    if (workerCount == 0) {
+      const uint32_t hwThreads = std::max(1u, std::thread::hardware_concurrency());
+      workerCount = std::min(4u, std::max(1u, hwThreads / 4));
+    }
+    m_workerThreads.reserve(workerCount);
+    for (uint32_t i = 0; i < workerCount; i++) {
+      m_workerThreads.emplace_back([this, i] {
+        env::setThreadName(str::format("rtx-cluster-lod-process-", i).c_str());
         workerLoop();
-      }) {
+      });
+    }
+    Logger::info(str::format("[ClusterLOD] geometry provider: ", workerCount, " processing worker(s)"));
   }
 
   ClusterLodGeometryProvider::~ClusterLodGeometryProvider() {
@@ -78,8 +93,10 @@ namespace dxvk {
       m_stopping = true;
     }
     m_condition.notify_all();
-    if (m_workerThread.joinable()) {
-      m_workerThread.join();
+    for (dxvk::thread& workerThread : m_workerThreads) {
+      if (workerThread.joinable()) {
+        workerThread.join();
+      }
     }
   }
 
@@ -166,6 +183,11 @@ namespace dxvk {
                        || snapshotResult == SnapshotResult::EligibleConverted;
     snapshot.isDeforming = skinned;
     snapshot.isMutating = deforming && !skinned;
+    // promotion candidates: captured AND content-stable. Mutating meshes stay
+    // pure Path B - they can never promote (frozen snapshot vs live rewrites)
+    // and their stable asset-rule hash + churning content hashes made every
+    // session reprocess + overwrite the same .nvsngeo (see GeometrySnapshot)
+    snapshot.isCaptured = captured && !skinned && !snapshot.isMutating;
     snapshot.topologyKey = topologyKey;
 
     std::unique_lock<std::mutex> lock(m_mutex);
@@ -212,14 +234,53 @@ namespace dxvk {
     m_condition.notify_one();
   }
 
+  void ClusterLodGeometryProvider::onReplacementGeometry(const RasterGeometry& geometryData, uint64_t geometryHash) {
+    // P4c load-time intake (plan 7.1a): replacement meshes processed during the
+    // load window, seconds before their first draw. Dedup shares m_knownHashes
+    // with the draw-time route, so whichever sees a geometry first wins and the
+    // other becomes a no-op.
+    {
+      std::unique_lock<std::mutex> lock(m_mutex);
+      if (!m_knownHashes.insert(geometryHash).second) {
+        return;
+      }
+    }
+
+    lodclusters_remix::GeometrySnapshot snapshot;
+    const SnapshotResult result = makeReplacementSnapshot(geometryData, geometryHash, snapshot);
+
+    std::unique_lock<std::mutex> lock(m_mutex);
+
+    if (result != SnapshotResult::Eligible) {
+      m_stats.ineligible++;
+      switch (result) {
+        case SnapshotResult::SkipTopology:  m_stats.skippedTopology++; break;
+        case SnapshotResult::SkipTooSmall:  m_stats.skippedTooSmall++; break;
+        case SnapshotResult::SkipFormat:    m_stats.skippedFormat++; break;
+        case SnapshotResult::SkipNoCpuData: m_stats.skippedNoCpuData++; break;
+        default: break;
+      }
+      return;
+    }
+
+    m_stats.submitted++;
+    m_stats.pending++;
+    m_stats.pendingBytes += snapshot.approximateSizeBytes();
+    snapshot.queuedAtUs = nowUs();
+    m_queue.push_back(std::move(snapshot));
+
+    lock.unlock();
+    m_condition.notify_one();
+  }
+
   ClusterLodGeometryProvider::Stats ClusterLodGeometryProvider::getStats() const {
     std::unique_lock<std::mutex> lock(m_mutex);
     return m_stats;
   }
 
-  std::vector<uint64_t> ClusterLodGeometryProvider::drainReadyGeometries() {
+  std::vector<ClusterLodGeometryProvider::ReadyGeometry> ClusterLodGeometryProvider::drainReadyGeometries() {
     std::unique_lock<std::mutex> lock(m_mutex);
-    return std::exchange(m_readyHashes, {});
+    return std::exchange(m_readyGeometries, {});
   }
 
   ClusterLodGeometryProvider::SnapshotResult ClusterLodGeometryProvider::makeSnapshot(
@@ -269,6 +330,10 @@ namespace dxvk {
     }
 
     if (!positionBuffer.defined()) {
+      // this was the ONLY silent skip - 18 replacement prims vanished into it on
+      // 2026-07-04 before it logged (plan 7.1a); every skip reason must announce
+      // its first occurrence and count in the stats line
+      ONCE(Logger::warn(str::format("[ClusterLOD] geometry 0x", std::hex, geometryHash, " skipped: no position buffer on the draw (stays classic; count of all such skips is in the stats log)")));
       return SnapshotResult::SkipNoCpuData;
     }
 
@@ -286,6 +351,21 @@ namespace dxvk {
 
     if ((usesIndices && indexPtr == nullptr) || positionPtr == nullptr) {
       ONCE(Logger::warn(str::format("[ClusterLOD] geometry 0x", std::hex, geometryHash, " skipped: no CPU-visible vertex/index data (stays classic; count of all such skips is in the stats log)")));
+      return SnapshotResult::SkipNoCpuData;
+    }
+
+    // Bounds: never read past a source slice. The counts come from the draw call
+    // but the buffers can legally be smaller than count x stride implies (and a
+    // mismatched hold/override pairing MUST skip here, not overread the heap).
+    if (usesIndices) {
+      const size_t indexSizeBytes = geometryData.indexBuffer.indexType() == VK_INDEX_TYPE_UINT16 ? 2 : 4;
+      if (size_t(primCount) * indexSizeBytes > geometryData.indexBuffer.length()) {
+        ONCE(Logger::warn(str::format("[ClusterLOD] geometry 0x", std::hex, geometryHash, " skipped: index buffer smaller than indexCount implies (stays classic; count of all such skips is in the stats log)")));
+        return SnapshotResult::SkipNoCpuData;
+      }
+    }
+    if (size_t(positionBuffer.offsetFromSlice()) + size_t(positionBuffer.stride()) * (vertexCount - 1) + 3 * sizeof(float) > positionBuffer.length()) {
+      ONCE(Logger::warn(str::format("[ClusterLOD] geometry 0x", std::hex, geometryHash, " skipped: position buffer smaller than vertexCount x stride implies (stays classic; count of all such skips is in the stats log)")));
       return SnapshotResult::SkipNoCpuData;
     }
 
@@ -385,10 +465,11 @@ namespace dxvk {
       if (normalFormat == VK_FORMAT_R32G32B32_SFLOAT || normalFormat == VK_FORMAT_R32G32B32A32_SFLOAT) {
         const uint8_t* normalPtr =
           (const uint8_t*) normalBuffer.mapPtr((size_t) normalBuffer.offsetFromSlice());
+        const size_t strideBytes = normalBuffer.stride();
 
-        if (normalPtr != nullptr) {
-          const size_t strideBytes = normalBuffer.stride();
-
+        // optional attribute: on a short buffer just cluster without normals
+        if (normalPtr != nullptr
+            && size_t(normalBuffer.offsetFromSlice()) + strideBytes * (vertexCount - 1) + 3 * sizeof(float) <= normalBuffer.length()) {
           outSnapshot.normals.resize(size_t(vertexCount) * 3);
           for (uint32_t v = 0; v < vertexCount; v++) {
             const float* src = (const float*) (normalPtr + strideBytes * v);
@@ -409,10 +490,11 @@ namespace dxvk {
           || texcoordFormat == VK_FORMAT_R32G32B32A32_SFLOAT) {
         const uint8_t* texcoordPtr =
           (const uint8_t*) texcoordBuffer.mapPtr((size_t) texcoordBuffer.offsetFromSlice());
+        const size_t strideBytes = texcoordBuffer.stride();
 
-        if (texcoordPtr != nullptr) {
-          const size_t strideBytes = texcoordBuffer.stride();
-
+        // optional attribute: on a short buffer just cluster without texcoords
+        if (texcoordPtr != nullptr
+            && size_t(texcoordBuffer.offsetFromSlice()) + strideBytes * (vertexCount - 1) + 2 * sizeof(float) <= texcoordBuffer.length()) {
           outSnapshot.texcoords0.resize(size_t(vertexCount) * 2);
           for (uint32_t v = 0; v < vertexCount; v++) {
             const float* src = (const float*) (texcoordPtr + strideBytes * v);
@@ -430,6 +512,133 @@ namespace dxvk {
     return (topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST && usesIndices)
       ? SnapshotResult::Eligible
       : SnapshotResult::EligibleConverted;
+  }
+
+  ClusterLodGeometryProvider::SnapshotResult ClusterLodGeometryProvider::makeReplacementSnapshot(
+      const RasterGeometry& geometryData,
+      uint64_t geometryHash,
+      lodclusters_remix::GeometrySnapshot& outSnapshot) {
+    // replacement meshes are authored as indexed uint32 triangle lists (the USD
+    // importer's contract); anything else is unexpected and skips with a count
+    if (geometryData.topology != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
+        || !geometryData.usesIndices() || geometryData.indexCount == 0
+        || geometryData.indexBuffer.indexType() != VK_INDEX_TYPE_UINT32) {
+      ONCE(Logger::info(str::format("[ClusterLOD] replacement 0x", std::hex, geometryHash, " skipped at load: unexpected topology/index layout (count of all such skips is in the stats log)")));
+      return SnapshotResult::SkipTopology;
+    }
+
+    const uint32_t vertexCount = geometryData.vertexCount;
+    const uint32_t triangleCount = geometryData.indexCount / 3;
+    if (triangleCount == 0 || vertexCount < 3) {
+      return SnapshotResult::SkipTooSmall;
+    }
+
+    const RasterBuffer& positionBuffer = geometryData.positionBuffer;
+    if (!positionBuffer.defined()) {
+      return SnapshotResult::SkipNoCpuData;
+    }
+
+    const VkFormat positionFormat = positionBuffer.vertexFormat();
+    if (positionFormat != VK_FORMAT_R32G32B32_SFLOAT && positionFormat != VK_FORMAT_R32G32B32A32_SFLOAT) {
+      ONCE(Logger::info(str::format("[ClusterLOD] replacement 0x", std::hex, geometryHash, " skipped at load: unsupported position format ", std::dec, positionFormat, " (count of all such skips is in the stats log)")));
+      return SnapshotResult::SkipFormat;
+    }
+
+    const uint32_t* indexPtr = (const uint32_t*) geometryData.indexBuffer.mapPtr();
+    const uint8_t* positionPtr =
+      (const uint8_t*) positionBuffer.mapPtr((size_t) positionBuffer.offsetFromSlice());
+
+    if (indexPtr == nullptr || positionPtr == nullptr) {
+      // dynamic (skinned) replacements are device-local by design - they take
+      // the draw-time Path B route; expected, so no warning
+      return SnapshotResult::SkipNoCpuData;
+    }
+
+    // bounds (same guards as the draw-time snapshot)
+    if (size_t(geometryData.indexCount) * sizeof(uint32_t) > geometryData.indexBuffer.length()) {
+      ONCE(Logger::warn(str::format("[ClusterLOD] replacement 0x", std::hex, geometryHash, " skipped at load: index buffer smaller than indexCount implies")));
+      return SnapshotResult::SkipNoCpuData;
+    }
+    if (size_t(positionBuffer.offsetFromSlice()) + size_t(positionBuffer.stride()) * (vertexCount - 1) + 3 * sizeof(float) > positionBuffer.length()) {
+      ONCE(Logger::warn(str::format("[ClusterLOD] replacement 0x", std::hex, geometryHash, " skipped at load: position buffer smaller than vertexCount x stride implies")));
+      return SnapshotResult::SkipNoCpuData;
+    }
+
+    outSnapshot = {};
+    outSnapshot.name = str::format("asset_", std::hex, geometryHash);
+    outSnapshot.geometryHash = geometryHash;
+    outSnapshot.indicesHash = geometryData.hashes[HashComponents::Indices];
+    outSnapshot.verticesHash = geometryData.hashes[HashComponents::VertexPosition];
+    outSnapshot.vertexCount = vertexCount;
+    outSnapshot.isDeforming = false;
+    outSnapshot.isMutating = false;
+    outSnapshot.topologyKey = makeTopologyKey(geometryData);
+
+    // indices: drop degenerate/out-of-range triangles like the draw-time path
+    outSnapshot.indices.reserve(size_t(triangleCount) * 3);
+    for (uint32_t t = 0; t < triangleCount; t++) {
+      const uint32_t idx0 = indexPtr[t * 3 + 0];
+      const uint32_t idx1 = indexPtr[t * 3 + 1];
+      const uint32_t idx2 = indexPtr[t * 3 + 2];
+
+      if (idx0 == idx1 || idx0 == idx2 || idx1 == idx2 ||
+          idx0 >= vertexCount || idx1 >= vertexCount || idx2 >= vertexCount) {
+        continue;
+      }
+
+      outSnapshot.indices.push_back(idx0);
+      outSnapshot.indices.push_back(idx1);
+      outSnapshot.indices.push_back(idx2);
+    }
+
+    if (outSnapshot.indices.empty()) {
+      return SnapshotResult::SkipTooSmall;
+    }
+
+    // positions -> tightly packed vec3
+    {
+      const size_t strideBytes = positionBuffer.stride();
+
+      outSnapshot.positions.resize(size_t(vertexCount) * 3);
+      for (uint32_t v = 0; v < vertexCount; v++) {
+        const float* src = (const float*) (positionPtr + strideBytes * v);
+        outSnapshot.positions[size_t(v) * 3 + 0] = src[0];
+        outSnapshot.positions[size_t(v) * 3 + 1] = src[1];
+        outSnapshot.positions[size_t(v) * 3 + 2] = src[2];
+      }
+    }
+
+    // texcoords -> tightly packed vec2 (replacements interleave float2)
+    const RasterBuffer& texcoordBuffer = geometryData.texcoordBuffer;
+    if (texcoordBuffer.defined()) {
+      const VkFormat texcoordFormat = texcoordBuffer.vertexFormat();
+      if (texcoordFormat == VK_FORMAT_R32G32_SFLOAT || texcoordFormat == VK_FORMAT_R32G32B32_SFLOAT
+          || texcoordFormat == VK_FORMAT_R32G32B32A32_SFLOAT) {
+        const uint8_t* texcoordPtr =
+          (const uint8_t*) texcoordBuffer.mapPtr((size_t) texcoordBuffer.offsetFromSlice());
+        const size_t strideBytes = texcoordBuffer.stride();
+
+        if (texcoordPtr != nullptr
+            && size_t(texcoordBuffer.offsetFromSlice()) + strideBytes * (vertexCount - 1) + 2 * sizeof(float) <= texcoordBuffer.length()) {
+          outSnapshot.texcoords0.resize(size_t(vertexCount) * 2);
+          for (uint32_t v = 0; v < vertexCount; v++) {
+            const float* src = (const float*) (texcoordPtr + strideBytes * v);
+            outSnapshot.texcoords0[size_t(v) * 2 + 0] = src[0];
+            outSnapshot.texcoords0[size_t(v) * 2 + 1] = src[1];
+          }
+        }
+      }
+    }
+
+    // normals: replacements store packed R32_UINT (octahedral) - same
+    // "cluster without normals" behavior as the draw-time snapshot.
+    // State bits: two-sided from the authored cull mode; alpha state is
+    // per-draw and unknown at load (P2's per-instance opaqueStatus overrides
+    // at render, sample parity).
+    outSnapshot.twoSided = geometryData.cullMode == VK_CULL_MODE_NONE;
+    outSnapshot.alphaMasked = false;
+
+    return SnapshotResult::Eligible;
   }
 
   void ClusterLodGeometryProvider::workerLoop() {
@@ -469,7 +678,13 @@ namespace dxvk {
         }
 
         const std::chrono::steady_clock::time_point registrationStart = std::chrono::steady_clock::now();
-        const bool registered = m_animatedHandler && m_animatedHandler(std::move(snapshot));
+        bool registered = false;
+        if (m_animatedHandler) {
+          // template system + GPU work: single-caller by design, serialize
+          // across the worker pool
+          std::lock_guard<std::mutex> templateLock(m_templateSerialMutex);
+          registered = m_animatedHandler(snapshot);
+        }
         const double registrationMs = double(elapsedUs(registrationStart)) * 1e-3;
 
         {
@@ -490,10 +705,53 @@ namespace dxvk {
                                    " geometry NOT registered for Path B - stays classic",
                                    " (queued ", queuedMs, " ms, attempt ", registrationMs, " ms)"));
         }
-        continue;
+
+        // P4c promotion foundation (plan 7.7): captured static-topology
+        // geometry ALSO runs the LOD pipeline at first sight - the .nvsngeo
+        // cache and generation residency are then ready the moment the
+        // promotion verdict machinery lands, and session 2+ is cache-instant.
+        // Instances keep rendering Path B meanwhile: the captured branch of
+        // isClusterInstance never consults Path A until promotion flips it.
+        if (!(snapshot.isCaptured && m_configProvider().processCapturedGeometry)) {
+          continue;
+        }
       }
 
       const lodclusters_remix::ProcessorConfig config = m_configProvider();
+
+      // P4c ladder: register interim cluster templates FIRST so the mesh renders
+      // as cluster geometry within milliseconds while the LOD DAG build below
+      // runs (seconds for large meshes). Pointless when the .nvsngeo already
+      // exists - Path A then lands within the cache-hit cooldown - so cache hits
+      // skip straight to processing. Template sets are TOPOLOGY-keyed and poses
+      // read each instance's own buffers, so a topology someone already
+      // registered (static or deforming) is reused, not duplicated. The handler
+      // gates on the interimTemplates option and logs its own chrono.
+      if (m_animatedHandler && !lodclusters_remix::geometryCacheFileExists(snapshot.geometryHash, config)) {
+        // template-serial lock held across check + register: two workers with
+        // different hashes but one topology must not both register a set
+        std::lock_guard<std::mutex> templateLock(m_templateSerialMutex);
+
+        bool topologyAlreadyRegistered = false;
+        {
+          std::unique_lock<std::mutex> lock(m_mutex);
+          topologyAlreadyRegistered = m_knownTopologyKeys.find(snapshot.topologyKey) != m_knownTopologyKeys.end();
+        }
+
+        if (!topologyAlreadyRegistered) {
+          const std::chrono::steady_clock::time_point interimStart = std::chrono::steady_clock::now();
+          if (m_animatedHandler(snapshot)) {
+            Logger::info(str::format("[ClusterLOD] ", snapshot.name,
+                                     ": static geometry registered INTERIM cluster templates in ",
+                                     double(elapsedUs(interimStart)) * 1e-3,
+                                     " ms - renders as clusters until the LOD build lands (queued ",
+                                     snapshot.queuedAtUs != 0 ? double(nowUs() - snapshot.queuedAtUs) * 1e-3 : 0.0, " ms)"));
+
+            std::unique_lock<std::mutex> lock(m_mutex);
+            m_knownTopologyKeys.insert(snapshot.topologyKey);
+          }
+        }
+      }
 
       lodclusters_remix::ProcessStats stats;
       const bool success = m_processor.processGeometry(snapshot, config, stats);
@@ -508,8 +766,9 @@ namespace dxvk {
           m_stats.totalClusters += stats.totalClusters;
           m_stats.totalTriangles += stats.totalTriangles;
 
-          // ready for the next render generation (P2)
-          m_readyHashes.push_back(snapshot.geometryHash);
+          // ready for the next render generation (P2); cache hits ride the
+          // manager's cooldown fast lane (P4c)
+          m_readyGeometries.push_back(ReadyGeometry { snapshot.geometryHash, stats.loadedFromCache });
         } else {
           m_stats.failed++;
         }
@@ -529,6 +788,14 @@ namespace dxvk {
                                " cache ", stats.cacheFileSizeBytes, " bytes",
                                stats.loadedFromCache ? (stats.memoryMapped ? " (cache hit, mapped)" : " (cache hit)") : " (processed)",
                                " in ", stats.processingMs, " ms (queued ", queuedMs, " ms)"));
+
+      // P4c (plan 7.7): captured candidates get their promotion probe built +
+      // uploaded here, on the worker, while the snapshot's CPU data is alive
+      // (upload rides the template system's queue - serialize with it)
+      if (snapshot.isCaptured && m_capturedProcessedHandler) {
+        std::lock_guard<std::mutex> templateLock(m_templateSerialMutex);
+        m_capturedProcessedHandler(snapshot);
+      }
 
       if (m_verifyProvider && m_verifyProvider()) {
         std::string message;

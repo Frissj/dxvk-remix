@@ -116,6 +116,11 @@ namespace dxvk {
 
       RTX_OPTION("rtx.clusterLod.processing", float, threadsPct, 0.5f,
                  "Fraction of hardware threads the background cluster processing may use.");
+      RTX_OPTION("rtx.clusterLod.processing", int, workerCount, 0,
+                 "Provider worker threads draining the geometry intake queue in parallel (P4c item 7:\n"
+                 "discovery floods outpaced the single worker - queue waits peaked at seconds). Each worker\n"
+                 "runs the CPU LOD pipeline independently; template/probe GPU work stays serialized across\n"
+                 "workers. 0 = auto (hardware threads / 4, clamped to [1, 4]). Read at startup.");
       RTX_OPTION("rtx.clusterLod.processing", bool, autoSaveCache, true,
                  "Saves a .nvsngeo cache file after processing a geometry.");
       RTX_OPTION("rtx.clusterLod.processing", bool, autoLoadCache, true,
@@ -150,9 +155,10 @@ namespace dxvk {
                  "Merges the leftover per-instance BLAS builds of shared geometries into one merged traversal.\n"
                  "NVIDIA sample default. Requires streaming mode (self-disables without it).\n"
                  "Read when the cluster render system starts (kernel variant selection).");
-      RTX_OPTION("rtx.clusterLod.render", bool, useBlasCaching, false,
+      RTX_OPTION("rtx.clusterLod.render", bool, useBlasCaching, true,
                  "Caches the built BLAS of shared geometries in a dedicated memory region so stable geometry stops\n"
-                 "being rebuilt every frame (P4). Requires streaming mode + BLAS sharing. Sample default off;\n"
+                 "being rebuilt every frame (P4). Requires streaming mode + BLAS sharing. Default on (F1,\n"
+                 "2026-07-04, NVIDIA's game-world guidance: 3.9->1.6 ms frame, 62->9 MB BLAS in their tests);\n"
                  "budgeted by rtx.clusterLod.streaming.maxBlasCachingMegaBytes.\n"
                  "Read when the cluster render system starts (kernel variant selection).");
       RTX_OPTION("rtx.clusterLod.render", bool, useForcedInvisibleCulling, false,
@@ -170,8 +176,10 @@ namespace dxvk {
                  "LOD levels above which BLAS-sharing election tolerates a coarser shared BLAS.");
       RTX_OPTION("rtx.clusterLod.render", int, sharingEnabledLevels, 8,
                  "Number of (coarse) LOD levels eligible for BLAS sharing.");
-      RTX_OPTION("rtx.clusterLod.render", bool, usePersistentTraversal, true,
-                 "Uses the persistent-threads traversal kernel instead of the multi-pass variant.");
+      RTX_OPTION("rtx.clusterLod.render", bool, usePersistentTraversal, false,
+                 "Uses the persistent-threads traversal kernel instead of the multi-pass variant.\n"
+                 "Default off (F2, 2026-07-04): NVIDIA's own render() comment calls multi-pass typically\n"
+                 "faster and the README calls the persistent thread heuristic crude.");
       RTX_OPTION("rtx.clusterLod.render", int, numRenderClusterBits, 20,
                  "log2 of the maximum renderable clusters per frame.");
       RTX_OPTION("rtx.clusterLod.render", int, numTraversalTaskBits, 20,
@@ -182,15 +190,29 @@ namespace dxvk {
                  "Geometry-slot capacity of a render generation (geometry table + BLAS-sharing buffers).\n"
                  "Newly processed geometries append to the running generation in O(new) while they fit;\n"
                  "exceeding the capacity triggers a full generation rebuild with a grown table.");
-      RTX_OPTION("rtx.clusterLod.render", int, positionTruncateBits, 0,
-                 "Mantissa bits truncated from CLAS vertex positions (smaller CLAS, faster builds).");
+      RTX_OPTION("rtx.clusterLod.render", int, positionTruncateBits, 4,
+                 "Mantissa bits truncated from CLAS vertex positions (smaller CLAS, faster builds).\n"
+                 "Default 4 (F3, 2026-07-04, NVIDIA-recommended): relative position error ~2^-19, far below\n"
+                 "visibility. Set 0 to disable.");
       RTX_OPTION("rtx.clusterLod.render", bool, blasFastTrace, true,
                  "Builds per-frame cluster BLAS with PREFER_FAST_TRACE (else PREFER_FAST_BUILD).");
+      RTX_OPTION("rtx.clusterLod.render", bool, routeTrivialToClassic, true,
+                 "Renders geometries whose LOD build produced a single LOD level through the classic triangle\n"
+                 "BLAS path at render time (F7, user-approved 2026-07-04; NVIDIA guidance: for purely static\n"
+                 "data without LOD benefit the traditional BLAS is still recommended - it also rejoins Remix's\n"
+                 "merged bucket BLASes). The geometry is still processed and cached, so it upgrades to clusters\n"
+                 "automatically if a config change ever gives it more LOD levels.");
       RTX_OPTION("rtx.clusterLod.render", int, generationCooldownFrames, 30,
                  "Minimum frames between render-generation updates. Newly processed geometries are batched and\n"
                  "join the running generation incrementally (O(new) upload, no re-upload of resident geometry);\n"
                  "a full rebuild (GPU-idle swap) only happens for the first generation, capacity growth or a\n"
                  "SceneConfig change.");
+      RTX_OPTION("rtx.clusterLod.render", int, cacheHitCooldownFrames, 4,
+                 "Cooldown used instead of generationCooldownFrames while the pending batch contains a geometry\n"
+                 "served from its .nvsngeo cache (fast lane, plan 7.7 first-frame guarantee). Cache loads cost\n"
+                 "milliseconds, so the full cooldown would delay their classic->cluster flip with nothing to\n"
+                 "amortize; a few frames of micro-batching still bounds append frequency during session-start\n"
+                 "cache-hit bursts.");
       RTX_OPTION("rtx.clusterLod.render", int, traversalPersistentThreads, 2048,
                  "Thread count used by the persistent traversal kernel.");
     };
@@ -200,7 +222,7 @@ namespace dxvk {
     struct Streaming {
       friend class ClusterLodManager;
 
-      RTX_OPTION("rtx.clusterLod.streaming", bool, preferStreaming, false,
+      RTX_OPTION("rtx.clusterLod.streaming", bool, preferStreaming, true,
                  "Renders through the on-demand streaming path (SceneStreaming) instead of keeping every\n"
                  "processed geometry fully resident (ScenePreloaded). Only the lowest-detail clusters stay\n"
                  "permanently on the GPU; higher detail cluster groups stream in when the LOD traversal asks\n"
@@ -221,9 +243,10 @@ namespace dxvk {
                  "Device memory budget for streamed cluster-group geometry data (MiB).");
       RTX_OPTION("rtx.clusterLod.streaming", int, maxClasMegaBytes, 2048,
                  "Device memory budget for the CLAS of streamed cluster groups (MiB).");
-      RTX_OPTION("rtx.clusterLod.streaming", bool, useAsyncTransfer, false,
+      RTX_OPTION("rtx.clusterLod.streaming", bool, useAsyncTransfer, true,
                  "Uploads streamed cluster groups on the dedicated transfer queue instead of the graphics\n"
-                 "queue command buffer (sample default off; per-frame submission takes the dxvk queue lock).");
+                 "queue command buffer. Default on (F4, 2026-07-04): Remix's transfer queue is mostly idle.\n"
+                 "Set False (sample default) if streaming instability appears.");
       RTX_OPTION("rtx.clusterLod.streaming", bool, useDecoupledAsyncTransfer, false,
                  "Async transfers may span multiple frames (scene update deferred until the transfer\n"
                  "completes) instead of the frame waiting on the transfer queue. Requires useAsyncTransfer.");
@@ -271,8 +294,10 @@ namespace dxvk {
       RTX_OPTION("rtx.clusterLod.animated", float, templateBboxBloatPercentage, 0.5f,
                  "instantiationBoundingBoxLimit bloat as a fraction of the geometry's bind-pose bbox diagonal -\n"
                  "the animation may move vertices this far outside the reference bbox. Negative disables the limit.");
-      RTX_OPTION("rtx.clusterLod.animated", int, positionTruncateBits, 0,
-                 "Mantissa bits truncated from CLAS vertex positions (smaller CLAS, faster instantiation).");
+      RTX_OPTION("rtx.clusterLod.animated", int, positionTruncateBits, 4,
+                 "Mantissa bits truncated from CLAS vertex positions (smaller CLAS, faster instantiation).\n"
+                 "Default 4 (F3, 2026-07-04): the animated sample calls truncation highly recommended.\n"
+                 "Set 0 to disable.");
       RTX_OPTION("rtx.clusterLod.animated", bool, templateBuildFastTrace, true,
                  "Builds cluster templates with PREFER_FAST_TRACE (sample default; templates build once).");
       RTX_OPTION("rtx.clusterLod.animated", bool, instantiateFastTrace, false,
@@ -284,6 +309,47 @@ namespace dxvk {
       RTX_OPTION("rtx.clusterLod.animated", int, maxPerFrameClusters, 1048576,
                  "Per-frame budget of instantiated clusters across all deforming meshes. Instances that would\n"
                  "exceed it render classic that frame (degrade, never corrupt - risk R15).");
+      RTX_OPTION("rtx.clusterLod.animated", bool, interimTemplates, false,
+                 "P4c ladder (plan 7.7): static geometry the LOD pipeline has not finished processing renders\n"
+                 "through cluster templates in the meantime instead of classic. DEFAULT OFF (user decision\n"
+                 "2026-07-04, minimal frame cost wins): the classic BLAS is built for the first 1-2 frames\n"
+                 "either way and then costs nothing per frame, while interim templates re-instantiate CLAS and\n"
+                 "rebuild BLAS every frame until Path A lands. Enable for cluster-pipeline uniformity testing\n"
+                 "or when AS memory matters more than frame time (clusters ~ half a classic BLAS on huge\n"
+                 "meshes). Skipped when the geometry's .nvsngeo cache already exists; interim pose sets age\n"
+                 "out via the normal 60-frame pose GC after the flip.");
+    };
+
+    // 7.7 rigid-capture promotion (P4c).
+    struct Promotion {
+      friend class ClusterLodManager;
+
+      RTX_OPTION("rtx.clusterLod.promotion", bool, enable, true,
+                 "Rigid-capture promotion (plan 7.7): per frame, a GPU kernel solves the affine transform that\n"
+                 "maps a captured mesh's input-space snapshot onto its vertex-capture output. When the fit is\n"
+                 "rigid (sparse residual streak + one full-mesh sweep), the instance flips from Path B cluster\n"
+                 "templates to the Path A LOD pipeline with the GPU-recovered transform patched into its\n"
+                 "render instance every frame - captured static world geometry gets real LOD/streaming.\n"
+                 "Universal: no per-game assumptions, the verdict is a property of the mesh data itself.");
+      RTX_OPTION("rtx.clusterLod.promotion", bool, processAtFirstSight, true,
+                 "Runs the LOD pipeline (clusterization, LOD DAG, .nvsngeo cache, generation residency) for\n"
+                 "vertex-captured static-topology geometry at first sight, in parallel with its Path B\n"
+                 "registration (plan 7.7, rule 3: spend background work to minimize flip latency).");
+      RTX_OPTION("rtx.clusterLod.promotion", int, rigidFrames, 2,
+                 "Consecutive rigid solve frames before the full-mesh gate is scheduled (hysteresis only - M is\n"
+                 "re-solved every frame, so streak length adds no correctness; see plan 7.7).");
+      RTX_OPTION("rtx.clusterLod.promotion", float, residualEpsilon, 0.005f,
+                 "Maximum solve/gate residual relative to the geometry's bounding radius for a frame to count\n"
+                 "as rigid. Non-rigid VS output (skinning in shader, foliage sway, billboards) fails this and\n"
+                 "keeps the mesh on Path B.");
+      RTX_OPTION("rtx.clusterLod.promotion", int, gateLagFrames, 6,
+                 "Frames between dispatching the full-mesh gate sweep and reading its verdict (covers the\n"
+                 "readback ring lag).");
+      RTX_OPTION("rtx.clusterLod.promotion", int, fullSweepIntervalFrames, 32,
+                 "Steady-state full-mesh residual sweep cadence per PROMOTED instance (plan 7.7, risk R20):\n"
+                 "the sparse per-frame solve can miss a VS animating a small vertex subset, so every promoted\n"
+                 "instance re-runs the every-vertex sweep on this interval (staggered by state slot). A failing\n"
+                 "sweep demotes that instance to Path B. 0 disables the sweeps (not recommended).");
     };
   };
 
@@ -309,6 +375,12 @@ namespace dxvk {
     // vertexDataUpdated = the existing BlasEntry's vertex data changed in
     // place this draw (kUpdateBVH) - the Path B mutation signal.
     void onDrawCallGeometry(const DrawCallState& drawCallState, bool vertexDataUpdated);
+
+    // Loader threads (P4c, plan 7.1a): load-time intake for replacement
+    // meshes - keys by the PURE geometry hash (same key the draw-time intake
+    // derives) and snapshots straight from the replacement's host-visible
+    // staging buffers, so cluster processing runs during the load window.
+    void onReplacementGeometryLoaded(const RasterGeometry& geometryData);
 
     void logStatistics() const;
 
@@ -355,6 +427,10 @@ namespace dxvk {
     // consumed by the path tracer's hit-side cluster fetch via raytrace_args
     uint64_t getGeometriesTableAddress() const;
 
+    // P4c: device address of the promotion matrices array (M/prevM per state
+    // slot; 0 while inactive) - consumed by promoted surfaces via raytrace_args
+    uint64_t getPromotionStateAddress() const;
+
     // P4b: device address of the global animated cluster table (0 if none);
     // consumed by the hit-side Path B primitive remap via raytrace_args
     uint64_t getAnimatedClusterTableAddress() const;
@@ -386,8 +462,10 @@ namespace dxvk {
 
     // worker thread (provider handler): full registration of one deforming
     // geometry - CPU clusterization, then the GPU template build under the
-    // dxvk submission lock
-    bool processAnimatedGeometry(lodclusters_remix::GeometrySnapshot&& snapshot);
+    // dxvk submission lock. Const ref (P4c): static snapshots register interim
+    // templates FIRST and then continue into Path A processing with the same
+    // snapshot - the handler only reads.
+    bool processAnimatedGeometry(const lodclusters_remix::GeometrySnapshot& snapshot);
     // worker + main thread; lazily creates the template system (mutex-guarded)
     bool ensureTemplateSystem();
     // Path B side of isClusterInstance
@@ -454,6 +532,72 @@ namespace dxvk {
     // appended in O(new) or - on capacity/config change - folded into a full
     // rebuild)
     std::vector<uint64_t> m_pendingGeometryHashes;
+    // P4c fast lane: true while any pending geometry came from its .nvsngeo
+    // cache - the batch then uses cacheHitCooldownFrames instead of the full
+    // cooldown (cleared whenever the pending batch is consumed)
+    bool m_pendingHasCacheHit = false;
+
+    // stats latches: slot lists are reset every onFrameBegin, so the periodic
+    // digest (which runs there) must report the counts captured at dispatch
+    // time instead of reading the just-cleared lists
+    uint32_t m_statsSlotsOpaque = 0;
+    uint32_t m_statsSlotsUnordered = 0;
+    uint32_t m_statsSlotsPathB = 0;
+
+    // F7: geometryIds whose LOD build produced a single LOD level - routed to
+    // the classic (bucket-merged) BLAS path at render time; rebuilt alongside
+    // m_geometryIdByHash
+    std::unordered_set<uint32_t> m_trivialGeometryIds;
+
+    // ---- P4c rigid-capture promotion (plan 7.7 spec) ----
+    struct PromotionCandidate {
+      uint64_t probeVa = 0;
+      uint32_t vertexCount = 0;
+      uint32_t stateSlot = 0;
+      enum class Phase : uint32_t { Probing, GateScheduled, GateRunning, Promoted, Rejected } phase = Phase::Probing;
+      uint32_t gateFrames = 0;
+    };
+    // main-thread after adoption in onFrameBegin
+    std::unordered_map<uint64_t, PromotionCandidate> m_promoCandidates;
+    // worker -> main handoff of uploaded probes
+    struct PendingProbe {
+      uint64_t geometryHash = 0;
+      uint64_t probeVa = 0;
+      uint32_t vertexCount = 0;
+    };
+    std::mutex m_promoPendingMutex;
+    std::vector<PendingProbe> m_promoPendingProbes;
+    uint32_t m_promoNextStateSlot = 0;
+    // per-INSTANCE state slots for PROMOTED instances (plan risk R21: M is per
+    // instance - every captured instance's buffer carries its own transform -
+    // so patch/prevM state must never alias across instances; the candidate's
+    // own slot serves only the geometry-level probe/gate verdict).
+    // demoted: instance-level demotion (former V1 limitation was geometry-
+    // level) - this instance renders Path B while its solves stay non-rigid;
+    // a fresh rigid streak re-promotes it. sweepPending/sweepLagFrames track
+    // the periodic full-mesh sweep verdict (risk R20).
+    struct PromoInstance {
+      uint32_t stateSlot = 0;
+      uint32_t sweepLagFrames = 0;
+      bool sweepPending = false;
+      bool demoted = false;
+    };
+    std::unordered_map<const BlasEntry*, PromoInstance> m_promoSlotByBlas;
+    // per-frame kernel work items (built in dispatchBuild, consumed by
+    // recordFrame the same call) + readback scratch
+    std::vector<lodclusters_remix::PromotionEntry> m_framePromoEntries;
+    std::vector<lodclusters_remix::PromotionStateView> m_promoStates;
+    bool m_promoStatesValid = false;
+    uint32_t m_statsPromoted = 0;
+    uint32_t m_statsPromoRejected = 0;
+
+    // worker thread (P4c): probe precompute (samples + Gram pseudoinverse in
+    // doubles) + upload through the template system's callback-locked path
+    void buildAndUploadPromotionProbe(const lodclusters_remix::GeometrySnapshot& snapshot);
+    // onFrameBegin: adopt pending probes, read verdicts, run the state machine
+    void updatePromotionStates();
+    // dispatchBuild: emit this frame's solve/gate/patch entries
+    void buildPromotionEntries();
     // SceneConfig cache digest the generation was built from; appends require
     // the current config to still resolve to it
     std::string m_generationConfigDigest;

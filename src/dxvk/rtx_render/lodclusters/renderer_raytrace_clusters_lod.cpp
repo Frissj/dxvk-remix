@@ -129,10 +129,19 @@ private:
   nvvk::Buffer m_sceneBuildBuffer;
   nvvk::Buffer m_sceneDataBuffer;
 
+  // NV-DXVK (risk R17): the implicit-destination BLAS pool is TRACE-READ.
+  // Frame N's ray trace dereferences BLASes in this pool while frame N+1's
+  // dispatchBuild records the next implicit build - single-buffered, frame
+  // N+1 would overwrite what frame N still reads (the exact race Path B hit
+  // and fixed by ringing its CLAS/BLAS pools; first triggered when Path A
+  // activated under streaming, VK_ERROR_DEVICE_LOST 2026-07-04). Ring one
+  // pool per frame-in-flight slot; everything else the trace reads (CLAS,
+  // cached BLAS memory, low-detail BLAS) is persistent and unaffected.
+  static constexpr uint32_t kBlasRingSlots = 4;
 #if USE_LARGE_BUFFER_BLAS
-  nvvk::LargeBuffer m_sceneBlasDataBuffer;
+  nvvk::LargeBuffer m_sceneBlasDataBuffers[kBlasRingSlots];
 #else
-  nvvk::Buffer m_sceneBlasDataBuffer;
+  nvvk::Buffer m_sceneBlasDataBuffers[kBlasRingSlots];
 #endif
   nvvk::Buffer            m_sceneTraversalBuffer;
   nvvk::Buffer            m_sceneGeometryHistogramBuffer;
@@ -401,14 +410,17 @@ bool RendererRayTraceClustersLod::init(Resources& res, RenderScene& rscene, cons
 
     m_sceneBuildShaderio.traversalNodeInfos = m_sceneTraversalBuffer.address;
 
+    for(uint32_t ringSlot = 0; ringSlot < kBlasRingSlots; ringSlot++)
+    {
 #if USE_LARGE_BUFFER_BLAS
-    res.createLargeBuffer(m_sceneBlasDataBuffer, m_blasDataSize,
-                          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR);
+      res.createLargeBuffer(m_sceneBlasDataBuffers[ringSlot], m_blasDataSize,
+                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR);
 #else
-    res.createBuffer(m_sceneBlasDataBuffer, m_blasDataSize,
-                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR);
+      res.createBuffer(m_sceneBlasDataBuffers[ringSlot], m_blasDataSize,
+                       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR);
 #endif
-    NVVK_DBG_NAME(m_sceneBlasDataBuffer.buffer);
+      NVVK_DBG_NAME(m_sceneBlasDataBuffers[ringSlot].buffer);
+    }
 
     if(m_config.useBlasSharing)
     {
@@ -899,7 +911,8 @@ void RendererRayTraceClustersLod::render(VkCommandBuffer cmd, Resources& res, Re
     cmdInfo.dstSizesArray.stride        = sizeof(uint32_t);
 
     // in implicit mode we provide one big chunk from which outputs are sub-allocated
-    cmdInfo.dstImplicitData = m_sceneBlasDataBuffer.address;
+    // NV-DXVK (R17): rotate the pool so in-flight traces never see this build
+    cmdInfo.dstImplicitData = m_sceneBlasDataBuffers[m_frameIndex % kBlasRingSlots].address;
 
     cmdInfo.scratchData = m_scratchBuffer.address;
 
@@ -990,8 +1003,8 @@ void RendererRayTraceClustersLod::render(VkCommandBuffer cmd, Resources& res, Re
   {
     // reservation for geometry may change
     m_resourceReservedUsage.geometryMemBytes = rscene.getGeometrySize(true);
-    // reservation for blas may change
-    m_resourceReservedUsage.rtBlasMemBytes = m_blasDataSize + rscene.getBlasSize(true);
+    // reservation for blas may change (R17: the implicit pool is ringed)
+    m_resourceReservedUsage.rtBlasMemBytes = m_blasDataSize * kBlasRingSlots + rscene.getBlasSize(true);
 
     m_resourceActualUsage                  = m_resourceReservedUsage;
     m_resourceActualUsage.geometryMemBytes = rscene.getGeometrySize(false);
@@ -1014,11 +1027,14 @@ void RendererRayTraceClustersLod::deinit(Resources& res)
   res.m_allocator.destroyBuffer(m_sceneBuildBuffer);
   res.m_allocator.destroyBuffer(m_sceneDataBuffer);
   res.m_allocator.destroyBuffer(m_sceneTraversalBuffer);
+  for(uint32_t ringSlot = 0; ringSlot < kBlasRingSlots; ringSlot++)
+  {
 #if USE_LARGE_BUFFER_BLAS
-  res.m_allocator.destroyLargeBuffer(m_sceneBlasDataBuffer);
+    res.m_allocator.destroyLargeBuffer(m_sceneBlasDataBuffers[ringSlot]);
 #else
-  res.m_allocator.destroyBuffer(m_sceneBlasDataBuffer);
+    res.m_allocator.destroyBuffer(m_sceneBlasDataBuffers[ringSlot]);
 #endif
+  }
   res.m_allocator.destroyBuffer(m_sceneGeometryHistogramBuffer);
 
   res.destroyPipelines(m_pipelines);

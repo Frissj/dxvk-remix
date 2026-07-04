@@ -227,6 +227,14 @@ struct ClusterTemplateSystem::Impl
   uint64_t                                                    tokenNext = 1;
   std::unordered_map<uint64_t, std::unique_ptr<PendingGeometry>> pendingGeometries;
 
+  // P4c: promotion probe blobs (uploadPromotionProbe) - device-local, read by
+  // the render system's promotion_solve kernel via BDA. Freed individually
+  // when their geometry's verdict goes terminal (freePromotionProbe, deferred
+  // via trash) or at deinit. Mutex: uploads run on the provider worker, frees
+  // on the main thread.
+  std::mutex                promotionProbeMutex;
+  std::vector<nvvk::Buffer> promotionProbes;
+
   //////////////////////////////////////////////////////////////////////////
   // global animated cluster table (REMIX, hit-side primitive remap)
 
@@ -666,6 +674,16 @@ void ClusterTemplateSystem::deinit()
 
   impl.processTrash(0, true);
 
+  // P4c: promotion probe blobs (uploadPromotionProbe)
+  for(nvvk::Buffer& probe : impl.promotionProbes)
+  {
+    if(probe.buffer)
+    {
+      impl.res.m_allocator.destroyBuffer(probe);
+    }
+  }
+  impl.promotionProbes.clear();
+
   for(auto& geometry : impl.geometries)
   {
     if(geometry)
@@ -736,6 +754,65 @@ void ClusterTemplateSystem::deinit()
   impl.initialized = false;
 }
 
+void ClusterTemplateSystem::setSubmitLockCallbacks(std::function<void()> lockFn, std::function<void()> unlockFn)
+{
+  Impl& impl = *m_impl;
+
+  impl.res.submitLockFn   = std::move(lockFn);
+  impl.res.submitUnlockFn = std::move(unlockFn);
+}
+
+uint64_t ClusterTemplateSystem::uploadPromotionProbe(const void* data, size_t bytes)
+{
+  Impl& impl = *m_impl;
+
+  if(!impl.initialized || data == nullptr || bytes == 0)
+  {
+    return 0;
+  }
+
+  nvvk::Buffer buffer;
+  NVVK_CHECK(impl.res.createBuffer(buffer, bytes,
+                                   VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT));
+  if(!buffer.buffer)
+  {
+    return 0;
+  }
+
+  lodclusters::Resources::BatchedUploader uploader(impl.res);
+  uploader.uploadBuffer<uint8_t>(buffer, 0, bytes, reinterpret_cast<const uint8_t*>(data));
+  uploader.flush();
+
+  {
+    std::lock_guard<std::mutex> lock(impl.promotionProbeMutex);
+    impl.promotionProbes.push_back(buffer);
+  }
+  return buffer.address;
+}
+
+void ClusterTemplateSystem::freePromotionProbe(uint64_t probeVa)
+{
+  Impl& impl = *m_impl;
+
+  if(!impl.initialized || probeVa == 0)
+  {
+    return;
+  }
+
+  std::lock_guard<std::mutex> lock(impl.promotionProbeMutex);
+  for(size_t i = 0; i < impl.promotionProbes.size(); i++)
+  {
+    if(impl.promotionProbes[i].address == probeVa)
+    {
+      // an in-flight frame's gate/solve may still read the blob - deferred
+      // destruction only (trash queue, kDestroyDelayFrames)
+      impl.deferDestroy(impl.promotionProbes[i]);
+      impl.promotionProbes.erase(impl.promotionProbes.begin() + ptrdiff_t(i));
+      return;
+    }
+  }
+}
+
 uint64_t ClusterTemplateSystem::clusterizeGeometry(const GeometrySnapshot& snapshot)
 {
   Impl& impl = *m_impl;
@@ -749,9 +826,12 @@ uint64_t ClusterTemplateSystem::clusterizeGeometry(const GeometrySnapshot& snaps
   pending->topologyKey = snapshot.topologyKey;
   pending->name        = snapshot.name;
   pending->opaque      = !snapshot.alphaMasked;
-  // skinned bind poses are in the live buffers' space; mutating/captured
-  // snapshots are not (see PendingGeometry::useBboxLimit)
-  pending->useBboxLimit = !snapshot.isMutating;
+  // Only skinned bind poses may bound instantiation: their reference positions
+  // ARE the live buffers' space. Mutating/captured snapshots are wrong-space,
+  // and P4c interim statics can SHARE a template set with a mesh of identical
+  // topology but different positions (template sets are topology-keyed) - a
+  // foreign bbox limit would clip real geometry.
+  pending->useBboxLimit = snapshot.isDeforming;
 
   animatedclusters::Scene::Geometry& geometry = pending->geometry;
   geometry.numTriangles                       = uint32_t(snapshot.indices.size() / 3);
@@ -767,7 +847,11 @@ uint64_t ClusterTemplateSystem::clusterizeGeometry(const GeometrySnapshot& snaps
   sceneConfig.clusterVertices          = impl.config.clusterVertices;
   sceneConfig.clusterTriangles         = impl.config.clusterTriangles;
   sceneConfig.clusterDedicatedVertices = false;  // Remix consumes the global-index topology (hit-side remap)
-  sceneConfig.processingThreadsPct     = impl.config.processingThreadsPct;
+  // pool sized once from the pct; 0 = "use the pool as-is" so NVIDIA's
+  // per-geometry ProcessingInfo::init/deinit pool resets never run (they were
+  // the ~20 ms fixed floor measured on every Path B registration, 2026-07-04)
+  configureProcessingThreadPool(impl.config.processingThreadsPct);
+  sceneConfig.processingThreadsPct     = 0.0f;
 
   if(!pending->scene.processSingleGeometry(geometry, sceneConfig))
   {

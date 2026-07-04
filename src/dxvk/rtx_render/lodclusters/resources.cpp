@@ -547,7 +547,15 @@ void Resources::tempSyncSubmit(VkCommandBuffer cmd)
   VkFence           fence     = nullptr;
   NVVK_CHECK(vkCreateFence(m_device, &fenceInfo, nullptr, &fence));
 
+  // NV-DXVK P4c: the queue is shared with dxvk's submit thread - only the
+  // submission itself needs the lock. The fence wait (the long part: it spans
+  // the temp work's GPU execution) runs unlocked so render-thread submissions
+  // are never blocked behind it.
+  if(submitLockFn)
+    submitLockFn();
   NVVK_CHECK(vkQueueSubmit2(m_queue.queue, 1, &submitInfo2, fence));
+  if(submitUnlockFn)
+    submitUnlockFn();
   NVVK_CHECK(vkWaitForFences(m_device, 1, &fence, VK_TRUE, ~0ULL));
 
   vkDestroyFence(m_device, fence, nullptr);

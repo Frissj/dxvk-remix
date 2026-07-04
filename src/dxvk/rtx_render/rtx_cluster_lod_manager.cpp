@@ -22,8 +22,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <mutex>
 
 #include "rtx_cluster_lod_manager.h"
@@ -98,10 +100,14 @@ namespace dxvk {
       config.compressionTexDropBits = uint32_t(ClusterLodOptions::SceneConfig::compressionTexDropBits());
 
       config.processingThreadsPct = ClusterLodOptions::Processing::threadsPct();
+      config.processingWorkerCount = uint32_t(std::max(0, ClusterLodOptions::Processing::workerCount()));
       config.autoSaveCache = ClusterLodOptions::Processing::autoSaveCache();
       config.autoLoadCache = ClusterLodOptions::Processing::autoLoadCache();
       config.memoryMappedCache = ClusterLodOptions::Processing::memoryMappedCache();
       config.forcePreprocessMiB = uint64_t(std::max(1, ClusterLodOptions::Processing::forcePreprocessMiB()));
+
+      // P4c promotion foundation (plan 7.7)
+      config.processCapturedGeometry = ClusterLodOptions::Promotion::processAtFirstSight();
 
       // one .nvsngeo per geometry hash, per SceneConfig digest, next to mods/captures/logs
       config.cacheDirectoryUtf8 = "rtx-remix/cache/geometry";
@@ -118,6 +124,89 @@ namespace dxvk {
     // recordClusterInstance geometryId handoff (AccelManager passes the value
     // through opaquely)
     constexpr uint32_t kPathBTag = 0x80000000u;
+
+    // P4c: promoted rigid-captured instance (plan 7.7) - Path A slot whose
+    // worldMatrix/TLAS transform the promotion kernel patches per frame.
+    // Layout: bit 30 tag, bits [29:17] promo state slot, bits [16:0] geometryId.
+    constexpr uint32_t kPromotedTag = 0x40000000u;
+    constexpr uint32_t kPromotedSlotShift = 17;
+    constexpr uint32_t kPromotedGeometryMask = (1u << kPromotedSlotShift) - 1u;
+
+    // 4x4 symmetric pseudoinverse via cyclic Jacobi (doubles; plan 7.7 probe
+    // precompute). Rank-deficient Gram matrices (coplanar meshes) invert on
+    // the non-null eigenspace only.
+    void pseudoInverse4x4(const double g[16], double out[16]) {
+      double a[16];
+      double v[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+      for (int i = 0; i < 16; i++) {
+        a[i] = g[i];
+      }
+
+      for (int sweep = 0; sweep < 32; sweep++) {
+        double off = 0.0;
+        for (int p = 0; p < 4; p++) {
+          for (int q = p + 1; q < 4; q++) {
+            off += a[p * 4 + q] * a[p * 4 + q];
+          }
+        }
+        if (off < 1e-24) {
+          break;
+        }
+
+        for (int p = 0; p < 4; p++) {
+          for (int q = p + 1; q < 4; q++) {
+            const double apq = a[p * 4 + q];
+            if (std::abs(apq) < 1e-30) {
+              continue;
+            }
+            const double theta = (a[q * 4 + q] - a[p * 4 + p]) / (2.0 * apq);
+            const double t = (theta >= 0.0 ? 1.0 : -1.0) / (std::abs(theta) + std::sqrt(theta * theta + 1.0));
+            const double c = 1.0 / std::sqrt(t * t + 1.0);
+            const double s = t * c;
+
+            for (int k = 0; k < 4; k++) {
+              const double akp = a[k * 4 + p];
+              const double akq = a[k * 4 + q];
+              a[k * 4 + p] = c * akp - s * akq;
+              a[k * 4 + q] = s * akp + c * akq;
+            }
+            for (int k = 0; k < 4; k++) {
+              const double apk = a[p * 4 + k];
+              const double aqk = a[q * 4 + k];
+              a[p * 4 + k] = c * apk - s * aqk;
+              a[q * 4 + k] = s * apk + c * aqk;
+            }
+            for (int k = 0; k < 4; k++) {
+              const double vkp = v[k * 4 + p];
+              const double vkq = v[k * 4 + q];
+              v[k * 4 + p] = c * vkp - s * vkq;
+              v[k * 4 + q] = s * vkp + c * vkq;
+            }
+          }
+        }
+      }
+
+      double eig[4];
+      double maxEig = 0.0;
+      for (int i = 0; i < 4; i++) {
+        eig[i] = a[i * 4 + i];
+        maxEig = std::max(maxEig, std::abs(eig[i]));
+      }
+      const double tol = maxEig * 1e-10;
+
+      // out = V * diag(1/eig where |eig| > tol) * V^T
+      for (int r = 0; r < 4; r++) {
+        for (int c = 0; c < 4; c++) {
+          double acc = 0.0;
+          for (int k = 0; k < 4; k++) {
+            if (std::abs(eig[k]) > tol) {
+              acc += v[r * 4 + k] * v[c * 4 + k] / eig[k];
+            }
+          }
+          out[r * 4 + c] = acc;
+        }
+      }
+    }
 
     lodclusters_remix::AnimatedConfig buildAnimatedConfig() {
       lodclusters_remix::AnimatedConfig config;
@@ -175,9 +264,13 @@ namespace dxvk {
     m_provider = std::make_unique<ClusterLodGeometryProvider>(
       &buildProcessorConfig,
       [] { return ClusterLodOptions::verifyCacheRoundTrip(); },
-      [this](lodclusters_remix::GeometrySnapshot&& snapshot) {
-        // provider worker thread (P4b Path B registration)
-        return processAnimatedGeometry(std::move(snapshot));
+      [this](const lodclusters_remix::GeometrySnapshot& snapshot) {
+        // provider worker thread (P4b Path B registration / P4c interim templates)
+        return processAnimatedGeometry(snapshot);
+      },
+      [this](const lodclusters_remix::GeometrySnapshot& snapshot) {
+        // provider worker thread (P4c promotion probe precompute + upload)
+        buildAndUploadPromotionProbe(snapshot);
       });
   }
 
@@ -189,6 +282,10 @@ namespace dxvk {
     m_provider = nullptr;
 
     if (m_templateSystem != nullptr) {
+      // deinit runs under the external lock - drop the internal submit-lock
+      // callbacks first so a stray temp submit inside cannot re-take the
+      // (non-recursive) submission lock
+      m_templateSystem->setSubmitLockCallbacks(nullptr, nullptr);
       m_device->lockSubmission();
       m_templateSystem->deinit();
       m_device->unlockSubmission();
@@ -245,8 +342,13 @@ namespace dxvk {
       return;
     }
 
-    // same stable identity that keys replacements and the runtime caches
-    const XXH64_hash_t geometryHash = drawCallState.getHash(RtxOptions::geometryAssetHashRule());
+    // PURE geometry identity (P4c): DrawCallState::getHash XORs the draw's
+    // legacy MATERIAL hash into the key - cluster data is pure geometry
+    // (material rides the instance; opaqueStatus overrides per instance), so
+    // keying on it would process + cache identical geometry once per material
+    // variant AND make load-time keying (7.1a - no draw material exists yet)
+    // impossible. Same rule, geometry hashes only.
+    const XXH64_hash_t geometryHash = drawCallState.getGeometryData().getHashForRule(RtxOptions::geometryAssetHashRule());
     if (geometryHash == kEmptyHash) {
       return;
     }
@@ -254,12 +356,32 @@ namespace dxvk {
     m_provider->onDrawCallGeometry(drawCallState, geometryHash, vertexDataUpdated);
   }
 
+  void ClusterLodManager::onReplacementGeometryLoaded(const RasterGeometry& geometryData) {
+    if (!ClusterLodOptions::enable()) {
+      return;
+    }
+
+    // pure geometry hash - the exact key onDrawCallGeometry derives at draw
+    // time, so the draw-time lookup finds the load-time entry
+    const XXH64_hash_t geometryHash = geometryData.getHashForRule(RtxOptions::geometryAssetHashRule());
+    if (geometryHash == kEmptyHash) {
+      return;
+    }
+
+    m_provider->onReplacementGeometry(geometryData, geometryHash);
+  }
+
   // P4b: full Path B registration of one deforming geometry, on the provider's
   // worker thread: CPU clusterization (no Vulkan), then the GPU template build
   // with temporary submissions under the dxvk submission lock (RTXIO
   // precedent for off-thread queue use).
-  bool ClusterLodManager::processAnimatedGeometry(lodclusters_remix::GeometrySnapshot&& snapshot) {
+  bool ClusterLodManager::processAnimatedGeometry(const lodclusters_remix::GeometrySnapshot& snapshot) {
     if (!ClusterLodOptions::Animated::enable()) {
+      return false;
+    }
+
+    // P4c: interim templates for static geometry have their own opt-out
+    if (!snapshot.isDeforming && !snapshot.isMutating && !ClusterLodOptions::Animated::interimTemplates()) {
       return false;
     }
 
@@ -278,20 +400,449 @@ namespace dxvk {
       return false;
     }
 
-    const std::chrono::steady_clock::time_point lockStart = std::chrono::steady_clock::now();
-    m_device->lockSubmission();
-    const double lockWaitMs = elapsedMs(lockStart);
-
+    // P4c: no external submission lock here anymore - the template system
+    // locks only around its raw queue submits (setSubmitLockCallbacks); the
+    // fence waits that dominate this call run without blocking render-thread
+    // submissions
     const std::chrono::steady_clock::time_point buildStart = std::chrono::steady_clock::now();
     const bool built = m_templateSystem->buildGeometryTemplates(token);
     const double buildMs = elapsedMs(buildStart);
-    m_device->unlockSubmission();
 
     Logger::info(str::format("[ClusterLOD] ", snapshot.name, ": Path B chrono: clusterize ", clusterizeMs,
-                             " ms, submission-lock wait ", lockWaitMs,
                              " ms, template build ", buildMs, " ms"));
 
     return built;
+  }
+
+  // ---- P4c rigid-capture promotion (plan 7.7 spec) --------------------------
+
+  namespace {
+    // byte-layout mirrors of promotion_solve.comp's ProbeBlob (scalar layout)
+    struct ProbeHeader {
+      uint32_t sampleCount;
+      uint32_t validationCount;
+      uint32_t vertexCount;
+      uint32_t pad;
+      float centroid[3];
+      float radius;
+      float gInv[16];
+    };
+    static_assert(sizeof(ProbeHeader) == 96, "kernel mirrors this layout");
+
+    struct ProbeSample {
+      uint32_t index;
+      float x, y, z;
+    };
+    static_assert(sizeof(ProbeSample) == 16, "kernel mirrors this layout");
+  }
+
+  // worker thread: probe precompute + upload (plan 7.7). Runs after the
+  // captured snapshot's Path A processing; the snapshot's CPU data is alive.
+  void ClusterLodManager::buildAndUploadPromotionProbe(const lodclusters_remix::GeometrySnapshot& snapshot) {
+    if (!ClusterLodOptions::Promotion::enable()) {
+      return;
+    }
+    if (!ensureTemplateSystem()) {
+      return;
+    }
+
+    const uint32_t vertexCount = snapshot.vertexCount;
+    if (vertexCount < 4 || snapshot.positions.size() < size_t(vertexCount) * 3) {
+      return;
+    }
+
+    const float* positions = snapshot.positions.data();
+
+    // centroid + bounding radius (residuals are relative to it)
+    double cx = 0.0, cy = 0.0, cz = 0.0;
+    for (uint32_t v = 0; v < vertexCount; v++) {
+      cx += positions[v * 3 + 0];
+      cy += positions[v * 3 + 1];
+      cz += positions[v * 3 + 2];
+    }
+    cx /= vertexCount;
+    cy /= vertexCount;
+    cz /= vertexCount;
+
+    double radiusSq = 0.0;
+    for (uint32_t v = 0; v < vertexCount; v++) {
+      const double dx = positions[v * 3 + 0] - cx;
+      const double dy = positions[v * 3 + 1] - cy;
+      const double dz = positions[v * 3 + 2] - cz;
+      radiusSq = std::max(radiusSq, dx * dx + dy * dy + dz * dz);
+    }
+    const float radius = float(std::sqrt(radiusSq));
+    if (!(radius > 0.0f)) {
+      return;  // degenerate point cloud - unpromotable, stays Path B
+    }
+
+    // farthest-point sampling over a strided candidate subset: 64 spread solve
+    // samples, then 32 validation samples continuing the same chain (spread
+    // AND disjoint from the solve set)
+    const uint32_t stride = std::max(1u, vertexCount / 4096u);
+    std::vector<uint32_t> candidates;
+    candidates.reserve(vertexCount / stride + 1);
+    for (uint32_t v = 0; v < vertexCount; v += stride) {
+      candidates.push_back(v);
+    }
+
+    const uint32_t solveCount = std::min<uint32_t>(64, uint32_t(candidates.size()));
+    const uint32_t validationCount = std::min<uint32_t>(32, uint32_t(candidates.size()) > solveCount
+                                                                ? uint32_t(candidates.size()) - solveCount : 0);
+
+    std::vector<uint32_t> picked;
+    picked.reserve(solveCount + validationCount);
+    std::vector<float> minDistSq(candidates.size(), std::numeric_limits<float>::max());
+
+    // seed: candidate farthest from the centroid
+    {
+      uint32_t seed = 0;
+      float best = -1.0f;
+      for (uint32_t i = 0; i < candidates.size(); i++) {
+        const uint32_t v = candidates[i];
+        const float dx = positions[v * 3 + 0] - float(cx);
+        const float dy = positions[v * 3 + 1] - float(cy);
+        const float dz = positions[v * 3 + 2] - float(cz);
+        const float d = dx * dx + dy * dy + dz * dz;
+        if (d > best) {
+          best = d;
+          seed = i;
+        }
+      }
+      picked.push_back(seed);
+    }
+
+    while (picked.size() < size_t(solveCount) + validationCount) {
+      const uint32_t lastVertex = candidates[picked.back()];
+      uint32_t next = 0;
+      float best = -1.0f;
+      for (uint32_t i = 0; i < candidates.size(); i++) {
+        const uint32_t v = candidates[i];
+        const float dx = positions[v * 3 + 0] - positions[lastVertex * 3 + 0];
+        const float dy = positions[v * 3 + 1] - positions[lastVertex * 3 + 1];
+        const float dz = positions[v * 3 + 2] - positions[lastVertex * 3 + 2];
+        minDistSq[i] = std::min(minDistSq[i], dx * dx + dy * dy + dz * dz);
+        if (minDistSq[i] > best) {
+          best = minDistSq[i];
+          next = i;
+        }
+      }
+      if (best <= 0.0f) {
+        break;  // all remaining candidates coincide with picked ones
+      }
+      picked.push_back(next);
+    }
+
+    const uint32_t pickedSolve = std::min<uint32_t>(solveCount, uint32_t(picked.size()));
+    uint32_t pickedValidation = uint32_t(picked.size()) - pickedSolve;
+
+    // Gram matrix over the solve samples (centered homogeneous, doubles)
+    double g[16] = {};
+    for (uint32_t i = 0; i < pickedSolve; i++) {
+      const uint32_t v = candidates[picked[i]];
+      const double h[4] = { positions[v * 3 + 0] - cx, positions[v * 3 + 1] - cy, positions[v * 3 + 2] - cz, 1.0 };
+      for (int r = 0; r < 4; r++) {
+        for (int c = 0; c < 4; c++) {
+          g[r * 4 + c] += h[r] * h[c];
+        }
+      }
+    }
+    double gInv[16];
+    pseudoInverse4x4(g, gInv);
+
+    // blob assembly: header + solve + validation (falls back to the solve set
+    // when no disjoint candidates exist - the 64-vs-12-DOF overdetermination
+    // still exposes non-affine output) + full centered ref positions (gate)
+    const uint32_t effectiveValidation = pickedValidation > 0 ? pickedValidation : pickedSolve;
+    std::vector<uint8_t> blob(sizeof(ProbeHeader)
+                              + sizeof(ProbeSample) * (size_t(pickedSolve) + effectiveValidation + vertexCount));
+
+    ProbeHeader header = {};
+    header.sampleCount = pickedSolve;
+    header.validationCount = effectiveValidation;
+    header.vertexCount = vertexCount;
+    header.centroid[0] = float(cx);
+    header.centroid[1] = float(cy);
+    header.centroid[2] = float(cz);
+    header.radius = radius;
+    for (int i = 0; i < 16; i++) {
+      header.gInv[i] = float(gInv[i]);
+    }
+    std::memcpy(blob.data(), &header, sizeof(header));
+
+    ProbeSample* samples = reinterpret_cast<ProbeSample*>(blob.data() + sizeof(ProbeHeader));
+    auto writeSample = [&](ProbeSample& out, uint32_t v) {
+      out.index = v;
+      out.x = positions[v * 3 + 0] - float(cx);
+      out.y = positions[v * 3 + 1] - float(cy);
+      out.z = positions[v * 3 + 2] - float(cz);
+    };
+    for (uint32_t i = 0; i < pickedSolve; i++) {
+      writeSample(samples[i], candidates[picked[i]]);
+    }
+    for (uint32_t i = 0; i < effectiveValidation; i++) {
+      const uint32_t pickIndex = pickedValidation > 0 ? pickedSolve + i : i;
+      writeSample(samples[pickedSolve + i], candidates[picked[pickIndex]]);
+    }
+    for (uint32_t v = 0; v < vertexCount; v++) {
+      writeSample(samples[size_t(pickedSolve) + effectiveValidation + v], v);
+    }
+
+    const uint64_t probeVa = m_templateSystem->uploadPromotionProbe(blob.data(), blob.size());
+    if (probeVa == 0) {
+      return;
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(m_promoPendingMutex);
+      m_promoPendingProbes.push_back(PendingProbe { snapshot.geometryHash, probeVa, vertexCount });
+    }
+
+    Logger::info(str::format("[ClusterLOD] ", snapshot.name, ": promotion probe uploaded (verts ", vertexCount,
+                             ", blob ", blob.size() / 1024, " KiB)"));
+  }
+
+  void ClusterLodManager::updatePromotionStates() {
+    if (m_renderSystem == nullptr || !ClusterLodOptions::Promotion::enable()) {
+      return;
+    }
+
+    // adopt worker-uploaded probes
+    {
+      std::lock_guard<std::mutex> lock(m_promoPendingMutex);
+      for (const PendingProbe& pending : m_promoPendingProbes) {
+        if (m_promoNextStateSlot >= lodclusters_remix::ClusterRenderSystem::kPromotionSlotCapacity) {
+          ONCE(Logger::warn("[ClusterLOD] promotion state slots exhausted - further candidates stay Path B"));
+          break;
+        }
+        PromotionCandidate candidate;
+        candidate.probeVa = pending.probeVa;
+        candidate.vertexCount = pending.vertexCount;
+        candidate.stateSlot = m_promoNextStateSlot++;
+        m_promoCandidates.emplace(pending.geometryHash, candidate);
+      }
+      m_promoPendingProbes.clear();
+    }
+
+    if (m_promoCandidates.empty()) {
+      return;
+    }
+
+    if (m_promoStates.size() != lodclusters_remix::ClusterRenderSystem::kPromotionSlotCapacity) {
+      m_promoStates.resize(lodclusters_remix::ClusterRenderSystem::kPromotionSlotCapacity);
+    }
+    m_promoStatesValid = m_renderSystem->readPromotionStates(m_promoStates.data());
+    if (!m_promoStatesValid) {
+      return;
+    }
+
+    const uint32_t rigidFrames = uint32_t(std::max(1, ClusterLodOptions::Promotion::rigidFrames()));
+    const float epsilon = std::max(1e-5f, ClusterLodOptions::Promotion::residualEpsilon());
+    const uint32_t gateLag = uint32_t(std::max(2, ClusterLodOptions::Promotion::gateLagFrames()));
+
+    for (auto& entry : m_promoCandidates) {
+      PromotionCandidate& candidate = entry.second;
+      const lodclusters_remix::PromotionStateView& state = m_promoStates[candidate.stateSlot];
+
+      switch (candidate.phase) {
+      case PromotionCandidate::Phase::Probing:
+        if (state.rigidStreak >= rigidFrames) {
+          candidate.phase = PromotionCandidate::Phase::GateScheduled;
+        }
+        break;
+
+      case PromotionCandidate::Phase::GateRunning:
+        if (++candidate.gateFrames >= gateLag) {
+          if (state.gateResidualRel > 0.0f && state.gateResidualRel <= epsilon) {
+            candidate.phase = PromotionCandidate::Phase::Promoted;
+            m_statsPromoted++;
+            Logger::info(str::format("[ClusterLOD] promotion: geometry 0x", std::hex, entry.first, std::dec,
+                                     " PROMOTED to Path A (full-mesh residual ", state.gateResidualRel, ")"));
+          } else if (state.gateResidualRel > epsilon) {
+            candidate.phase = PromotionCandidate::Phase::Rejected;
+            m_statsPromoRejected++;
+            Logger::info(str::format("[ClusterLOD] promotion: geometry 0x", std::hex, entry.first, std::dec,
+                                     " gate REJECTED - partial deformation (full-mesh residual ",
+                                     state.gateResidualRel, "), stays Path B"));
+            // rejection is terminal - nothing references the probe blob (incl.
+            // its full-mesh ref positions) anymore; deferred-free it (former
+            // V1 limitation: blobs lived until shutdown)
+            if (m_templateSystemMT != nullptr && candidate.probeVa != 0) {
+              m_templateSystemMT->freePromotionProbe(candidate.probeVa);
+              candidate.probeVa = 0;
+            }
+          } else {
+            // gate never accumulated (instance off-screen that frame) - retry
+            candidate.phase = PromotionCandidate::Phase::GateScheduled;
+            candidate.gateFrames = 0;
+          }
+        }
+        break;
+
+      case PromotionCandidate::Phase::Promoted:
+        break;  // demotion is detected on the per-instance slots below
+
+      default:
+        break;
+      }
+    }
+
+    // demotion: PER-INSTANCE (former V1 limitation was geometry-level). An
+    // instance whose last solve went non-rigid, or whose periodic full-mesh
+    // sweep (risk R20) failed, re-routes to Path B by itself - its siblings
+    // keep rendering Path A. A fresh rigid streak re-promotes it.
+    for (auto& slotEntry : m_promoSlotByBlas) {
+      PromoInstance& promoInstance = slotEntry.second;
+      const lodclusters_remix::PromotionStateView& state = m_promoStates[promoInstance.stateSlot];
+
+      // periodic full-mesh sweep verdict (same lag handling as the gate)
+      if (promoInstance.sweepPending && ++promoInstance.sweepLagFrames >= gateLag) {
+        promoInstance.sweepPending = false;
+        if (state.gateResidualRel > epsilon && !promoInstance.demoted) {
+          promoInstance.demoted = true;
+          Logger::info(str::format("[ClusterLOD] promotion: instance (slot ", promoInstance.stateSlot,
+                                   ") DEMOTED to Path B - full-mesh sweep residual ", state.gateResidualRel,
+                                   " (sparse-blind partial deformation, risk R20)"));
+        }
+      }
+
+      if (!promoInstance.demoted && (state.flags & 4u) != 0) {
+        promoInstance.demoted = true;
+        Logger::info(str::format("[ClusterLOD] promotion: instance (slot ", promoInstance.stateSlot,
+                                 ") DEMOTED to Path B (solve went non-rigid; last-good transform covered the lag)"));
+      } else if (promoInstance.demoted && state.rigidStreak >= rigidFrames) {
+        promoInstance.demoted = false;
+        Logger::info(str::format("[ClusterLOD] promotion: instance (slot ", promoInstance.stateSlot,
+                                 ") RE-PROMOTED to Path A (rigid streak rebuilt)"));
+      }
+    }
+  }
+
+  void ClusterLodManager::buildPromotionEntries() {
+    m_framePromoEntries.clear();
+
+    if (m_renderSystem == nullptr || !m_renderSystem->hasGeneration()
+        || !ClusterLodOptions::Promotion::enable() || m_promoCandidates.empty()) {
+      return;
+    }
+
+    // Path B instances: geometry-level probe / gate entries (one per candidate
+    // per frame - rigidity is a property of the shared capture content class,
+    // every instance solves the same way for the verdict's purposes)
+    std::unordered_set<uint64_t> emitted;
+    std::unordered_set<uint32_t> emittedInstanceSlots;
+    for (const size_t tlasType : { size_t(Tlas::Opaque), size_t(Tlas::Unordered) }) {
+      for (size_t i = 0; i < m_slotsB[tlasType].size(); i++) {
+        const ClusterSlot& slot = m_slotsB[tlasType][i];
+        const uint32_t framePoseIndex = slot.geometryId & ~kPathBTag;
+        if (framePoseIndex >= m_framePoses.size()) {
+          continue;
+        }
+        const BlasEntry* blasEntry = slot.instance->getBlas();
+        if (blasEntry == nullptr) {
+          continue;
+        }
+        const XXH64_hash_t hash = blasEntry->input.getGeometryData().getHashForRule(RtxOptions::geometryAssetHashRule());
+        const auto found = m_promoCandidates.find(hash);
+        if (found == m_promoCandidates.end()) {
+          continue;
+        }
+        PromotionCandidate& candidate = found->second;
+
+        // DEMOTED promoted-instance rendering Path B: keep solving ITS OWN
+        // slot so a rebuilt rigid streak re-promotes it (per-instance
+        // demotion; dedup by state slot - instances sharing a BlasEntry share
+        // capture content and therefore a slot)
+        if (candidate.phase == PromotionCandidate::Phase::Promoted && candidate.probeVa != 0) {
+          const auto instanceIt = m_promoSlotByBlas.find(blasEntry);
+          if (instanceIt != m_promoSlotByBlas.end() && instanceIt->second.demoted
+              && emittedInstanceSlots.insert(instanceIt->second.stateSlot).second) {
+            lodclusters_remix::PromotionEntry probeEntry;
+            probeEntry.probeVa = candidate.probeVa;
+            probeEntry.captureVa = m_framePoses[framePoseIndex].positionsAddress;
+            probeEntry.captureStrideBytes = m_framePoses[framePoseIndex].positionsStrideBytes;
+            probeEntry.stateSlot = instanceIt->second.stateSlot;
+            probeEntry.patchSlot = 0xFFFFFFFFu;
+            m_framePromoEntries.push_back(probeEntry);
+          }
+          continue;
+        }
+
+        if (candidate.phase == PromotionCandidate::Phase::Rejected
+            || candidate.phase == PromotionCandidate::Phase::Promoted) {
+          continue;
+        }
+        if (!emitted.insert(hash).second) {
+          continue;
+        }
+
+        lodclusters_remix::PromotionEntry promoEntry;
+        promoEntry.probeVa = candidate.probeVa;
+        promoEntry.captureVa = m_framePoses[framePoseIndex].positionsAddress;
+        promoEntry.captureStrideBytes = m_framePoses[framePoseIndex].positionsStrideBytes;
+        promoEntry.stateSlot = candidate.stateSlot;
+        promoEntry.patchSlot = 0xFFFFFFFFu;
+        if (candidate.phase == PromotionCandidate::Phase::GateScheduled) {
+          promoEntry.mode = 1;
+          promoEntry.vertexCount = candidate.vertexCount;
+          candidate.phase = PromotionCandidate::Phase::GateRunning;
+          candidate.gateFrames = 0;
+        }
+        m_framePromoEntries.push_back(promoEntry);
+      }
+    }
+
+    // Path A slots: per-INSTANCE solve+patch entries for promoted instances
+    // (plan R21: each instance's capture carries its own transform, so each
+    // gets its own state slot for M/prevM continuity and hit-side fetch)
+    uint32_t flatIndex = 0;
+    for (const size_t tlasType : { size_t(Tlas::Opaque), size_t(Tlas::Unordered) }) {
+      for (size_t i = 0; i < m_slots[tlasType].size(); i++, flatIndex++) {
+        const ClusterSlot& slot = m_slots[tlasType][i];
+        if ((slot.geometryId & kPromotedTag) == 0) {
+          continue;
+        }
+        const BlasEntry* blasEntry = slot.instance->getBlas();
+        if (blasEntry == nullptr) {
+          continue;
+        }
+        const XXH64_hash_t hash = blasEntry->input.getGeometryData().getHashForRule(RtxOptions::geometryAssetHashRule());
+        const auto found = m_promoCandidates.find(hash);
+        if (found == m_promoCandidates.end()) {
+          continue;
+        }
+
+        const RaytraceBuffer& positions = blasEntry->modifiedGeometryData.positionBuffer;
+
+        lodclusters_remix::PromotionEntry promoEntry;
+        promoEntry.probeVa = found->second.probeVa;
+        promoEntry.captureVa = positions.getDeviceAddress() + positions.offsetFromSlice();
+        promoEntry.captureStrideBytes = positions.stride();
+        promoEntry.stateSlot = (slot.geometryId >> kPromotedSlotShift) & 0x1FFFu;
+        promoEntry.patchSlot = flatIndex;
+        m_framePromoEntries.push_back(promoEntry);
+
+        // periodic full-mesh residual sweep (risk R20): the sparse solve can
+        // miss a VS animating a small vertex subset, so every promoted
+        // instance re-runs the every-vertex gate on a stagger. Reads the M the
+        // solve entry above writes this frame (recordPromotion orders gates
+        // after solves); the verdict demotes just this instance.
+        const uint32_t sweepInterval = uint32_t(std::max(0, ClusterLodOptions::Promotion::fullSweepIntervalFrames()));
+        if (sweepInterval > 0 && found->second.probeVa != 0) {
+          const auto instanceIt = m_promoSlotByBlas.find(blasEntry);
+          if (instanceIt != m_promoSlotByBlas.end() && !instanceIt->second.sweepPending
+              && ((m_device->getCurrentFrameId() + instanceIt->second.stateSlot) % sweepInterval) == 0) {
+            lodclusters_remix::PromotionEntry sweepEntry = promoEntry;
+            sweepEntry.patchSlot = 0xFFFFFFFFu;
+            sweepEntry.mode = 1;
+            sweepEntry.vertexCount = found->second.vertexCount;
+            m_framePromoEntries.push_back(sweepEntry);
+            instanceIt->second.sweepPending = true;
+            instanceIt->second.sweepLagFrames = 0;
+          }
+        }
+      }
+    }
   }
 
   bool ClusterLodManager::ensureTemplateSystem() {
@@ -333,6 +884,16 @@ namespace dxvk {
       m_templateSystemFailed = true;
       return false;
     }
+
+    // P4c: from here on the template system locks around its raw vkQueueSubmit
+    // calls itself - fence waits run unlocked, so a registration flood cannot
+    // block the render threads' submissions for the GPU duration of each
+    // template build (init above ran under the external lock, callbacks
+    // deliberately installed after)
+    DxvkDevice* device = m_device;
+    templateSystem->setSubmitLockCallbacks(
+      [device] { device->lockSubmission(); },
+      [device] { device->unlockSubmission(); });
 
     m_templateSystem = std::move(templateSystem);
 
@@ -399,9 +960,9 @@ namespace dxvk {
       if (m_renderSystem->getFrameStats(frameStats)) {
         Logger::info(str::format("[ClusterLOD] render: generation ", m_generationCount,
                                  ", geometries ", m_geometryIdByHash.size(),
-                                 ", slots opaque ", m_slots[Tlas::Opaque].size(),
-                                 " unordered ", m_slots[Tlas::Unordered].size(),
-                                 " pathB ", m_slotsB[Tlas::Opaque].size() + m_slotsB[Tlas::Unordered].size(),
+                                 ", slots opaque ", m_statsSlotsOpaque,
+                                 " unordered ", m_statsSlotsUnordered,
+                                 " pathB ", m_statsSlotsPathB,
                                  ", renderClusters ", frameStats.numRenderClusters,
                                  ", blasBuilds ", frameStats.numBlasBuilds,
                                  ", blasBytes ", frameStats.blasActualSizeBytes,
@@ -586,9 +1147,14 @@ namespace dxvk {
       return 0.0;
     }
 
-    // batch generation updates
+    // batch generation updates. Cache-hit batches take the fast lane (P4c,
+    // plan 7.7): a .nvsngeo load costs milliseconds, so the full cooldown
+    // would delay the classic->cluster flip with nothing to amortize.
     const uint32_t currentFrame = m_device->getCurrentFrameId();
-    const uint32_t cooldown = uint32_t(std::max(1, ClusterLodOptions::Render::generationCooldownFrames()));
+    uint32_t cooldown = uint32_t(std::max(1, ClusterLodOptions::Render::generationCooldownFrames()));
+    if (m_pendingHasCacheHit) {
+      cooldown = std::min(cooldown, uint32_t(std::max(1, ClusterLodOptions::Render::cacheHitCooldownFrames())));
+    }
     if (m_generationCount > 0 && currentFrame - m_lastGenerationFrame < cooldown) {
       return 0.0;
     }
@@ -624,6 +1190,9 @@ namespace dxvk {
         const std::vector<lodclusters_remix::GeometryRenderInfo>& infos = m_renderSystem->getGeometryRenderInfos();
         for (uint32_t geometryId = uint32_t(m_residentGeometryHashes.size()); geometryId < infos.size(); geometryId++) {
           m_geometryIdByHash.emplace(infos[geometryId].geometryHash, geometryId);
+          if (infos[geometryId].lodLevelsCount <= 1) {
+            m_trivialGeometryIds.insert(geometryId);  // F7
+          }
         }
 
         m_residentGeometryHashes.insert(m_residentGeometryHashes.end(),
@@ -634,6 +1203,7 @@ namespace dxvk {
                                  " in ", elapsedMs(generationStart), " ms (lock wait ", appendLockWaitMs, " ms)"));
 
         m_pendingGeometryHashes.clear();
+        m_pendingHasCacheHit = false;
         m_lastGenerationFrame = currentFrame;
 
         // instances of the appended geometries flip classic -> cluster: their
@@ -652,6 +1222,7 @@ namespace dxvk {
                                 " geometries FAILED - they stay on the classic path (",
                                 elapsedMs(generationStart), " ms)"));
         m_pendingGeometryHashes.clear();
+        m_pendingHasCacheHit = false;
         m_lastGenerationFrame = currentFrame;
         return elapsedMs(generationStart);
       }
@@ -666,6 +1237,7 @@ namespace dxvk {
     m_residentGeometryHashes.insert(m_residentGeometryHashes.end(),
                                     m_pendingGeometryHashes.begin(), m_pendingGeometryHashes.end());
     m_pendingGeometryHashes.clear();
+    m_pendingHasCacheHit = false;
 
     std::vector<std::string> cacheFiles;
     cacheFiles.reserve(m_residentGeometryHashes.size());
@@ -683,6 +1255,7 @@ namespace dxvk {
     m_frameOverflowCount = 0;
 
     m_geometryIdByHash.clear();
+    m_trivialGeometryIds.clear();
 
     if (!built) {
       // isClusterInstance rejects everything while no generation exists; retried
@@ -698,6 +1271,9 @@ namespace dxvk {
     const std::vector<lodclusters_remix::GeometryRenderInfo>& infos = m_renderSystem->getGeometryRenderInfos();
     for (uint32_t geometryId = 0; geometryId < infos.size(); geometryId++) {
       m_geometryIdByHash.emplace(infos[geometryId].geometryHash, geometryId);
+      if (infos[geometryId].lodLevelsCount <= 1) {
+        m_trivialGeometryIds.insert(geometryId);  // F7
+      }
     }
 
     m_generationCount++;
@@ -816,8 +1392,13 @@ namespace dxvk {
 
     // geometries whose background processing completed; they join the
     // generation (append or rebuild) once the cooldown batches them
-    for (const uint64_t hash : m_provider->drainReadyGeometries()) {
-      m_pendingGeometryHashes.push_back(hash);
+    // P4c: adopt worker-uploaded promotion probes, read GPU verdicts, run the
+    // promote/demote state machine (plan 7.7)
+    updatePromotionStates();
+
+    for (const ClusterLodGeometryProvider::ReadyGeometry& ready : m_provider->drainReadyGeometries()) {
+      m_pendingGeometryHashes.push_back(ready.hash);
+      m_pendingHasCacheHit |= ready.fromCache;
     }
 
     const double generationMs = buildGenerationIfDue(accelManager, instanceManager);
@@ -869,33 +1450,83 @@ namespace dxvk {
                              && blasEntry->frameLastUpdated != blasEntry->frameCreated;
 
     if (skinned || captured || updatedInPlace) {
+      // ---- P4c rigid-capture promotion (plan 7.7): PROMOTED captured
+      // instances render Path A LOD clusters; the promotion kernel patches
+      // their worldMatrix/TLAS transform from the per-frame solve ----
+      if (captured && !skinned && !updatedInPlace
+          && m_renderSystem != nullptr && m_renderSystem->hasGeneration()
+          && ClusterLodOptions::Promotion::enable() && !m_promoCandidates.empty()) {
+        const XXH64_hash_t geometryHash = blasEntry->input.getGeometryData().getHashForRule(RtxOptions::geometryAssetHashRule());
+        const auto candidate = m_promoCandidates.find(geometryHash);
+        if (candidate != m_promoCandidates.end()
+            && candidate->second.phase == PromotionCandidate::Phase::Promoted) {
+          const auto found = m_geometryIdByHash.find(geometryHash);
+          if (found != m_geometryIdByHash.end()
+              && found->second <= kPromotedGeometryMask
+              && (!ClusterLodOptions::Render::routeTrivialToClassic() || m_trivialGeometryIds.count(found->second) == 0)) {
+            const uint32_t usedSlots = uint32_t(m_slots[Tlas::Opaque].size() + m_slots[Tlas::Unordered].size());
+            if (usedSlots < m_renderSystem->getMaxRenderInstances()) {
+              // per-INSTANCE promotion state slot (plan R21: every captured
+              // instance's buffer carries its own transform)
+              auto slotIt = m_promoSlotByBlas.find(blasEntry);
+              if (slotIt == m_promoSlotByBlas.end()
+                  && m_promoNextStateSlot < lodclusters_remix::ClusterRenderSystem::kPromotionSlotCapacity) {
+                PromoInstance promoInstance;
+                promoInstance.stateSlot = m_promoNextStateSlot++;
+                slotIt = m_promoSlotByBlas.emplace(blasEntry, promoInstance).first;
+              }
+              // per-instance demotion: a demoted instance falls through to
+              // Path B below while its siblings stay promoted; its slot keeps
+              // solving (buildPromotionEntries) so it can re-promote
+              if (slotIt != m_promoSlotByBlas.end() && !slotIt->second.demoted) {
+                outGeometryId = kPromotedTag | (slotIt->second.stateSlot << kPromotedSlotShift) | found->second;
+                return true;
+              }
+            }
+          }
+        }
+      }
+
       return isClusterTemplateInstance(instance, blasEntry, outGeometryId);
     }
 
-    if (m_renderSystem == nullptr || !m_renderSystem->hasGeneration()) {
-      return false;
+    // ---- P4c ladder: Path A when resident, interim templates while it loads ----
+    if (m_renderSystem != nullptr && m_renderSystem->hasGeneration()) {
+      // pure geometry hash - MUST match the intake's keying (see onDrawCallGeometry)
+      const XXH64_hash_t geometryHash = blasEntry->input.getGeometryData().getHashForRule(RtxOptions::geometryAssetHashRule());
+
+      const auto found = m_geometryIdByHash.find(geometryHash);
+      if (found != m_geometryIdByHash.end()) {
+        // F7: single-LOD-level geometry gains nothing from the cluster path -
+        // NVIDIA's own guidance keeps purely static no-LOD data on the classic
+        // triangle BLAS (which also bucket-merges it)
+        if (ClusterLodOptions::Render::routeTrivialToClassic() && m_trivialGeometryIds.count(found->second) != 0) {
+          return false;
+        }
+
+        // capacity guard: overflowing instances render classic this frame; the next
+        // generation rebuild grows the renderer's buffers
+        const uint32_t usedSlots = uint32_t(m_slots[Tlas::Opaque].size() + m_slots[Tlas::Unordered].size());
+        if (usedSlots >= m_renderSystem->getMaxRenderInstances()) {
+          m_frameOverflowCount++;
+          ONCE(Logger::warn(str::format("[ClusterLOD] render instance capacity (",
+                                        m_renderSystem->getMaxRenderInstances(),
+                                        ") exceeded - overflowing instances render classic until the capacity grows")));
+          return false;
+        }
+
+        outGeometryId = found->second;
+        return true;
+      }
     }
 
-    const XXH64_hash_t geometryHash = blasEntry->input.getHash(RtxOptions::geometryAssetHashRule());
-
-    const auto found = m_geometryIdByHash.find(geometryHash);
-    if (found == m_geometryIdByHash.end()) {
-      return false;
-    }
-
-    // capacity guard: overflowing instances render classic this frame; the next
-    // generation rebuild grows the renderer's buffers
-    const uint32_t usedSlots = uint32_t(m_slots[Tlas::Opaque].size() + m_slots[Tlas::Unordered].size());
-    if (usedSlots >= m_renderSystem->getMaxRenderInstances()) {
-      m_frameOverflowCount++;
-      ONCE(Logger::warn(str::format("[ClusterLOD] render instance capacity (",
-                                    m_renderSystem->getMaxRenderInstances(),
-                                    ") exceeded - overflowing instances render classic until the capacity grows")));
-      return false;
-    }
-
-    outGeometryId = found->second;
-    return true;
+    // not (yet) resident in the LOD generation: render through the interim
+    // template set the worker registered at first sight. A lookup miss falls
+    // through to classic - that covers interim disabled, the cache-hit skip,
+    // and the first frames before the registration lands. Once the geometry
+    // joins the generation the branch above wins and the interim pose sets
+    // age out via the normal 60-frame pose GC.
+    return isClusterTemplateInstance(instance, blasEntry, outGeometryId);
   }
 
   bool ClusterLodManager::isClusterTemplateInstance(const RtInstance* instance, const BlasEntry* blasEntry, uint32_t& outGeometryId) {
@@ -1008,12 +1639,19 @@ namespace dxvk {
       return;
     }
 
+    // P4c: promoted rigid-captured instances arrive TAGGED (bit 30 + state
+    // slot); the slot list keeps the tagged id (buildPromotionEntries decodes
+    // it), table lookups and the surface use the plain geometryId
+    const bool promoted = (geometryId & kPromotedTag) != 0;
+    const uint32_t plainGeometryId = promoted ? (geometryId & kPromotedGeometryMask) : geometryId;
+    const uint32_t promoStateSlotPlusOne = promoted ? (((geometryId >> kPromotedSlotShift) & 0x1FFFu) + 1u) : 0u;
+
     m_slots[tlasType].push_back({ instance, geometryId });
 
     // pre-fill blasReference with the geometry's low-detail BLAS: the safe default
     // instance_assign_blas expects for skipped/culled builds
     VkAccelerationStructureInstanceKHR instanceData = blasInstance;
-    instanceData.accelerationStructureReference = m_renderSystem->getGeometryRenderInfos()[geometryId].lowDetailBlasAddress;
+    instanceData.accelerationStructureReference = m_renderSystem->getGeometryRenderInfos()[plainGeometryId].lowDetailBlasAddress;
     m_slotInstanceData[tlasType].push_back(instanceData);
 
     if (isSssDuplicate) {
@@ -1023,10 +1661,13 @@ namespace dxvk {
       m_sssDuplicates.push_back({ uint32_t(m_slots[Tlas::Opaque].size() - 1) });
     }
 
-    // hit-side routing (surface_interaction cluster fetch)
+    // hit-side routing (surface_interaction cluster fetch). Promoted instances
+    // pack (stateSlot+1) into bits [30:18] - their object->world transforms
+    // are GPU-solved and fetched from the promotion state buffer at hit time;
+    // plain cluster surfaces keep 0 there and use the CPU surface matrices.
     instance->surface.isClusterLod = true;
     instance->surface.isClusterTemplate = false;
-    instance->surface.clusterGeometryId = geometryId;
+    instance->surface.clusterGeometryId = plainGeometryId | (promoStateSlotPlusOne << 18);
   }
 
   uint32_t ClusterLodManager::getClusterSlotCount(size_t tlasType) const {
@@ -1043,9 +1684,22 @@ namespace dxvk {
     const uint32_t numUnordered = uint32_t(m_slots[Tlas::Unordered].size());
     const uint32_t count = numOpaque + numUnordered;
 
+    // stats latch: the periodic digest runs in onFrameBegin AFTER the per-frame
+    // slot reset, so reading m_slots there always shows 0 (verified in the
+    // 2026-07-04 log against a live first-cluster-dispatch of 18) - report the
+    // counts captured here, while they are live
+    m_statsSlotsOpaque = numOpaque;
+    m_statsSlotsUnordered = numUnordered;
+
     const uint32_t countB = uint32_t(m_slotsB[Tlas::Opaque].size() + m_slotsB[Tlas::Unordered].size());
 
-    const bool pathAActive = m_renderSystem != nullptr && m_renderSystem->hasGeneration() && count > 0;
+    // P4c: this frame's promotion solve/gate/patch work items (needs the slot
+    // lists, which are final here). Probing runs even when no Path A instance
+    // rendered this frame - recordFrame handles the promotion-only case.
+    buildPromotionEntries();
+
+    const bool pathAActive = m_renderSystem != nullptr && m_renderSystem->hasGeneration()
+                          && (count > 0 || !m_framePromoEntries.empty());
     const bool pathBActive = m_templateSystemMT != nullptr && countB > 0;
 
     if (!pathAActive && !pathBActive) {
@@ -1082,7 +1736,10 @@ namespace dxvk {
 
         lodclusters_remix::InstanceInput& input = instanceInputs[flatIndex];
         writeMatrix(input.worldMatrix, slot.instance->getTransform());
-        input.geometryID = slot.geometryId;
+        // P4c: promoted slots carry the tag + state slot; the renderer wants
+        // the plain table index (its worldMatrix gets kernel-patched anyway)
+        input.geometryID = (slot.geometryId & kPromotedTag) ? (slot.geometryId & kPromotedGeometryMask)
+                                                            : slot.geometryId;
         // actual two-sidedness is carried per cluster in the baked state bits
         input.twoSided = false;
         input.opaqueStatus = slot.instance->surface.alphaState.isFullyOpaque ? 1u : 2u;
@@ -1093,7 +1750,8 @@ namespace dxvk {
 
     // one-time proof of what the reserved TLAS slots carry before the GPU patch:
     // mask 0 = invisible to every ray, blas 0 = rays pass through until
-    // instance_assign_blas patches the slot
+    // instance_assign_blas patches the slot (skipped on promotion-only frames)
+    if (count > 0)
     ONCE(Logger::info(str::format("[ClusterLOD] first cluster dispatch: slots opaque ", numOpaque,
                                   ", unordered ", numUnordered,
                                   "; slot0 mask 0x", std::hex, uint32_t(tlasInstances[0].mask),
@@ -1143,6 +1801,11 @@ namespace dxvk {
     frameParams.sharingEnabledLevels = uint32_t(std::clamp(ClusterLodOptions::Render::sharingEnabledLevels(), 0, 32));
     frameParams.cachingAgeThreshold = uint32_t(std::clamp(ClusterLodOptions::Streaming::cachingAgeThreshold(), 1, 4096));
     frameParams.cachingEnabledLevels = uint32_t(std::clamp(ClusterLodOptions::Streaming::cachingEnabledLevels(), 0, 32));
+
+    // P4c rigid-capture promotion: this frame's solve/gate/patch work items
+    frameParams.promotionEntries = m_framePromoEntries.empty() ? nullptr : m_framePromoEntries.data();
+    frameParams.promotionEntryCount = uint32_t(m_framePromoEntries.size());
+    frameParams.promotionResidualEpsilon = std::max(1e-5f, ClusterLodOptions::Promotion::residualEpsilon());
 
     // P4: HiZ occlusion feed. This runs from SceneManager::prepareSceneData,
     // BEFORE injectRTX re-points m_primaryDepth at this frame's target - so
@@ -1291,6 +1954,9 @@ namespace dxvk {
     const uint32_t countB = numOpaqueB + numUnorderedB;
     const uint32_t poseCount = uint32_t(m_framePoses.size());
 
+    // stats latch (see dispatchBuild)
+    m_statsSlotsPathB = countB;
+
     if (countB == 0 || poseCount == 0) {
       return;
     }
@@ -1407,6 +2073,13 @@ namespace dxvk {
       return 0;
     }
     return m_renderSystem->getGeometriesTableAddress();
+  }
+
+  uint64_t ClusterLodManager::getPromotionStateAddress() const {
+    if (m_renderSystem == nullptr || !ClusterLodOptions::Promotion::enable()) {
+      return 0;
+    }
+    return m_renderSystem->getPromotionStateAddress();
   }
 
   uint64_t ClusterLodManager::getAnimatedClusterTableAddress() const {

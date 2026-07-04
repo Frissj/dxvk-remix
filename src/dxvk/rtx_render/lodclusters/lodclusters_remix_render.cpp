@@ -156,6 +156,33 @@ struct ClusterRenderSystem::Impl
   bool      lodLatchValid = false;
   bool      depthConventionLogged = false;
 
+  // ---- P4c rigid-capture promotion (plan 7.7 spec) ----
+  // System scope (survives generation swaps). SoA state: matrices hold M +
+  // prevM (96 B/slot, prevM read by the hit side for motion vectors), status
+  // holds the 32 B/slot compact state the CPU reads back. Entries ride a
+  // host-visible BDA ring; the status array is copied into a host readback
+  // ring each frame promotion work ran.
+  static constexpr uint32_t kPromoMatricesStride = 96;
+  static constexpr uint32_t kPromoStatusStride   = 32;
+  static constexpr uint32_t kPromoEntryStride    = sizeof(PromotionEntry);
+
+  shaderc::SpvCompilationResult promoShader;
+  VkPipelineLayout promoPipelineLayout = VK_NULL_HANDLE;
+  VkPipeline       promoPipeline       = VK_NULL_HANDLE;
+  nvvk::Buffer promoMatricesBuffer;
+  nvvk::Buffer promoStatusBuffer;
+  nvvk::Buffer promoEntryBuffers[kStagingSlots];
+  nvvk::Buffer promoReadbackBuffers[kStagingSlots];
+  uint32_t promoUsedSlots = 0;                        // stateSlot high-water + 1
+  uint32_t promoReadbackUsedSlots[kStagingSlots] = {};
+  uint32_t promoFramesRecorded = 0;
+  bool     promoStateCleared = false;
+  bool     promoReady = false;
+
+  bool initPromotion();
+  void deinitPromotion();
+  void recordPromotion(VkCommandBuffer cmd, const FrameParams& frame, uint32_t instanceCount);
+
   void destroyGeneration()
   {
     if(renderer)
@@ -208,6 +235,241 @@ struct ClusterRenderSystem::Impl
   }
 };
 
+// ---- P4c rigid-capture promotion (plan 7.7 spec) -----------------------------
+
+// mirrors promotion_solve.comp's push_constant block (scalar layout - u64s
+// first, then 32-bit fields, identical order)
+struct PromoPush
+{
+  uint64_t entriesVa;
+  uint64_t matricesVa;
+  uint64_t statusVa;
+  uint64_t renderInstancesVa;
+  uint64_t tlasInstancesVa;
+  uint32_t entryCount;
+  uint32_t frameId;
+  uint32_t riStrideBytes;
+  uint32_t riWorldMatrixOffset;
+  uint32_t riWorldMatrixIOffset;
+  uint32_t riFlipWindingOffset;
+  float    residualEpsilon;
+  uint32_t gateEntryIndex;
+};
+
+bool ClusterRenderSystem::Impl::initPromotion()
+{
+  // pipeline: push constants + buffer device addresses only, no descriptors
+  if(!res.compileShader(promoShader, VK_SHADER_STAGE_COMPUTE_BIT, "promotion_solve.comp.glsl", nullptr))
+  {
+    LOGE("ClusterRenderSystem: promotion_solve shader missing from the variant table\n");
+    return false;
+  }
+
+  VkPushConstantRange pushRange{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PromoPush)};
+  VkPipelineLayoutCreateInfo pipeLayoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  pipeLayoutInfo.pushConstantRangeCount = 1;
+  pipeLayoutInfo.pPushConstantRanges    = &pushRange;
+  NVVK_CHECK(vkCreatePipelineLayout(deviceInfo.device, &pipeLayoutInfo, nullptr, &promoPipelineLayout));
+
+  VkShaderModuleCreateInfo shaderInfo = nvvkglsl::GlslCompiler::makeShaderModuleCreateInfo(promoShader);
+  VkComputePipelineCreateInfo compInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+  compInfo.stage       = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+  compInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+  compInfo.stage.pName = "main";
+  compInfo.stage.pNext = &shaderInfo;
+  compInfo.layout      = promoPipelineLayout;
+  NVVK_CHECK(vkCreateComputePipelines(deviceInfo.device, nullptr, 1, &compInfo, nullptr, &promoPipeline));
+
+  NVVK_CHECK(res.createBuffer(promoMatricesBuffer, size_t(kPromoMatricesStride) * kPromotionSlotCapacity,
+                              VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT
+                                  | VK_BUFFER_USAGE_2_TRANSFER_DST_BIT));
+  NVVK_CHECK(res.createBuffer(promoStatusBuffer, size_t(kPromoStatusStride) * kPromotionSlotCapacity,
+                              VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT
+                                  | VK_BUFFER_USAGE_2_TRANSFER_DST_BIT | VK_BUFFER_USAGE_2_TRANSFER_SRC_BIT));
+
+  for(uint32_t i = 0; i < kStagingSlots; i++)
+  {
+    NVVK_CHECK(res.createBuffer(promoEntryBuffers[i], size_t(kPromoEntryStride) * kPromotionSlotCapacity,
+                                VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT,
+                                VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                                VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT));
+    NVVK_CHECK(res.createBuffer(promoReadbackBuffers[i], size_t(kPromoStatusStride) * kPromotionSlotCapacity,
+                                VK_BUFFER_USAGE_2_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                                VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT));
+  }
+
+  promoReady = promoPipeline != VK_NULL_HANDLE && promoMatricesBuffer.buffer != VK_NULL_HANDLE
+               && promoStatusBuffer.buffer != VK_NULL_HANDLE;
+  return promoReady;
+}
+
+void ClusterRenderSystem::Impl::deinitPromotion()
+{
+  if(promoPipeline != VK_NULL_HANDLE)
+  {
+    vkDestroyPipeline(deviceInfo.device, promoPipeline, nullptr);
+    promoPipeline = VK_NULL_HANDLE;
+  }
+  if(promoPipelineLayout != VK_NULL_HANDLE)
+  {
+    vkDestroyPipelineLayout(deviceInfo.device, promoPipelineLayout, nullptr);
+    promoPipelineLayout = VK_NULL_HANDLE;
+  }
+  if(promoMatricesBuffer.buffer)
+  {
+    res.m_allocator.destroyBuffer(promoMatricesBuffer);
+  }
+  if(promoStatusBuffer.buffer)
+  {
+    res.m_allocator.destroyBuffer(promoStatusBuffer);
+  }
+  for(uint32_t i = 0; i < kStagingSlots; i++)
+  {
+    if(promoEntryBuffers[i].buffer)
+    {
+      res.m_allocator.destroyBuffer(promoEntryBuffers[i]);
+    }
+    if(promoReadbackBuffers[i].buffer)
+    {
+      res.m_allocator.destroyBuffer(promoReadbackBuffers[i]);
+    }
+  }
+  promoReady = false;
+}
+
+void ClusterRenderSystem::Impl::recordPromotion(VkCommandBuffer cmd, const FrameParams& frame, uint32_t instanceCount)
+{
+  if(!promoReady)
+  {
+    return;
+  }
+
+  const uint32_t slot = frameIndex % kStagingSlots;
+
+  // one-time zero init of the persistent state (recorded before any use)
+  const bool needsClear = !promoStateCleared;
+  if(needsClear)
+  {
+    vkCmdFillBuffer(cmd, promoMatricesBuffer.buffer, 0, VK_WHOLE_SIZE, 0);
+    vkCmdFillBuffer(cmd, promoStatusBuffer.buffer, 0, VK_WHOLE_SIZE, 0);
+    promoStateCleared = true;
+  }
+
+  uint32_t entryCount = frame.promotionEntryCount;
+  if(entryCount > kPromotionSlotCapacity)
+  {
+    entryCount = kPromotionSlotCapacity;
+  }
+  if(entryCount == 0 || frame.promotionEntries == nullptr)
+  {
+    promoReadbackUsedSlots[slot] = 0;
+    return;
+  }
+
+  // stage this frame's entries (host-coherent mapped ring, read via BDA);
+  // drop entries whose patch target would exceed this frame's instance range
+  PromotionEntry* stagedEntries = reinterpret_cast<PromotionEntry*>(promoEntryBuffers[slot].mapping);
+  bool anyGate = false;
+  uint32_t usedSlots = promoUsedSlots;
+  for(uint32_t i = 0; i < entryCount; i++)
+  {
+    PromotionEntry entry = frame.promotionEntries[i];
+    if(entry.patchSlot != 0xFFFFFFFFu && entry.patchSlot >= instanceCount)
+    {
+      entry.patchSlot = 0xFFFFFFFFu;
+    }
+    if(entry.stateSlot >= kPromotionSlotCapacity)
+    {
+      entry.patchSlot = 0xFFFFFFFFu;
+      entry.stateSlot = kPromotionSlotCapacity - 1;
+    }
+    anyGate |= entry.mode == 1;
+    usedSlots = std::max(usedSlots, entry.stateSlot + 1);
+    stagedEntries[i] = entry;
+  }
+  promoUsedSlots = std::min(usedSlots, kPromotionSlotCapacity);
+
+  // gate entries: reset their max-residual accumulators
+  for(uint32_t i = 0; i < entryCount; i++)
+  {
+    if(stagedEntries[i].mode == 1)
+    {
+      vkCmdFillBuffer(cmd, promoStatusBuffer.buffer,
+                      VkDeviceSize(stagedEntries[i].stateSlot) * kPromoStatusStride + 4, 4, 0);
+    }
+  }
+
+  // fills + this frame's instance-array upload -> kernel reads/writes
+  VkMemoryBarrier memBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+  memBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  memBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+  vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &memBarrier, 0,
+                       nullptr, 0, nullptr);
+
+  auto timerSection = profilerGpuTimer.cmdFrameSection(cmd, "Promotion Solve");
+
+  PromoPush push{};
+  push.entriesVa            = promoEntryBuffers[slot].address;
+  push.matricesVa           = promoMatricesBuffer.address;
+  push.statusVa             = promoStatusBuffer.address;
+  push.renderInstancesVa    = renderer->getRenderInstanceBuffer().address;
+  push.tlasInstancesVa      = renderer->getTlasInstancesBuffer().address;
+  push.entryCount           = entryCount;
+  push.frameId              = frameIndex;
+  push.riStrideBytes        = uint32_t(sizeof(shaderio::RenderInstance));
+  push.riWorldMatrixOffset  = uint32_t(offsetof(shaderio::RenderInstance, worldMatrix));
+  push.riWorldMatrixIOffset = uint32_t(offsetof(shaderio::RenderInstance, worldMatrixI));
+  // dword packing flipWinding|twoSided|multiMaterial|opaqueStatus - the kernel
+  // RMWs it, so the byte layout must stay dword-aligned
+  static_assert(offsetof(shaderio::RenderInstance, flipWinding) % 4 == 0
+                && offsetof(shaderio::RenderInstance, twoSided) == offsetof(shaderio::RenderInstance, flipWinding) + 1,
+                "promotion_solve RMWs this dword");
+  push.riFlipWindingOffset  = uint32_t(offsetof(shaderio::RenderInstance, flipWinding));
+  push.residualEpsilon      = frame.promotionResidualEpsilon;
+  push.gateEntryIndex       = 0xFFFFFFFFu;
+
+  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, promoPipeline);
+  vkCmdPushConstants(cmd, promoPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PromoPush), &push);
+  vkCmdDispatch(cmd, entryCount, 1, 1);
+
+  // full-mesh gate sweeps read the matrices the solve above just wrote
+  if(anyGate)
+  {
+    memBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    memBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
+                         &memBarrier, 0, nullptr, 0, nullptr);
+
+    for(uint32_t i = 0; i < entryCount; i++)
+    {
+      const PromotionEntry& entry = stagedEntries[i];
+      if(entry.mode != 1 || entry.vertexCount == 0)
+      {
+        continue;
+      }
+      push.gateEntryIndex = i;
+      vkCmdPushConstants(cmd, promoPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PromoPush), &push);
+      vkCmdDispatch(cmd, (entry.vertexCount + 63u) / 64u, 1, 1);
+    }
+  }
+
+  // patch writes -> downstream kernels + copy-out; status writes -> readback
+  memBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+  memBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+  vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &memBarrier, 0,
+                       nullptr, 0, nullptr);
+
+  // status snapshot for the CPU (readPromotionStates drains with the ring lag)
+  {
+    VkBufferCopy region{0, 0, VkDeviceSize(promoUsedSlots) * kPromoStatusStride};
+    vkCmdCopyBuffer(cmd, promoStatusBuffer.buffer, promoReadbackBuffers[slot].buffer, 1, &region);
+    promoReadbackUsedSlots[slot] = promoUsedSlots;
+  }
+
+  promoFramesRecorded++;
+}
+
 ClusterRenderSystem::ClusterRenderSystem()
     : m_impl(std::make_unique<Impl>())
 {
@@ -255,6 +517,13 @@ bool ClusterRenderSystem::init(const RenderDeviceInfo& deviceInfo, const RenderC
   impl.profilerGpuTimer.init(impl.profilerTimeline, deviceInfo.device, deviceInfo.physicalDevice,
                              int(deviceInfo.graphicsQueueFamilyIndex), false);
 
+  // P4c: promotion solve pipeline + state buffers (failure leaves promotion
+  // dormant - candidates then simply stay on Path B)
+  if(!impl.initPromotion())
+  {
+    LOGW("ClusterRenderSystem: rigid-capture promotion unavailable\n");
+  }
+
   impl.initialized = true;
   return true;
 }
@@ -271,6 +540,7 @@ void ClusterRenderSystem::deinit()
   vkDeviceWaitIdle(impl.deviceInfo.device);
 
   impl.destroyGeneration();
+  impl.deinitPromotion();
 
   impl.profilerGpuTimer.deinit();
   if(impl.profilerTimeline)
@@ -317,6 +587,11 @@ bool ClusterRenderSystem::buildGeneration(const std::vector<std::string>& cacheF
   loaderConfig.autoLoadCache                  = true;
   loaderConfig.autoSaveCache                  = false;
   loaderConfig.memoryMappedCache              = true;
+  // 0 = "use the pool as-is": the struct default (0.5) made ProcessingInfo::
+  // init/deinit reset the whole shared thread pool down and back up around
+  // every generation build/append - a hidden main-thread hitch (rule 3). The
+  // pool is sized once by configureProcessingThreadPool on the processing path.
+  loaderConfig.processingThreadsPct           = 0.0f;
 
   lodclusters::Scene::Result result = impl.scene->initFromCachedGeometries(cachePaths, sceneConfig, loaderConfig);
   if(result != lodclusters::Scene::SCENE_RESULT_SUCCESS)
@@ -541,13 +816,23 @@ void ClusterRenderSystem::recordFrame(VkCommandBuffer                           
     *outSubmitSync = {};
   }
 
-  if(!impl.hasGeneration || count == 0 || count > impl.maxRenderInstances)
+  if(!impl.hasGeneration || count > impl.maxRenderInstances
+     || (count == 0 && frame.promotionEntryCount == 0))
   {
     return;
   }
 
   impl.res.beginFrame(impl.frameIndex % 4);
   impl.profilerTimeline->frameAdvance();
+
+  // P4c: promotion-only frames (candidates probing while no promoted/static
+  // instance rendered) - record just the solve + readback and advance the ring
+  if(count == 0)
+  {
+    impl.recordPromotion(cmd, frame, 0);
+    impl.frameIndex++;
+    return;
+  }
 
   // stage this frame's instance data
   nvvk::Buffer& staging = impl.stagingBuffers[impl.frameIndex % Impl::kStagingSlots];
@@ -603,6 +888,12 @@ void ClusterRenderSystem::recordFrame(VkCommandBuffer                           
     region.size      = sizeof(VkAccelerationStructureInstanceKHR) * count;
     vkCmdCopyBuffer(cmd, staging.buffer, tlasInstancesBuffer.buffer, 1, &region);
   }
+
+  // P4c rigid-capture promotion (plan 7.7): solve M per candidate against the
+  // capture output and patch promoted slots' worldMatrix/TLAS transform -
+  // recorded HERE, after this frame's instance data landed in the device
+  // arrays and before any kernel consumes them
+  impl.recordPromotion(cmd, frame, count);
 
   const glm::mat4 viewMatrix     = toMat4(frame.viewMatrix);
   const glm::mat4 projMatrix     = toMat4(frame.projMatrix);
@@ -756,6 +1047,52 @@ uint64_t ClusterRenderSystem::getGeometriesTableAddress() const
     return 0;
   }
   return impl.rscene->getShaderGeometriesBuffer().address;
+}
+
+uint64_t ClusterRenderSystem::getPromotionStateAddress() const
+{
+  // 96 B per slot: M rows (row-major 3x4) at +0, prevM rows at +48
+  Impl& impl = *m_impl;
+  return impl.promoReady ? impl.promoMatricesBuffer.address : 0;
+}
+
+bool ClusterRenderSystem::readPromotionStates(PromotionStateView* outStates)
+{
+  Impl& impl = *m_impl;
+
+  // the ring holds one snapshot per in-flight frame; only trust it once every
+  // slot has been written at least once (the +1 slot below is then the oldest
+  // complete snapshot = safely retired by the frames-in-flight window)
+  if(!impl.promoReady || outStates == nullptr || impl.promoFramesRecorded < Impl::kStagingSlots)
+  {
+    return false;
+  }
+
+  const uint32_t slot = (impl.frameIndex + 1u) % Impl::kStagingSlots;
+  const uint32_t used = std::min(impl.promoReadbackUsedSlots[slot], kPromotionSlotCapacity);
+  const uint8_t* src  = reinterpret_cast<const uint8_t*>(impl.promoReadbackBuffers[slot].mapping);
+  if(src == nullptr)
+  {
+    return false;
+  }
+
+  for(uint32_t i = 0; i < kPromotionSlotCapacity; i++)
+  {
+    outStates[i] = {};
+  }
+  for(uint32_t i = 0; i < used; i++)
+  {
+    const uint8_t* s = src + size_t(i) * Impl::kPromoStatusStride;
+    PromotionStateView& v = outStates[i];
+    memcpy(&v.residualRel, s + 0, sizeof(float));
+    uint32_t gateBits = 0;
+    memcpy(&gateBits, s + 4, sizeof(uint32_t));
+    memcpy(&v.gateResidualRel, &gateBits, sizeof(float));  // ordered-uint == float bits for non-negatives
+    memcpy(&v.rigidStreak, s + 8, sizeof(uint32_t));
+    memcpy(&v.flags, s + 12, sizeof(uint32_t));
+    memcpy(&v.lastFrame, s + 16, sizeof(uint32_t));
+  }
+  return true;
 }
 
 bool ClusterRenderSystem::getFrameStats(FrameStats& outStats) const
