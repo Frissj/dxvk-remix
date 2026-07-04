@@ -148,12 +148,15 @@ namespace dxvk {
     {
       std::unique_lock<std::mutex> lock(m_mutex);
 
-      if (vertexDataUpdated && !skinned) {
+      if (vertexDataUpdated && !skinned && !captured) {
         // remember the churn source so its per-frame "new" asset hashes stop
         // being treated as fresh static geometry below (and never bloat
         // m_knownHashes - one entry per frame would grow unboundedly).
-        // ONLY in-place mutation (kUpdateBVH) belongs here - captured draws
-        // have stable asset hashes and are the promotion candidates
+        // ONLY in-place mutation (kUpdateBVH) of NON-captured geometry belongs
+        // here. A rigidly-moving captured object ALSO trips vertexDataUpdated
+        // every frame (its positions churn), but it is a promotion candidate,
+        // not a mutator - the per-frame affine solve handles its motion. Tagging
+        // it mutating would exile it to pure Path B, defeating promotion.
         m_mutatingTopologyKeys.insert(topologyKey);
       }
 
@@ -184,16 +187,17 @@ namespace dxvk {
     const bool eligible = snapshotResult == SnapshotResult::Eligible
                        || snapshotResult == SnapshotResult::EligibleConverted;
     snapshot.isDeforming = skinned;
-    // mutating = in-place vertex rewrites (kUpdateBVH) ONLY. Deriving this
-    // from `deforming` (which folds in `captured` for dedup keying) flagged
-    // every captured draw as mutating, which made isCaptured impossible and
-    // kept the entire game on Path B - promotion never saw a candidate
-    snapshot.isMutating = vertexDataUpdated && !skinned;
-    // promotion candidates: captured AND content-stable. Mutating meshes stay
-    // pure Path B - they can never promote (frozen snapshot vs live rewrites)
-    // and their stable asset-rule hash + churning content hashes made every
-    // session reprocess + overwrite the same .nvsngeo (see GeometrySnapshot)
-    snapshot.isCaptured = captured && !skinned && !snapshot.isMutating;
+    // mutating = in-place vertex rewrites (kUpdateBVH) of NON-captured geometry
+    // ONLY. Deriving this from `deforming` (which folds in `captured` for dedup
+    // keying) flagged every captured draw as mutating, which made isCaptured
+    // impossible and kept the entire game on Path B - promotion never saw a
+    // candidate. A moving captured object also trips vertexDataUpdated, but it
+    // is a promotion candidate (rigid solve handles the motion), not a mutator.
+    snapshot.isMutating = vertexDataUpdated && !skinned && !captured;
+    // promotion candidates: ALL non-skinned captured geometry. Their motion (if
+    // any) is resolved by the per-frame affine solve; the promotion gate is the
+    // real rigid-vs-deforming filter, so we no longer pre-exclude by mutation.
+    snapshot.isCaptured = captured && !skinned;
     snapshot.topologyKey = topologyKey;
 
     std::unique_lock<std::mutex> lock(m_mutex);
@@ -723,19 +727,6 @@ namespace dxvk {
         // isClusterInstance never consults Path A until promotion flips it.
         if (!(snapshot.isCaptured && m_configProvider().processCapturedGeometry)) {
           continue;
-        }
-
-        // late-mutation check: kUpdateBVH is detected one frame late by
-        // construction (a mesh's first sighting is kAdded), so a genuinely
-        // mutating mesh can be snapshotted as a clean captured candidate. Its
-        // update usually fires within the queue wait - re-check the mutating
-        // set at the last moment so it skips Path A processing + probe (no
-        // .nvsngeo churn, no doomed promotion candidate)
-        {
-          std::unique_lock<std::mutex> lock(m_mutex);
-          if (m_mutatingTopologyKeys.find(snapshot.topologyKey) != m_mutatingTopologyKeys.end()) {
-            continue;
-          }
         }
       }
 
