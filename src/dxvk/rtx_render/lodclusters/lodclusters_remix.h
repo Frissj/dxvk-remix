@@ -566,6 +566,13 @@ namespace lodclusters_remix {
     // Remix's hit-side cluster fetch (raytrace_args)
     uint64_t getGeometriesTableAddress() const;
 
+    // device address of the streaming resident-clusters table (BDA):
+    // uint64 cluster address per clusterResidentID, the index space a streaming
+    // CLAS bakes into ClusterID. 0 in preloaded mode (there the hit side must
+    // use the per-geometry preloadedClusters array instead) or while no
+    // generation is active. For Remix's hit-side cluster fetch (raytrace_args).
+    uint64_t getResidentClustersTableAddress() const;
+
     // ---- P4c rigid-capture promotion (plan 7.7 spec) ----
 
     // fixed number of persistent promotion state slots (system scope -

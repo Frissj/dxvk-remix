@@ -424,6 +424,16 @@ struct RaytraceArgs {
   uint clusterGeometriesTableAddressLo;
   uint clusterGeometriesTableAddressHi;
 
+  // NV-DXVK: RTX Mega Geometry cluster LOD, streaming mode.
+  // Device address (BDA) of the streaming resident-clusters table: one uint64
+  // cluster address per clusterResidentID - the index space streaming CLASes
+  // bake into ClusterID (stream_update_scene.comp). In streaming mode the
+  // per-geometry preloadedClusters array is null by design, so cluster-surface
+  // hits must resolve through this global table instead. 0 in preloaded mode
+  // or while no generation is active (then the per-geometry path applies).
+  uint clusterResidentClustersAddressLo;
+  uint clusterResidentClustersAddressHi;
+
   // NV-DXVK: RTX Mega Geometry Path B (P4b, deforming geometry).
   // Device address (BDA) of the global animated cluster table: one uint64 per
   // cluster holding the device address of the cluster's triangles inside its
@@ -442,6 +452,15 @@ struct RaytraceArgs {
   // 0 while promotion is inactive.
   uint promotionStateAddressLo;
   uint promotionStateAddressHi;
+
+  // NV-DXVK: RTX Mega Geometry Path B null-record probe (diagnostic; 0 =
+  // disabled). Device address (BDA) of an 8-byte buffer: [+0] uint lastNullFrame,
+  // [+4] uint lastNullClusterId. clusterTemplateGetTriangleIndices writes it
+  // when a template hit reads a null (not-yet-resident) cluster-table record -
+  // the manager reads it back to verify the visibility defer and pin any
+  // residual adopt->hit ordering gap.
+  uint clusterTemplateDiagAddressLo;
+  uint clusterTemplateDiagAddressHi;
 
   // NOTE: Add structs to the top section of RaytraceArgs, not the bottom.
   // NOTE: bool does not work in debug builds, use uint instead.

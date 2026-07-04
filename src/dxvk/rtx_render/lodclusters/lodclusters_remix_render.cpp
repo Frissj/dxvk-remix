@@ -1049,6 +1049,18 @@ uint64_t ClusterRenderSystem::getGeometriesTableAddress() const
   return impl.rscene->getShaderGeometriesBuffer().address;
 }
 
+uint64_t ClusterRenderSystem::getResidentClustersTableAddress() const
+{
+  Impl& impl = *m_impl;
+  if(!impl.hasGeneration || !impl.rscene->useStreaming)
+  {
+    return 0;
+  }
+  // stable for the generation's lifetime: the resident buffer is allocated
+  // once in StreamingResident::init and never reallocated
+  return impl.rscene->sceneStreaming.getShaderStreamingData().resident.clusters;
+}
+
 uint64_t ClusterRenderSystem::getPromotionStateAddress() const
 {
   // 96 B per slot: M rows (row-major 3x4) at +0, prevM rows at +48

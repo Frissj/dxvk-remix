@@ -1328,6 +1328,42 @@ namespace dxvk {
 
     const uint32_t currentFrame = m_device->getCurrentFrameId();
 
+    // ---- per-frame spike detector ----
+    // Real frame time = wall-clock delta between consecutive onFrameBegin calls
+    // (captures the WHOLE frame, incl. the path tracer + present, not just the
+    // cluster sections). classify was just folded above, and frameBegin/
+    // dispatchA/dispatchB hold last frame's lastMs - so on a spike we attribute
+    // the just-completed frame. Fires immediately (the interval avg/max chrono
+    // averages spikes away).
+    {
+      const std::chrono::steady_clock::time_point nowTp = std::chrono::steady_clock::now();
+      const int thresholdMs = ClusterLodOptions::spikeLogThresholdMs();
+      if (m_havePrevFrameTp && thresholdMs > 0) {
+        const double frameMs = std::chrono::duration<double, std::milli>(nowTp - m_prevFrameTp).count();
+        if (frameMs > double(thresholdMs)) {
+          m_spikeCountInterval++;
+          m_worstFrameMsInterval = std::max(m_worstFrameMsInterval, frameMs);
+          const double clusterMs = m_frameTimes.frameBegin.lastMs + m_frameTimes.classify.lastMs
+                                 + m_frameTimes.dispatchA.lastMs + m_frameTimes.dispatchB.lastMs;
+          Logger::warn(str::format(
+              "[Spike] frame ", currentFrame, ": ", frameMs, " ms (>", thresholdMs,
+              ") | cluster CPU ", clusterMs, " ms = onFrameBegin ", m_frameTimes.frameBegin.lastMs,
+              " + classify ", m_frameTimes.classify.lastMs, " + dispatchA ", m_frameTimes.dispatchA.lastMs,
+              " (record ", m_frameTimes.recordA.lastMs, ", hizFeed ", m_frameTimes.hizFeed.lastMs,
+              ", asyncLockWait ", m_frameTimes.lockWaitA.lastMs, ") + dispatchB ", m_frameTimes.dispatchB.lastMs,
+              " (record ", m_frameTimes.recordB.lastMs, ") | slots A ", m_statsSlotsOpaque + m_statsSlotsUnordered,
+              ", B ", m_statsSlotsPathB,
+              " | ", (clusterMs > frameMs * 0.5 ? "CLUSTER-BOUND" : "outside cluster work (GPU/path-tracer/present)")));
+        }
+      }
+      m_prevFrameTp = nowTp;
+      m_havePrevFrameTp = true;
+    }
+
+    // null-record probe: direct read of the host-visible flag; logs if the
+    // shader ever read a null record (must never happen with the visibility defer)
+    updateNullRecordProbe();
+
     // Periodic stats so the log always carries the intake/skip counts - the
     // per-geometry skip messages are ONCE-per-reason and cannot show totals.
     // Only prints when the counters actually changed since the last line.
@@ -1353,6 +1389,31 @@ namespace dxvk {
       // dispatched (menus/loading), so this only speaks during gameplay
       logFrameTimes();
 
+      // visibility-defer verification: holds = instances kept classic by the
+      // gate this interval, flips = geometries that first crossed to Path B,
+      // heldFrames = how long they waited (should equal kTemplateVisibilityDelay
+      // Frames). Only speaks when the defer actually did something.
+      if (m_deferHoldsInterval != 0 || m_deferFlipsInterval != 0) {
+        Logger::info(str::format("[TemplateVis] deferGate: holds ", m_deferHoldsInterval,
+                                 ", flips ", m_deferFlipsInterval,
+                                 ", heldFrames ", (m_deferHeldMinInterval == ~0u ? 0u : m_deferHeldMinInterval),
+                                 "/", m_deferHeldMaxInterval,
+                                 " (delay ", kTemplateVisibilityDelayFrames, ")"));
+      }
+      m_deferHoldsInterval = 0;
+      m_deferFlipsInterval = 0;
+      m_deferHeldMinInterval = ~0u;
+      m_deferHeldMaxInterval = 0;
+
+      // spike summary for the interval (individual spikes log immediately above)
+      if (m_spikeCountInterval != 0) {
+        Logger::info(str::format("[Spike] ", m_spikeCountInterval, " frame(s) over ",
+                                 ClusterLodOptions::spikeLogThresholdMs(), " ms this interval, worst ",
+                                 m_worstFrameMsInterval, " ms"));
+      }
+      m_spikeCountInterval = 0;
+      m_worstFrameMsInterval = 0.0;
+
       m_lastStatsLogFrame = currentFrame;
     }
 
@@ -1362,7 +1423,14 @@ namespace dxvk {
       // template sets whose worker-side registration completed
       bool anyReady = false;
       for (const lodclusters_remix::ClusterTemplateSystem::ReadyGeometry& ready : m_templateSystemMT->drainReadyGeometries()) {
-        m_animatedGeometryByKey[ready.topologyKey] = ready.geometryIndex;
+        // adoptedFrame stamps the visibility defer (see AnimatedGeometryEntry).
+        // A topology registers once (provider dedups), so first-seen wins; guard
+        // against a re-adoption resetting the clock backwards regardless.
+        auto& entry = m_animatedGeometryByKey[ready.topologyKey];
+        if (entry.geometryIndex == ~0u) {
+          entry.adoptedFrame = currentFrame;
+        }
+        entry.geometryIndex = ready.geometryIndex;
         anyReady = true;
       }
 
@@ -1541,7 +1609,7 @@ namespace dxvk {
       // registration still running (or failed) - classic until ready
       return false;
     }
-    const uint32_t geometryIndex = foundGeometry->second;
+    const uint32_t geometryIndex = foundGeometry->second.geometryIndex;
 
     // the per-frame instantiation consumes the live skinned/updated positions
     const RaytraceBuffer& positions = blasEntry->modifiedGeometryData.positionBuffer;
@@ -1550,6 +1618,25 @@ namespace dxvk {
     }
 
     const uint32_t currentFrame = m_device->getCurrentFrameId();
+
+    // visibility defer (see AnimatedGeometryEntry): keep the instance on the
+    // classic path until a frame boundary has passed since adoption, so this
+    // frame's path tracer can never read a not-yet-visible (zero) cluster-table
+    // record. Classic renders the same mesh identically, so this is seamless.
+    AnimatedGeometryEntry& animEntry = foundGeometry->second;
+    if (currentFrame < animEntry.adoptedFrame + kTemplateVisibilityDelayFrames) {
+      m_deferHoldsInterval++;  // instrumentation: the gate is actively holding
+      return false;
+    }
+    // first frame this geometry flips to the cluster-template path (verifies the
+    // defer executed and how many classic frames it held)
+    if (animEntry.firstFlipFrame == 0) {
+      animEntry.firstFlipFrame = currentFrame;
+      const uint32_t held = currentFrame - animEntry.adoptedFrame;
+      m_deferFlipsInterval++;
+      m_deferHeldMinInterval = std::min(m_deferHeldMinInterval, held);
+      m_deferHeldMaxInterval = std::max(m_deferHeldMaxInterval, held);
+    }
 
     // frame-local dedup: instances sharing a BlasEntry share its pose (one
     // CLAS + BLAS; each instance still gets its own TLAS slot)
@@ -2075,6 +2162,13 @@ namespace dxvk {
     return m_renderSystem->getGeometriesTableAddress();
   }
 
+  uint64_t ClusterLodManager::getResidentClustersTableAddress() const {
+    if (m_renderSystem == nullptr) {
+      return 0;
+    }
+    return m_renderSystem->getResidentClustersTableAddress();
+  }
+
   uint64_t ClusterLodManager::getPromotionStateAddress() const {
     if (m_renderSystem == nullptr || !ClusterLodOptions::Promotion::enable()) {
       return 0;
@@ -2087,6 +2181,69 @@ namespace dxvk {
       return 0;
     }
     return m_templateSystemMT->getClusterTableAddress();
+  }
+
+  // ---- Path B null-record probe (2026-07-04) ----
+  // Verifies the visibility defer: the template hit path stores {lastNullFrame,
+  // lastNullClusterId} into m_templateDiag via BDA whenever it reads a
+  // not-yet-resident (zero) cluster-table record - the device-loss root cause.
+  // ONE host-visible buffer, read directly (no ring, no GPU->host copy): a
+  // readback pipeline cannot catch the crashing frame anyway (device-loss kills
+  // the copy), so its only job is to detect a null while the guard keeps the
+  // shader alive - and the flag is persistent, so a direct read never misses it.
+  // With the defer in place lastNullFrame must never advance.
+  void ClusterLodManager::ensureTemplateDiagBuffers() {
+    if (m_templateDiagReady || !ClusterLodOptions::Animated::diagnoseNullRecords()) {
+      return;
+    }
+
+    // 8 bytes: [+0] lastNullFrame, [+4] lastNullClusterId. Host-visible so the
+    // shader writes it via BDA and the CPU reads it directly (host-coherent).
+    DxvkBufferCreateInfo info;
+    info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    info.stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR
+                | VK_PIPELINE_STAGE_HOST_BIT;
+    info.access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+    info.size = 8;
+    m_templateDiag = m_device->createBuffer(info,
+                                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                            DxvkMemoryStats::Category::RTXBuffer, "ClusterLOD NullRecordProbe");
+
+    // zero-init on the CPU (host-visible - no GPU clear needed)
+    m_templateDiagMapped = reinterpret_cast<uint32_t*>(m_templateDiag->mapPtr(0));
+    m_templateDiagMapped[0] = 0;
+    m_templateDiagMapped[1] = 0;
+
+    m_templateDiagAddress = m_templateDiag->getDeviceAddress();
+    m_templateDiagReady = true;
+  }
+
+  uint64_t ClusterLodManager::getTemplateDiagAddress() const {
+    return m_templateDiagAddress;  // 0 until ensureTemplateDiagBuffers runs / when disabled
+  }
+
+  void ClusterLodManager::updateNullRecordProbe() {
+    if (!ClusterLodOptions::Animated::diagnoseNullRecords()) {
+      return;
+    }
+    ensureTemplateDiagBuffers();
+    if (!m_templateDiagReady) {
+      return;
+    }
+
+    // direct read of the host-coherent buffer - reflects the GPU's completed
+    // writes from prior frames; the flag persists (last-writer), so any null
+    // the shader ever hit is caught here within a frame
+    const uint32_t nullFrame = m_templateDiagMapped[0];
+    const uint32_t nullClusterId = m_templateDiagMapped[1];
+    if (nullFrame != 0 && nullFrame != m_lastLoggedNullFrame) {
+      m_lastLoggedNullFrame = nullFrame;
+      Logger::warn(str::format("[TemplateVis] NULL RECORD read by the path tracer at frame ", nullFrame,
+                               ", clusterId ", nullClusterId,
+                               " - the visibility defer (", kTemplateVisibilityDelayFrames,
+                               " frames) did NOT cover this adopt->hit gap. Raise kTemplateVisibilityDelayFrames"
+                               " or move to in-frame table upload."));
+    }
   }
 
 }  // namespace dxvk

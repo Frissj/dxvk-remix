@@ -1385,6 +1385,13 @@ namespace dxvk {
       constants.clusterGeometriesTableAddressLo = uint32_t(clusterGeometriesTableAddress);
       constants.clusterGeometriesTableAddressHi = uint32_t(clusterGeometriesTableAddress >> 32);
 
+      // streaming mode: global resident-clusters table for the hit-side fetch
+      // (0 in preloaded mode, where the per-geometry preloadedClusters applies)
+      const uint64_t clusterResidentClustersAddress =
+        clusterLodManager != nullptr ? clusterLodManager->getResidentClustersTableAddress() : 0;
+      constants.clusterResidentClustersAddressLo = uint32_t(clusterResidentClustersAddress);
+      constants.clusterResidentClustersAddressHi = uint32_t(clusterResidentClustersAddress >> 32);
+
       // P4b Path B: animated cluster table for the hit-side primitive remap
       const uint64_t animatedClusterTableAddress =
         clusterLodManager != nullptr ? clusterLodManager->getAnimatedClusterTableAddress() : 0;
@@ -1396,6 +1403,14 @@ namespace dxvk {
         clusterLodManager != nullptr ? clusterLodManager->getPromotionStateAddress() : 0;
       constants.promotionStateAddressLo = uint32_t(promotionStateAddress);
       constants.promotionStateAddressHi = uint32_t(promotionStateAddress >> 32);
+
+      // P4b null-record probe (0 = disabled): the template hit path stores the
+      // last frame + clusterId it read a null cluster-table record here so the
+      // manager can verify the visibility defer closed the device-loss window
+      const uint64_t clusterTemplateDiagAddress =
+        clusterLodManager != nullptr ? clusterLodManager->getTemplateDiagAddress() : 0;
+      constants.clusterTemplateDiagAddressLo = uint32_t(clusterTemplateDiagAddress);
+      constants.clusterTemplateDiagAddressHi = uint32_t(clusterTemplateDiagAddress >> 32);
     }
     // NV-DXVK end
 

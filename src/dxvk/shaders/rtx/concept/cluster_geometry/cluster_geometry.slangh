@@ -28,9 +28,11 @@
 // attribute_encoding.h): ClusterID -> resident cluster address -> Cluster
 // header decode -> per-triangle uint8 indices, vec3 positions, oct-encoded
 // normals (+ tangent angle bits) and vec2 texcoords, all read through buffer
-// device addresses (the preloaded cluster data of the active render
-// generation, see ClusterLodManager). Preloaded cluster data is always
-// decompressed on upload, matching the sample's rchit assumptions.
+// device addresses. Covers BOTH of the sample rchit's modes: streaming
+// (ClusterID = global clusterResidentID -> streaming.resident.clusters table)
+// and preloaded (ClusterID = geometry-local -> Geometry.preloadedClusters).
+// Cluster data is always decompressed on upload, matching the sample's rchit
+// assumptions.
 //
 // The byte offsets below mirror shaderio_scene.h with scalar layout:
 //   shaderio::Geometry (128 bytes, of which):
@@ -66,6 +68,16 @@ uint clusterGeometryLoadU32(uint64_t address)
 uint64_t clusterGeometryLoadU64(uint64_t address)
 {
   return *(Ptr<uint64_t>(address));
+}
+
+// NV-DXVK (P4b diagnostic): plain BDA store, mirrors the loads above. Used only
+// by the null-record probe below; deliberately NOT atomic (this slangc has no
+// vk::RawBufferLoad and raw-pointer atomics are exactly the shader-side risk we
+// are debugging) - last-writer-wins is sufficient to answer "did the hit shader
+// read a null cluster-table record, and at what frame / clusterId".
+void clusterGeometryStoreU32(uint64_t address, uint value)
+{
+  *(Ptr<uint>(address)) = value;
 }
 
 float clusterGeometryLoadF32(uint64_t address)
@@ -116,10 +128,18 @@ struct ClusterGeometry
 };
 
 // Resolves geometryId (cluster geometry table index, from the Surface) and
-// clusterId (ClusterIDNV, geometry-local in the preloaded path) to the cluster
-// header. geometriesTableAddress comes from the raytrace args (0 while no
-// cluster render generation is active).
-ClusterGeometry clusterGeometryCreate(uint64_t geometriesTableAddress, uint geometryId, uint clusterId)
+// clusterId (ClusterIDNV) to the cluster header. Mirrors the sample rchit's
+// USE_STREAMING split (render_raytrace_clusters.rchit.glsl):
+// - streaming: clusterId is the GLOBAL clusterResidentID baked into the CLAS
+//   (stream_update_scene.comp), resolved via the global resident-clusters
+//   table (residentClustersTableAddress). The per-geometry preloadedClusters
+//   array is null by design in this mode - it must not be used.
+// - preloaded: clusterId is geometry-local, resolved via the geometry's
+//   preloadedClusters array.
+// Both table addresses come from the raytrace args (0 while inactive;
+// residentClustersTableAddress selects the mode: non-zero == streaming).
+ClusterGeometry clusterGeometryCreate(uint64_t geometriesTableAddress, uint geometryId, uint clusterId,
+                                      uint64_t residentClustersTableAddress)
 {
   ClusterGeometry clusterGeometry;
 
@@ -128,19 +148,40 @@ ClusterGeometry clusterGeometryCreate(uint64_t geometriesTableAddress, uint geom
     return clusterGeometry;
   }
 
-  // Geometry table entry -> preloaded cluster address array -> cluster
-  const uint64_t geometryAddress =
-    geometriesTableAddress + uint64_t(geometryId) * CLUSTER_GEOMETRY_SIZEOF_SHADERIO_GEOMETRY;
+  uint64_t clusterRecords;
+  if (residentClustersTableAddress != 0)
+  {
+    // streaming: global resident table, indexed by clusterResidentID
+    clusterRecords = residentClustersTableAddress;
+  }
+  else
+  {
+    // preloaded: Geometry table entry -> per-geometry cluster address array
+    const uint64_t geometryAddress =
+      geometriesTableAddress + uint64_t(geometryId) * CLUSTER_GEOMETRY_SIZEOF_SHADERIO_GEOMETRY;
 
-  const uint64_t preloadedClusters =
-    clusterGeometryLoadU64(geometryAddress + CLUSTER_GEOMETRY_OFFSETOF_PRELOADED_CLUSTERS);
+    clusterRecords =
+      clusterGeometryLoadU64(geometryAddress + CLUSTER_GEOMETRY_OFFSETOF_PRELOADED_CLUSTERS);
+  }
 
-  if (preloadedClusters == 0)
+  if (clusterRecords == 0)
   {
     return clusterGeometry;
   }
 
-  const uint64_t clusterAddress = clusterGeometryLoadU64(preloadedClusters + uint64_t(clusterId) * 8);
+  const uint64_t clusterAddress = clusterGeometryLoadU64(clusterRecords + uint64_t(clusterId) * 8);
+
+  // Defense-in-depth: a null record must not be dereferenced (offset 0 read
+  // faults at GPU VA 0x0 -> hard device-loss, Aftermath-confirmed 2026-07-04,
+  // shader 0x86399afa). With the streaming table properly routed above this is
+  // not expected to fire (resident entries are written before the CLAS/BLAS
+  // referencing their residentID is built); keep it as the crash backstop.
+  // Return the default (isValid = false, clusterAddress = 0); the getters
+  // below degenerate rather than crash.
+  if (clusterAddress == 0)
+  {
+    return clusterGeometry;
+  }
 
   // shaderio::Cluster header (16 bytes)
   const uint headerWord0 = clusterGeometryLoadU32(clusterAddress + 0);
@@ -162,6 +203,12 @@ ClusterGeometry clusterGeometryCreate(uint64_t geometriesTableAddress, uint geom
 // Cluster-local uint8 triangle indices (Cluster_getTriangleIndices)
 uint3 clusterGeometryGetTriangleIndices(ClusterGeometry clusterGeometry, uint primitiveIndex)
 {
+  // null (non-resident) cluster - never dereference clusterAddress 0 (faults at 0x0)
+  if (clusterGeometry.clusterAddress == 0)
+  {
+    return uint3(0, 0, 0);
+  }
+
   const uint64_t indicesAddress =
     clusterGeometry.clusterAddress + clusterGeometry.trianglesOffset + uint64_t(primitiveIndex) * 3;
 
@@ -175,6 +222,11 @@ uint3 clusterGeometryGetTriangleIndices(ClusterGeometry clusterGeometry, uint pr
 // vec3 object-space position (Cluster_getVertexPositions)
 vec3 clusterGeometryGetPosition(ClusterGeometry clusterGeometry, uint vertexIndex)
 {
+  if (clusterGeometry.clusterAddress == 0)
+  {
+    return vec3(0.0f, 0.0f, 0.0f);
+  }
+
   const uint64_t positionAddress =
     clusterGeometry.clusterAddress + clusterGeometry.verticesOffset + uint64_t(vertexIndex) * 12;
 
@@ -187,6 +239,11 @@ vec3 clusterGeometryGetPosition(ClusterGeometry clusterGeometry, uint vertexInde
 // packed normal(+tangent) attribute word (Cluster_getVertexNormals)
 uint clusterGeometryGetPackedNormal(ClusterGeometry clusterGeometry, uint vertexIndex)
 {
+  if (clusterGeometry.clusterAddress == 0)
+  {
+    return 0;
+  }
+
   const uint64_t normalsAddress = clusterGeometry.clusterAddress + clusterGeometry.verticesOffset
     + uint64_t(clusterGeometry.vertexCount) * 12 + uint64_t(vertexIndex) * 4;
 
@@ -197,6 +254,11 @@ uint clusterGeometryGetPackedNormal(ClusterGeometry clusterGeometry, uint vertex
 // present, the packed normal/tangent word; 8-byte aligned)
 vec2 clusterGeometryGetTexcoord0(ClusterGeometry clusterGeometry, uint vertexIndex)
 {
+  if (clusterGeometry.clusterAddress == 0)
+  {
+    return vec2(0.0f, 0.0f);
+  }
+
   const uint elementsPerVertex = clusterGeometry.hasNormals ? 4u : 3u;
 
   uint64_t texcoordsAddress = clusterGeometry.clusterAddress
@@ -221,7 +283,12 @@ vec2 clusterGeometryGetTexcoord0(ClusterGeometry clusterGeometry, uint vertexInd
 
 // Returns the original (global) uint32 vertex indices of a template-cluster
 // hit. tableAddress comes from the raytrace args (0 while Path B inactive).
-uint3 clusterTemplateGetTriangleIndices(uint64_t tableAddress, uint clusterId, uint primitiveIndex)
+// diagAddress: optional device buffer (0 = disabled) for the null-record probe.
+// Layout: [+0] uint lastNullFrame, [+4] uint lastNullClusterId. The manager
+// reads it back and, if lastNullFrame advances, maps the clusterId to its
+// geometry's adopt frame to measure the real adopt->hit ordering delta.
+uint3 clusterTemplateGetTriangleIndices(uint64_t tableAddress, uint clusterId, uint primitiveIndex,
+                                        uint64_t diagAddress, uint frameId)
 {
   if (tableAddress == 0 || clusterId == CLUSTER_ID_INVALID)
   {
@@ -229,6 +296,27 @@ uint3 clusterTemplateGetTriangleIndices(uint64_t tableAddress, uint clusterId, u
   }
 
   const uint64_t trianglesAddress = clusterGeometryLoadU64(tableAddress + uint64_t(clusterId) * 8);
+
+  // The record can be 0 for a cluster whose triangle topology is not resident
+  // yet: a Path B instance's per-frame BLAS makes it hittable one or more
+  // frames before the worker's cluster-table upload lands (ordering gap). A
+  // null record dereferenced at primitiveIndex 0 faults at GPU VA 0x0 -> hard
+  // device-loss (Aftermath-confirmed 2026-07-04). Guard it exactly like the
+  // null base above; a degenerate index triple collapses the triangle for the
+  // handful of transient frames until the record resolves (rule 3: no crash).
+  if (trianglesAddress == 0)
+  {
+    // probe: record the last frame + clusterId a null record was hit. With the
+    // visibility defer in place this must never advance; if it does, the
+    // clusterId + frame pin the exact geometry and adopt->hit delta.
+    if (diagAddress != 0)
+    {
+      clusterGeometryStoreU32(diagAddress + 0, frameId);
+      clusterGeometryStoreU32(diagAddress + 4, clusterId);
+    }
+    return uint3(0, 0, 0);
+  }
+
   const uint64_t indicesAddress = trianglesAddress + uint64_t(primitiveIndex) * 12;
 
   return uint3(

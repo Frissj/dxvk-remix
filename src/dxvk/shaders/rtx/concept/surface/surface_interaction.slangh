@@ -261,8 +261,13 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
     const uint64_t clusterGeometriesTableAddress =
       (uint64_t(cb.clusterGeometriesTableAddressHi) << 32) | uint64_t(cb.clusterGeometriesTableAddressLo);
 
+    // streaming resident-clusters table (0 = preloaded mode, per-geometry path)
+    const uint64_t clusterResidentClustersAddress =
+      (uint64_t(cb.clusterResidentClustersAddressHi) << 32) | uint64_t(cb.clusterResidentClustersAddressLo);
+
     clusterGeometry = clusterGeometryCreate(
-      clusterGeometriesTableAddress, surface.clusterGeometryId & 0x3FFFF, rayInteraction.clusterId);
+      clusterGeometriesTableAddress, surface.clusterGeometryId & 0x3FFFF, rayInteraction.clusterId,
+      clusterResidentClustersAddress);
     clusterIndices = clusterGeometryGetTriangleIndices(clusterGeometry, rayInteraction.primitiveIndex);
   }
   else if (isTemplateHit)
@@ -270,8 +275,14 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
     const uint64_t animatedClusterTableAddress =
       (uint64_t(cb.animatedClusterTableAddressHi) << 32) | uint64_t(cb.animatedClusterTableAddressLo);
 
+    // P4b null-record probe (0 = disabled): verifies the visibility defer and
+    // pins any residual adopt->hit ordering gap (see cluster_geometry.slangh).
+    const uint64_t clusterTemplateDiagAddress =
+      (uint64_t(cb.clusterTemplateDiagAddressHi) << 32) | uint64_t(cb.clusterTemplateDiagAddressLo);
+
     clusterIndices = clusterTemplateGetTriangleIndices(
-      animatedClusterTableAddress, rayInteraction.clusterId, rayInteraction.primitiveIndex);
+      animatedClusterTableAddress, rayInteraction.clusterId, rayInteraction.primitiveIndex,
+      clusterTemplateDiagAddress, cb.frameIdx);
   }
 
   // Compute vertex indicies
