@@ -271,19 +271,39 @@ struct ClusterTemplateSystem::Impl
 
   // maxima across registered geometries (BLAS size query inputs)
   uint32_t maxGeometryClusters = 0;
+  // the maxGeometryClusters the BLAS scratch + implicit pool were last sized
+  // for. maxGeometryClusters grows in drainReadyGeometries (a newly-ready,
+  // larger geometry) independently of the per-frame totals, so it needs its own
+  // grow trigger - otherwise the BLAS build (recordFrame) runs with a bigger
+  // maxClusterCountPerAccelerationStructure than the scratch/pool were queried
+  // for and the driver over-reads them (illegal-access AS-build fault)
+  uint32_t sizedMaxGeometryClusters = 0;
 
   // worst-case size of one explicitly built CLAS (direct build mode)
   VkDeviceSize singleExplicitClusterSize = 0;
 
-  nvvk::Buffer dstSizesBuffer;       // u32 per cluster (built CLAS sizes, stats)
-  nvvk::Buffer blasAddressesBuffer;  // u64 per pose (built BLAS addresses)
-  nvvk::Buffer blasSizesBuffer;      // u32 per pose (built BLAS sizes, stats)
-  nvvk::Buffer tlasInstancesBuffer;  // VkAccelerationStructureInstanceKHR per slot
+  nvvk::Buffer dstSizesBuffer;       // u32 per cluster (built CLAS sizes, stats only - never dereferenced, single is safe)
+  nvvk::Buffer blasSizesBuffer;      // u32 per pose (built BLAS sizes, stats only - never dereferenced, single is safe)
+  nvvk::Buffer tlasInstancesBuffer;  // VkAccelerationStructureInstanceKHR per slot (refs come from the ringed blasAddresses below, so a cross-frame torn read is at worst a stale-but-valid ref, never a bad translate)
+  // per-frame-in-flight rings (kRingSlots): a LATER stage dereferences these
+  // across the frame boundary, so overlapping frames must not share one
+  // instance (same reasoning as blasImplicitBuffers / risk R17):
+  //  - blasAddresses: frame N patches these BLAS addresses into its TLAS
+  //    instance references; single-buffered, frame N+1's BLAS build overwrites
+  //    them before frame N's TLAS build consumes them.
+  //  - scratch: the cluster ops' internal working memory. Single-buffered, two
+  //    overlapping AS builds corrupt each other's build-internal pointers and
+  //    the driver dereferences an unmapped address -> device-lost, unit
+  //    "AS Build or Refit", fault VA owned by no allocation. This transient
+  //    scratch was the one per-frame GPU buffer left shared when the input
+  //    rings / CLAS dst / implicit-BLAS pools were ringed (the device-loss root
+  //    cause).
+  nvvk::Buffer blasAddressesBuffer[kRingSlots];  // u64 per pose (built BLAS addresses)
   // implicit-destination BLAS pool, one per frame-in-flight slot (kRingSlots):
   // the TLAS of frame N references BLASes in slot N%kRingSlots which the trace
   // dereferences, so frame N+1 must build into a different slot (risk R17)
   nvvk::Buffer blasImplicitBuffers[kRingSlots];
-  nvvk::Buffer scratchBuffer;
+  nvvk::Buffer scratchBuffers[kRingSlots];
   VkDeviceSize scratchSize = 0;
 
   nvvk::Buffer readbackBuffer;      // device AnimatedReadback
@@ -360,8 +380,12 @@ struct ClusterTemplateSystem::Impl
     const bool growClusters = totalClusters > clusterCapacity || totalTriangles > triangleCapacity || totalVertices > vertexCapacity;
     const bool growPoses    = poseCount > poseCapacity;
     const bool growSlots    = slotCount > slotCapacity;
+    // the BLAS scratch + implicit pool are sized from maxGeometryClusters (line
+    // ~411 / recordFrame) - a newly-ready larger geometry must force a re-query
+    // even when the per-frame totals are unchanged (else the build over-reads them)
+    const bool growBlas     = maxGeometryClusters > sizedMaxGeometryClusters;
 
-    if(!growClusters && !growPoses && !growSlots && scratchBuffer.buffer)
+    if(!growClusters && !growPoses && !growSlots && !growBlas && scratchBuffers[0].buffer)
     {
       return true;
     }
@@ -371,6 +395,9 @@ struct ClusterTemplateSystem::Impl
     vertexCapacity   = std::max(vertexCapacity, nextPowerOfTwo(std::max(totalVertices, 1024u)));
     poseCapacity     = std::max(poseCapacity, nextPowerOfTwo(std::max(poseCount, 16u)));
     slotCapacity     = std::max(slotCapacity, nextPowerOfTwo(std::max(slotCount, 16u)));
+    // committed here so the BLAS size query below (and every subsequent build)
+    // matches the scratch/pool we are about to allocate
+    sizedMaxGeometryClusters = maxGeometryClusters;
 
     // ---- size queries (sample: initRayTracingScene / initRayTracingBlas) ----
 
@@ -417,8 +444,11 @@ struct ClusterTemplateSystem::Impl
     deferDestroy(dstSizesBuffer);
     NVVK_CHECK(res.createBuffer(dstSizesBuffer, sizeof(uint32_t) * clusterCapacity, kDeviceUsage));
 
-    deferDestroy(blasAddressesBuffer);
-    NVVK_CHECK(res.createBuffer(blasAddressesBuffer, sizeof(uint64_t) * poseCapacity, kDeviceUsage));
+    for(nvvk::Buffer& blasAddresses : blasAddressesBuffer)
+    {
+      deferDestroy(blasAddresses);
+      NVVK_CHECK(res.createBuffer(blasAddresses, sizeof(uint64_t) * poseCapacity, kDeviceUsage));
+    }
 
     deferDestroy(blasSizesBuffer);
     NVVK_CHECK(res.createBuffer(blasSizesBuffer, sizeof(uint32_t) * poseCapacity, kDeviceUsage));
@@ -438,10 +468,13 @@ struct ClusterTemplateSystem::Impl
                                       | VK_BUFFER_USAGE_2_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR));
     }
 
-    deferDestroy(scratchBuffer);
     scratchSize = newScratchSize;
-    NVVK_CHECK(res.createBuffer(scratchBuffer, scratchSize,
-                                VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT));
+    for(nvvk::Buffer& scratch : scratchBuffers)
+    {
+      deferDestroy(scratch);
+      NVVK_CHECK(res.createBuffer(scratch, scratchSize,
+                                  VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT));
+    }
 
     // ---- host-visible per-frame input ring ----
 
@@ -717,14 +750,20 @@ void ClusterTemplateSystem::deinit()
 
   impl.res.m_allocator.destroyBuffer(impl.clusterTableBuffer);
   impl.res.m_allocator.destroyBuffer(impl.dstSizesBuffer);
-  impl.res.m_allocator.destroyBuffer(impl.blasAddressesBuffer);
   impl.res.m_allocator.destroyBuffer(impl.blasSizesBuffer);
   impl.res.m_allocator.destroyBuffer(impl.tlasInstancesBuffer);
+  for(nvvk::Buffer& blasAddresses : impl.blasAddressesBuffer)
+  {
+    impl.res.m_allocator.destroyBuffer(blasAddresses);
+  }
   for(nvvk::Buffer& blasPool : impl.blasImplicitBuffers)
   {
     impl.res.m_allocator.destroyBuffer(blasPool);
   }
-  impl.res.m_allocator.destroyBuffer(impl.scratchBuffer);
+  for(nvvk::Buffer& scratch : impl.scratchBuffers)
+  {
+    impl.res.m_allocator.destroyBuffer(scratch);
+  }
   impl.res.m_allocator.destroyBuffer(impl.readbackBuffer);
   impl.res.m_allocator.destroyBuffer(impl.readbackHostBuffer);
   for(nvvk::Buffer& ring : impl.ringBuffers)
@@ -1650,7 +1689,7 @@ bool ClusterTemplateSystem::recordFrame(VkCommandBuffer                         
     cmdInfo.srcInfosArray.stride = impl.config.useTemplates ? sizeof(VkClusterAccelerationStructureInstantiateClusterInfoNV) :
                                                               sizeof(VkClusterAccelerationStructureBuildTriangleClusterInfoNV);
 
-    cmdInfo.scratchData = impl.scratchBuffer.address;
+    cmdInfo.scratchData = impl.scratchBuffers[ringIndex].address;
     cmdInfo.input       = inputs;
     vkCmdBuildClusterAccelerationStructureIndirectNV(cmd, &cmdInfo);
   }
@@ -1680,7 +1719,7 @@ bool ClusterTemplateSystem::recordFrame(VkCommandBuffer                         
     inputs.flags                         = impl.clusterBlasFlags;
 
     // we feed the generated blas addresses directly into the patch kernel
-    cmdInfo.dstAddressesArray.deviceAddress = impl.blasAddressesBuffer.address;
+    cmdInfo.dstAddressesArray.deviceAddress = impl.blasAddressesBuffer[ringIndex].address;
     cmdInfo.dstAddressesArray.size          = sizeof(uint64_t) * poseCount;
     cmdInfo.dstAddressesArray.stride        = sizeof(VkDeviceAddress);
 
@@ -1696,7 +1735,7 @@ bool ClusterTemplateSystem::recordFrame(VkCommandBuffer                         
     // (this frame's ring slot, distinct from the pools earlier frames are tracing)
     cmdInfo.dstImplicitData = impl.blasImplicitBuffers[ringIndex].address;
 
-    cmdInfo.scratchData = impl.scratchBuffer.address;
+    cmdInfo.scratchData = impl.scratchBuffers[ringIndex].address;
     cmdInfo.input       = inputs;
     vkCmdBuildClusterAccelerationStructureIndirectNV(cmd, &cmdInfo);
   }
@@ -1720,7 +1759,7 @@ bool ClusterTemplateSystem::recordFrame(VkCommandBuffer                         
     blasConstants.animated      = 0;
     blasConstants.instances     = ring.address + impl.ringRenderInstancesOffset;
     blasConstants.rayInstances  = impl.tlasInstancesBuffer.address;
-    blasConstants.blasAddresses = impl.blasAddressesBuffer.address;
+    blasConstants.blasAddresses = impl.blasAddressesBuffer[ringIndex].address;
     blasConstants.sizes         = impl.blasSizesBuffer.address;
     blasConstants.sum           = impl.readbackBuffer.address + offsetof(AnimatedReadback, blasesSize);
 
@@ -1807,8 +1846,8 @@ bool ClusterTemplateSystem::getStats(AnimatedStats& outStats) const
   outStats.geometryBytes        = geometryBytes + sizeof(uint64_t) * impl.clusterTableCapacity;
   outStats.clasBytes            = impl.poseClasBytes;
   outStats.blasReservedBytes    = impl.blasImplicitBuffers[0].bufferSize * Impl::kRingSlots;
-  outStats.operationsBytes      = impl.scratchBuffer.bufferSize + impl.dstSizesBuffer.bufferSize
-                                  + impl.blasAddressesBuffer.bufferSize + impl.blasSizesBuffer.bufferSize
+  outStats.operationsBytes      = impl.scratchBuffers[0].bufferSize * Impl::kRingSlots + impl.dstSizesBuffer.bufferSize
+                                  + impl.blasAddressesBuffer[0].bufferSize * Impl::kRingSlots + impl.blasSizesBuffer.bufferSize
                                   + impl.tlasInstancesBuffer.bufferSize
                                   + (impl.ringBuffers[0].buffer ? impl.ringBuffers[0].bufferSize * Impl::kRingSlots : 0);
 
