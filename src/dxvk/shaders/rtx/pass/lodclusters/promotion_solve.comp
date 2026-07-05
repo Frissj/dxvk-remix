@@ -59,9 +59,18 @@ layout(local_size_x = 64) in;
 
 #define PROMO_FLAG_RIGID   1u
 #define PROMO_FLAG_DEMOTED 4u
+#define PROMO_FLAG_SKIPPED 8u    // diagnostic: this slot took the re-solve skip
+// promo state slot capacity (mirror of ClusterRenderSystem::kPromotionSlotCapacity)
+// - a defensive in-shader bound so a bad stateSlot can never scribble the promo
+// buffers (turns a would-be device-lost into a silently dropped entry)
+#define PROMO_SLOT_CAPACITY 8192u
 
 #define PROMO_SOLVE_SAMPLES      64
 #define PROMO_VALIDATION_SAMPLES 32
+// re-solve skip: samples thread 0 tests the cached M against before deciding an
+// instance is static this frame (rigid motion moves all vertices, so a handful
+// of spread samples catch it; subtle deformation is caught by MODE_GATE).
+#define PROMO_CHECK_SAMPLES      8
 
 // ---- data layouts (mirrored by lodclusters_remix.h / the provider's
 //      precompute - keep in exact sync with the plan 7.7 spec) ----
@@ -162,6 +171,7 @@ shared float s_b[64][12];      // per-thread partial b vectors (3 rows x 4)
 shared float s_dev[64];        // validation deviations
 shared float s_M[12];          // solved rows [A|t'] (row-major 3x4)
 shared bool  s_rigid;
+shared bool  s_skip;           // re-solve skip verdict (thread 0 -> all)
 
 vec3 loadCapture(uint64_t captureVa, uint strideBytes, uint index)
 {
@@ -184,6 +194,16 @@ void main()
   // the batched solve dispatch covers every entry by group index - gate
   // entries run through their own per-entry dispatches (gateEntryIndex set)
   if(push.gateEntryIndex == 0xFFFFFFFFu && entry.mode != PROMO_MODE_SOLVE)
+  {
+    return;
+  }
+
+  // defensive: a bad stateSlot would index the promo matrices/status buffers
+  // out of bounds and can device-lost. Drop the whole (uniform) workgroup - the
+  // stateSlot is per-entry uniform, so every thread returns together (no barrier
+  // reached, no divergence). probeVa==0 means the probe was freed (rejected) -
+  // also nothing safe to do.
+  if(entry.stateSlot >= PROMO_SLOT_CAPACITY || entry.probeVa == 0ul)
   {
     return;
   }
@@ -240,6 +260,133 @@ void main()
   // ======================================================================
   // MODE_SOLVE: one 64-thread group per entry
   // ======================================================================
+
+  // ---- P4c RE-SOLVE SKIP: if last frame's cached M still fits this frame's
+  //      capture (the instance is static), re-patch from cache and skip the
+  //      full solve. Most promoted geometry sits still, so this turns a
+  //      96-sample solve + pseudoinverse into ~8 sample reads.
+  //
+  //      SAFETY (learned the hard way - two GPU-fault builds):
+  //        * ONLY thread 0 reads the status/matrices and decides; the barrier
+  //          below is UNCONDITIONAL and the return is on a shared flag, so no
+  //          status-dependent divergent barrier can hang the workgroup.
+  //        * patch is INLINED, not a helper function - an extracted function
+  //          taking float[12] by value and doing buffer_reference writes was in
+  //          both crashing builds and is a known SPIR-V codegen landmine.
+  //        * only PROMOTED instances (patchSlot valid) skip; candidate/probe
+  //          entries always full-solve so rigidity tracking stays honest.
+  //        * cached M is NaN/Inf-guarded before it can reach the TLAS.
+  if(threadId == 0)
+  {
+    s_skip = false;
+    const PromoStatus stChk = statuses.s[entry.stateSlot];
+    const bool haveCachedM = stChk.lastFrame != 0u
+                          && (stChk.lastFrame + 1u == push.frameId)
+                          && (stChk.flags & PROMO_FLAG_RIGID) != 0u
+                          && entry.patchSlot != 0xFFFFFFFFu;
+    if(haveCachedM)
+    {
+      PromoMatrices matrices = PromoMatrices(push.matricesVa);
+      const uint mBase = entry.stateSlot * 24;
+
+      float P[12];
+      bool finite = true;
+      for(uint k = 0; k < 12; k++)
+      {
+        P[k] = matrices.m[mBase + k];
+        finite = finite && !isinf(P[k]) && !isnan(P[k]);
+      }
+
+      // fold centroid into the translation (matrices hold DECENTERED M, samples
+      // are CENTERED) - same correction MODE_GATE needs, else off-origin meshes
+      // never match and the skip never fires
+      const vec3 cChk = probe.centroidPos;
+      const vec3 tC = vec3(P[0]*cChk.x + P[1]*cChk.y + P[2]*cChk.z + P[3],
+                           P[4]*cChk.x + P[5]*cChk.y + P[6]*cChk.z + P[7],
+                           P[8]*cChk.x + P[9]*cChk.y + P[10]*cChk.z + P[11]);
+
+      const uint checkN = min(probe.validationCount, uint(PROMO_CHECK_SAMPLES));
+      float maxDev = 0.0;
+      for(uint i = 0; i < checkN; i++)
+      {
+        const PromoSample smp = probe.samples[probe.sampleCount + i];
+        const vec3 pc  = vec3(smp.refX, smp.refY, smp.refZ);
+        const vec3 cap = loadCapture(entry.captureVa, entry.captureStrideBytes, smp.index);
+        const vec3 fit = vec3(P[0]*pc.x + P[1]*pc.y + P[2]*pc.z,
+                              P[4]*pc.x + P[5]*pc.y + P[6]*pc.z,
+                              P[8]*pc.x + P[9]*pc.y + P[10]*pc.z) + tC;
+        maxDev = max(maxDev, length(fit - cap));
+      }
+
+      if(finite && checkN > 0u && (maxDev / max(probe.radius, 1e-6)) <= push.residualEpsilon)
+      {
+        // static this frame: prevM = M (zero motion), keep the streak, patch
+        for(uint k = 0; k < 12; k++)
+        {
+          matrices.m[mBase + 12 + k] = P[k];
+        }
+        PromoStatus st = stChk;
+        st.rigidStreak = st.rigidStreak + 1u;
+        st.lastFrame   = push.frameId;
+        st.flags       = (st.flags & ~PROMO_FLAG_DEMOTED) | PROMO_FLAG_RIGID | PROMO_FLAG_SKIPPED;
+        statuses.s[entry.stateSlot] = st;
+
+        // --- INLINE patch (mirrors the full-solve patch at the end of main) ---
+        RawFloats wm = RawFloats(push.renderInstancesVa + uint64_t(entry.patchSlot) * uint64_t(push.riStrideBytes)
+                                 + uint64_t(push.riWorldMatrixOffset));
+        wm.f[0] = P[0]; wm.f[1] = P[4]; wm.f[2] = P[8];
+        wm.f[3] = P[1]; wm.f[4] = P[5]; wm.f[5] = P[9];
+        wm.f[6] = P[2]; wm.f[7] = P[6]; wm.f[8] = P[10];
+        wm.f[9] = P[3]; wm.f[10] = P[7]; wm.f[11] = P[11];
+
+        const float det = P[0] * (P[5] * P[10] - P[6] * P[9])
+                        - P[1] * (P[4] * P[10] - P[6] * P[8])
+                        + P[2] * (P[4] * P[9] - P[5] * P[8]);
+        const float invDet = abs(det) > 1e-20 ? 1.0 / det : 0.0;
+        float I[9];
+        I[0] = (P[5]*P[10]-P[6]*P[9])*invDet; I[1] = (P[2]*P[9]-P[1]*P[10])*invDet; I[2] = (P[1]*P[6]-P[2]*P[5])*invDet;
+        I[3] = (P[6]*P[8]-P[4]*P[10])*invDet; I[4] = (P[0]*P[10]-P[2]*P[8])*invDet; I[5] = (P[2]*P[4]-P[0]*P[6])*invDet;
+        I[6] = (P[4]*P[9]-P[5]*P[8])*invDet;  I[7] = (P[1]*P[8]-P[0]*P[9])*invDet;  I[8] = (P[0]*P[5]-P[1]*P[4])*invDet;
+        const vec3 it = -vec3(I[0]*P[3]+I[1]*P[7]+I[2]*P[11],
+                              I[3]*P[3]+I[4]*P[7]+I[5]*P[11],
+                              I[6]*P[3]+I[7]*P[7]+I[8]*P[11]);
+        RawFloats wmi = RawFloats(push.renderInstancesVa + uint64_t(entry.patchSlot) * uint64_t(push.riStrideBytes)
+                                  + uint64_t(push.riWorldMatrixIOffset));
+        wmi.f[0] = I[0]; wmi.f[1] = I[3]; wmi.f[2] = I[6];
+        wmi.f[3] = I[1]; wmi.f[4] = I[4]; wmi.f[5] = I[7];
+        wmi.f[6] = I[2]; wmi.f[7] = I[5]; wmi.f[8] = I[8];
+        wmi.f[9] = it.x; wmi.f[10] = it.y; wmi.f[11] = it.z;
+
+        const bool mirrored = det < 0.0;
+        {
+          RawUints riPacked = RawUints(push.renderInstancesVa + uint64_t(entry.patchSlot) * uint64_t(push.riStrideBytes)
+                                       + uint64_t(push.riFlipWindingOffset));
+          uint packed = riPacked.u[0];
+          const bool twoSided = ((packed >> 8) & 0xFFu) != 0u;
+          packed = (packed & ~0xFFu) | ((!twoSided && mirrored) ? 1u : 0u);
+          riPacked.u[0] = packed;
+        }
+        if(mirrored)
+        {
+          RawUints tlasFlags = RawUints(push.tlasInstancesVa + uint64_t(entry.patchSlot) * 64ul + 52ul);
+          tlasFlags.u[0] ^= (2u << 24);
+        }
+        RawFloats tlas = RawFloats(push.tlasInstancesVa + uint64_t(entry.patchSlot) * 64ul);
+        for(uint k = 0; k < 12; k++)
+        {
+          tlas.f[k] = P[k];
+        }
+
+        s_skip = true;
+      }
+    }
+  }
+
+  barrier();          // UNCONDITIONAL - every thread hits this exactly once
+  if(s_skip)          // uniform: shared, written by thread 0 before the barrier
+  {
+    return;
+  }
 
   // ---- partial b vectors: b_r = sum(refH * cap_r) over the solve samples ----
   for(uint k = 0; k < 12; k++)
@@ -354,7 +501,8 @@ void main()
   status.residualRel = residualRel;
   status.rigidStreak = rigid ? (contiguous ? status.rigidStreak + 1u : 1u) : 0u;
   status.lastFrame   = push.frameId;
-  status.flags       = (status.flags & ~(PROMO_FLAG_RIGID | PROMO_FLAG_DEMOTED))
+  // clear SKIPPED too - this frame did the full solve (diagnostic counter)
+  status.flags       = (status.flags & ~(PROMO_FLAG_RIGID | PROMO_FLAG_DEMOTED | PROMO_FLAG_SKIPPED))
                      | (rigid ? PROMO_FLAG_RIGID : PROMO_FLAG_DEMOTED);
   statuses.s[entry.stateSlot] = status;
 

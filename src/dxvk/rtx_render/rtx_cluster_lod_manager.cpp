@@ -380,8 +380,12 @@ namespace dxvk {
       return false;
     }
 
-    // P4c: interim templates for static geometry have their own opt-out
-    if (!snapshot.isDeforming && !snapshot.isMutating && !ClusterLodOptions::Animated::interimTemplates()) {
+    // P4c: interim templates for static geometry have their own opt-out.
+    // 4a: captured meshes are exempt - they MUST build templates (Path B is the
+    // only correct render for them until promotion recovers their transform), so
+    // only pure-static non-captured geometry honors the interimTemplates opt-out.
+    if (!snapshot.isDeforming && !snapshot.isMutating && !snapshot.isCaptured
+        && !ClusterLodOptions::Animated::interimTemplates()) {
       return false;
     }
 
