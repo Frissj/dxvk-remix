@@ -1723,6 +1723,28 @@ size_t SceneStreaming::getClasSize(bool reserved) const
   }
 }
 
+// NV-DXVK: valid CLAS memory ranges for the Path A [BlasCapture] device-lost
+// dump - a cluster BLAS build reference must point inside one of these.
+void SceneStreaming::appendClasRanges(std::vector<std::pair<uint64_t, uint64_t>>& outRanges) const
+{
+  if(m_shaderData.resident.clasBaseAddress && m_shaderData.resident.clasMaxSize)
+  {
+    outRanges.emplace_back(m_shaderData.resident.clasBaseAddress,
+                           m_shaderData.resident.clasBaseAddress + m_shaderData.resident.clasMaxSize);
+  }
+  if(m_clasLowDetailBuffer.buffer)
+  {
+    outRanges.emplace_back(m_clasLowDetailBuffer.address, m_clasLowDetailBuffer.address + m_clasLowDetailBuffer.bufferSize);
+  }
+  for(const nvvk::Buffer& appendBuffer : m_clasLowDetailAppendBuffers)
+  {
+    if(appendBuffer.buffer)
+    {
+      outRanges.emplace_back(appendBuffer.address, appendBuffer.address + appendBuffer.bufferSize);
+    }
+  }
+}
+
 size_t SceneStreaming::getBlasSize(bool reserved) const
 {
   size_t size = m_blasSize;

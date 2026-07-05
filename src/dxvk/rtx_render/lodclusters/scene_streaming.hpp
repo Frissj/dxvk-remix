@@ -345,6 +345,10 @@ private:
                                   const FrameSettings& settings,
                                   uint32_t             popRequestIndex);
 
+  // NV-DXVK: device-lost forensics - the valid CLAS memory ranges a cluster
+  // BLAS build's references must point inside (Path A [BlasCapture] dump).
+  void appendClasRanges(std::vector<std::pair<uint64_t, uint64_t>>& outRanges) const;
+
 private:
   void handleBlasCaching(StreamingUpdates::TaskInfo& updateTask, const FrameSettings& settings);
 
