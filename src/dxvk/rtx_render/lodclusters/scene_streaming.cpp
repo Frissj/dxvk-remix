@@ -375,6 +375,7 @@ bool SceneStreaming::initPersistentGeometry(Resources& res, size_t geometryIndex
 // NV-DXVK P3: appends geometries to the live streaming system - see header.
 bool SceneStreaming::appendGeometries(size_t firstGeometry, size_t geometryCount)
 {
+  dbgSetTempLabel("append");
   assert(m_resources && m_scene && "appendGeometries requires init");
   assert(firstGeometry == m_persistentGeometries.size() && "append range must extend the resident set");
   assert(firstGeometry + geometryCount <= m_scene->getActiveGeometryCount());
@@ -2156,6 +2157,7 @@ bool SceneStreaming::initClas()
 // their own per-batch buffers so resident CLAS/BLAS never move.
 bool SceneStreaming::buildLowDetailClas(size_t firstGeometry, size_t geometryCount, nvvk::Buffer& clasBuffer, nvvk::Buffer& blasBuffer)
 {
+  dbgSetTempLabel(firstGeometry == 0 ? "loBuild-init" : "loBuild-append");
   Resources& res = *m_resources;
 
   {

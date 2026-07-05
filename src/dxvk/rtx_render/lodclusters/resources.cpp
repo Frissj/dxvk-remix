@@ -521,13 +521,21 @@ bool Resources::compileShader(shaderc::SpvCompilationResult& compiled,
 namespace {
   std::atomic<uint64_t> g_tempSeq{0};
   inline uint32_t dbgTid() { return uint32_t(std::hash<std::thread::id>{}(std::this_thread::get_id()) & 0xFFFFFFu); }
+  thread_local const char* t_tempLabel = "?";
+}
+
+// NV-DXVK: label the next temp op(s) on this thread so [TempSubmit] names which
+// operation submitted the hanging work. Inherited by nested temp ops.
+void dbgSetTempLabel(const char* label)
+{
+  t_tempLabel = label ? label : "?";
 }
 
 VkCommandBuffer Resources::createTempCmdBuffer()
 {
   const int inFlight = m_tempInFlight.fetch_add(1) + 1;
-  LOGI("[TempSubmit] alloc  pool=%p tid=%06x seq=%llu inFlight=%d%s\n", (void*)m_tempCommandPool, dbgTid(),
-       (unsigned long long)g_tempSeq.fetch_add(1), inFlight,
+  LOGI("[TempSubmit] alloc  pool=%p tid=%06x seq=%llu inFlight=%d op=%s%s\n", (void*)m_tempCommandPool, dbgTid(),
+       (unsigned long long)g_tempSeq.fetch_add(1), inFlight, t_tempLabel,
        inFlight > 1 ? "  *** CONCURRENT temp op on THIS pool -> RACE ***" : "");
 
   VkCommandBufferAllocateInfo allocInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
@@ -577,7 +585,7 @@ void Resources::tempSyncSubmit(VkCommandBuffer cmd)
   // submission itself needs the lock. The fence wait (the long part: it spans
   // the temp work's GPU execution) runs unlocked so render-thread submissions
   // are never blocked behind it.
-  LOGI("[TempSubmit] submit pool=%p tid=%06x inFlight=%d\n", (void*)m_tempCommandPool, dbgTid(), m_tempInFlight.load());
+  LOGI("[TempSubmit] submit pool=%p tid=%06x inFlight=%d op=%s\n", (void*)m_tempCommandPool, dbgTid(), m_tempInFlight.load(), t_tempLabel);
   if(submitLockFn)
     submitLockFn();
   NVVK_CHECK(vkQueueSubmit2(m_queue.queue, 1, &submitInfo2, fence));

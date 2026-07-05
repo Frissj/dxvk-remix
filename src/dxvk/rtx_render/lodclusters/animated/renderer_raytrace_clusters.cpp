@@ -803,6 +803,7 @@ void ClusterTemplateSystem::setSubmitLockCallbacks(std::function<void()> lockFn,
 
 uint64_t ClusterTemplateSystem::uploadPromotionProbe(const void* data, size_t bytes)
 {
+  dbgSetTempLabel("probeUpload");
   Impl& impl = *m_impl;
 
   if(!impl.initialized || data == nullptr || bytes == 0)
@@ -854,6 +855,7 @@ void ClusterTemplateSystem::freePromotionProbe(uint64_t probeVa)
 
 uint64_t ClusterTemplateSystem::clusterizeGeometry(const GeometrySnapshot& snapshot)
 {
+  dbgSetTempLabel("clusterize");
   Impl& impl = *m_impl;
 
   if(!impl.initialized || snapshot.indices.empty() || snapshot.vertexCount < 3 || snapshot.positions.size() < size_t(snapshot.vertexCount) * 3)
@@ -905,6 +907,7 @@ uint64_t ClusterTemplateSystem::clusterizeGeometry(const GeometrySnapshot& snaps
 
 bool ClusterTemplateSystem::buildGeometryTemplates(uint64_t token)
 {
+  dbgSetTempLabel("templateBuild");
   Impl& impl = *m_impl;
 
   auto found = impl.pendingGeometries.find(token);

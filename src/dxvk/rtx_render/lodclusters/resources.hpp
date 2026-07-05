@@ -119,6 +119,10 @@ std::string formatMemorySize(size_t sizeInBytes);
 // matter which system's thread notices the loss first.
 std::function<void()>& deviceLostAuxDumpFn();
 
+// NV-DXVK: label this thread's next temp op(s) so [TempSubmit] names which
+// operation submitted the faulting work (device-lost forensics).
+void dbgSetTempLabel(const char* label);
+
 inline size_t logMemoryUsage(size_t size, const char* memtype, const char* what)
 {
   LOGI("%s memory: %s - %s\n", memtype, formatMemorySize(size).c_str(), what);
