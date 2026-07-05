@@ -578,10 +578,28 @@ namespace dxvk {
       uint64_t positionsAddress = 0;
       uint32_t positionsStrideBytes = 0;
       Rc<DxvkBuffer> positionsBuffer;  // lifetime tracking on the cmd list
+      // tracked-staging inputs (flicker fix): byte offset of the position data
+      // within positionsBuffer and the byte length the build will read
+      VkDeviceSize positionsByteOffset = 0;
+      VkDeviceSize positionsLengthBytes = 0;
     };
     std::vector<FramePose> m_framePoses;
     std::unordered_map<const BlasEntry*, uint32_t> m_framePoseIndexByBlas;
     uint32_t m_frameClusterBudgetUsed = 0;
+
+    // Path B live-position staging ring (flicker fix): the CLAS build's vertex
+    // reads are RAW commands dxvk's barrier tracker never sees - trackResource
+    // keeps the game's live buffer ALIVE but does not ORDER the read against
+    // the game's next write to it. The kUpdateBVH history ping-pong is only 2
+    // buffers deep, so a mutating mesh's buffer is rewritten every 2 frames
+    // while GPU frames overlap up to 4 deep -> the raw read tears mid-write ->
+    // flickering garbage clusters. Fix: a TRACKED ctx->copyBuffer stages each
+    // pose's positions here first (dxvk auto-barriers it against the game's
+    // writes in both directions); the raw gather/build then reads Path-B-owned
+    // staging only. Ring depth mirrors the template system's kRingSlots (the
+    // raw reads are frame-overlap-exposed, tracked writes are not).
+    static constexpr uint32_t kPoseStagingRing = 6;
+    Rc<DxvkBuffer> m_poseStagingBuffers[kPoseStagingRing];
     std::vector<ClusterSlot> m_slotsB[Tlas::Count];  // geometryId = frame pose index
     std::vector<VkAccelerationStructureInstanceKHR> m_slotInstanceDataB[Tlas::Count];
     std::vector<SssDuplicate> m_sssDuplicatesB;      // flat index into the B Opaque block

@@ -31,6 +31,7 @@
 
 #include "rtx_cluster_lod_manager.h"
 #include "rtx_cluster_lod_geometry_provider.h"
+#include "../../util/util_math.h"
 #include "rtx_hashing.h"
 #include "rtx_accel_manager.h"
 #include "rtx_camera_manager.h"
@@ -1831,6 +1832,15 @@ namespace dxvk {
     framePose.positionsAddress = positions.getDeviceAddress() + positions.offsetFromSlice();
     framePose.positionsStrideBytes = positions.stride();
     framePose.positionsBuffer = positions.buffer();
+    if (framePose.positionsBuffer != nullptr) {
+      // tracked-staging inputs (flicker fix, see kPoseStagingRing): byte range
+      // of the position data within the live DxvkBuffer
+      const uint32_t vertexCount = blasEntry->input.getGeometryData().vertexCount;
+      framePose.positionsByteOffset = framePose.positionsAddress - framePose.positionsBuffer->getDeviceAddress();
+      framePose.positionsLengthBytes = vertexCount > 0
+        ? VkDeviceSize(framePose.positionsStrideBytes) * (vertexCount - 1u) + 3u * sizeof(float)
+        : 0;
+    }
 
     const uint32_t framePoseIndex = uint32_t(m_framePoses.size());
     m_framePoses.push_back(std::move(framePose));
@@ -2204,36 +2214,72 @@ namespace dxvk {
     // culprit. Log its ranges (deduped) + LOUDLY flag any pose whose buffer Rc is
     // null: those skip trackResource below yet still feed the CLAS build an
     // untracked address that can be freed -> exactly this fault.
-    static std::unordered_set<uint64_t> s_diagLoggedPosBuffers;
+    // ---- tracked live-position staging (flicker fix, see kPoseStagingRing) ----
+    // The raw gather/CLAS reads below are invisible to dxvk's barrier tracker,
+    // so they must never touch the game's live buffers directly (the kUpdateBVH
+    // ping-pong rewrites them every 2 frames while GPU frames overlap 4 deep -
+    // torn positions = flickering garbage clusters). Stage each pose's position
+    // range through TRACKED ctx->copyBuffer first: dxvk orders those copies
+    // against the game's vertex uploads in both directions, and everything raw
+    // downstream reads only Path-B-owned staging.
+    VkDeviceSize stagingTotal = 0;
+    std::vector<VkDeviceSize> stagingOffsets(poseCount);
+    for (uint32_t p = 0; p < poseCount; p++) {
+      stagingOffsets[p] = stagingTotal;
+      stagingTotal += align(m_framePoses[p].positionsLengthBytes, 16);
+    }
+
+    const uint32_t stagingIndex = m_device->getCurrentFrameId() % kPoseStagingRing;
+    Rc<DxvkBuffer>& staging = m_poseStagingBuffers[stagingIndex];
+    if (stagingTotal > 0 && (staging == nullptr || staging->info().size < stagingTotal)) {
+      DxvkBufferCreateInfo info;
+      info.size = align(std::max<VkDeviceSize>(stagingTotal, 1 << 20), 1 << 20);  // MiB-align growth, no churn
+      info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+                 | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
+                 | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+      info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+                  | VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
+      info.access = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT
+                  | VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+      // old buffer's Rc drops here; dxvk keeps it alive while any tracked
+      // command list still references it
+      staging = m_device->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                                       DxvkMemoryStats::Category::RTXAccelerationStructure, "PathB Pose Staging");
+    }
+
     uint32_t nullBufferPoses = 0;
     std::vector<lodclusters_remix::ClusterTemplateSystem::PoseInput> poses(poseCount);
     for (uint32_t p = 0; p < poseCount; p++) {
       poses[p].poseSetId = m_framePoses[p].poseSetId;
-      poses[p].positionsAddress = m_framePoses[p].positionsAddress;
       poses[p].positionsStrideBytes = m_framePoses[p].positionsStrideBytes;
 
-      // the instantiation reads the skinned/live positions this frame - keep
-      // the buffer alive for dxvk's lifetime tracking
-      if (m_framePoses[p].positionsBuffer != nullptr) {
-        ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_framePoses[p].positionsBuffer);
-
-        const uint64_t addr = m_framePoses[p].positionsAddress;
-        if (s_diagLoggedPosBuffers.insert(addr).second) {
-          const VkDeviceSize sz = m_framePoses[p].positionsBuffer->info().size;
-          Logger::info(str::format("[ClusterLOD] posBuf range 0x", std::hex, addr, "..0x", addr + sz,
-                                   std::dec, " (", sz, " bytes)"));
-        }
+      if (m_framePoses[p].positionsBuffer != nullptr && staging != nullptr
+          && m_framePoses[p].positionsLengthBytes > 0) {
+        // tracked copy: live buffer -> this frame's staging slice (dxvk
+        // barriers this against the game's writes to the live buffer)
+        ctx->copyBuffer(staging, stagingOffsets[p],
+                        m_framePoses[p].positionsBuffer, m_framePoses[p].positionsByteOffset,
+                        m_framePoses[p].positionsLengthBytes);
+        poses[p].positionsAddress = staging->getDeviceAddress() + stagingOffsets[p];
       } else {
+        // no Rc (untracked capture path) - fall back to the raw live address;
+        // rare, flagged loudly below
+        poses[p].positionsAddress = m_framePoses[p].positionsAddress;
         nullBufferPoses++;
-        // the address is still used by the build below - this is the leak
-        Logger::warn(str::format("[ClusterLOD] *** UNTRACKED POSITIONS *** pose ", p,
+        Logger::warn(str::format("[ClusterLOD] *** UNSTAGED POSITIONS *** pose ", p,
                                  " addr 0x", std::hex, m_framePoses[p].positionsAddress, std::dec,
-                                 " (null buffer Rc -> not lifetime-tracked, can be freed under the AS build)"));
+                                 " (null buffer Rc -> raw unordered read; tearing/lifetime hazards possible)"));
       }
     }
     if (nullBufferPoses > 0) {
       Logger::warn(str::format("[ClusterLOD] frame ", m_device->getCurrentFrameId(),
-                               ": ", nullBufferPoses, "/", poseCount, " Path B poses have UNTRACKED positions"));
+                               ": ", nullBufferPoses, "/", poseCount, " Path B poses have UNSTAGED positions"));
+    }
+    if (staging != nullptr) {
+      // the raw gather reads the staging after the tracked copies; keep it on
+      // this command list for lifetime (ordering is the ring + same-cmdbuf
+      // barriers inside recordFrame)
+      ctx->getCommandList()->trackResource<DxvkAccess::Read>(staging);
     }
 
     std::vector<uint32_t> slotPoseIndex(countB);
