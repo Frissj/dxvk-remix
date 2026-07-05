@@ -199,6 +199,10 @@ public:
   const std::vector<shaderio::Geometry>& getShaderGeometries() const { return m_shaderGeometries; }
   const nvvk::Buffer&                          getShaderStreamingBuffer() const { return m_shaderBuffer; }
   const shaderio::SceneStreaming&              getShaderStreamingData() const { return m_shaderData; }
+
+  // NV-DXVK: device-lost forensics - the valid CLAS memory ranges a cluster
+  // BLAS build's references must point inside (Path A [BlasCapture] dump).
+  void appendClasRanges(std::vector<std::pair<uint64_t, uint64_t>>& outRanges) const;
   const StreamingConfig&                       getStreamingConfig() const { return m_config; }
 
   // device side memory usage, reserved or current state
@@ -344,10 +348,6 @@ private:
                                   QueueState&          asyncQueueState,
                                   const FrameSettings& settings,
                                   uint32_t             popRequestIndex);
-
-  // NV-DXVK: device-lost forensics - the valid CLAS memory ranges a cluster
-  // BLAS build's references must point inside (Path A [BlasCapture] dump).
-  void appendClasRanges(std::vector<std::pair<uint64_t, uint64_t>>& outRanges) const;
 
 private:
   void handleBlasCaching(StreamingUpdates::TaskInfo& updateTask, const FrameSettings& settings);
