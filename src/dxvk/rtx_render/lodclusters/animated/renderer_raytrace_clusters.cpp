@@ -51,6 +51,7 @@
 
 #include <volk.h>
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstring>
@@ -310,6 +311,12 @@ struct ClusterTemplateSystem::Impl
   {
     nvvk::Buffer buffer;
     uint32_t     frameId;
+    // DIAG (2026-07-05): device-address range + call-site tag so a post-crash
+    // log can match the Aftermath page-fault address to the exact buffer and
+    // see the queue/free frames (whether the 8-frame delay was actually enough)
+    uint64_t     address;
+    uint64_t     size;
+    const char*  tag;
   };
   std::mutex            trashMutex;
   std::deque<Trash>     trash;
@@ -317,14 +324,21 @@ struct ClusterTemplateSystem::Impl
 
   //////////////////////////////////////////////////////////////////////////
 
-  void deferDestroy(nvvk::Buffer& buffer)
+  void deferDestroy(nvvk::Buffer& buffer, const char* tag = "?")
   {
     if(!buffer.buffer)
     {
       return;
     }
     std::lock_guard<std::mutex> lock(trashMutex);
-    trash.push_back({buffer, currentFrameId.load()});
+    const uint32_t fid = currentFrameId.load();
+    // DIAG: log the range being deferred. Match the Aftermath fault address
+    // (e.g. 0xa60bb000) against these [addr, addr+size) ranges post-crash.
+    LOGI("[ClusterLOD] deferDestroy '%s': range 0x%llx..0x%llx (%llu bytes), queued frame %u\n",
+         tag, (unsigned long long)buffer.address,
+         (unsigned long long)(buffer.address + buffer.bufferSize),
+         (unsigned long long)buffer.bufferSize, fid);
+    trash.push_back({buffer, fid, buffer.address, buffer.bufferSize, tag});
     buffer = {};
   }
 
@@ -333,9 +347,160 @@ struct ClusterTemplateSystem::Impl
     std::lock_guard<std::mutex> lock(trashMutex);
     while(!trash.empty() && (force || frameId - trash.front().frameId > kDestroyDelayFrames))
     {
+      const Trash& t = trash.front();
+      // DIAG: log the actual free. If a page fault hits an address in this
+      // range shortly AFTER this line, the buffer was freed while still GPU-live
+      // (delay too short) - the queue->free frame gap shows the real headroom.
+      LOGI("[ClusterLOD] FREE '%s': range 0x%llx..0x%llx, queued frame %u, freed frame %u (delay %u)\n",
+           t.tag, (unsigned long long)t.address, (unsigned long long)(t.address + t.size),
+           t.frameId, frameId, frameId - t.frameId);
       res.m_allocator.destroyBuffer(trash.front().buffer);
       trash.pop_front();
     }
+  }
+
+  // NV-DXVK: device-lost forensics (Path B). All per-frame build inputs live
+  // in the host-visible ring, so no GPU copies are needed: pre/post stamps
+  // bracket the instantiation + BLAS build, and the dump reads the faulting
+  // frame's ring directly (the ring survives - deferDestroy holds buffers 8
+  // frames and the device dies well within that window).
+  nvvk::Buffer dbgStampHost;
+  struct DbgFrameInfo
+  {
+    uint32_t       stamp         = 0;
+    uint32_t       ringIndex     = 0;
+    uint32_t       poseCount     = 0;
+    uint32_t       totalClusters = 0;
+    uint32_t       slotCount     = 0;
+    const uint8_t* ringMapping   = nullptr;
+    uint64_t       ringVa        = 0;
+    size_t         dstOff        = 0;
+    size_t         blasOff       = 0;
+    // every pose's full vertex read range [addr, addr + stride*numVertices) +
+    // pose set id - the builds' only reads outside cluster-owned memory are
+    // these, so the Aftermath fault address must match one of them (or the
+    // vertex-read theory is dead)
+    std::vector<std::array<uint64_t, 3>> poseRanges;
+  };
+  DbgFrameInfo dbgFrames[2];
+
+  void debugDump()
+  {
+    static std::mutex s_dumpMutex;
+    static bool       s_dumped = false;
+    std::lock_guard<std::mutex> lock(s_dumpMutex);
+    if(s_dumped || !dbgStampHost.mapping)
+    {
+      return;
+    }
+    s_dumped = true;
+
+    const uint32_t* stamps = reinterpret_cast<const uint32_t*>(dbgStampHost.mapping);
+
+    LOGE("[AnimCapture] ==== device lost - dumping Path B (animated) build inputs ====\n");
+    for(uint32_t slot = 0; slot < 2; slot++)
+    {
+      const DbgFrameInfo& info = dbgFrames[slot];
+      const uint32_t      pre  = stamps[slot * 2 + 0];
+      const uint32_t      post = stamps[slot * 2 + 1];
+
+      LOGE("[AnimCapture] slot %u: pre %u post %u -> %s (ring %u, poses %u, clusters %u, slots %u, ringVa 0x%llx)\n",
+           slot, pre, post,
+           pre == 0 ? "never used" : (pre == post ? "builds COMPLETED" : "builds DID NOT COMPLETE (faulting frame)"),
+           info.ringIndex, info.poseCount, info.totalClusters, info.slotCount, (unsigned long long)info.ringVa);
+
+      if(pre == 0 || pre == post || info.ringMapping == nullptr)
+      {
+        continue;
+      }
+
+      uint32_t loggedLines = 0;
+
+      // BLAS build inputs: cluster reference list pointers must sit inside
+      // this ring slot's dstAddresses array
+      const auto* dumpBlasInfos = reinterpret_cast<const VkClusterAccelerationStructureBuildClustersBottomLevelInfoNV*>(
+          info.ringMapping + info.blasOff);
+      const uint64_t dstVaBase = info.ringVa + info.dstOff;
+      const uint64_t dstVaEnd  = dstVaBase + sizeof(uint64_t) * uint64_t(info.totalClusters);
+      uint32_t       badBlas   = 0;
+      for(uint32_t p = 0; p < info.poseCount; p++)
+      {
+        const auto& b     = dumpBlasInfos[p];
+        const bool  ptrOk = b.clusterReferences >= dstVaBase
+                           && b.clusterReferences + uint64_t(b.clusterReferencesCount) * 8 <= dstVaEnd;
+        if(!ptrOk || b.clusterReferencesStride != 8 || b.clusterReferencesCount == 0)
+        {
+          badBlas++;
+          if(loggedLines < 32)
+          {
+            LOGE("[AnimCapture]  BAD BLAS %u: count %u stride %u references 0x%llx (dst array 0x%llx..0x%llx)\n", p,
+                 b.clusterReferencesCount, b.clusterReferencesStride, (unsigned long long)b.clusterReferences,
+                 (unsigned long long)dstVaBase, (unsigned long long)dstVaEnd);
+            loggedLines++;
+          }
+        }
+      }
+
+      // CLAS destinations (CPU-written): raw sample + null count
+      const uint64_t* dumpDst  = reinterpret_cast<const uint64_t*>(info.ringMapping + info.dstOff);
+      uint32_t        nullDst  = 0;
+      for(uint32_t c = 0; c < info.totalClusters; c++)
+      {
+        if(dumpDst[c] == 0)
+        {
+          nullDst++;
+        }
+      }
+      for(uint32_t c = 0; c < std::min(info.totalClusters, 8u); c++)
+      {
+        LOGE("[AnimCapture]  dst[%u] = 0x%llx\n", c, (unsigned long long)dumpDst[c]);
+      }
+
+      // instantiation inputs: template + live vertex buffer addresses
+      uint32_t nullTemplates = 0, nullVertices = 0;
+      if(config.useTemplates)
+      {
+        const auto* dumpInst =
+            reinterpret_cast<const VkClusterAccelerationStructureInstantiateClusterInfoNV*>(info.ringMapping);
+        for(uint32_t c = 0; c < info.totalClusters; c++)
+        {
+          const auto& inst = dumpInst[c];
+          if(inst.clusterTemplateAddress == 0)
+          {
+            nullTemplates++;
+          }
+          if(inst.vertexBuffer.startAddress == 0)
+          {
+            nullVertices++;
+          }
+          if((inst.clusterTemplateAddress == 0 || inst.vertexBuffer.startAddress == 0) && loggedLines < 64)
+          {
+            LOGE("[AnimCapture]  BAD INST %u: template 0x%llx vtx 0x%llx stride %llu\n", c,
+                 (unsigned long long)inst.clusterTemplateAddress, (unsigned long long)inst.vertexBuffer.startAddress,
+                 (unsigned long long)inst.vertexBuffer.strideInBytes);
+            loggedLines++;
+          }
+        }
+        for(uint32_t c = 0; c < std::min(info.totalClusters, 8u); c++)
+        {
+          const auto& inst = dumpInst[c];
+          LOGE("[AnimCapture]  inst[%u]: template 0x%llx vtx 0x%llx stride %llu\n", c,
+               (unsigned long long)inst.clusterTemplateAddress, (unsigned long long)inst.vertexBuffer.startAddress,
+               (unsigned long long)inst.vertexBuffer.strideInBytes);
+        }
+      }
+
+      // every pose's vertex read range - match the Aftermath fault address here
+      for(size_t p = 0; p < info.poseRanges.size() && p < 192; p++)
+      {
+        LOGE("[AnimCapture]  pose %zu set %llu vtx 0x%llx..0x%llx\n", p, (unsigned long long)info.poseRanges[p][2],
+             (unsigned long long)info.poseRanges[p][0], (unsigned long long)info.poseRanges[p][1]);
+      }
+
+      LOGE("[AnimCapture] slot %u summary: %u bad blas infos, %u null dst, %u null templates, %u null vertex buffers\n",
+           slot, badBlas, nullDst, nullTemplates, nullVertices);
+    }
+    LOGE("[AnimCapture] ==== dump end ====\n");
   }
 
   VkClusterAccelerationStructureTriangleClusterInputNV makeTriangleClusterInput(uint32_t maxTotalTriangles, uint32_t maxTotalVertices) const
@@ -414,16 +579,16 @@ struct ClusterTemplateSystem::Impl
     const VkBufferUsageFlags2 kDeviceUsage = VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT
                                              | VK_BUFFER_USAGE_2_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
 
-    deferDestroy(dstSizesBuffer);
+    deferDestroy(dstSizesBuffer, "dstSizes");
     NVVK_CHECK(res.createBuffer(dstSizesBuffer, sizeof(uint32_t) * clusterCapacity, kDeviceUsage));
 
-    deferDestroy(blasAddressesBuffer);
+    deferDestroy(blasAddressesBuffer, "blasAddresses");
     NVVK_CHECK(res.createBuffer(blasAddressesBuffer, sizeof(uint64_t) * poseCapacity, kDeviceUsage));
 
-    deferDestroy(blasSizesBuffer);
+    deferDestroy(blasSizesBuffer, "blasSizes");
     NVVK_CHECK(res.createBuffer(blasSizesBuffer, sizeof(uint32_t) * poseCapacity, kDeviceUsage));
 
-    deferDestroy(tlasInstancesBuffer);
+    deferDestroy(tlasInstancesBuffer, "tlasInstances");
     NVVK_CHECK(res.createBuffer(tlasInstancesBuffer, sizeof(VkAccelerationStructureInstanceKHR) * slotCapacity,
                                 VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT
                                     | VK_BUFFER_USAGE_2_TRANSFER_DST_BIT | VK_BUFFER_USAGE_2_TRANSFER_SRC_BIT));
@@ -432,13 +597,13 @@ struct ClusterTemplateSystem::Impl
     // trace reads the previous frames' BLASes, so each frame builds into its own
     for(nvvk::Buffer& blasPool : blasImplicitBuffers)
     {
-      deferDestroy(blasPool);
+      deferDestroy(blasPool, "blasImplicit");
       NVVK_CHECK(res.createBuffer(blasPool, blasPoolSize,
                                   VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT
                                       | VK_BUFFER_USAGE_2_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR));
     }
 
-    deferDestroy(scratchBuffer);
+    deferDestroy(scratchBuffer, "scratch");
     scratchSize = newScratchSize;
     NVVK_CHECK(res.createBuffer(scratchBuffer, scratchSize,
                                 VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT));
@@ -488,13 +653,26 @@ struct ClusterTemplateSystem::Impl
 
     for(nvvk::Buffer& ring : ringBuffers)
     {
-      deferDestroy(ring);
+      deferDestroy(ring, "ring");
       NVVK_CHECK(res.m_allocator.createBuffer(ring, bufferInfo, vmaInfo));
     }
 
     LOGI("ClusterTemplateSystem: frame capacities - clusters %u, poses %u, slots %u, blas pool %s, scratch %s\n",
          clusterCapacity, poseCapacity, slotCapacity, lodclusters::formatMemorySize(blasPoolSize).c_str(),
          lodclusters::formatMemorySize(scratchSize).c_str());
+
+    // DIAG (2026-07-05): new per-frame buffer ranges, so a page-fault address
+    // can be matched to the newly-grown (post-deferDestroy) allocations
+    LOGI("[ClusterLOD] grow ranges: scratch 0x%llx..0x%llx, dstSizes 0x%llx..0x%llx, tlasInst 0x%llx..0x%llx\n",
+         (unsigned long long)scratchBuffer.address, (unsigned long long)(scratchBuffer.address + scratchBuffer.bufferSize),
+         (unsigned long long)dstSizesBuffer.address, (unsigned long long)(dstSizesBuffer.address + dstSizesBuffer.bufferSize),
+         (unsigned long long)tlasInstancesBuffer.address, (unsigned long long)(tlasInstancesBuffer.address + tlasInstancesBuffer.bufferSize));
+    for(uint32_t s = 0; s < kRingSlots; s++)
+    {
+      LOGI("[ClusterLOD] grow ranges: ring[%u] 0x%llx..0x%llx, blasImplicit[%u] 0x%llx..0x%llx\n",
+           s, (unsigned long long)ringBuffers[s].address, (unsigned long long)(ringBuffers[s].address + ringBuffers[s].bufferSize),
+           s, (unsigned long long)blasImplicitBuffers[s].address, (unsigned long long)(blasImplicitBuffers[s].address + blasImplicitBuffers[s].bufferSize));
+    }
 
     return true;
   }
@@ -528,7 +706,7 @@ struct ClusterTemplateSystem::Impl
     }
 
     // frames in flight may still read the old table through raytrace_args
-    deferDestroy(clusterTableBuffer);
+    deferDestroy(clusterTableBuffer, "clusterTable");
 
     clusterTableBuffer   = newBuffer;
     clusterTableCapacity = newCapacity;
@@ -653,6 +831,22 @@ bool ClusterTemplateSystem::init(const RenderDeviceInfo& deviceInfo, const Anima
   impl.profilerGpuTimer.init(impl.profilerTimeline, deviceInfo.device, deviceInfo.physicalDevice,
                              int(deviceInfo.graphicsQueueFamilyIndex), false);
 
+  // NV-DXVK: Path B device-lost forensics (see Impl::debugDump). Registered on
+  // this system's own Resources (its tempSyncSubmit noticed past losses first)
+  // and on the shared aux hook the LOD renderer's primary dump chains into.
+  NVVK_CHECK(impl.res.m_allocator.createBuffer(impl.dbgStampHost, sizeof(uint32_t) * 4, VK_BUFFER_USAGE_2_TRANSFER_DST_BIT,
+                                               VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                                               VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT));
+  if(impl.dbgStampHost.mapping)
+  {
+    memset(impl.dbgStampHost.mapping, 0, sizeof(uint32_t) * 4);
+  }
+  {
+    Impl* implPtr                       = m_impl.get();
+    impl.res.deviceLostDumpFn           = [implPtr]() { implPtr->debugDump(); };
+    lodclusters::deviceLostAuxDumpFn()  = [implPtr]() { implPtr->debugDump(); };
+  }
+
   impl.initialized = true;
 
   LOGI("ClusterTemplateSystem: initialized (%s, cluster %u/%u)\n", config.useTemplates ? "templates" : "direct builds",
@@ -671,6 +865,11 @@ void ClusterTemplateSystem::deinit()
   }
 
   vkDeviceWaitIdle(impl.deviceInfo.device);
+
+  // NV-DXVK: forensic teardown
+  impl.res.deviceLostDumpFn          = nullptr;
+  lodclusters::deviceLostAuxDumpFn() = nullptr;
+  impl.res.m_allocator.destroyBuffer(impl.dbgStampHost);
 
   impl.processTrash(0, true);
 
@@ -806,7 +1005,7 @@ void ClusterTemplateSystem::freePromotionProbe(uint64_t probeVa)
     {
       // an in-flight frame's gate/solve may still read the blob - deferred
       // destruction only (trash queue, kDestroyDelayFrames)
-      impl.deferDestroy(impl.promotionProbes[i]);
+      impl.deferDestroy(impl.promotionProbes[i], "promoProbe");
       impl.promotionProbes.erase(impl.promotionProbes.begin() + ptrdiff_t(i));
       return;
     }
@@ -1297,6 +1496,14 @@ bool ClusterTemplateSystem::buildGeometryTemplates(uint64_t token)
        data->numTriangles, data->numVertices,
        impl.config.useTemplates ? lodclusters::formatMemorySize(data->templatesBuffer.bufferSize).insert(0, ", templates ").c_str() : "");
 
+  // DIAG (2026-07-05): persistent geometry buffer ranges (append-only, freed
+  // only at deinit; the CLAS build reads templateAddresses into templatesBuffer,
+  // the index into trianglesBuffer). Match a fault address to rule these in/out.
+  LOGI("[ClusterLOD] geom create: %s templates 0x%llx..0x%llx, triangles 0x%llx..0x%llx\n",
+       data->name.c_str(),
+       (unsigned long long)data->templatesBuffer.address, (unsigned long long)(data->templatesBuffer.address + data->templatesBuffer.bufferSize),
+       (unsigned long long)data->trianglesBuffer.address, (unsigned long long)(data->trianglesBuffer.address + data->trianglesBuffer.bufferSize));
+
   // publish for main-thread adoption
   {
     std::lock_guard<std::mutex> lock(impl.readyMutex);
@@ -1399,6 +1606,15 @@ uint32_t ClusterTemplateSystem::createPoseSet(uint32_t geometryIndex)
   impl.activePoseSets++;
   impl.poseClasBytes += poseClasBytes;
 
+  // DIAG (2026-07-05): per-pose CLAS ranges (persistent until releasePoseSet;
+  // the BLAS build reads these via the dst-address array). Match a fault address.
+  LOGI("[ClusterLOD] poseClas create: set %u geom %u ranges 0x%llx..0x%llx / 0x%llx..0x%llx / 0x%llx..0x%llx / 0x%llx..0x%llx\n",
+       poseSetId, geometryIndex,
+       (unsigned long long)clasBuffers[0].address, (unsigned long long)(clasBuffers[0].address + clasBuffers[0].bufferSize),
+       (unsigned long long)clasBuffers[1].address, (unsigned long long)(clasBuffers[1].address + clasBuffers[1].bufferSize),
+       (unsigned long long)clasBuffers[2].address, (unsigned long long)(clasBuffers[2].address + clasBuffers[2].bufferSize),
+       (unsigned long long)clasBuffers[3].address, (unsigned long long)(clasBuffers[3].address + clasBuffers[3].bufferSize));
+
   return poseSetId;
 }
 
@@ -1416,7 +1632,7 @@ void ClusterTemplateSystem::releasePoseSet(uint32_t poseSetId)
   for(nvvk::Buffer& clasBuffer : poseSet.clasBuffers)
   {
     impl.poseClasBytes -= clasBuffer.bufferSize;
-    impl.deferDestroy(clasBuffer);  // in-flight frames may still trace it
+    impl.deferDestroy(clasBuffer, "poseClas");  // in-flight frames may still trace it
   }
   impl.activePoseSets--;
 
@@ -1610,6 +1826,37 @@ bool ClusterTemplateSystem::recordFrame(VkCommandBuffer                         
 
   vkCmdFillBuffer(cmd, impl.readbackBuffer.buffer, 0, sizeof(AnimatedReadback), 0);
 
+  // NV-DXVK: Path B forensics - snapshot this frame's ring + pre-stamp (the
+  // barrier below orders the fill before the builds, so a build fault cannot
+  // lose it)
+  const uint32_t dbgSlot  = impl.frameCounter & 1;
+  const uint32_t dbgStamp = impl.frameCounter + 1;
+  if(impl.dbgStampHost.buffer)
+  {
+    Impl::DbgFrameInfo& dbgInfo = impl.dbgFrames[dbgSlot];
+    dbgInfo.stamp               = dbgStamp;
+    dbgInfo.ringIndex           = ringIndex;
+    dbgInfo.poseCount           = poseCount;
+    dbgInfo.totalClusters       = totalClusters;
+    dbgInfo.slotCount           = slotCount;
+    dbgInfo.ringMapping         = mapping;
+    dbgInfo.ringVa              = ring.address;
+    dbgInfo.dstOff              = impl.ringDstAddressesOffset;
+    dbgInfo.blasOff             = impl.ringBlasInfosOffset;
+    dbgInfo.poseRanges.clear();
+    dbgInfo.poseRanges.reserve(poseCount);
+    for(uint32_t p = 0; p < poseCount; p++)
+    {
+      const Impl::PoseSet&      dbgPoseSet  = impl.poseSets[poses[p].poseSetId];
+      const Impl::GeometryData& dbgGeometry = *impl.geometries[dbgPoseSet.geometryIndex];
+      dbgInfo.poseRanges.push_back(
+          {poses[p].positionsAddress,
+           poses[p].positionsAddress + uint64_t(poses[p].positionsStrideBytes) * dbgGeometry.numVertices,
+           uint64_t(poses[p].poseSetId)});
+    }
+    vkCmdFillBuffer(cmd, impl.dbgStampHost.buffer, sizeof(uint32_t) * (dbgSlot * 2 + 0), sizeof(uint32_t), dbgStamp);
+  }
+
   // wait for animation update (gpu_skinning writes from this submission's
   // earlier commands / prior submissions) and our staging writes
   VkMemoryBarrier memBarrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -1699,6 +1946,18 @@ bool ClusterTemplateSystem::recordFrame(VkCommandBuffer                         
     cmdInfo.scratchData = impl.scratchBuffer.address;
     cmdInfo.input       = inputs;
     vkCmdBuildClusterAccelerationStructureIndirectNV(cmd, &cmdInfo);
+  }
+
+  // NV-DXVK: Path B forensics post-stamp - executes only if the instantiation
+  // and BLAS build above did not kill the device
+  if(impl.dbgStampHost.buffer)
+  {
+    VkMemoryBarrier dbgBarrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    dbgBarrier.srcAccessMask   = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+    dbgBarrier.dstAccessMask   = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                         1, &dbgBarrier, 0, nullptr, 0, nullptr);
+    vkCmdFillBuffer(cmd, impl.dbgStampHost.buffer, sizeof(uint32_t) * (dbgSlot * 2 + 1), sizeof(uint32_t), dbgStamp);
   }
 
   memBarrier.srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR

@@ -95,6 +95,12 @@ namespace dxvk {
     }
     // NV-DXVK end
 
+    // NV-DXVK: see the [BufVa] CREATE counterpart in getDeviceAddress
+    if (m_deviceAddress != 0) {
+      Logger::info(str::format("[BufVa] DESTROY 0x", std::hex, m_deviceAddress, "..0x",
+                               m_deviceAddress + info().size, std::dec));
+    }
+
     const auto& vkd = m_device->vkd();
 
     for (const auto& buffer : m_buffers)
@@ -111,6 +117,14 @@ namespace dxvk {
       bufferInfo.buffer = m_physSlice.handle;
       m_deviceAddress = vkd->vkGetBufferDeviceAddress(vkd->device(), &bufferInfo);
       m_deviceAddress += getDynamicOffset(0);
+
+      // NV-DXVK: [BufVa] lifecycle ledger for RT-visible buffers. Only buffers
+      // whose device address is actually queried land here - exactly the set
+      // whose raw addresses can escape into AS-build inputs. DESTROY fires at
+      // real object death; an Aftermath fault inside a DESTROYed range names
+      // the buffer that was freed under in-flight GPU work.
+      Logger::info(str::format("[BufVa] CREATE 0x", std::hex, m_deviceAddress, "..0x",
+                               m_deviceAddress + info().size, std::dec, " (", info().size, " bytes)"));
     }
     return m_deviceAddress;
   }
@@ -397,10 +411,24 @@ namespace dxvk {
         "\n  size:  ", accelCreateInfo.size,
         "\n  type: ", accelType));
     }
+
+    // NV-DXVK: [AccelVa] lifecycle ledger. DESTROY fires at actual Rc death,
+    // so an Aftermath fault address inside a DESTROYed range proves the AS
+    // memory was reclaimed while GPU work still referenced it (and the
+    // create/destroy timestamps show whether cmdlist tracking held it).
+    m_dbgAccelVa = getAccelDeviceAddress();
+    Logger::info(str::format("[AccelVa] CREATE 0x", std::hex, m_dbgAccelVa, "..0x",
+                             m_dbgAccelVa + accelCreateInfo.size, std::dec, " (", accelCreateInfo.size,
+                             " bytes, type ", uint32_t(accelType), ", ", name ? name : "?", ")"));
   }
 
   DxvkAccelStructure::~DxvkAccelStructure() {
     if (accelStructureRef != VK_NULL_HANDLE) {
+      // NV-DXVK: see the CREATE counterpart above
+      if (m_dbgAccelVa != 0) {
+        Logger::info(str::format("[AccelVa] DESTROY 0x", std::hex, m_dbgAccelVa, "..0x",
+                                 m_dbgAccelVa + info().size, std::dec));
+      }
       const auto& vkd = m_device->vkd();
       vkd->vkDestroyAccelerationStructureKHR(m_device->handle(), accelStructureRef, nullptr);
     }

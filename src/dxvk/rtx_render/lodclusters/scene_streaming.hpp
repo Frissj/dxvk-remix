@@ -199,6 +199,12 @@ public:
   const shaderio::SceneStreaming&              getShaderStreamingData() const { return m_shaderData; }
   const StreamingConfig&                       getStreamingConfig() const { return m_config; }
 
+  // NV-DXVK: appends every device-address range that can legitimately hold a
+  // CLAS referenced by the per-frame BLAS builds (streamed pool + lowest-detail
+  // buffers). Used by the renderer's device-lost forensic dump to classify
+  // captured cluster references.
+  void appendClasRanges(std::vector<std::pair<uint64_t, uint64_t>>& outRanges) const;
+
   // device side memory usage, reserved or current state
   size_t getClasSize(bool reserved) const;
   size_t getBlasSize(bool reserved) const;

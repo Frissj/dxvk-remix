@@ -920,8 +920,31 @@ lodclusters::StreamingUpdates::TaskInfo& StreamingUpdates::getNewTask(uint32_t t
   task.newClusterCount             = 0;
   task.loadActiveGroupsOffset      = ~0;
   task.loadActiveClustersOffset    = ~0;
+  // NV-DXVK: a recycled index always had its handles given back on completion
+  // (or via freeAllCachedBlasHandles); this only drops empty state
+  task.cachedBlasFreeHandles.clear();
 
   return task;
+}
+
+// NV-DXVK
+void StreamingUpdates::freeCachedBlasHandles(uint32_t taskIndex, nvvk::BufferSubAllocator& allocator)
+{
+  TaskInfo& task = m_taskInfos[taskIndex];
+  for(nvvk::BufferSubAllocation& handle : task.cachedBlasFreeHandles)
+  {
+    allocator.subFree(handle);
+  }
+  task.cachedBlasFreeHandles.clear();
+}
+
+// NV-DXVK
+void StreamingUpdates::freeAllCachedBlasHandles(nvvk::BufferSubAllocator& allocator)
+{
+  for(uint32_t taskIndex = 0; taskIndex < STREAMING_MAX_ACTIVE_TASKS; taskIndex++)
+  {
+    freeCachedBlasHandles(taskIndex, allocator);
+  }
 }
 
 size_t StreamingUpdates::cmdUploadTask(VkCommandBuffer cmd, uint32_t taskIndex)

@@ -2146,6 +2146,14 @@ namespace dxvk {
     }
 
     // flat kernel-array order: [Opaque B block][Unordered B block]
+    // DIAG (2026-07-05): the Aftermath page fault (0x54975000) is disjoint from
+    // every logged cluster buffer (all at 0x116x...), so the AS build's remaining
+    // input - pose.positionsAddress (the live game vertex buffer) - is the
+    // culprit. Log its ranges (deduped) + LOUDLY flag any pose whose buffer Rc is
+    // null: those skip trackResource below yet still feed the CLAS build an
+    // untracked address that can be freed -> exactly this fault.
+    static std::unordered_set<uint64_t> s_diagLoggedPosBuffers;
+    uint32_t nullBufferPoses = 0;
     std::vector<lodclusters_remix::ClusterTemplateSystem::PoseInput> poses(poseCount);
     for (uint32_t p = 0; p < poseCount; p++) {
       poses[p].poseSetId = m_framePoses[p].poseSetId;
@@ -2156,7 +2164,24 @@ namespace dxvk {
       // the buffer alive for dxvk's lifetime tracking
       if (m_framePoses[p].positionsBuffer != nullptr) {
         ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_framePoses[p].positionsBuffer);
+
+        const uint64_t addr = m_framePoses[p].positionsAddress;
+        if (s_diagLoggedPosBuffers.insert(addr).second) {
+          const VkDeviceSize sz = m_framePoses[p].positionsBuffer->info().size;
+          Logger::info(str::format("[ClusterLOD] posBuf range 0x", std::hex, addr, "..0x", addr + sz,
+                                   std::dec, " (", sz, " bytes)"));
+        }
+      } else {
+        nullBufferPoses++;
+        // the address is still used by the build below - this is the leak
+        Logger::warn(str::format("[ClusterLOD] *** UNTRACKED POSITIONS *** pose ", p,
+                                 " addr 0x", std::hex, m_framePoses[p].positionsAddress, std::dec,
+                                 " (null buffer Rc -> not lifetime-tracked, can be freed under the AS build)"));
       }
+    }
+    if (nullBufferPoses > 0) {
+      Logger::warn(str::format("[ClusterLOD] frame ", m_device->getCurrentFrameId(),
+                               ": ", nullBufferPoses, "/", poseCount, " Path B poses have UNTRACKED positions"));
     }
 
     std::vector<uint32_t> slotPoseIndex(countB);
