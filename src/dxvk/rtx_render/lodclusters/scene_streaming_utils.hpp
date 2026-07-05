@@ -429,6 +429,14 @@ public:
     shaderio::StreamingPatch*         unloadPatches;
     nvvk::BufferSubAllocation*        unloadHandles;
     shaderio::StreamingGeometryPatch* geometryPatches;
+    // NV-DXVK: cached-BLAS allocations this task's geometry patches replace or
+    // invalidate. Like unloadHandles, the memory may only be given back after
+    // the update task completed on the GPU timeline - in-flight frames keep
+    // tracing TLAS instances that reference the old cached BLAS address until
+    // the patch executes (an immediate subFree destroys the backing
+    // VkBuffer/VkDeviceMemory CPU-side and unmaps its GPU virtual address,
+    // page-faulting those frames).
+    std::vector<nvvk::BufferSubAllocation> cachedBlasFreeHandles;
   };
 
   struct NewInfo
@@ -475,6 +483,16 @@ public:
 
   // later frame, must have applied task completed
   const TaskInfo& getCompletedTask(uint32_t taskIndex) const { return m_taskInfos[taskIndex]; }
+
+  // NV-DXVK: gives back the task's deferred cached-BLAS allocations (see
+  // TaskInfo::cachedBlasFreeHandles). Call only once the task completed on the
+  // GPU timeline.
+  void freeCachedBlasHandles(uint32_t taskIndex, nvvk::BufferSubAllocator& allocator);
+
+  // NV-DXVK: gives back every pending deferred cached-BLAS allocation across
+  // all tasks, including ones never applied (decoupled transfers cut short by
+  // a reset). Requires an idle device.
+  void freeAllCachedBlasHandles(nvvk::BufferSubAllocator& allocator);
 
 private:
   bool m_useBlasCaching = false;

@@ -43,6 +43,10 @@
 #include <nvutils/logger.hpp>
 #include <fmt/format.h>
 
+#include <mutex>
+
+#include <nvvk/check_error.hpp>
+
 #include "renderer.hpp"
 
 #define USE_LARGE_BUFFER_BLAS 1
@@ -162,6 +166,27 @@ private:
   nvvk::Buffer m_tlasInstancesBuffer;
 
   nvvk::Buffer m_scratchBuffer;
+
+  // NV-DXVK: device-lost forensics for the streaming crash. Every frame the
+  // per-frame cluster BLAS build's inputs (SceneBuilding counters, the
+  // BlasBuildInfo array, the CLAS reference lists) are copied to a host mirror
+  // BEFORE the build runs, with an execution barrier so the copies complete
+  // before the build can page-fault the device. Pre/post stamps bracket the
+  // build; on VK_ERROR_DEVICE_LOST the slot whose post-stamp is missing holds
+  // exactly what the faulting build consumed, and debugDumpBlasInputCapture
+  // classifies every value against the valid CLAS pools.
+  static constexpr uint32_t kDbgCaptureSlots        = 2;
+  static constexpr uint32_t kDbgCaptureMaxAddresses = 1u << 21;  // 16 MiB of refs per slot
+  nvvk::Buffer m_dbgCaptureHost[kDbgCaptureSlots];
+  nvvk::Buffer m_dbgStampHost;
+  uint32_t     m_dbgCaptureAddressCount = 0;
+  VkDeviceSize m_dbgCaptureInfosOffset  = 0;
+  VkDeviceSize m_dbgCaptureAddrsOffset  = 0;
+  std::vector<std::pair<uint64_t, uint64_t>> m_dbgClasRanges;
+
+  void debugRecordBlasInputCapture(VkCommandBuffer cmd, uint32_t slot);
+  void debugStampBuildCompleted(VkCommandBuffer cmd, uint32_t slot);
+  void debugDumpBlasInputCapture();
 };
 
 bool RendererRayTraceClustersLod::initShaders(Resources& res, RenderScene& rscene, const RendererConfig& config)
@@ -420,6 +445,47 @@ bool RendererRayTraceClustersLod::init(Resources& res, RenderScene& rscene, cons
                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR);
 #endif
       NVVK_DBG_NAME(m_sceneBlasDataBuffers[ringSlot].buffer);
+    }
+
+    // NV-DXVK: device-lost forensics host mirrors (see the member block)
+    {
+      m_dbgCaptureAddressCount = std::min(m_sceneBuildShaderio.maxRenderClusters, kDbgCaptureMaxAddresses);
+      m_dbgCaptureInfosOffset  = nvutils::align_up(VkDeviceSize(sizeof(shaderio::SceneBuilding)), VkDeviceSize(16));
+      m_dbgCaptureAddrsOffset =
+          m_dbgCaptureInfosOffset + nvutils::align_up(VkDeviceSize(sizeof(shaderio::BlasBuildInfo)) * m_maxBlasBuilds, VkDeviceSize(16));
+      const VkDeviceSize captureSize = m_dbgCaptureAddrsOffset + sizeof(uint64_t) * VkDeviceSize(m_dbgCaptureAddressCount);
+
+      for(uint32_t slot = 0; slot < kDbgCaptureSlots; slot++)
+      {
+        res.createBuffer(m_dbgCaptureHost[slot], captureSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_CPU_ONLY,
+                         VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
+      }
+      res.createBuffer(m_dbgStampHost, sizeof(uint32_t) * 2 * kDbgCaptureSlots, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                       VMA_MEMORY_USAGE_CPU_ONLY, VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
+      if(m_dbgStampHost.mapping)
+      {
+        memset(m_dbgStampHost.mapping, 0, sizeof(uint32_t) * 2 * kDbgCaptureSlots);
+      }
+
+      if(m_dbgCaptureAddressCount < m_sceneBuildShaderio.maxRenderClusters)
+      {
+        LOGI("[BlasCapture] cluster reference capture capped at %u of %u possible entries\n", m_dbgCaptureAddressCount,
+             m_sceneBuildShaderio.maxRenderClusters);
+      }
+
+      res.deviceLostDumpFn = [this]() { debugDumpBlasInputCapture(); };
+
+      // NV-DXVK: NVVK_CHECK exit()s the process on the FIRST failing thread -
+      // including the template system's Resources, which has no dump hook (its
+      // exit truncated the 12:37 dump after two lines). CheckError's pre-exit
+      // callback is process-wide: whichever thread fails first either writes
+      // the dump itself or blocks inside it until it is complete.
+      nvvk::CheckError::getInstance().setCallbackFunction([this](VkResult result) {
+        if(result == VK_ERROR_DEVICE_LOST)
+        {
+          debugDumpBlasInputCapture();
+        }
+      });
     }
 
     if(m_config.useBlasSharing)
@@ -872,6 +938,15 @@ void RendererRayTraceClustersLod::render(VkCommandBuffer cmd, Resources& res, Re
     rscene.sceneStreaming.cmdEndFrame(cmd, res.m_queueStates.primary, profiler);
   }
 
+  // NV-DXVK: forensic capture of this frame's BLAS build inputs (the barrier
+  // above already orders the insert-kernel writes against TRANSFER)
+  m_dbgClasRanges.clear();
+  if(rscene.useStreaming)
+  {
+    rscene.sceneStreaming.appendClasRanges(m_dbgClasRanges);
+  }
+  debugRecordBlasInputCapture(cmd, m_frameIndex % kDbgCaptureSlots);
+
   // what is this? nah we never had any bugs in building and allocating the cluster data, totally not needed
 #if !STREAMING_DEBUG_WITHOUT_RT
   {
@@ -917,6 +992,9 @@ void RendererRayTraceClustersLod::render(VkCommandBuffer cmd, Resources& res, Re
     cmdInfo.scratchData = m_scratchBuffer.address;
 
     vkCmdBuildClusterAccelerationStructureIndirectNV(cmd, &cmdInfo);
+
+    // NV-DXVK: post-stamp - executes only if the build did not kill the device
+    debugStampBuildCompleted(cmd, m_frameIndex % kDbgCaptureSlots);
 
     memBarrier.srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
     memBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
@@ -1018,9 +1096,190 @@ void RendererRayTraceClustersLod::render(VkCommandBuffer cmd, Resources& res, Re
   m_frameIndex++;
 }
 
+// NV-DXVK: see the forensic-capture member block
+void RendererRayTraceClustersLod::debugRecordBlasInputCapture(VkCommandBuffer cmd, uint32_t slot)
+{
+  nvvk::Buffer& dst = m_dbgCaptureHost[slot];
+  if(dst.buffer == VK_NULL_HANDLE)
+  {
+    return;
+  }
+
+  // pre-stamp: +1 so a raw 0 means "slot never used"
+  const uint32_t frameStamp = m_frameIndex + 1;
+  vkCmdFillBuffer(cmd, m_dbgStampHost.buffer, sizeof(uint32_t) * (slot * 2 + 0), sizeof(uint32_t), frameStamp);
+
+  VkBufferCopy region;
+  region.srcOffset = 0;
+  region.dstOffset = 0;
+  region.size      = sizeof(shaderio::SceneBuilding);
+  vkCmdCopyBuffer(cmd, m_sceneBuildBuffer.buffer, dst.buffer, 1, &region);
+
+  VkBufferCopy regions[2];
+  regions[0].srcOffset = m_sceneBuildShaderio.blasBuildInfos - m_sceneDataBuffer.address;
+  regions[0].dstOffset = m_dbgCaptureInfosOffset;
+  regions[0].size      = sizeof(shaderio::BlasBuildInfo) * VkDeviceSize(m_maxBlasBuilds);
+  regions[1].srcOffset = m_sceneBuildShaderio.blasClusterAddresses - m_sceneDataBuffer.address;
+  regions[1].dstOffset = m_dbgCaptureAddrsOffset;
+  regions[1].size      = sizeof(uint64_t) * VkDeviceSize(m_dbgCaptureAddressCount);
+  vkCmdCopyBuffer(cmd, m_sceneDataBuffer.buffer, dst.buffer, 2, regions);
+
+  // the mirrors must be fully written before the build gets a chance to
+  // page-fault the device, else the capture of the faulting frame is lost
+  VkMemoryBarrier memBarrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+  memBarrier.srcAccessMask   = VK_ACCESS_TRANSFER_WRITE_BIT;
+  memBarrier.dstAccessMask   = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+  vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, 0, 1,
+                       &memBarrier, 0, nullptr, 0, nullptr);
+}
+
+// NV-DXVK
+void RendererRayTraceClustersLod::debugStampBuildCompleted(VkCommandBuffer cmd, uint32_t slot)
+{
+  if(m_dbgStampHost.buffer == VK_NULL_HANDLE)
+  {
+    return;
+  }
+
+  VkMemoryBarrier memBarrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+  memBarrier.srcAccessMask   = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+  memBarrier.dstAccessMask   = VK_ACCESS_TRANSFER_WRITE_BIT;
+  vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1,
+                       &memBarrier, 0, nullptr, 0, nullptr);
+  vkCmdFillBuffer(cmd, m_dbgStampHost.buffer, sizeof(uint32_t) * (slot * 2 + 1), sizeof(uint32_t), m_frameIndex + 1);
+}
+
+// NV-DXVK
+void RendererRayTraceClustersLod::debugDumpBlasInputCapture()
+{
+  // one dump per process run; any other failing thread blocks here until the
+  // dump is written, so its NVVK_CHECK exit() cannot truncate it
+  static std::mutex s_dumpMutex;
+  static bool       s_dumped = false;
+  std::lock_guard<std::mutex> lock(s_dumpMutex);
+  if(s_dumped)
+  {
+    return;
+  }
+  s_dumped = true;
+
+  if(m_dbgStampHost.mapping == nullptr)
+  {
+    return;
+  }
+
+  const uint32_t* stamps = reinterpret_cast<const uint32_t*>(m_dbgStampHost.mapping);
+
+  LOGE("[BlasCapture] ==== device lost - dumping captured cluster BLAS build inputs ====\n");
+  for(const std::pair<uint64_t, uint64_t>& range : m_dbgClasRanges)
+  {
+    LOGE("[BlasCapture] valid clas range 0x%llx..0x%llx\n", (unsigned long long)range.first, (unsigned long long)range.second);
+  }
+
+  const uint32_t clasAlignment = std::max(1u, m_rtClasProperties.clusterBottomLevelByteAlignment);
+
+  for(uint32_t slot = 0; slot < kDbgCaptureSlots; slot++)
+  {
+    const uint32_t pre  = stamps[slot * 2 + 0];
+    const uint32_t post = stamps[slot * 2 + 1];
+
+    LOGE("[BlasCapture] slot %u: pre-stamp %u post-stamp %u -> %s\n", slot, pre, post,
+         pre == 0 ? "never used" : (pre == post ? "build COMPLETED" : "build DID NOT COMPLETE (faulting frame)"));
+
+    if(pre == 0 || m_dbgCaptureHost[slot].mapping == nullptr)
+    {
+      continue;
+    }
+
+    const uint8_t*                  base  = m_dbgCaptureHost[slot].mapping;
+    const shaderio::SceneBuilding&  sb    = *reinterpret_cast<const shaderio::SceneBuilding*>(base);
+    const shaderio::BlasBuildInfo*  infos = reinterpret_cast<const shaderio::BlasBuildInfo*>(base + m_dbgCaptureInfosOffset);
+    const uint64_t*                 addrs = reinterpret_cast<const uint64_t*>(base + m_dbgCaptureAddrsOffset);
+    const uint64_t                  addrsBase = m_sceneBuildShaderio.blasClusterAddresses;
+    const uint64_t                  addrsEnd  = addrsBase + sizeof(uint64_t) * uint64_t(m_dbgCaptureAddressCount);
+
+    LOGE("[BlasCapture] slot %u counters: blasBuildCounter %u (max %u), blasClasCounter %u, renderClusterCounter %u\n",
+         slot, sb.blasBuildCounter, m_maxBlasBuilds, sb.blasClasCounter, sb.renderClusterCounter);
+
+    const uint32_t buildCount = std::min(sb.blasBuildCounter, m_maxBlasBuilds);
+    uint32_t       badBuilds = 0, badRefs = 0, loggedLines = 0;
+
+    for(uint32_t i = 0; i < buildCount; i++)
+    {
+      const shaderio::BlasBuildInfo& info = infos[i];
+
+      const bool ptrOk = info.clusterReferences >= addrsBase
+                         && info.clusterReferences + uint64_t(info.clusterReferencesCount) * 8 <= addrsEnd;
+      const bool metaOk = info.clusterReferencesStride == 8 && info.clusterReferencesCount > 0
+                          && info.clusterReferencesCount <= m_blasInput.maxClusterCountPerAccelerationStructure;
+
+      if(!ptrOk || !metaOk)
+      {
+        badBuilds++;
+        if(loggedLines < 48)
+        {
+          LOGE("[BlasCapture]  BAD BUILD %u: count %u stride %u references 0x%llx (array 0x%llx..0x%llx)\n", i,
+               info.clusterReferencesCount, info.clusterReferencesStride, (unsigned long long)info.clusterReferences,
+               (unsigned long long)addrsBase, (unsigned long long)addrsEnd);
+          loggedLines++;
+        }
+      }
+      if(!ptrOk)
+      {
+        continue;
+      }
+
+      const uint64_t* refList = addrs + (info.clusterReferences - addrsBase) / 8;
+      for(uint32_t c = 0; c < info.clusterReferencesCount; c++)
+      {
+        const uint64_t a       = refList[c];
+        bool           inRange = false;
+        for(const std::pair<uint64_t, uint64_t>& range : m_dbgClasRanges)
+        {
+          if(a >= range.first && a < range.second)
+          {
+            inRange = true;
+            break;
+          }
+        }
+        if(a == 0 || (a % clasAlignment) != 0 || !inRange)
+        {
+          badRefs++;
+          if(loggedLines < 96)
+          {
+            LOGE("[BlasCapture]  BAD REF build %u ref %u/%u: 0x%llx%s%s%s\n", i, c, info.clusterReferencesCount,
+                 (unsigned long long)a, a == 0 ? " NULL" : "", (a % clasAlignment) != 0 ? " MISALIGNED" : "",
+                 !inRange && a != 0 ? " OUT-OF-POOL" : "");
+            loggedLines++;
+          }
+        }
+      }
+    }
+
+    LOGE("[BlasCapture] slot %u summary: %u builds checked, %u bad build infos, %u bad clas refs\n", slot, buildCount,
+         badBuilds, badRefs);
+  }
+  LOGE("[BlasCapture] ==== dump end ====\n");
+
+  // NV-DXVK: chain the Path B (animated template system) capture - same loss
+  if(deviceLostAuxDumpFn())
+  {
+    deviceLostAuxDumpFn()();
+  }
+}
+
 void RendererRayTraceClustersLod::deinit(Resources& res)
 {
   deinitBasics(res);
+
+  // NV-DXVK: forensic capture teardown
+  res.deviceLostDumpFn = nullptr;
+  nvvk::CheckError::getInstance().setCallbackFunction(nvvk::CheckError::Callback());
+  for(uint32_t slot = 0; slot < kDbgCaptureSlots; slot++)
+  {
+    res.m_allocator.destroyBuffer(m_dbgCaptureHost[slot]);
+  }
+  res.m_allocator.destroyBuffer(m_dbgStampHost);
 
   res.m_allocator.destroyBuffer(m_tlasInstancesBuffer);
   res.m_allocator.destroyBuffer(m_scratchBuffer);

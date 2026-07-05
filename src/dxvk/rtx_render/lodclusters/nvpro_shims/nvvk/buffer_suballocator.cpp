@@ -19,6 +19,8 @@
 
 #include <cassert>
 
+#include <nvutils/logger.hpp>
+
 #include "check_error.hpp"
 #include "debug_util.hpp"
 #include "buffer_suballocator.hpp"
@@ -364,6 +366,15 @@ void BufferSubAllocator::subFree(BufferSubAllocation& subAllocation)
     // and maybe depending on how many blocks to keep
     if(!offsetAllocator || (m_state.activeBlockCount > m_info.keepBlockCount))
     {
+      // NV-DXVK: block destruction unmaps this GPU VA range immediately - a
+      // fault decode landing in a logged range means someone freed under
+      // in-flight GPU work (the cached-BLAS streaming device-lost class)
+      {
+        const nvvk::Buffer& blockBuffer = m_blocks[subAllocation.m_block].buffer;
+        LOGI("[SubAlloc] %s block %u DESTROY range 0x%llx..0x%llx (%llu bytes)\n", m_info.debugName.c_str(),
+             uint32_t(subAllocation.m_block), (unsigned long long)blockBuffer.address,
+             (unsigned long long)(blockBuffer.address + blockBuffer.bufferSize), (unsigned long long)blockBuffer.bufferSize);
+      }
       m_info.resourceAllocator->destroyBuffer(m_blocks[subAllocation.m_block].buffer);
 
       // blocks with OffsetAllocators are counted to active blocks
@@ -450,6 +461,11 @@ VkResult BufferSubAllocator::createNewBuffer(nvvk::Buffer& buffer, VkDeviceSize 
 
   nvvk::DebugUtil::getInstance().setObjectName(buffer.buffer, std::string(typeid(*this).name()) + "::" + m_info.debugName
                                                                   + "_" + std::to_string(blockIndex));
+  // NV-DXVK: counterpart of the DESTROY log in subFree - together they map any
+  // future fault address to the sub-allocator block that owned it
+  LOGI("[SubAlloc] %s block %u CREATE range 0x%llx..0x%llx (%llu bytes)\n", m_info.debugName.c_str(),
+       blockIndex, (unsigned long long)buffer.address, (unsigned long long)(buffer.address + buffer.bufferSize),
+       (unsigned long long)buffer.bufferSize);
   return VK_SUCCESS;
 }
 

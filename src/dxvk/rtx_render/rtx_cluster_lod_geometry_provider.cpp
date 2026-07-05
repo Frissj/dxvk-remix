@@ -148,10 +148,15 @@ namespace dxvk {
     {
       std::unique_lock<std::mutex> lock(m_mutex);
 
-      if (deforming && !skinned) {
+      if (vertexDataUpdated && !skinned && !captured) {
         // remember the churn source so its per-frame "new" asset hashes stop
         // being treated as fresh static geometry below (and never bloat
-        // m_knownHashes - one entry per frame would grow unboundedly)
+        // m_knownHashes - one entry per frame would grow unboundedly).
+        // ONLY in-place mutation (kUpdateBVH) of NON-captured geometry belongs
+        // here. A rigidly-moving captured object ALSO trips vertexDataUpdated
+        // every frame (its positions churn), but it is a promotion candidate,
+        // not a mutator - the per-frame affine solve handles its motion. Tagging
+        // it mutating would exile it to pure Path B, defeating promotion.
         m_mutatingTopologyKeys.insert(topologyKey);
       }
 
@@ -182,12 +187,17 @@ namespace dxvk {
     const bool eligible = snapshotResult == SnapshotResult::Eligible
                        || snapshotResult == SnapshotResult::EligibleConverted;
     snapshot.isDeforming = skinned;
-    snapshot.isMutating = deforming && !skinned;
-    // promotion candidates: captured AND content-stable. Mutating meshes stay
-    // pure Path B - they can never promote (frozen snapshot vs live rewrites)
-    // and their stable asset-rule hash + churning content hashes made every
-    // session reprocess + overwrite the same .nvsngeo (see GeometrySnapshot)
-    snapshot.isCaptured = captured && !skinned && !snapshot.isMutating;
+    // mutating = in-place vertex rewrites (kUpdateBVH) of NON-captured geometry
+    // ONLY. Deriving this from `deforming` (which folds in `captured` for dedup
+    // keying) flagged every captured draw as mutating, which made isCaptured
+    // impossible and kept the entire game on Path B - promotion never saw a
+    // candidate. A moving captured object also trips vertexDataUpdated, but it
+    // is a promotion candidate (rigid solve handles the motion), not a mutator.
+    snapshot.isMutating = vertexDataUpdated && !skinned && !captured;
+    // promotion candidates: ALL non-skinned captured geometry. Their motion (if
+    // any) is resolved by the per-frame affine solve; the promotion gate is the
+    // real rigid-vs-deforming filter, so we no longer pre-exclude by mutation.
+    snapshot.isCaptured = captured && !skinned;
     snapshot.topologyKey = topologyKey;
 
     std::unique_lock<std::mutex> lock(m_mutex);
@@ -664,13 +674,16 @@ namespace dxvk {
       // a session, discovery outpaces processing (raise processing.threadsPct)
       const double queuedMs = snapshot.queuedAtUs != 0 ? double(nowUs() - snapshot.queuedAtUs) * 1e-3 : 0.0;
 
-      if (snapshot.isDeforming || snapshot.isMutating) {
+      if (snapshot.isDeforming || snapshot.isMutating || snapshot.isCaptured) {
         // P4b Path B: cluster templates (vk_animated_clusters). The manager's
         // handler runs the one-time registration on this worker thread: CPU
         // clusterization of the topology, then the GPU template build under
-        // Remix's submission lock.
+        // Remix's submission lock. Captured snapshots register here too -
+        // Path B is their render path until the promotion verdict flips them.
         const std::string name = snapshot.name;
-        const bool skinned = snapshot.isDeforming;
+        const char* kind = snapshot.isDeforming ? "skinned"
+                         : snapshot.isMutating  ? "mutating"
+                                                : "captured";
 
         {
           std::unique_lock<std::mutex> lock(m_mutex);
@@ -697,11 +710,11 @@ namespace dxvk {
         }
 
         if (registered) {
-          Logger::info(str::format("[ClusterLOD] ", name, ": ", skinned ? "skinned" : "mutating",
+          Logger::info(str::format("[ClusterLOD] ", name, ": ", kind,
                                    " geometry registered for Path B (cluster templates)",
                                    " - queued ", queuedMs, " ms, registration ", registrationMs, " ms"));
         } else {
-          Logger::info(str::format("[ClusterLOD] ", name, ": ", skinned ? "skinned" : "mutating",
+          Logger::info(str::format("[ClusterLOD] ", name, ": ", kind,
                                    " geometry NOT registered for Path B - stays classic",
                                    " (queued ", queuedMs, " ms, attempt ", registrationMs, " ms)"));
         }

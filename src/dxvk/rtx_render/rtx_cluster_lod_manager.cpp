@@ -380,8 +380,11 @@ namespace dxvk {
       return false;
     }
 
-    // P4c: interim templates for static geometry have their own opt-out
-    if (!snapshot.isDeforming && !snapshot.isMutating && !ClusterLodOptions::Animated::interimTemplates()) {
+    // P4c: interim templates for static geometry have their own opt-out.
+    // Captured snapshots pass regardless of that option - Path B templates
+    // are their PRIMARY render path until promotion, not an interim nicety
+    if (!snapshot.isDeforming && !snapshot.isMutating && !snapshot.isCaptured
+        && !ClusterLodOptions::Animated::interimTemplates()) {
       return false;
     }
 
@@ -595,7 +598,7 @@ namespace dxvk {
 
     {
       std::lock_guard<std::mutex> lock(m_promoPendingMutex);
-      m_promoPendingProbes.push_back(PendingProbe { snapshot.geometryHash, probeVa, vertexCount });
+      m_promoPendingProbes.push_back(PendingProbe { snapshot.geometryHash, snapshot.topologyKey, probeVa, vertexCount });
     }
 
     Logger::info(str::format("[ClusterLOD] ", snapshot.name, ": promotion probe uploaded (verts ", vertexCount,
@@ -620,6 +623,12 @@ namespace dxvk {
         candidate.vertexCount = pending.vertexCount;
         candidate.stateSlot = m_promoNextStateSlot++;
         m_promoCandidates.emplace(pending.geometryHash, candidate);
+        // stable-key translation: a moving captured object cannot recompute its
+        // intake asset hash at render (positions churn), so map its position-
+        // independent topologyKey -> this intake hash for the render lookups
+        if (pending.topologyKey != 0) {
+          m_capturedStableHashByTopologyKey[pending.topologyKey] = pending.geometryHash;
+        }
       }
       m_promoPendingProbes.clear();
     }
@@ -691,9 +700,16 @@ namespace dxvk {
     // instance whose last solve went non-rigid, or whose periodic full-mesh
     // sweep (risk R20) failed, re-routes to Path B by itself - its siblings
     // keep rendering Path A. A fresh rigid streak re-promotes it.
+    m_statsPromoSolveSkipped = 0;
     for (auto& slotEntry : m_promoSlotByBlas) {
       PromoInstance& promoInstance = slotEntry.second;
       const lodclusters_remix::PromotionStateView& state = m_promoStates[promoInstance.stateSlot];
+
+      // diagnostic: did this instance's last (readback-lagged) solve take the
+      // GPU re-solve skip? (kernel PROMO_FLAG_SKIPPED = 8u)
+      if ((state.flags & 8u) != 0) {
+        m_statsPromoSolveSkipped++;
+      }
 
       // periodic full-mesh sweep verdict (same lag handling as the gate)
       if (promoInstance.sweepPending && ++promoInstance.sweepLagFrames >= gateLag) {
@@ -742,7 +758,10 @@ namespace dxvk {
         if (blasEntry == nullptr) {
           continue;
         }
-        const XXH64_hash_t hash = blasEntry->input.getGeometryData().getHashForRule(RtxOptions::geometryAssetHashRule());
+        // stable key: a moving captured object's live hash churns; translate via
+        // topologyKey so the SOLVE runs on the mover (a Path B slot here may be
+        // skinned/mutating too - those simply won't map to a captured candidate)
+        const XXH64_hash_t hash = stableClusterHash(blasEntry, blasEntry->input.preCaptureVertexData != nullptr);
         const auto found = m_promoCandidates.find(hash);
         if (found == m_promoCandidates.end()) {
           continue;
@@ -806,7 +825,9 @@ namespace dxvk {
         if (blasEntry == nullptr) {
           continue;
         }
-        const XXH64_hash_t hash = blasEntry->input.getGeometryData().getHashForRule(RtxOptions::geometryAssetHashRule());
+        // stable key: this is a tagged PROMOTED captured slot - its live hash
+        // churns with motion, so translate via topologyKey (see stableClusterHash)
+        const XXH64_hash_t hash = stableClusterHash(blasEntry, /*captured*/ true);
         const auto found = m_promoCandidates.find(hash);
         if (found == m_promoCandidates.end()) {
           continue;
@@ -843,6 +864,29 @@ namespace dxvk {
         }
       }
     }
+
+    // CRASH BREADCRUMB (survives a device-lost - emitted on the CPU BEFORE the
+    // promotion GPU dispatch this frame). On a GPU hang the render thread blocks
+    // on a fence and logging stops, so the LAST of these lines before the gap
+    // names the frame whose dispatch hung, plus the exact entry/slot extents the
+    // kernel was about to touch. Verbose by design while we chase the crash;
+    // gate/remove once stable. Also flags any out-of-range slot (should be none).
+    uint32_t maxStateSlot = 0, maxPatchSlot = 0, gateEntries = 0;
+    for (const lodclusters_remix::PromotionEntry& e : m_framePromoEntries) {
+      maxStateSlot = std::max(maxStateSlot, e.stateSlot);
+      if (e.patchSlot != 0xFFFFFFFFu) {
+        maxPatchSlot = std::max(maxPatchSlot, e.patchSlot);
+      }
+      if (e.mode == 1) {
+        gateEntries++;
+      }
+    }
+    Logger::info(str::format("[ClusterLOD] promo dispatch: frame ", m_device->getCurrentFrameId(),
+                             ", entries ", m_framePromoEntries.size(), " (gate ", gateEntries, ")",
+                             ", promoInstances ", m_promoSlotByBlas.size(),
+                             ", maxStateSlot ", maxStateSlot, ", maxPatchSlot ", maxPatchSlot,
+                             (maxStateSlot >= lodclusters_remix::ClusterRenderSystem::kPromotionSlotCapacity
+                                ? " *** STATESLOT OUT OF RANGE ***" : "")));
   }
 
   bool ClusterLodManager::ensureTemplateSystem() {
@@ -968,6 +1012,20 @@ namespace dxvk {
                                  ", blasBytes ", frameStats.blasActualSizeBytes,
                                  ", clasReservedBytes ", frameStats.reservedClasBytes,
                                  ", geoReservedBytes ", frameStats.reservedGeometryBytes));
+
+        // P4c promotion routing: raw per-frame accounting of promoted candidates
+        // seen at classify. routedA = actually rendering Path A this frame;
+        // droppedTrivial/KeyMiss/Capacity = promoted verdict but held on Path B
+        // for that reason. candidates/promoted are cumulative geometry-level.
+        Logger::info(str::format("[ClusterLOD] promotion routing: candidates ", m_promoCandidates.size(),
+                                 ", promoted ", m_statsPromoted, ", rejected ", m_statsPromoRejected,
+                                 " | this frame routedA ", m_statsPromoRoutedALatched,
+                                 ", droppedTrivial ", m_statsPromoDroppedTrivialLatched,
+                                 ", droppedKeyMiss ", m_statsPromoDroppedKeyMissLatched,
+                                 ", droppedCapacity ", m_statsPromoDroppedCapacityLatched,
+                                 " | promoInstances ", m_promoSlotByBlas.size(),
+                                 ", solveSkipped ", m_statsPromoSolveSkipped,
+                                 ", stableKeys ", m_capturedStableHashByTopologyKey.size()));
 
         // P3: streaming residency/budget health. The couldNot* counters are
         // soft saturation (budget/table full) - persistent nonzero values mean
@@ -1305,6 +1363,11 @@ namespace dxvk {
     m_sssDuplicates.clear();
     m_sssDuplicatesB.clear();
     m_framePoses.clear();
+    // P4c routing diagnostics: reset before the classify pass repopulates them
+    m_promoRoutedA = 0;
+    m_promoDroppedTrivial = 0;
+    m_promoDroppedKeyMiss = 0;
+    m_promoDroppedCapacity = 0;
     m_framePoseIndexByBlas.clear();
     m_frameClusterBudgetUsed = 0;
 
@@ -1481,6 +1544,23 @@ namespace dxvk {
         || (m_templateSystemMT != nullptr && !m_animatedGeometryByKey.empty());
   }
 
+  uint64_t ClusterLodManager::stableClusterHash(const BlasEntry* blasEntry, bool captured) const {
+    const RasterGeometry& geometryData = blasEntry->input.getGeometryData();
+    const XXH64_hash_t live = geometryData.getHashForRule(RtxOptions::geometryAssetHashRule());
+    if (!captured) {
+      // non-captured static geometry never moves in place - the live asset hash
+      // equals the intake hash it was registered under
+      return live;
+    }
+    // captured: the live hash churns with motion. Recover the intake hash via
+    // the position-independent topologyKey (stable across frames). Fall back to
+    // the live hash if this geometry has no probe yet (not a candidate) - it
+    // then simply won't match a candidate, which is correct.
+    const uint64_t topologyKey = ClusterLodGeometryProvider::makeTopologyKey(geometryData);
+    const auto it = m_capturedStableHashByTopologyKey.find(topologyKey);
+    return it != m_capturedStableHashByTopologyKey.end() ? it->second : live;
+  }
+
   bool ClusterLodManager::isClusterInstance(const RtInstance* instance, uint32_t& outGeometryId) {
     if (!ClusterLodOptions::enable()) {
       return false;
@@ -1521,19 +1601,29 @@ namespace dxvk {
       // ---- P4c rigid-capture promotion (plan 7.7): PROMOTED captured
       // instances render Path A LOD clusters; the promotion kernel patches
       // their worldMatrix/TLAS transform from the per-frame solve ----
-      if (captured && !skinned && !updatedInPlace
+      // NOTE: no !updatedInPlace guard. A rigidly-MOVING captured object is
+      // updatedInPlace every frame (its positions churn) yet is the very thing
+      // promotion targets - the gate already proved it rigid, so a Promoted
+      // verdict is authoritative regardless of this frame's in-place update.
+      if (captured && !skinned
           && m_renderSystem != nullptr && m_renderSystem->hasGeneration()
           && ClusterLodOptions::Promotion::enable() && !m_promoCandidates.empty()) {
-        const XXH64_hash_t geometryHash = blasEntry->input.getGeometryData().getHashForRule(RtxOptions::geometryAssetHashRule());
+        // stable key: a moved captured object's live asset hash no longer
+        // matches its intake hash - translate via topologyKey (see stableClusterHash)
+        const XXH64_hash_t geometryHash = stableClusterHash(blasEntry, /*captured*/ true);
         const auto candidate = m_promoCandidates.find(geometryHash);
         if (candidate != m_promoCandidates.end()
             && candidate->second.phase == PromotionCandidate::Phase::Promoted) {
           const auto found = m_geometryIdByHash.find(geometryHash);
-          if (found != m_geometryIdByHash.end()
-              && found->second <= kPromotedGeometryMask
-              && (!ClusterLodOptions::Render::routeTrivialToClassic() || m_trivialGeometryIds.count(found->second) == 0)) {
+          if (found == m_geometryIdByHash.end() || found->second > kPromotedGeometryMask) {
+            m_promoDroppedKeyMiss++;
+          } else if (ClusterLodOptions::Render::routeTrivialToClassic() && m_trivialGeometryIds.count(found->second) != 0) {
+            m_promoDroppedTrivial++;
+          } else {
             const uint32_t usedSlots = uint32_t(m_slots[Tlas::Opaque].size() + m_slots[Tlas::Unordered].size());
-            if (usedSlots < m_renderSystem->getMaxRenderInstances()) {
+            if (usedSlots >= m_renderSystem->getMaxRenderInstances()) {
+              m_promoDroppedCapacity++;
+            } else {
               // per-INSTANCE promotion state slot (plan R21: every captured
               // instance's buffer carries its own transform)
               auto slotIt = m_promoSlotByBlas.find(blasEntry);
@@ -1548,6 +1638,7 @@ namespace dxvk {
               // solving (buildPromotionEntries) so it can re-promote
               if (slotIt != m_promoSlotByBlas.end() && !slotIt->second.demoted) {
                 outGeometryId = kPromotedTag | (slotIt->second.stateSlot << kPromotedSlotShift) | found->second;
+                m_promoRoutedA++;
                 return true;
               }
             }
@@ -1777,6 +1868,12 @@ namespace dxvk {
     // counts captured here, while they are live
     m_statsSlotsOpaque = numOpaque;
     m_statsSlotsUnordered = numUnordered;
+
+    // P4c routing diagnostics: latch the classify-pass accumulators the same way
+    m_statsPromoRoutedALatched = m_promoRoutedA;
+    m_statsPromoDroppedTrivialLatched = m_promoDroppedTrivial;
+    m_statsPromoDroppedKeyMissLatched = m_promoDroppedKeyMiss;
+    m_statsPromoDroppedCapacityLatched = m_promoDroppedCapacity;
 
     const uint32_t countB = uint32_t(m_slotsB[Tlas::Opaque].size() + m_slotsB[Tlas::Unordered].size());
 
@@ -2049,6 +2146,14 @@ namespace dxvk {
     }
 
     // flat kernel-array order: [Opaque B block][Unordered B block]
+    // DIAG (2026-07-05): the Aftermath page fault (0x54975000) is disjoint from
+    // every logged cluster buffer (all at 0x116x...), so the AS build's remaining
+    // input - pose.positionsAddress (the live game vertex buffer) - is the
+    // culprit. Log its ranges (deduped) + LOUDLY flag any pose whose buffer Rc is
+    // null: those skip trackResource below yet still feed the CLAS build an
+    // untracked address that can be freed -> exactly this fault.
+    static std::unordered_set<uint64_t> s_diagLoggedPosBuffers;
+    uint32_t nullBufferPoses = 0;
     std::vector<lodclusters_remix::ClusterTemplateSystem::PoseInput> poses(poseCount);
     for (uint32_t p = 0; p < poseCount; p++) {
       poses[p].poseSetId = m_framePoses[p].poseSetId;
@@ -2059,7 +2164,24 @@ namespace dxvk {
       // the buffer alive for dxvk's lifetime tracking
       if (m_framePoses[p].positionsBuffer != nullptr) {
         ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_framePoses[p].positionsBuffer);
+
+        const uint64_t addr = m_framePoses[p].positionsAddress;
+        if (s_diagLoggedPosBuffers.insert(addr).second) {
+          const VkDeviceSize sz = m_framePoses[p].positionsBuffer->info().size;
+          Logger::info(str::format("[ClusterLOD] posBuf range 0x", std::hex, addr, "..0x", addr + sz,
+                                   std::dec, " (", sz, " bytes)"));
+        }
+      } else {
+        nullBufferPoses++;
+        // the address is still used by the build below - this is the leak
+        Logger::warn(str::format("[ClusterLOD] *** UNTRACKED POSITIONS *** pose ", p,
+                                 " addr 0x", std::hex, m_framePoses[p].positionsAddress, std::dec,
+                                 " (null buffer Rc -> not lifetime-tracked, can be freed under the AS build)"));
       }
+    }
+    if (nullBufferPoses > 0) {
+      Logger::warn(str::format("[ClusterLOD] frame ", m_device->getCurrentFrameId(),
+                               ": ", nullBufferPoses, "/", poseCount, " Path B poses have UNTRACKED positions"));
     }
 
     std::vector<uint32_t> slotPoseIndex(countB);

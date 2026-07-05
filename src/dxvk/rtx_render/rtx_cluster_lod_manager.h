@@ -328,12 +328,13 @@ namespace dxvk {
                  "or when AS memory matters more than frame time (clusters ~ half a classic BLAS on huge\n"
                  "meshes). Skipped when the geometry's .nvsngeo cache already exists; interim pose sets age\n"
                  "out via the normal 60-frame pose GC after the flip.");
-      RTX_OPTION("rtx.clusterLod.animated", bool, diagnoseNullRecords, true,
+      RTX_OPTION("rtx.clusterLod.animated", bool, diagnoseNullRecords, false,
                  "Diagnostic (2026-07-04): plumbs a tiny GPU probe buffer into the template hit path so the\n"
                  "shader records the last frame + clusterId it ever read a NULL cluster-table record (the\n"
                  "device-loss root cause). Verifies the visibility defer - with the fix the probe must never\n"
                  "advance. Logs '[TemplateVis] NULL RECORD ...' if it does, plus periodic '[TemplateVis]\n"
-                 "deferGate' lines showing holds/flips. Cheap; leave on until the fix is soaked.");
+                 "deferGate' lines showing holds/flips. Soaked clean 2026-07-04 (streaming-table fix run:\n"
+                 "no NULL RECORD, no device loss) - default off; re-enable if the crash class reappears.");
     };
 
     // 7.7 rigid-capture promotion (P4c).
@@ -628,12 +629,44 @@ namespace dxvk {
     // worker -> main handoff of uploaded probes
     struct PendingProbe {
       uint64_t geometryHash = 0;
+      uint64_t topologyKey = 0;
       uint64_t probeVa = 0;
       uint32_t vertexCount = 0;
     };
     std::mutex m_promoPendingMutex;
     std::vector<PendingProbe> m_promoPendingProbes;
     uint32_t m_promoNextStateSlot = 0;
+
+    // P4c stable-key translation (plan 7.7): every cluster lookup keys on the
+    // geometry ASSET hash, which INCLUDES vertex positions. That is stable for
+    // a static mesh but CHURNS every frame for a rigidly-moving captured object
+    // (it re-captures new world positions each frame) - so the intake-frame
+    // hash a candidate/geometry was registered under can never be recomputed
+    // from a moved instance. Promotion exists precisely for moving rigid props,
+    // so we translate: captured geometry's position-INDEPENDENT topologyKey
+    // (indices hash + vertexCount + topology, recomputable at render time) maps
+    // to the intake asset hash under which its candidate + Path A geometry live.
+    // Populated on probe adoption; read by the render-time lookups.
+    std::unordered_map<uint64_t, uint64_t> m_capturedStableHashByTopologyKey;
+    // captured instance's live geometry data -> the intake asset hash its
+    // cluster/promotion records are keyed by (falls back to the live hash for
+    // non-captured or not-yet-registered geometry, whose positions are stable)
+    uint64_t stableClusterHash(const BlasEntry* blasEntry, bool captured) const;
+
+    // P4c routing diagnostics (raw counts): why a promoted candidate seen at
+    // render did or didn't reach a Path A slot. Accumulated during the classify
+    // pass (isClusterInstance), reset each onFrameBegin, LATCHED at dispatchBuild
+    // into the m_statsPromo*Latched fields the digest reads (the digest runs at
+    // the next onFrameBegin, after the reset - same pattern as m_statsSlots*).
+    uint32_t m_promoRoutedA = 0;             // promoted -> Path A opaque/unordered slot
+    uint32_t m_promoDroppedTrivial = 0;      // promoted but single-LOD -> Path B (F7)
+    uint32_t m_promoDroppedKeyMiss = 0;      // promoted candidate but geometryId not resident
+    uint32_t m_promoDroppedCapacity = 0;     // promoted but slot capacity full
+    uint32_t m_statsPromoSolveSkipped = 0;   // instances that took the GPU re-solve skip (readback-lagged)
+    uint32_t m_statsPromoRoutedALatched = 0;
+    uint32_t m_statsPromoDroppedTrivialLatched = 0;
+    uint32_t m_statsPromoDroppedKeyMissLatched = 0;
+    uint32_t m_statsPromoDroppedCapacityLatched = 0;
     // per-INSTANCE state slots for PROMOTED instances (plan risk R21: M is per
     // instance - every captured instance's buffer carries its own transform -
     // so patch/prevM state must never alias across instances; the candidate's

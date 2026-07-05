@@ -539,6 +539,14 @@ void SceneStreaming::cmdBeginFrame(VkCommandBuffer         cmd,
       m_storage.free(update.unloadHandles[g]);
     }
 
+    // NV-DXVK: cached-BLAS memory retired by this update's geometry patches -
+    // only now is it certain no in-flight frame still traces the old BLAS
+    // (see handleBlasCaching)
+    if(m_requiresClas && m_config.allowBlasCaching)
+    {
+      m_updates.freeCachedBlasHandles(popUpdateIndex, m_cachedBlasAllocator);
+    }
+
     m_updatesTaskQueue.releaseTaskIndex(popUpdateIndex);
   }
 
@@ -1149,10 +1157,20 @@ void SceneStreaming::handleBlasCaching(StreamingUpdates::TaskInfo& updateTask, c
     {
       if(isLowerDetail || isInvalidateOnly)
       {
-        // de-allocate first, because will use less space next, which is guaranteed to fit
+        // NV-DXVK: the old cached BLAS must outlive every in-flight frame that
+        // still traces it - TLAS instances reference its device address until
+        // this task's geometry patch executes on the GPU timeline. An immediate
+        // subFree here destroys the backing VkBuffer/VkDeviceMemory on the CPU
+        // (the allocator keeps no empty blocks), unmapping the GPU virtual
+        // address under those frames' AS builds/traces -> device-lost page
+        // fault. Defer the free to handleCompletedUpdate instead.
+        // Trade-off vs. the original free-first ordering: the (smaller)
+        // re-allocation below is no longer guaranteed to fit this frame; on
+        // failure the invalidate path runs and caching retries later.
         if(persistentGeometry.cachedBlasAllocation)
         {
-          m_cachedBlasAllocator.subFree(persistentGeometry.cachedBlasAllocation);
+          updateTask.cachedBlasFreeHandles.push_back(persistentGeometry.cachedBlasAllocation);
+          persistentGeometry.cachedBlasAllocation = {};
         }
       }
 
@@ -1170,9 +1188,11 @@ void SceneStreaming::handleBlasCaching(StreamingUpdates::TaskInfo& updateTask, c
         // de-allocate old if still exists
         // isHigherDetail attempts to get space for higher detail first,
         // so it can keep old cached blas if building fails
+        // NV-DXVK: deferred for the same in-flight-frame reason as above
         if(persistentGeometry.cachedBlasAllocation)
         {
-          m_cachedBlasAllocator.subFree(persistentGeometry.cachedBlasAllocation);
+          updateTask.cachedBlasFreeHandles.push_back(persistentGeometry.cachedBlasAllocation);
+          persistentGeometry.cachedBlasAllocation = {};
         }
         persistentGeometry.cachedBlasLevel       = sgpatch.cachedBlasLodLevel;
         persistentGeometry.cachedBlasAllocation  = subAllocation;
@@ -1688,6 +1708,27 @@ size_t SceneStreaming::getClasSize(bool reserved) const
   }
 }
 
+// NV-DXVK
+void SceneStreaming::appendClasRanges(std::vector<std::pair<uint64_t, uint64_t>>& outRanges) const
+{
+  if(m_shaderData.resident.clasBaseAddress && m_shaderData.resident.clasMaxSize)
+  {
+    outRanges.emplace_back(m_shaderData.resident.clasBaseAddress,
+                           m_shaderData.resident.clasBaseAddress + m_shaderData.resident.clasMaxSize);
+  }
+  if(m_clasLowDetailBuffer.buffer)
+  {
+    outRanges.emplace_back(m_clasLowDetailBuffer.address, m_clasLowDetailBuffer.address + m_clasLowDetailBuffer.bufferSize);
+  }
+  for(const nvvk::Buffer& appendBuffer : m_clasLowDetailAppendBuffers)
+  {
+    if(appendBuffer.buffer)
+    {
+      outRanges.emplace_back(appendBuffer.address, appendBuffer.address + appendBuffer.bufferSize);
+    }
+  }
+}
+
 size_t SceneStreaming::getBlasSize(bool reserved) const
 {
   size_t size = m_blasSize;
@@ -1792,6 +1833,13 @@ void SceneStreaming::reset()
   m_requestsTaskQueue = {};
   m_storageTaskQueue  = {};
   m_updatesTaskQueue  = {};
+
+  // NV-DXVK: wiping the task queues orphans deferred cached-BLAS frees still
+  // riding pending update tasks - give them back now (device is idle)
+  if(m_requiresClas && m_config.allowBlasCaching)
+  {
+    m_updates.freeAllCachedBlasHandles(m_cachedBlasAllocator);
+  }
 
   // reset resident objects to just roots
   m_resident.reset(m_shaderData.resident);
@@ -2458,6 +2506,10 @@ void SceneStreaming::deinitClas()
 
   if(m_config.allowBlasCaching)
   {
+    // NV-DXVK: deferred frees still riding pending update tasks - handles must
+    // not dangle into a later initClas re-creating the allocator
+    m_updates.freeAllCachedBlasHandles(m_cachedBlasAllocator);
+
     for(auto& persistentGeometry : m_persistentGeometries)
     {
       if(persistentGeometry.cachedBlasAllocation)

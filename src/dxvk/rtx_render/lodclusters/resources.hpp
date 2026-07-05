@@ -33,6 +33,7 @@
 #pragma once
 
 #include <functional>
+#include <mutex>
 #include <span>
 
 #if __INTELLISENSE__
@@ -110,6 +111,12 @@ inline void cmdCopyBuffer(VkCommandBuffer cmd, const nvvk::Buffer& src, const nv
 }
 
 std::string formatMemorySize(size_t sizeInBytes);
+
+// NV-DXVK: process-wide secondary device-lost dump. The animated template
+// system (Path B) registers its forensic dump here; the LOD renderer's
+// primary dump chains into it so one device-lost flushes both captures no
+// matter which system's thread notices the loss first.
+std::function<void()>& deviceLostAuxDumpFn();
 
 inline size_t logMemoryUsage(size_t size, const char* memtype, const char* what)
 {
@@ -488,6 +495,15 @@ public:
   // used by the render system's generation builds).
   std::function<void()> submitLockFn;
   std::function<void()> submitUnlockFn;
+
+  // NV-DXVK: fired once when tempSyncSubmit's fence wait returns
+  // VK_ERROR_DEVICE_LOST - both observed streaming device-losts were noticed
+  // here. The renderer hooks its BLAS-input forensic dump into this so the
+  // faulting frame's captured build inputs reach the log before NVVK_CHECK
+  // exit()s the process. The mutex keeps a concurrently-failing thread from
+  // exiting mid-dump.
+  std::function<void()> deviceLostDumpFn;
+  std::mutex            m_deviceLostDumpMutex;
 
   VkDevice         m_device          = {};
   VkPhysicalDevice m_physicalDevice  = {};
