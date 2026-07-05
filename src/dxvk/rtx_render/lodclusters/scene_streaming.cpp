@@ -2344,6 +2344,44 @@ bool SceneStreaming::buildLowDetailClas(size_t firstGeometry, size_t geometryCou
 
     assert(clusterOffset == loClustersCount);
 
+    // NV-DXVK: append-path device-lost diagnostic. buildLowDetailClas over the
+    // APPENDED range (firstGeometry>0) hangs the GPU at tempSyncSubmit once
+    // promotion appends geometry - a path that never ran before. The release
+    // build compiles out the invariant asserts above, so log the values they
+    // guard and compare the working initial build (firstGeometry==0) against
+    // the faulting append: does the range overflow the resident CLAS table, are
+    // any appended groups not resident, are the cluster refs in range?
+    {
+      const nvvk::Buffer& dbgClasBuffer = m_resident.getClasBuffer();
+      const uint64_t addrDstEnd = (m_shaderData.resident.clasAddresses - dbgClasBuffer.address)
+                                  + sizeof(uint64_t) * uint64_t(firstClusterResidentID + loClustersCount);
+      const uint64_t sizeDstEnd = (m_shaderData.resident.clasSizes - dbgClasBuffer.address)
+                                  + sizeof(uint32_t) * uint64_t(firstClusterResidentID + loClustersCount);
+      const uint64_t refBase = m_shaderData.resident.clasAddresses;
+      const uint64_t refEnd  = refBase + sizeof(uint64_t) * uint64_t(firstClusterResidentID + loClustersCount);
+      uint32_t notResident = 0, refOOB = 0, seqBreaks = 0;
+      uint32_t expectResID = firstClusterResidentID;
+      for(uint32_t g = 0; g < loGroupsCount; g++)
+      {
+        const StreamingResident::Group& dgrp = m_resident.getGroup(uint32_t(firstGeometry) + g);
+        if(dgrp.deviceAddress == 0) notResident++;
+        if(dgrp.clusterResidentID != expectResID) seqBreaks++;
+        expectResID = dgrp.clusterResidentID + dgrp.clusterCount;
+        const uint64_t ref = blasBuildInfos[g].clusterReferences;
+        if(ref < refBase || ref + uint64_t(blasBuildInfos[g].clusterReferencesCount) * 8 > refEnd) refOOB++;
+      }
+      LOGI("[LoBuild] firstGeom %zu firstClusterResID %u loGroups %u loClusters %u | residentClasBuf %llu bytes: "
+           "clasAddr end %llu %s, clasSize end %llu %s | notResident %u seqBreaks %u refOOB %u | "
+           "clasAddresses 0x%llx blasRef[0] 0x%llx blasRef[last] 0x%llx\n",
+           firstGeometry, firstClusterResidentID, loGroupsCount, loClustersCount,
+           (unsigned long long)dbgClasBuffer.bufferSize,
+           (unsigned long long)addrDstEnd, addrDstEnd > dbgClasBuffer.bufferSize ? "OOB!!" : "ok",
+           (unsigned long long)sizeDstEnd, sizeDstEnd > dbgClasBuffer.bufferSize ? "OOB!!" : "ok",
+           notResident, seqBreaks, refOOB, (unsigned long long)refBase,
+           (unsigned long long)blasBuildInfos[0].clusterReferences,
+           (unsigned long long)blasBuildInfos[loGroupsCount - 1].clusterReferences);
+    }
+
     VkClusterAccelerationStructureCommandsInfoNV cmdInfo = {VK_STRUCTURE_TYPE_CLUSTER_ACCELERATION_STRUCTURE_COMMANDS_INFO_NV};
     cmdInfo.scratchData = scratchTemp.address;
     assert(cmdInfo.scratchData % m_clasScratchAlignment == 0);
