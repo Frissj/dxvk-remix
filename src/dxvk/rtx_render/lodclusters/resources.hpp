@@ -32,6 +32,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <functional>
 #include <mutex>
 #include <span>
@@ -510,6 +511,9 @@ public:
   nvvk::QueueInfo  m_queue           = {};
   nvvk::QueueInfo  m_queueTransfer   = {};
   VkCommandPool    m_tempCommandPool = {};
+  // NV-DXVK: per-pool in-flight temp-op counter (device-lost race probe). Unlike
+  // a global counter this is >1 ONLY when two threads share THIS pool.
+  std::atomic<int> m_tempInFlight{0};
 
   nvvk::ResourceAllocator m_allocator        = {};
   nvvk::SamplerPool       m_samplerPool      = {};
