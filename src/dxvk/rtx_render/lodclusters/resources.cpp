@@ -26,6 +26,8 @@
 // bodies are unchanged from the sample.
 
 #include <algorithm>
+#include <atomic>
+#include <thread>
 
 #include <volk.h>
 #include <nvutils/logger.hpp>
@@ -509,8 +511,25 @@ bool Resources::compileShader(shaderc::SpvCompilationResult& compiled,
   return false;
 }
 
+// NV-DXVK: device-lost forensics. m_tempCommandPool is a single pool shared by
+// every createTempCmdBuffer/tempSyncSubmit on this Resources; VkCommandPool is
+// NOT internally synchronized and submitLockFn only guards the queue submit,
+// NOT the pool alloc/free/recording. If two threads overlap a temp op, inFlight
+// goes >1 -> concurrent pool use -> command-buffer corruption -> GPU hang. This
+// probe proves/kills that (the streaming device-lost is intermittent, the mark
+// of a race). Delete once diagnosed.
+namespace {
+  std::atomic<int>      g_tempInFlight{0};
+  std::atomic<uint64_t> g_tempSeq{0};
+  inline uint32_t dbgTid() { return uint32_t(std::hash<std::thread::id>{}(std::this_thread::get_id()) & 0xFFFFFFu); }
+}
+
 VkCommandBuffer Resources::createTempCmdBuffer()
 {
+  const int inFlight = g_tempInFlight.fetch_add(1) + 1;
+  LOGI("[TempSubmit] alloc  tid=%06x seq=%llu inFlight=%d%s\n", dbgTid(), (unsigned long long)g_tempSeq.fetch_add(1),
+       inFlight, inFlight > 1 ? "  *** CONCURRENT temp op -> POOL RACE ***" : "");
+
   VkCommandBufferAllocateInfo allocInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
   allocInfo.level                       = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
   allocInfo.commandPool                 = m_tempCommandPool;
@@ -558,6 +577,7 @@ void Resources::tempSyncSubmit(VkCommandBuffer cmd)
   // submission itself needs the lock. The fence wait (the long part: it spans
   // the temp work's GPU execution) runs unlocked so render-thread submissions
   // are never blocked behind it.
+  LOGI("[TempSubmit] submit tid=%06x inFlight=%d\n", dbgTid(), g_tempInFlight.load());
   if(submitLockFn)
     submitLockFn();
   NVVK_CHECK(vkQueueSubmit2(m_queue.queue, 1, &submitInfo2, fence));
@@ -582,6 +602,7 @@ void Resources::tempSyncSubmit(VkCommandBuffer cmd)
 
   vkDestroyFence(m_device, fence, nullptr);
   vkFreeCommandBuffers(m_device, m_tempCommandPool, 1, &cmd);
+  g_tempInFlight.fetch_sub(1);
 }
 
 void Resources::cmdImageTransition(VkCommandBuffer cmd, nvvk::Image& rimg, VkImageAspectFlags aspects, VkImageLayout newLayout, bool needBarrier) const
