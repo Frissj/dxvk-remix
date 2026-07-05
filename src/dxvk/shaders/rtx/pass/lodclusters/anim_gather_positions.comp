@@ -1,0 +1,95 @@
+// NV-DXVK: build-time shader variants for RTX Remix (see compile_shaders.py)
+//!variant anim_gather_positions.comp ANIM_GATHER_POSITIONS=1
+//!end-variants
+
+/*
+* Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+
+/*
+  RTX Remix glue kernel (P4b, authored - not part of the NVIDIA samples).
+
+  ANIMATED CLUSTER VERTEX GATHER: the NV cluster-triangle build/instantiate
+  ops index vertices in [0, per-cluster vertexCount) - CLUSTER-LOCAL indices.
+  Remix clusterizes with clusterDedicatedVertices=false, so the live (skinned/
+  updated/captured) vertex buffers are in the game's GLOBAL vertex order.
+  This kernel reorders one pose's live positions into cluster-local layout
+  each frame:
+
+      dst[slot] = src[clusterLocalVertices[slot]]
+
+  so the per-cluster build inputs (vertexBuffer = dst + firstLocalVertex*12,
+  vertexCount = cluster.numVertices) are self-consistent. Fixes the mis-built
+  razor-triangle clusters that global indices produced on every multi-cluster
+  mesh (the build read vertices [0, numVertices) of the WHOLE mesh while the
+  indices spanned all of it).
+
+  Descriptor-free: all inputs via push constants + buffer device addresses
+  (same idiom as promotion_solve.comp).
+*/
+
+#version 460
+
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 64) in;
+
+// raw float access at arbitrary byte address (live buffers have arbitrary stride)
+layout(buffer_reference, buffer_reference_align = 4, scalar) restrict readonly buffer FloatsAt
+{
+  float v[];
+};
+
+layout(buffer_reference, buffer_reference_align = 4, scalar) restrict readonly buffer Uints
+{
+  uint v[];
+};
+
+layout(buffer_reference, buffer_reference_align = 4, scalar) restrict writeonly buffer Vec3sOut
+{
+  vec3 v[];
+};
+
+layout(push_constant, scalar) uniform PushConstants
+{
+  uint64_t srcPositions;     // live positions base (this pose's buffer, global vertex order)
+  uint64_t localVertexMap;   // uint32 per local slot -> global vertex index (clusterLocalVertices)
+  uint64_t dstPositions;     // gathered tightly-packed vec3 out (this pose's slice of the gather ring)
+  uint vertexCount;          // local slots to gather (geometry.numClusterVertices)
+  uint srcStrideBytes;       // live buffer position stride
+};
+
+void main()
+{
+  const uint slot = gl_GlobalInvocationID.x;
+  if(slot >= vertexCount)
+  {
+    return;
+  }
+
+  const uint globalIndex = Uints(localVertexMap).v[slot];
+
+  FloatsAt src = FloatsAt(srcPositions + uint64_t(globalIndex) * uint64_t(srcStrideBytes));
+
+  Vec3sOut(dstPositions).v[slot] = vec3(src.v[0], src.v[1], src.v[2]);
+}

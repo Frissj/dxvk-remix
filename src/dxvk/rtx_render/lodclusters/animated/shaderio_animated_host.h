@@ -98,10 +98,25 @@ struct ClusterBlasConstants
   uint64_t sum;            // uint64s_inout
 };
 
+// push constants of anim_gather_positions.comp (per-pose live-position
+// reorder into cluster-local layout; see the razor-triangle fix in
+// renderer_raytrace_clusters.cpp)
+struct GatherConstants
+{
+  uint64_t srcPositions;    // live positions base (global vertex order)
+  uint64_t localVertexMap;  // uint32 per local slot -> global vertex index
+  uint64_t dstPositions;    // gathered tightly-packed vec3 out
+  uint32_t vertexCount;     // local slots to gather (numClusterVertices)
+  uint32_t srcStrideBytes;  // live buffer position stride
+};
+
 static_assert(sizeof(BBox) == 24, "animated shaderio::BBox layout mismatch");
 static_assert(sizeof(Cluster) == 16, "animated shaderio::Cluster layout mismatch");
 static_assert(sizeof(RenderInstance) == 144, "animated shaderio::RenderInstance layout mismatch");
 static_assert(sizeof(ClusterBlasConstants) == 56, "animated shaderio::ClusterBlasConstants layout mismatch");
+static_assert(sizeof(GatherConstants) == 32, "animated shaderio::GatherConstants layout mismatch");
+static_assert(sizeof(GatherConstants) <= sizeof(ClusterBlasConstants),
+              "GatherConstants must fit the shared compute pipeline layout's push range");
 
 }  // namespace shaderio
 }  // namespace animatedclusters

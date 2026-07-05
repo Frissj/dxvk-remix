@@ -139,8 +139,12 @@ struct ClusterTemplateSystem::Impl
   // (risk R17), so without this the overwrite races the previous frame's trace -
   // invisible at debug's ~2 FPS (GPU idle between frames), visible as deforming
   // objects lagging/jittering once the release build lets frames overlap. Must
-  // be >= Remix's frames in flight; 4 covers dxvk's pipelining.
-  static constexpr uint32_t kRingSlots = 4;
+  // be >= Remix's frames in flight PLUS ONE: with kMaxFramesInFlight submitted
+  // and incomplete (N..N+3), frame N+4 is already recording - at 4 slots it
+  // writes slot N%4 while frame N's trace still reads it (the flickering
+  // garbage-triangle clumps under deep GPU queueing: spike frames hit the
+  // boundary exactly). 6 = 4 in flight + recording + margin.
+  static constexpr uint32_t kRingSlots = 6;
 
   bool initialized = false;
 
@@ -165,6 +169,10 @@ struct ClusterTemplateSystem::Impl
   shaderc::SpvCompilationResult blasInstancesShader;
   VkPipelineLayout              computePipelineLayout = VK_NULL_HANDLE;
   VkPipeline                    blasInstancesPipeline = VK_NULL_HANDLE;
+  // per-pose vertex gather (global -> cluster-local order; razor-triangle fix).
+  // Shares computePipelineLayout (GatherConstants fits its push range).
+  shaderc::SpvCompilationResult gatherShader;
+  VkPipeline                    gatherPipeline = VK_NULL_HANDLE;
 
   //////////////////////////////////////////////////////////////////////////
   // registered geometries (template sets)
@@ -187,8 +195,22 @@ struct ClusterTemplateSystem::Impl
     std::vector<animatedclusters::shaderio::Cluster> clusters;
 
     // resident cluster-ordered index topology (uvec3 global vertex indices):
-    // template/cluster build input AND the hit-side primitive remap target
+    // the hit-side primitive remap target (cluster table records). NOT a build
+    // input - the NV cluster build indexes vertices in [0, vertexCount) per
+    // cluster, so it consumes the LOCAL topology below (razor-triangle fix).
     nvvk::Buffer trianglesBuffer;
+
+    // cluster-LOCAL topology (build inputs):
+    //  - localTrianglesBuffer: uint8 indices in [0, cluster.numVertices) per
+    //    cluster at Cluster::firstLocalTriangle (3 per triangle, same triangle
+    //    ORDER as trianglesBuffer, so primitiveIndex remap is unchanged)
+    //  - localVerticesBuffer: uint32 local slot -> global vertex index at
+    //    Cluster::firstLocalVertex (the per-frame gather kernel's map)
+    nvvk::Buffer localTrianglesBuffer;
+    nvvk::Buffer localVerticesBuffer;
+    // total local vertex slots (sum of cluster.numVertices; the pose's gather
+    // output size and the build's per-frame vertex total)
+    uint32_t     numClusterVertices = 0;
 
     // template mode
     nvvk::Buffer          templatesBuffer;
@@ -285,7 +307,12 @@ struct ClusterTemplateSystem::Impl
 
   nvvk::Buffer dstSizesBuffer;       // u32 per cluster (built CLAS sizes, stats only - never dereferenced, single is safe)
   nvvk::Buffer blasSizesBuffer;      // u32 per pose (built BLAS sizes, stats only - never dereferenced, single is safe)
-  nvvk::Buffer tlasInstancesBuffer;  // VkAccelerationStructureInstanceKHR per slot (refs come from the ringed blasAddresses below, so a cross-frame torn read is at worst a stale-but-valid ref, never a bad translate)
+  // VkAccelerationStructureInstanceKHR per slot. RINGED: the frame's copy-in /
+  // patch / copy-out are same-frame barriered, but these are raw vkCmd accesses
+  // dxvk's barrier tracking never sees - frame N+1's copy-in would WAW/WAR race
+  // frame N's copy-out on a single buffer once submissions overlap
+  nvvk::Buffer tlasInstancesBuffers[kRingSlots];
+  uint32_t     lastRecordedRingIndex = 0;  // getTlasInstancesBuffer (the caller's copy-out runs after recordFrame)
   // per-frame-in-flight rings (kRingSlots): a LATER stage dereferences these
   // across the frame boundary, so overlapping frames must not share one
   // instance (same reasoning as blasImplicitBuffers / risk R17):
@@ -306,6 +333,11 @@ struct ClusterTemplateSystem::Impl
   nvvk::Buffer blasImplicitBuffers[kRingSlots];
   nvvk::Buffer scratchBuffers[kRingSlots];
   VkDeviceSize scratchSize = 0;
+  // per-frame gathered positions (vec3 per local vertex slot, all poses
+  // concatenated): output of anim_gather_positions.comp, vertex input of the
+  // CLAS instantiate/build. Ringed - the build of frame N reads slot N%4 while
+  // frame N+1 gathers into its own slot (razor-triangle fix)
+  nvvk::Buffer gatherBuffers[kRingSlots];
 
   nvvk::Buffer readbackBuffer;      // device AnimatedReadback
   nvvk::Buffer readbackHostBuffer;  // host ring of AnimatedReadback
@@ -618,10 +650,13 @@ struct ClusterTemplateSystem::Impl
     deferDestroy(blasSizesBuffer, "blasSizes");
     NVVK_CHECK(res.createBuffer(blasSizesBuffer, sizeof(uint32_t) * poseCapacity, kDeviceUsage));
 
-    deferDestroy(tlasInstancesBuffer, "tlasInstances");
-    NVVK_CHECK(res.createBuffer(tlasInstancesBuffer, sizeof(VkAccelerationStructureInstanceKHR) * slotCapacity,
-                                VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT
-                                    | VK_BUFFER_USAGE_2_TRANSFER_DST_BIT | VK_BUFFER_USAGE_2_TRANSFER_SRC_BIT));
+    for(nvvk::Buffer& tlasInstances : tlasInstancesBuffers)
+    {
+      deferDestroy(tlasInstances, "tlasInstances");
+      NVVK_CHECK(res.createBuffer(tlasInstances, sizeof(VkAccelerationStructureInstanceKHR) * slotCapacity,
+                                  VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT
+                                      | VK_BUFFER_USAGE_2_TRANSFER_DST_BIT | VK_BUFFER_USAGE_2_TRANSFER_SRC_BIT));
+    }
 
     // one implicit BLAS pool per frame-in-flight slot (see kRingSlots): the
     // trace reads the previous frames' BLASes, so each frame builds into its own
@@ -639,6 +674,17 @@ struct ClusterTemplateSystem::Impl
       deferDestroy(scratch, "scratch");
       NVVK_CHECK(res.createBuffer(scratch, scratchSize,
                                   VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT));
+    }
+
+    // gathered positions: vec3 per local vertex slot (vertexCapacity counts
+    // cluster-local slots - recordFrame sums geometry.numClusterVertices).
+    // Written by the gather kernel, read by the CLAS instantiate/build.
+    for(nvvk::Buffer& gather : gatherBuffers)
+    {
+      deferDestroy(gather, "gather");
+      NVVK_CHECK(res.createBuffer(gather, sizeof(glm::vec3) * vertexCapacity,
+                                  VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT
+                                      | VK_BUFFER_USAGE_2_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR));
     }
 
     // ---- host-visible per-frame input ring ----
@@ -696,18 +742,24 @@ struct ClusterTemplateSystem::Impl
 
     // DIAG (2026-07-05): new per-frame buffer ranges, so a page-fault address
     // can be matched to the newly-grown (post-deferDestroy) allocations
-    LOGI("[ClusterLOD] grow ranges: dstSizes 0x%llx..0x%llx, tlasInst 0x%llx..0x%llx\n",
-         (unsigned long long)dstSizesBuffer.address, (unsigned long long)(dstSizesBuffer.address + dstSizesBuffer.bufferSize),
-         (unsigned long long)tlasInstancesBuffer.address, (unsigned long long)(tlasInstancesBuffer.address + tlasInstancesBuffer.bufferSize));
+    LOGI("[ClusterLOD] grow ranges: dstSizes 0x%llx..0x%llx\n",
+         (unsigned long long)dstSizesBuffer.address, (unsigned long long)(dstSizesBuffer.address + dstSizesBuffer.bufferSize));
+    for(uint32_t s = 0; s < kRingSlots; s++)
+    {
+      LOGI("[ClusterLOD] grow ranges: tlasInst[%u] 0x%llx..0x%llx\n",
+           s, (unsigned long long)tlasInstancesBuffers[s].address,
+           (unsigned long long)(tlasInstancesBuffers[s].address + tlasInstancesBuffers[s].bufferSize));
+    }
     // scratch + blasAddresses are now ringed (kRingSlots) - log every slot so a
     // fault address still matches (see the scratch-overlap fix)
     for(uint32_t s = 0; s < kRingSlots; s++)
     {
-      LOGI("[ClusterLOD] grow ranges: ring[%u] 0x%llx..0x%llx, blasImplicit[%u] 0x%llx..0x%llx, scratch[%u] 0x%llx..0x%llx, blasAddr[%u] 0x%llx..0x%llx\n",
+      LOGI("[ClusterLOD] grow ranges: ring[%u] 0x%llx..0x%llx, blasImplicit[%u] 0x%llx..0x%llx, scratch[%u] 0x%llx..0x%llx, blasAddr[%u] 0x%llx..0x%llx, gather[%u] 0x%llx..0x%llx\n",
            s, (unsigned long long)ringBuffers[s].address, (unsigned long long)(ringBuffers[s].address + ringBuffers[s].bufferSize),
            s, (unsigned long long)blasImplicitBuffers[s].address, (unsigned long long)(blasImplicitBuffers[s].address + blasImplicitBuffers[s].bufferSize),
            s, (unsigned long long)scratchBuffers[s].address, (unsigned long long)(scratchBuffers[s].address + scratchBuffers[s].bufferSize),
-           s, (unsigned long long)blasAddressesBuffer[s].address, (unsigned long long)(blasAddressesBuffer[s].address + blasAddressesBuffer[s].bufferSize));
+           s, (unsigned long long)blasAddressesBuffer[s].address, (unsigned long long)(blasAddressesBuffer[s].address + blasAddressesBuffer[s].bufferSize),
+           s, (unsigned long long)gatherBuffers[s].address, (unsigned long long)(gatherBuffers[s].address + gatherBuffers[s].bufferSize));
     }
 
     return true;
@@ -829,6 +881,23 @@ bool ClusterTemplateSystem::init(const RenderDeviceInfo& deviceInfo, const Anima
 
     shaderInfo = nvvkglsl::GlslCompiler::makeShaderModuleCreateInfo(impl.blasInstancesShader);
     vkCreateComputePipelines(impl.res.m_device, nullptr, 1, &compInfo, nullptr, &impl.blasInstancesPipeline);
+
+    // per-pose vertex gather kernel (global -> cluster-local order; the
+    // razor-triangle fix). Same descriptor-free layout - GatherConstants fits
+    // the ClusterBlasConstants push range (static_asserted in shaderio).
+    impl.res.compileShader(impl.gatherShader, VK_SHADER_STAGE_COMPUTE_BIT, "anim_gather_positions.comp.glsl");
+    if(!impl.res.verifyShaders(1, &impl.gatherShader))
+    {
+      LOGE("ClusterTemplateSystem: anim_gather_positions shader lookup failed\n");
+      vkDestroyPipeline(impl.res.m_device, impl.blasInstancesPipeline, nullptr);
+      impl.blasInstancesPipeline = VK_NULL_HANDLE;
+      vkDestroyPipelineLayout(impl.res.m_device, impl.computePipelineLayout, nullptr);
+      impl.computePipelineLayout = VK_NULL_HANDLE;
+      impl.res.deinit();
+      return false;
+    }
+    shaderInfo = nvvkglsl::GlslCompiler::makeShaderModuleCreateInfo(impl.gatherShader);
+    vkCreateComputePipelines(impl.res.m_device, nullptr, 1, &compInfo, nullptr, &impl.gatherPipeline);
   }
 
   // direct (non-template) mode: worst-case size of one explicitly built CLAS.
@@ -924,6 +993,8 @@ void ClusterTemplateSystem::deinit()
     if(geometry)
     {
       impl.res.m_allocator.destroyBuffer(geometry->trianglesBuffer);
+      impl.res.m_allocator.destroyBuffer(geometry->localTrianglesBuffer);
+      impl.res.m_allocator.destroyBuffer(geometry->localVerticesBuffer);
       impl.res.m_allocator.destroyBuffer(geometry->templatesBuffer);
     }
   }
@@ -934,6 +1005,8 @@ void ClusterTemplateSystem::deinit()
     for(auto& entry : impl.readyGeometries)
     {
       impl.res.m_allocator.destroyBuffer(entry.data->trianglesBuffer);
+      impl.res.m_allocator.destroyBuffer(entry.data->localTrianglesBuffer);
+      impl.res.m_allocator.destroyBuffer(entry.data->localVerticesBuffer);
       impl.res.m_allocator.destroyBuffer(entry.data->templatesBuffer);
     }
     impl.readyGeometries.clear();
@@ -953,7 +1026,10 @@ void ClusterTemplateSystem::deinit()
   impl.res.m_allocator.destroyBuffer(impl.clusterTableBuffer);
   impl.res.m_allocator.destroyBuffer(impl.dstSizesBuffer);
   impl.res.m_allocator.destroyBuffer(impl.blasSizesBuffer);
-  impl.res.m_allocator.destroyBuffer(impl.tlasInstancesBuffer);
+  for(nvvk::Buffer& tlasInstances : impl.tlasInstancesBuffers)
+  {
+    impl.res.m_allocator.destroyBuffer(tlasInstances);
+  }
   for(nvvk::Buffer& blasAddresses : impl.blasAddressesBuffer)
   {
     impl.res.m_allocator.destroyBuffer(blasAddresses);
@@ -966,6 +1042,10 @@ void ClusterTemplateSystem::deinit()
   {
     impl.res.m_allocator.destroyBuffer(scratch);
   }
+  for(nvvk::Buffer& gather : impl.gatherBuffers)
+  {
+    impl.res.m_allocator.destroyBuffer(gather);
+  }
   impl.res.m_allocator.destroyBuffer(impl.readbackBuffer);
   impl.res.m_allocator.destroyBuffer(impl.readbackHostBuffer);
   for(nvvk::Buffer& ring : impl.ringBuffers)
@@ -977,6 +1057,11 @@ void ClusterTemplateSystem::deinit()
   {
     vkDestroyPipeline(impl.res.m_device, impl.blasInstancesPipeline, nullptr);
     impl.blasInstancesPipeline = VK_NULL_HANDLE;
+  }
+  if(impl.gatherPipeline)
+  {
+    vkDestroyPipeline(impl.res.m_device, impl.gatherPipeline, nullptr);
+    impl.gatherPipeline = VK_NULL_HANDLE;
   }
   if(impl.computePipelineLayout)
   {
@@ -1129,6 +1214,36 @@ bool ClusterTemplateSystem::buildGeometryTemplates(uint64_t token)
   data->opaque       = pending->opaque;
   data->clusters     = std::move(geometry.clusters);
 
+  // [ClusterLOD] AnimIdx probe (2026-07-05, repurposed post-fix): the build now
+  // consumes the cluster-LOCAL topology, whose indices MUST be < each cluster's
+  // numVertices and whose local->global map MUST be < the mesh vertex count.
+  // A hit here means clusterizer output corruption - expect silence.
+  {
+    uint32_t badLocal = 0, badMap = 0;
+    for (uint32_t c = 0; c < numClusters; c++) {
+      const animatedclusters::shaderio::Cluster& cl = data->clusters[c];
+      for (uint32_t e = 0; e < uint32_t(cl.numTriangles) * 3; e++) {
+        const uint32_t entry = cl.firstLocalTriangle + e;
+        if (entry >= geometry.clusterLocalTriangles.size()
+            || geometry.clusterLocalTriangles[entry] >= cl.numVertices) {
+          badLocal++;
+        }
+      }
+      for (uint32_t v = 0; v < cl.numVertices; v++) {
+        const uint32_t slot = cl.firstLocalVertex + v;
+        if (slot >= geometry.clusterLocalVertices.size()
+            || geometry.clusterLocalVertices[slot] >= geometry.numVertices) {
+          badMap++;
+        }
+      }
+    }
+    if (badLocal > 0 || badMap > 0) {
+      LOGW("[ClusterLOD] AnimIdx %s: clusters=%u LOCAL topology invalid - badLocalIndices=%u badVertexMap=%u (clusterizer output corrupt)\n",
+           data->name.c_str(), numClusters, badLocal, badMap);
+      return false;
+    }
+  }
+
   // global cluster table range (REMIX: baked into template clusterIDs)
   data->globalClusterBase = impl.clusterTableCount;
   if(!impl.ensureClusterTableCapacity(impl.clusterTableCount + numClusters))
@@ -1137,8 +1252,15 @@ bool ClusterTemplateSystem::buildGeometryTemplates(uint64_t token)
   }
   impl.clusterTableCount += numClusters;
 
-  // ---- resident cluster-ordered index topology + temporary reference
-  //      positions (bind pose; template build only) ----
+  // ---- resident topology + temporary reference positions ----
+  //  - trianglesBuffer: GLOBAL uvec3 indices, hit-side primitive remap only
+  //  - localTrianglesBuffer / localVerticesBuffer: cluster-LOCAL build topology
+  //    + local->global gather map (razor-triangle fix)
+  //  - positionsBuffer (temp, template build only): reference positions in
+  //    cluster-LOCAL order - the local indices the template bakes must address
+  //    the same layout the per-frame gathered live positions will use
+
+  data->numClusterVertices = uint32_t(geometry.clusterLocalVertices.size());
 
   nvvk::Buffer positionsBuffer;
 
@@ -1146,20 +1268,38 @@ bool ClusterTemplateSystem::buildGeometryTemplates(uint64_t token)
     NVVK_CHECK(impl.res.createBuffer(data->trianglesBuffer, sizeof(glm::uvec3) * geometry.triangles.size(),
                                      VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT
                                          | VK_BUFFER_USAGE_2_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR));
-    NVVK_CHECK(impl.res.createBuffer(positionsBuffer, sizeof(glm::vec3) * geometry.positions.size(),
+    NVVK_CHECK(impl.res.createBuffer(data->localTrianglesBuffer, sizeof(uint8_t) * geometry.clusterLocalTriangles.size(),
+                                     VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT
+                                         | VK_BUFFER_USAGE_2_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR));
+    NVVK_CHECK(impl.res.createBuffer(data->localVerticesBuffer, sizeof(uint32_t) * geometry.clusterLocalVertices.size(),
+                                     VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT));
+    NVVK_CHECK(impl.res.createBuffer(positionsBuffer, sizeof(glm::vec3) * data->numClusterVertices,
                                      VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT
                                          | VK_BUFFER_USAGE_2_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR));
 
-    if(!data->trianglesBuffer.buffer || !positionsBuffer.buffer)
+    if(!data->trianglesBuffer.buffer || !data->localTrianglesBuffer.buffer || !data->localVerticesBuffer.buffer
+       || !positionsBuffer.buffer)
     {
       impl.res.m_allocator.destroyBuffer(data->trianglesBuffer);
+      impl.res.m_allocator.destroyBuffer(data->localTrianglesBuffer);
+      impl.res.m_allocator.destroyBuffer(data->localVerticesBuffer);
       impl.res.m_allocator.destroyBuffer(positionsBuffer);
       return false;
     }
 
+    // reference positions gathered into cluster-local order (CPU-side; the
+    // per-frame GPU gather kernel does the same reorder on the live buffers)
+    std::vector<glm::vec3> localReferencePositions(data->numClusterVertices);
+    for(uint32_t slot = 0; slot < data->numClusterVertices; slot++)
+    {
+      localReferencePositions[slot] = geometry.positions[geometry.clusterLocalVertices[slot]];
+    }
+
     lodclusters::Resources::BatchedUploader uploader(impl.res);
     uploader.uploadBuffer(data->trianglesBuffer, geometry.triangles.data());
-    uploader.uploadBuffer(positionsBuffer, geometry.positions.data());
+    uploader.uploadBuffer(data->localTrianglesBuffer, geometry.clusterLocalTriangles.data());
+    uploader.uploadBuffer(data->localVerticesBuffer, geometry.clusterLocalVertices.data());
+    uploader.uploadBuffer(positionsBuffer, localReferencePositions.data());
     uploader.flush();
   }
 
@@ -1301,13 +1441,15 @@ bool ClusterTemplateSystem::buildGeometryTemplates(uint64_t token)
         templateInfo.baseGeometryIndexAndGeometryFlags.geometryFlags =
             data->opaque ? VK_CLUSTER_ACCELERATION_STRUCTURE_GEOMETRY_OPAQUE_BIT_NV : 0;
 
-        // non-dedicated vertices (Remix always clusterizes with global
-        // indices - the hit side remaps through them)
-        templateInfo.indexBuffer       = data->trianglesBuffer.address + (sizeof(uint32_t) * cluster.firstTriangle * 3);
-        templateInfo.indexBufferStride = sizeof(uint32_t);
-        templateInfo.indexType         = VK_CLUSTER_ACCELERATION_STRUCTURE_INDEX_FORMAT_32BIT_NV;
+        // cluster-LOCAL topology (razor-triangle fix): the template build
+        // indexes vertices in [0, vertexCount), so it gets the uint8 local
+        // indices + the reference positions in cluster-local order. The
+        // GLOBAL trianglesBuffer stays hit-side only (primitive remap).
+        templateInfo.indexBuffer       = data->localTrianglesBuffer.address + cluster.firstLocalTriangle;
+        templateInfo.indexBufferStride = sizeof(uint8_t);
+        templateInfo.indexType         = VK_CLUSTER_ACCELERATION_STRUCTURE_INDEX_FORMAT_8BIT_NV;
 
-        templateInfo.vertexBuffer       = positionsBuffer.address;
+        templateInfo.vertexBuffer       = positionsBuffer.address + sizeof(glm::vec3) * cluster.firstLocalVertex;
         templateInfo.vertexBufferStride = sizeof(glm::vec3);
 
         templateInfo.positionTruncateBitCount = impl.config.positionTruncateBits;
@@ -1519,6 +1661,8 @@ bool ClusterTemplateSystem::buildGeometryTemplates(uint64_t token)
   {
     LOGE("ClusterTemplateSystem: %s: template build FAILED\n", data->name.c_str());
     impl.res.m_allocator.destroyBuffer(data->trianglesBuffer);
+    impl.res.m_allocator.destroyBuffer(data->localTrianglesBuffer);
+    impl.res.m_allocator.destroyBuffer(data->localVerticesBuffer);
     impl.res.m_allocator.destroyBuffer(data->templatesBuffer);
     return false;
   }
@@ -1734,7 +1878,10 @@ bool ClusterTemplateSystem::recordFrame(VkCommandBuffer                         
     const Impl::GeometryData& geometry = *impl.geometries[poseSet.geometryIndex];
     totalClusters += geometry.numClusters;
     totalTriangles += geometry.numTriangles;
-    totalVertices += geometry.numVertices;
+    // cluster-LOCAL vertex slots (razor-triangle fix): the build consumes the
+    // gathered per-cluster layout, so both the op's maxTotalVertexCount and
+    // the gather ring are sized by numClusterVertices, not the mesh count
+    totalVertices += geometry.numClusterVertices;
   }
 
   if(!impl.ensureFrameCapacities(totalClusters, totalTriangles, totalVertices, poseCount, slotCount))
@@ -1747,6 +1894,7 @@ bool ClusterTemplateSystem::recordFrame(VkCommandBuffer                         
   impl.profilerTimeline->frameAdvance();
 
   const uint32_t     ringIndex = impl.frameCounter % Impl::kRingSlots;
+  impl.lastRecordedRingIndex   = ringIndex;  // getTlasInstancesBuffer's copy-out follows this recordFrame
   const nvvk::Buffer& ring     = impl.ringBuffers[ringIndex];
   uint8_t*            mapping  = ring.mapping;
 
@@ -1763,6 +1911,17 @@ bool ClusterTemplateSystem::recordFrame(VkCommandBuffer                         
 
   const uint64_t ringDstAddressesVa = ring.address + impl.ringDstAddressesOffset;
 
+  // razor-triangle fix: the CLAS build/instantiate indexes vertices in
+  // [0, per-cluster vertexCount) - CLUSTER-LOCAL. The live buffers are in
+  // GLOBAL vertex order, so the gather kernel reorders each pose's positions
+  // into this frame's gather ring slot first; every per-cluster vertex input
+  // below points into the gathered layout (gatherBase + firstLocalVertex).
+  const nvvk::Buffer& gatherRing   = impl.gatherBuffers[ringIndex];
+  const uint64_t      gatherBaseVa = gatherRing.address;
+  uint32_t            gatherSlotOffset = 0;
+
+  std::vector<animatedclusters::shaderio::GatherConstants> gatherDispatches(poseCount);
+
   uint32_t clusterOffset = 0;
 
   for(uint32_t p = 0; p < poseCount; p++)
@@ -1775,6 +1934,16 @@ bool ClusterTemplateSystem::recordFrame(VkCommandBuffer                         
     // still being traced by earlier in-flight frames
     const uint64_t clasBase = poseSet.clasBuffers[ringIndex].address;
 
+    // this pose's slice of the gathered positions (tightly packed vec3)
+    const uint64_t poseGatherVa = gatherBaseVa + uint64_t(gatherSlotOffset) * sizeof(glm::vec3);
+
+    animatedclusters::shaderio::GatherConstants& gather = gatherDispatches[p];
+    gather.srcPositions   = pose.positionsAddress;
+    gather.localVertexMap = geometry.localVerticesBuffer.address;
+    gather.dstPositions   = poseGatherVa;
+    gather.vertexCount    = geometry.numClusterVertices;
+    gather.srcStrideBytes = pose.positionsStrideBytes;
+
     if(impl.config.useTemplates)
     {
       auto* instantiationInfos =
@@ -1782,6 +1951,7 @@ bool ClusterTemplateSystem::recordFrame(VkCommandBuffer                         
 
       for(uint32_t c = 0; c < geometry.numClusters; c++)
       {
+        const animatedclusters::shaderio::Cluster&               cluster  = geometry.clusters[c];
         VkClusterAccelerationStructureInstantiateClusterInfoNV& instInfo = instantiationInfos[clusterOffset + c];
 
         instInfo                        = {};
@@ -1789,9 +1959,10 @@ bool ClusterTemplateSystem::recordFrame(VkCommandBuffer                         
         instInfo.geometryIndexOffset    = 0;
         instInfo.clusterTemplateAddress = geometry.templateAddresses[c];
 
-        // current-frame vertex data (gpu_skinning output / live buffer)
-        instInfo.vertexBuffer.startAddress  = pose.positionsAddress;
-        instInfo.vertexBuffer.strideInBytes = pose.positionsStrideBytes;
+        // current-frame vertex data, gathered into the cluster-local layout
+        // the template's baked (local) indices address
+        instInfo.vertexBuffer.startAddress  = poseGatherVa + uint64_t(cluster.firstLocalVertex) * sizeof(glm::vec3);
+        instInfo.vertexBuffer.strideInBytes = sizeof(glm::vec3);
 
         // destination (persistent per-pose CLAS memory)
         dstAddresses[clusterOffset + c] = clasBase + geometry.instantiationOffsets[c];
@@ -1817,12 +1988,13 @@ bool ClusterTemplateSystem::recordFrame(VkCommandBuffer                         
         buildInfo.baseGeometryIndexAndGeometryFlags.geometryFlags =
             geometry.opaque ? VK_CLUSTER_ACCELERATION_STRUCTURE_GEOMETRY_OPAQUE_BIT_NV : 0;
 
-        buildInfo.indexBuffer       = geometry.trianglesBuffer.address + (sizeof(uint32_t) * cluster.firstTriangle * 3);
-        buildInfo.indexBufferStride = sizeof(uint32_t);
-        buildInfo.indexType         = VK_CLUSTER_ACCELERATION_STRUCTURE_INDEX_FORMAT_32BIT_NV;
+        // cluster-LOCAL indices + gathered cluster-local vertex layout
+        buildInfo.indexBuffer       = geometry.localTrianglesBuffer.address + cluster.firstLocalTriangle;
+        buildInfo.indexBufferStride = sizeof(uint8_t);
+        buildInfo.indexType         = VK_CLUSTER_ACCELERATION_STRUCTURE_INDEX_FORMAT_8BIT_NV;
 
-        buildInfo.vertexBuffer       = pose.positionsAddress;
-        buildInfo.vertexBufferStride = pose.positionsStrideBytes;
+        buildInfo.vertexBuffer       = poseGatherVa + uint64_t(cluster.firstLocalVertex) * sizeof(glm::vec3);
+        buildInfo.vertexBufferStride = sizeof(glm::vec3);
 
         buildInfo.positionTruncateBitCount = impl.config.positionTruncateBits;
 
@@ -1830,6 +2002,8 @@ bool ClusterTemplateSystem::recordFrame(VkCommandBuffer                         
         dstAddresses[clusterOffset + c] = clasBase + impl.singleExplicitClusterSize * c;
       }
     }
+
+    gatherSlotOffset += geometry.numClusterVertices;
 
     // BLAS build input: this pose's cluster references (sample:
     // initRayTracingBlas - clusterReferences into the dst address array)
@@ -1863,7 +2037,7 @@ bool ClusterTemplateSystem::recordFrame(VkCommandBuffer                         
     region.srcOffset = impl.ringTlasOffset;
     region.dstOffset = 0;
     region.size      = sizeof(VkAccelerationStructureInstanceKHR) * slotCount;
-    vkCmdCopyBuffer(cmd, ring.buffer, impl.tlasInstancesBuffer.buffer, 1, &region);
+    vkCmdCopyBuffer(cmd, ring.buffer, impl.tlasInstancesBuffers[ringIndex].buffer, 1, &region);
   }
 
   vkCmdFillBuffer(cmd, impl.readbackBuffer.buffer, 0, sizeof(AnimatedReadback), 0);
@@ -1899,8 +2073,39 @@ bool ClusterTemplateSystem::recordFrame(VkCommandBuffer                         
     vkCmdFillBuffer(cmd, impl.dbgStampHost.buffer, sizeof(uint32_t) * (dbgSlot * 2 + 0), sizeof(uint32_t), dbgStamp);
   }
 
-  // wait for animation update (gpu_skinning writes from this submission's
-  // earlier commands / prior submissions) and our staging writes
+  // ---- per-pose vertex gather (razor-triangle fix) ----
+  // Reorder each pose's live positions (global vertex order, gpu_skinning /
+  // capture output) into this frame's gather ring slot in cluster-local
+  // layout. Runs before the CLAS ops, which consume the gathered data.
+  {
+    auto timerSection = impl.profilerGpuTimer.cmdFrameSection(cmd, "Anim Vtx Gather");
+
+    // wait for the live-buffer writes before the gather reads them: gpu_skinning
+    // is COMPUTE, but mutating (kUpdateBVH) meshes' vertex data lands via
+    // TRANSFER copies (cacheVertexDataOnGPU) - both sources must be covered
+    VkMemoryBarrier gatherBarrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    gatherBarrier.srcAccessMask   = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    gatherBarrier.dstAccessMask   = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
+                         &gatherBarrier, 0, nullptr, 0, nullptr);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, impl.gatherPipeline);
+    for(uint32_t p = 0; p < poseCount; p++)
+    {
+      const animatedclusters::shaderio::GatherConstants& gather = gatherDispatches[p];
+      if(gather.vertexCount == 0)
+      {
+        continue;
+      }
+      vkCmdPushConstants(cmd, impl.computePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                         sizeof(animatedclusters::shaderio::GatherConstants), &gather);
+      vkCmdDispatch(cmd, (gather.vertexCount + 63) / 64, 1, 1);
+    }
+  }
+
+  // wait for the gather writes (and our staging writes) before the CLAS ops
+  // read the gathered vertex data / build inputs
   VkMemoryBarrier memBarrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
   memBarrier.srcAccessMask   = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
   memBarrier.dstAccessMask   = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_SHADER_READ_BIT;
@@ -2020,7 +2225,7 @@ bool ClusterTemplateSystem::recordFrame(VkCommandBuffer                         
     blasConstants.sumCount      = poseCount;
     blasConstants.animated      = 0;
     blasConstants.instances     = ring.address + impl.ringRenderInstancesOffset;
-    blasConstants.rayInstances  = impl.tlasInstancesBuffer.address;
+    blasConstants.rayInstances  = impl.tlasInstancesBuffers[ringIndex].address;
     blasConstants.blasAddresses = impl.blasAddressesBuffer[ringIndex].address;
     blasConstants.sizes         = impl.blasSizesBuffer.address;
     blasConstants.sum           = impl.readbackBuffer.address + offsetof(AnimatedReadback, blasesSize);
@@ -2067,7 +2272,7 @@ bool ClusterTemplateSystem::recordFrame(VkCommandBuffer                         
 
 VkBuffer ClusterTemplateSystem::getTlasInstancesBuffer() const
 {
-  return m_impl->tlasInstancesBuffer.buffer;
+  return m_impl->tlasInstancesBuffers[m_impl->lastRecordedRingIndex].buffer;
 }
 
 uint64_t ClusterTemplateSystem::getClusterTableAddress() const
@@ -2110,7 +2315,8 @@ bool ClusterTemplateSystem::getStats(AnimatedStats& outStats) const
   outStats.blasReservedBytes    = impl.blasImplicitBuffers[0].bufferSize * Impl::kRingSlots;
   outStats.operationsBytes      = impl.scratchBuffers[0].bufferSize * Impl::kRingSlots + impl.dstSizesBuffer.bufferSize
                                   + impl.blasAddressesBuffer[0].bufferSize * Impl::kRingSlots + impl.blasSizesBuffer.bufferSize
-                                  + impl.tlasInstancesBuffer.bufferSize
+                                  + impl.gatherBuffers[0].bufferSize * Impl::kRingSlots
+                                  + impl.tlasInstancesBuffers[0].bufferSize * Impl::kRingSlots
                                   + (impl.ringBuffers[0].buffer ? impl.ringBuffers[0].bufferSize * Impl::kRingSlots : 0);
 
   if(impl.anyFrameRecorded && impl.readbackHostBuffer.mapping)

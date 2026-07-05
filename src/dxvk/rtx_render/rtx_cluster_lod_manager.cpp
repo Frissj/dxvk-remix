@@ -27,6 +27,7 @@
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <unordered_set>
 
 #include "rtx_cluster_lod_manager.h"
 #include "rtx_cluster_lod_geometry_provider.h"
@@ -1773,6 +1774,57 @@ namespace dxvk {
       return false;
     }
     m_frameClusterBudgetUsed += poseClusters;
+
+    // [ClusterLOD] AnimVtx probe (2026-07-05): the per-frame cluster build reads
+    // this pose's positions from the live buffer. Verify the byte range the build
+    // will touch is in-bounds, the format/stride are sane, and the data was
+    // actually written this frame - the flicker-razor suspects. Each offending
+    // mesh logs once; a periodic summary shows prevalence. Gameplay-gated.
+    if (currentFrame > 200) {
+      static std::unordered_set<uint64_t> s_flagged;
+      static uint32_t s_poses = 0, s_oob = 0, s_stale = 0, s_badFmt = 0, s_badStride = 0, s_lastSummary = 0;
+
+      const RasterGeometry& g = blasEntry->input.getGeometryData();
+      const uint32_t vtx = g.vertexCount;
+      const uint32_t stride = positions.stride();
+      const uint64_t offset = positions.offsetFromSlice();
+      const uint64_t bufSize = positions.buffer() != nullptr ? positions.buffer()->info().size : 0;
+      const uint64_t requiredEnd = vtx > 0 ? offset + uint64_t(stride) * (vtx - 1u) + 3u * sizeof(float) : 0;
+      const VkFormat fmt = positions.vertexFormat();
+      const bool writtenThisFrame = blasEntry->frameLastUpdated == currentFrame;
+      const bool oob = requiredEnd > bufSize;
+      const bool badStride = stride < 3u * sizeof(float);
+      const bool badFmt = fmt != VK_FORMAT_R32G32B32_SFLOAT && fmt != VK_FORMAT_R32G32B32A32_SFLOAT;
+
+      s_poses++;
+      if (oob) { s_oob++; }
+      if (!writtenThisFrame) { s_stale++; }
+      if (badFmt) { s_badFmt++; }
+      if (badStride) { s_badStride++; }
+
+      if (oob || badStride || badFmt || !writtenThisFrame) {
+        const uint64_t key = ClusterLodGeometryProvider::makeTopologyKey(g);
+        if (s_flagged.insert(key).second) {
+          Logger::warn(str::format(
+            "[ClusterLOD] AnimVtx FLAG key=0x", std::hex, key, std::dec,
+            " verts=", vtx, " stride=", stride, " offset=", offset,
+            " bufSize=", bufSize, " requiredEnd=", requiredEnd, " fmt=", uint32_t(fmt),
+            " frameLastUpdated=", blasEntry->frameLastUpdated, " cur=", currentFrame,
+            " frameCreated=", blasEntry->frameCreated,
+            oob ? " *OOB*" : "", badStride ? " *STRIDE*" : "",
+            badFmt ? " *FMT*" : "", !writtenThisFrame ? " *STALE*" : ""));
+        }
+      }
+
+      if (currentFrame - s_lastSummary >= 300) {
+        s_lastSummary = currentFrame;
+        Logger::info(str::format(
+          "[ClusterLOD] AnimVtx summary @frame ", currentFrame, ": posesThisInterval=", s_poses,
+          " oob=", s_oob, " stale=", s_stale, " badFmt=", s_badFmt, " badStride=", s_badStride,
+          " distinctFlagged=", s_flagged.size()));
+        s_poses = s_oob = s_stale = s_badFmt = s_badStride = 0;
+      }
+    }
 
     FramePose framePose;
     framePose.poseSetId = pose.poseSetId;
