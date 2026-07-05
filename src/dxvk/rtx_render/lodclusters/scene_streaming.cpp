@@ -161,6 +161,10 @@ void SceneStreaming::updateBindings(const nvvk::Buffer& sceneBuildingBuffer)
 
 void SceneStreaming::resetCachedBlas(Resources::BatchedUploader& uploader)
 {
+  // F1 UAF: return any deferred cached-BLAS ranges now (this reset is a safe
+  // point) so they are not leaked inside the allocator across the rebuild.
+  drainCachedBlasPendingFree(true);
+
   for(size_t geometryIndex = 0; geometryIndex < m_scene->getActiveGeometryCount(); geometryIndex++)
   {
     SceneStreaming::PersistentGeometry& persistentGeometry = m_persistentGeometries[geometryIndex];
@@ -1088,8 +1092,32 @@ uint32_t SceneStreaming::handleCompletedRequest(VkCommandBuffer      cmd,
   return useDecoupledUpdate ? INVALID_TASK_INDEX : pushUpdateIndex;
 }
 
+void SceneStreaming::deferCachedBlasFree(nvvk::BufferSubAllocation& allocation)
+{
+  if(!allocation)
+  {
+    return;
+  }
+  m_cachedBlasPendingFree.push_back({allocation, m_frameIndex});
+  allocation = {};
+}
+
+void SceneStreaming::drainCachedBlasPendingFree(bool force)
+{
+  while(!m_cachedBlasPendingFree.empty()
+        && (force || m_frameIndex - m_cachedBlasPendingFree.front().frameId > kCachedBlasFreeDelayFrames))
+  {
+    m_cachedBlasAllocator.subFree(m_cachedBlasPendingFree.front().allocation);
+    m_cachedBlasPendingFree.pop_front();
+  }
+}
+
 void SceneStreaming::handleBlasCaching(StreamingUpdates::TaskInfo& updateTask, const FrameSettings& settings)
 {
+  // return the ranges of cached BLAS replaced kCachedBlasFreeDelayFrames+ frames
+  // ago now that in-flight frames have retired their trace references (F1 UAF).
+  drainCachedBlasPendingFree(false);
+
   uint32_t writeIndex = 0;
 
   uint32_t cachedBuildsTotal   = 0;
@@ -1120,7 +1148,12 @@ void SceneStreaming::handleBlasCaching(StreamingUpdates::TaskInfo& updateTask, c
       {
         uint32_t groupCount          = geometryView.lodLevels[i].groupCount;
         uint32_t groupOffset         = geometryView.lodLevels[i].groupOffset;
-        uint32_t cachedClustersCount = geometryView.lodLevels[i].clusterCount;
+        // F1 fix: assign the OUTER cachedClustersCount (declared above), do NOT
+        // redeclare. A shadowing `uint32_t` here scoped this write to the if-block,
+        // so the outer accumulator stayed 0 and isLowerDetail / isHigherDetail
+        // (both `cachedClustersCount && ...`) were permanently false - the cache
+        // only ever invalidated, never built.
+        cachedClustersCount = geometryView.lodLevels[i].clusterCount;
 
         // check if it fits
         if(cachedClustersCount <= STREAMING_CACHED_BLAS_MAX_CLUSTERS)
@@ -1150,9 +1183,10 @@ void SceneStreaming::handleBlasCaching(StreamingUpdates::TaskInfo& updateTask, c
       if(isLowerDetail || isInvalidateOnly)
       {
         // de-allocate first, because will use less space next, which is guaranteed to fit
+        // F1 UAF: defer - in-flight frames' TLAS still trace this old cached BLAS.
         if(persistentGeometry.cachedBlasAllocation)
         {
-          m_cachedBlasAllocator.subFree(persistentGeometry.cachedBlasAllocation);
+          deferCachedBlasFree(persistentGeometry.cachedBlasAllocation);
         }
       }
 
@@ -1170,9 +1204,10 @@ void SceneStreaming::handleBlasCaching(StreamingUpdates::TaskInfo& updateTask, c
         // de-allocate old if still exists
         // isHigherDetail attempts to get space for higher detail first,
         // so it can keep old cached blas if building fails
+        // F1 UAF: defer - in-flight frames' TLAS still trace this old cached BLAS.
         if(persistentGeometry.cachedBlasAllocation)
         {
-          m_cachedBlasAllocator.subFree(persistentGeometry.cachedBlasAllocation);
+          deferCachedBlasFree(persistentGeometry.cachedBlasAllocation);
         }
         persistentGeometry.cachedBlasLevel       = sgpatch.cachedBlasLodLevel;
         persistentGeometry.cachedBlasAllocation  = subAllocation;
@@ -2458,6 +2493,10 @@ void SceneStreaming::deinitClas()
 
   if(m_config.allowBlasCaching)
   {
+    // F1 UAF: flush deferred frees before we free live allocations and deinit
+    // the allocator (which destroys all blocks the pending handles point into).
+    drainCachedBlasPendingFree(true);
+
     for(auto& persistentGeometry : m_persistentGeometries)
     {
       if(persistentGeometry.cachedBlasAllocation)

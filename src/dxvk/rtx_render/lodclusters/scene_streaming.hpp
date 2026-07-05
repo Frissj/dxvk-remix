@@ -19,6 +19,8 @@
 
 #pragma once
 
+#include <deque>
+
 #include "scene_streaming_utils.hpp"
 
 namespace lodclusters {
@@ -307,6 +309,32 @@ private:
   // manages memory of cached BLAS builds
   nvvk::BufferSubAllocator m_cachedBlasAllocator;
   uint32_t                 m_cachedBlasAlignment = 4;
+
+  // NV-DXVK (F1 UAF): cached BLAS memory is TRACE-READ by in-flight frames'
+  // TLAS. When handleBlasCaching replaces a geometry's cached BLAS it must NOT
+  // return the old suballocation range to m_cachedBlasAllocator immediately -
+  // the allocator would re-hand that exact range to the replacement build while
+  // an earlier frame's trace still dereferences the old BLAS there
+  // (VK_ERROR_DEVICE_LOST, same class as risk R17 / the Path B scratch race).
+  // Defer the subFree by kCachedBlasFreeDelayFrames so all frames-in-flight
+  // have retired first (mirrors Path B's deferDestroy / kDestroyDelayFrames).
+  // Only fed while useBlasCaching is enabled; completely inert otherwise.
+  // Single-threaded like every other m_cachedBlasAllocator access: fed from the
+  // update task (handleBlasCaching), force-drained from reset/deinit only when
+  // that task is joined - so no lock, matching the existing subFree discipline.
+  static constexpr uint32_t kCachedBlasFreeDelayFrames = 8;
+  struct PendingCachedBlasFree
+  {
+    nvvk::BufferSubAllocation allocation;
+    uint32_t                  frameId;
+  };
+  std::deque<PendingCachedBlasFree> m_cachedBlasPendingFree;
+
+  // queue a cached-BLAS suballocation to be freed once frames-in-flight have
+  // retired its trace references; clears `allocation` (mirrors deferDestroy).
+  void deferCachedBlasFree(nvvk::BufferSubAllocation& allocation);
+  // real subFree of every pending entry old enough (or all of them, if force).
+  void drainCachedBlasPendingFree(bool force);
 
   // This is the main function where we react on streaming requests.
   // It processes the request by issuing new storage upload work and prepares the scene patching and resident update task.
