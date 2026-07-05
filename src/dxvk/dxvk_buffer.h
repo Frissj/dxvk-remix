@@ -750,6 +750,10 @@ namespace dxvk {
   class DxvkAccelStructure : public DxvkBuffer {
     VkAccelerationStructureKHR accelStructureRef = VK_NULL_HANDLE;
 
+    // NV-DXVK: [AccelVa] lifecycle ledger - cached AS device address so the
+    // destructor can log the range without touching a possibly-dead device
+    VkDeviceAddress m_dbgAccelVa = 0;
+
   public:
     DxvkAccelStructure(
             DxvkDevice* device,

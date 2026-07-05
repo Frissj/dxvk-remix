@@ -36,6 +36,13 @@
 
 namespace lodclusters {
 
+// NV-DXVK
+std::function<void()>& deviceLostAuxDumpFn()
+{
+  static std::function<void()> s_fn;
+  return s_fn;
+}
+
 std::string formatMemorySize(size_t sizeInBytes)
 {
   static const std::string units[]     = {"B", "KB", "MB", "GB"};
@@ -556,7 +563,22 @@ void Resources::tempSyncSubmit(VkCommandBuffer cmd)
   NVVK_CHECK(vkQueueSubmit2(m_queue.queue, 1, &submitInfo2, fence));
   if(submitUnlockFn)
     submitUnlockFn();
-  NVVK_CHECK(vkWaitForFences(m_device, 1, &fence, VK_TRUE, ~0ULL));
+  const VkResult waitResult = vkWaitForFences(m_device, 1, &fence, VK_TRUE, ~0ULL);
+
+  // NV-DXVK: forensic hook - MUST run before NVVK_CHECK, which exit()s the
+  // process on any error. The mutex holds a second crashing thread at the
+  // door so its exit() cannot truncate the first thread's dump.
+  if(waitResult == VK_ERROR_DEVICE_LOST)
+  {
+    std::lock_guard<std::mutex> lock(m_deviceLostDumpMutex);
+    if(deviceLostDumpFn)
+    {
+      std::function<void()> fn;
+      fn.swap(deviceLostDumpFn);
+      fn();
+    }
+  }
+  NVVK_CHECK(waitResult);
 
   vkDestroyFence(m_device, fence, nullptr);
   vkFreeCommandBuffers(m_device, m_tempCommandPool, 1, &cmd);

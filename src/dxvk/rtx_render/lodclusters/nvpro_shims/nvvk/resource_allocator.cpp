@@ -187,6 +187,15 @@ VkResult nvvk::ResourceAllocator::createBuffer(nvvk::Buffer&                  re
 
   addLeakDetection(resultBuffer.allocation);
 
+  // NV-DXVK: complete VA ledger - every cluster-side buffer passes through
+  // here. Correlating an Aftermath fault address against these CREATE/DESTROY
+  // ranges classifies a device-lost in one step: inside a destroyed range =
+  // lifetime bug, inside a live range = sparse/binding hole, in no range ever
+  // = garbage device address from corrupted AS-build inputs.
+  LOGI("[VaLedger] CREATE 0x%llx..0x%llx (%llu bytes)%s\n", (unsigned long long)resultBuffer.address,
+       (unsigned long long)(resultBuffer.address + resultBuffer.bufferSize), (unsigned long long)resultBuffer.bufferSize,
+       resultBuffer.mapping ? " host" : "");
+
   return result;
 }
 
@@ -197,6 +206,10 @@ void nvvk::ResourceAllocator::destroyBuffer(nvvk::Buffer& buffer) const
     buffer = {};
     return;
   }
+
+  // NV-DXVK: see the CREATE counterpart in createBuffer
+  LOGI("[VaLedger] DESTROY 0x%llx..0x%llx (%llu bytes)\n", (unsigned long long)buffer.address,
+       (unsigned long long)(buffer.address + buffer.bufferSize), (unsigned long long)buffer.bufferSize);
 
   vmaDestroyBuffer(m_allocator, buffer.buffer, buffer.allocation);
   buffer = {};
@@ -342,6 +355,11 @@ VkResult nvvk::ResourceAllocator::createLargeBuffer(LargeBuffer&                
     largeBuffer.address    = vkGetBufferDeviceAddress(m_device, &info);
     largeBuffer.bufferSize = createInfo.size;
 
+    // NV-DXVK: see the [VaLedger] note in createBuffer
+    LOGI("[VaLedger] CREATE-LARGE 0x%llx..0x%llx (%llu bytes, %u sparse chunks)\n", (unsigned long long)largeBuffer.address,
+         (unsigned long long)(largeBuffer.address + largeBuffer.bufferSize), (unsigned long long)largeBuffer.bufferSize,
+         uint32_t(largeBuffer.allocations.size()));
+
     return VK_SUCCESS;
   }
 }
@@ -384,6 +402,12 @@ VkResult nvvk::ResourceAllocator::createLargeBuffer(LargeBuffer&           large
 
 void nvvk::ResourceAllocator::destroyLargeBuffer(LargeBuffer& buffer) const
 {
+  // NV-DXVK: see the [VaLedger] note in createBuffer
+  if(buffer.buffer != VK_NULL_HANDLE)
+  {
+    LOGI("[VaLedger] DESTROY-LARGE 0x%llx..0x%llx (%llu bytes)\n", (unsigned long long)buffer.address,
+         (unsigned long long)(buffer.address + buffer.bufferSize), (unsigned long long)buffer.bufferSize);
+  }
   vkDestroyBuffer(m_device, buffer.buffer, nullptr);
   vmaFreeMemoryPages(m_allocator, buffer.allocations.size(), buffer.allocations.data());
   buffer = {};
