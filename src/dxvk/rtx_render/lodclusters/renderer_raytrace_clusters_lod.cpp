@@ -137,6 +137,14 @@ private:
   // activated under streaming, VK_ERROR_DEVICE_LOST 2026-07-04). Ring one
   // pool per frame-in-flight slot; everything else the trace reads (CLAS,
   // cached BLAS memory, low-detail BLAS) is persistent and unaffected.
+  //
+  // Correctness bound: kBlasRingSlots >= max frames-in-flight. dxvk's hard cap
+  // is dxvk::kMaxFramesInFlight = 4 (rtx_utils.h) - default frame latency is 3,
+  // but SetMaximumFrameLatency / d3d9.maxFrameLatency can request up to 4, so a
+  // title can run 4 frames deep. 4 is therefore the *minimum* safe value here,
+  // not an over-provision: do NOT shrink to 3 - that reintroduces the exact
+  // device-lost race above whenever frames-in-flight hits 4. (Matches Path B's
+  // kRingSlots = 4 in animated/renderer_raytrace_clusters.cpp.)
   static constexpr uint32_t kBlasRingSlots = 4;
 #if USE_LARGE_BUFFER_BLAS
   nvvk::LargeBuffer m_sceneBlasDataBuffers[kBlasRingSlots];
