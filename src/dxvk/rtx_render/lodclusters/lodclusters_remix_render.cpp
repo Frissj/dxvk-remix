@@ -386,6 +386,20 @@ void ClusterRenderSystem::Impl::recordPromotion(VkCommandBuffer cmd, const Frame
     anyGate |= entry.mode == 1;
     usedSlots = std::max(usedSlots, entry.stateSlot + 1);
     stagedEntries[i] = entry;
+
+    // NV-DXVK: [PromoSolveNull] promotion_solve reads captureVa (live positions)
+    // for every entry, and probeVa (reference blob) per-vertex on gate entries
+    // (mode 1), on the GPU. A 0 address there is the compute's Read@VA=0 - the
+    // deterministic device-lost that VANISHES with promotion.enable=False and
+    // fires no other probe. captureVa is the pose positionsAddress, which is 0
+    // when the instance wasn't posed this frame; the gate emit guards probeVa!=0
+    // but NEVER captureVa. Log NOW, before the vkCmdDispatch below (crash-safe).
+    if (entry.captureVa == 0 || (entry.mode == 1 && entry.probeVa == 0)) {
+      LOGE("[PromoSolveNull] entry %u mode %u stateSlot %u patchSlot %u vtx %u probeVa 0x%llx captureVa 0x%llx"
+           "  *** NULL PROMO SOLVE ADDR ***\n",
+           i, uint32_t(entry.mode), entry.stateSlot, entry.patchSlot, entry.vertexCount,
+           (unsigned long long)entry.probeVa, (unsigned long long)entry.captureVa);
+    }
   }
   promoUsedSlots = std::min(usedSlots, kPromotionSlotCapacity);
 

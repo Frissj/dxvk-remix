@@ -5,6 +5,12 @@
 #include <unordered_set>
 #include "dxvk_scoped_annotation.h"
 
+// NV-DXVK: [AftermathShaderHash] SPIR-V hash matching Aftermath crash-dump
+// shader hashes (GFSDK_Aftermath_GpuCrashDump_ShaderInfo.shaderHash), so an
+// anonymous "compute_XX" in a dump can be matched to an app shader by name -
+// or proven driver-internal when no logged hash matches.
+#include "GFSDK_Aftermath_GpuCrashDumpDecoding.h"
+
 namespace dxvk {
   
   DxvkShaderConstData::DxvkShaderConstData()
@@ -193,6 +199,21 @@ namespace dxvk {
     // Replace undefined input variables with zero
     for (uint32_t u : bit::BitMask(info.undefinedInputs))
       eliminateInput(spirvCode, u);
+
+    // NV-DXVK: [AftermathShaderHash] log each shader's Aftermath hash once (over
+    // the FINAL, binding-remapped SPIR-V - what the driver compiles). Grep the
+    // log for a crash dump's shader hash to name its anonymous "compute_XX".
+    if (!m_aftermathHashLogged) {
+      m_aftermathHashLogged = true;
+      GFSDK_Aftermath_SpirvCode sc = {};
+      sc.pData = spirvCode.data();
+      sc.size  = uint32_t(spirvCode.size());
+      GFSDK_Aftermath_ShaderBinaryHash h = {};
+      if (GFSDK_Aftermath_SUCCEED(GFSDK_Aftermath_GetShaderHashSpirv(GFSDK_Aftermath_Version_API, &sc, &h))) {
+        Logger::info(str::format("[AftermathShaderHash] ", h.hash, " = ", debugName(),
+                                 " (", spirvCode.size(), " bytes)"));
+      }
+    }
 
     return DxvkShaderModule(vkd, this, spirvCode);
   }

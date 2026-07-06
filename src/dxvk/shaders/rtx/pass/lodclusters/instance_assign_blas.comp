@@ -72,6 +72,13 @@
 
 #include "shaderio.h"
 
+// NV-DXVK: [BlasHeadScan] raw u64 reader for dereferencing a blasReference
+// address (see Readback::dbgBlasHeads)
+layout(buffer_reference, buffer_reference_align=8, scalar) buffer BlasHeadRef
+{
+  uint64_t d[];
+};
+
 layout(scalar, binding = BINDINGS_FRAME_UBO, set = 0) uniform frameConstantsBuffer
 {
   FrameConstants view;
@@ -170,12 +177,49 @@ void main()
       }
     #endif
       
-      build.tlasInstances.d[instanceID].blasReference =
+      uint64_t assignAddr =
       #if USE_BLAS_CACHING
-        blasAddress != 0 ? blasAddress : 
+        blasAddress != 0 ? blasAddress :
       #endif
         build.blasBuildAddresses.d[buildIndex];
+      // NV-DXVK: never overwrite with a 0 reference. Remix full-builds the TLAS
+      // every frame (MODE_BUILD) and dereferences every instance's BLAS regardless
+      // of mask; if the per-frame build produced no address (blasBuildCounter 0
+      // this frame), keep the valid pre-set lowDetailBlasAddress from
+      // traversal_init/instance_classify_lod instead of writing 0 -> GPU VA=0.
+      if (assignAddr != 0)
+      {
+        build.tlasInstances.d[instanceID].blasReference = assignAddr;
+      }
     }
+
+    // NV-DXVK: [ZeroRefScan] this is the last Path-A writer of blasReference; flag
+    // any instance whose FINAL reference is still 0 (the null the full TLAS build
+    // reads as VA=0). Report the first one so the CPU can name it.
+    if (build.tlasInstances.d[instanceID].blasReference == 0)
+    {
+      uint prev = atomicAdd(readback.zeroRefCount, 1);
+      if (prev == 0)
+      {
+        readback.zeroRefInstanceId = instanceID;
+        readback.zeroRefGeometryId = buildInfo.geometryID;
+        readback.zeroRefBuildIndex = buildInfo.blasBuildIndex;
+      }
+    }
+
+  }
+
+  // NV-DXVK: [BlasHeadScan] mirror the final reference AND the first 8 bytes
+  // at that address. The per-frame cluster BLAS builds retired before this
+  // dispatch (barriers), so a nonzero ref with a zero head means the TLAS
+  // will reference AS memory nothing built - the traversal VA=0 source.
+  // Slots beyond this frame's instance count are zeroed (no stale carryover).
+  if (instanceID < 64)
+  {
+    uint64_t finalRef = instanceID < build.numRenderInstances ?
+      build.tlasInstances.d[instanceID].blasReference : uint64_t(0);
+    readback.dbgBlasRefs[instanceID] = finalRef;
+    readback.dbgBlasHeads[instanceID] = finalRef != 0 ? BlasHeadRef(finalRef).d[0] : uint64_t(0);
   }
   
 #if 1

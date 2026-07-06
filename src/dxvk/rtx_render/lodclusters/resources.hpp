@@ -119,6 +119,29 @@ std::string formatMemorySize(size_t sizeInBytes);
 // matter which system's thread notices the loss first.
 std::function<void()>& deviceLostAuxDumpFn();
 
+// NV-DXVK: same dump, reachable from DxvkSubmissionQueue's device-lost site.
+// When no lodclusters temp submit is in flight at the loss, neither the
+// tempSyncSubmit fence wait nor NVVK_CHECK ever observes it - the dxvk submit
+// thread is then the ONLY observer, and it must be able to flush [BlasCapture].
+std::function<void()>& deviceLostQueueDumpFn();
+
+// NV-DXVK: [HeadWatch] registry of AS memory pools (Path-A per-frame BLAS ring
+// slots, low-detail CLAS/BLAS batches, ...) so AccelManager's per-frame scan
+// can re-read the first bytes AT every TLAS cluster reference each frame.
+// [BlasHeadScan] proved the heads are valid at assign time; the fault appears
+// frames later - this watch catches the frame the content gets stomped.
+// Thread-safe: registration from worker threads, lookup from the CS thread.
+struct WatchedAsPool
+{
+  VkBuffer buffer  = VK_NULL_HANDLE;
+  uint64_t address = 0;
+  uint64_t size    = 0;
+};
+void registerWatchedAsPool(VkBuffer buffer, uint64_t address, uint64_t size);
+void unregisterWatchedAsPool(VkBuffer buffer);
+// snapshot copy for race-free iteration
+std::vector<WatchedAsPool> getWatchedAsPools();
+
 // NV-DXVK: label this thread's next temp op(s) so [TempSubmit] names which
 // operation submitted the faulting work (device-lost forensics).
 void dbgSetTempLabel(const char* label);

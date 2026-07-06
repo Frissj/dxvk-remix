@@ -183,8 +183,15 @@ private:
   // VK_ERROR_DEVICE_LOST the slot whose post-stamp is missing holds exactly
   // what the faulting build consumed, and debugDumpBlasInputCapture classifies
   // every cluster reference against the valid CLAS pools.
-  static constexpr uint32_t kDbgCaptureSlots        = 2;
+  // NV-DXVK: 8 slots (was 2) - the null CLAS ref is BAKED at the promotion-wave
+  // build frame but the device-lost happens 2+ frames later (in the volume
+  // ReSTIR visibility traversal, per Aftermath markers), so a 2-frame ring had
+  // always evicted the bake by dump time.
+  static constexpr uint32_t kDbgCaptureSlots        = 8;
   static constexpr uint32_t kDbgCaptureMaxAddresses = 1u << 21;  // 16 MiB of refs per slot
+  // NV-DXVK: [BlasHeadScan] Resources access for the device-lost dump (reads the
+  // Readback host ring's dbgBlasRefs/dbgBlasHeads written by instance_assign_blas)
+  Resources* m_dbgRes = nullptr;
   nvvk::Buffer m_dbgCaptureHost[kDbgCaptureSlots];
   nvvk::Buffer m_dbgStampHost;
   uint32_t     m_dbgCaptureAddressCount = 0;
@@ -349,9 +356,13 @@ bool RendererRayTraceClustersLod::init(Resources& res, RenderScene& rscene, cons
   // scene building data
 
   {
+    // NV-DXVK: TRANSFER_SRC so debugRecordBlasInputCapture's forensic mirror
+    // copy is VALID (it was silently no-op'ing without it - VUID 00118 - which
+    // is why [BlasCapture] reported "0 builds" on every device-lost dump).
     res.createBuffer(m_sceneBuildBuffer, sizeof(shaderio::SceneBuilding),
                      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT
-                         | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR);
+                         | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR
+                         | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
     NVVK_DBG_NAME(m_sceneBuildBuffer.buffer);
     m_resourceReservedUsage.operationsMemBytes += logMemoryUsage(m_sceneBuildBuffer.bufferSize, "operations", "build shaderio");
 
@@ -411,8 +422,10 @@ bool RendererRayTraceClustersLod::init(Resources& res, RenderScene& rscene, cons
       mem.endOverlap();
     }
 
+    // NV-DXVK: TRANSFER_SRC for debugRecordBlasInputCapture (see m_sceneBuildBuffer)
     res.createBuffer(m_sceneDataBuffer, mem.getSize(),
-                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR);
+                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR
+                         | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
     NVVK_DBG_NAME(m_sceneDataBuffer.buffer);
     m_resourceReservedUsage.operationsMemBytes += logMemoryUsage(m_sceneDataBuffer.bufferSize, "operations", "build data");
 
@@ -453,6 +466,10 @@ bool RendererRayTraceClustersLod::init(Resources& res, RenderScene& rscene, cons
                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR);
 #endif
       NVVK_DBG_NAME(m_sceneBlasDataBuffers[ringSlot].buffer);
+      // NV-DXVK: [HeadWatch] Path-A per-frame BLAS ring - the pool the fatal
+      // TLAS refs live in; AccelManager re-reads heads at these refs per frame
+      lodclusters::registerWatchedAsPool(m_sceneBlasDataBuffers[ringSlot].buffer, m_sceneBlasDataBuffers[ringSlot].address,
+                                         m_sceneBlasDataBuffers[ringSlot].bufferSize);
     }
 
     // NV-DXVK: device-lost forensics host mirrors (see the member block)
@@ -482,6 +499,12 @@ bool RendererRayTraceClustersLod::init(Resources& res, RenderScene& rscene, cons
       }
 
       res.deviceLostDumpFn = [this]() { debugDumpBlasInputCapture(); };
+      // NV-DXVK: also reachable from DxvkSubmissionQueue's device-lost site
+      // (the only observer when no temp submit is in flight at the loss).
+      // debugDumpBlasInputCapture itself guards against double-dump.
+      deviceLostQueueDumpFn() = [this]() { debugDumpBlasInputCapture(); };
+      // NV-DXVK: [BlasHeadScan] readback-ring access for the dump
+      m_dbgRes = &res;
 
       // NV-DXVK: NVVK_CHECK exit()s the process on the FIRST failing thread -
       // including the template system's Resources, which has no dump hook. This
@@ -1097,7 +1120,25 @@ void RendererRayTraceClustersLod::render(VkCommandBuffer cmd, Resources& res, Re
     shaderio::Readback readback;
     res.getReadbackData(readback);
     m_resourceActualUsage.rtBlasMemBytes = readback.blasActualSizes + rscene.getBlasSize(false);
+
+    // NV-DXVK: [ZeroRefScan] a render instance reached the TLAS build with a 0
+    // blasReference (the null read as GPU VA=0). Name it so we can trace which
+    // geometry/build-index produced it. Readback lags a couple frames.
+    if(readback.zeroRefCount != 0)
+    {
+      LOGE("[ZeroRefScan] %u render instance(s) have blasReference 0 | first: instanceId %u geometryId %u buildIndex 0x%x"
+           "  *** NULL TLAS REF ***\n",
+           readback.zeroRefCount, readback.zeroRefInstanceId, readback.zeroRefGeometryId, readback.zeroRefBuildIndex);
+    }
   }
+
+  // NV-DXVK: [BlasWave] every render() is a Path-A cluster BLAS build wave into
+  // pool slot m_frameIndex%kBlasRingSlots. The BlasCapture stamps proved this
+  // ran ONCE by crash time while streaming churns CLAS residency every frame -
+  // log each wave so the fatal frame's TLAS refs can be dated against the wave
+  // that built them (a stale wave + CLAS unloads in between = UAF underneath a
+  // frozen BLAS).
+  LOGI("[BlasWave] wave %u done (pool slot %u)\n", m_frameIndex, m_frameIndex % kBlasRingSlots);
 
   m_frameIndex++;
 }
@@ -1182,7 +1223,16 @@ void RendererRayTraceClustersLod::debugDumpBlasInputCapture()
     LOGE("[BlasCapture] valid clas range 0x%llx..0x%llx\n", (unsigned long long)range.first, (unsigned long long)range.second);
   }
 
-  const uint32_t clasAlignment = std::max(1u, m_rtClasProperties.clusterBottomLevelByteAlignment);
+  // NV-DXVK: a cluster REFERENCE is a CLAS (cluster-level AS) address, aligned to
+  // clusterByteAlignment - NOT clusterBottomLevelByteAlignment, which is the BLAS
+  // OUTPUT alignment. The reference sample packs CLAS at clusterByteAlignment
+  // granularity (scene_streaming.cpp CLAS allocator) and never rounds refs to the
+  // bottom-level alignment. Checking against the stricter bottom-level value made
+  // valid 128-aligned refs read as MISALIGNED (false positive). Log both so the
+  // value is ground-truth in the dump, and validate against the correct one.
+  LOGE("[BlasCapture] CLAS alignment: clusterByteAlignment %u, clusterBottomLevelByteAlignment %u (refs checked vs clusterByteAlignment)\n",
+       m_rtClasProperties.clusterByteAlignment, m_rtClasProperties.clusterBottomLevelByteAlignment);
+  const uint32_t clasAlignment = std::max(1u, m_rtClasProperties.clusterByteAlignment);
 
   for(uint32_t slot = 0; slot < kDbgCaptureSlots; slot++)
   {
@@ -1267,6 +1317,46 @@ void RendererRayTraceClustersLod::debugDumpBlasInputCapture()
   }
   LOGE("[BlasCapture] ==== dump end ====\n");
 
+  // NV-DXVK: [BlasHeadScan] the GPU-side content probe: instance_assign_blas
+  // mirrored every render instance's FINAL blasReference and the u64 AT that
+  // address into the Readback ring (4 frames of history). A nonzero ref with a
+  // ZERO head = the TLAS referenced AS memory nothing had built at assign time.
+  if(m_dbgRes != nullptr && m_dbgRes->m_commonBuffers.readBackHost.buffer)
+  {
+    const shaderio::Readback* ring = m_dbgRes->m_commonBuffers.readBackHost.data();
+    LOGE("[BlasHeadScan] ==== readback ring (cycle now %u) ====\n", m_dbgRes->m_cycleIndex);
+    for(uint32_t r = 0; r < 4; r++)
+    {
+      const shaderio::Readback& rb = ring[r];
+      uint32_t nonzeroRefs = 0, zeroHeads = 0;
+      int      firstBad = -1;
+      for(uint32_t i = 0; i < 64; i++)
+      {
+        if(rb.dbgBlasRefs[i] == 0)
+          continue;
+        nonzeroRefs++;
+        if(rb.dbgBlasHeads[i] == 0)
+        {
+          zeroHeads++;
+          if(firstBad < 0) firstBad = int(i);
+        }
+      }
+      LOGE("[BlasHeadScan] ring %u: numBlasBuilds %u zeroRefCount %u | refs %u zeroHeads %u first %d%s\n", r,
+           rb.numBlasBuilds, rb.zeroRefCount, nonzeroRefs, zeroHeads, firstBad,
+           zeroHeads ? "  *** REF INTO UNBUILT AS MEMORY ***" : "");
+      for(uint32_t i = 0; i < 64 && zeroHeads != 0; i++)
+      {
+        if(rb.dbgBlasRefs[i] != 0)
+        {
+          LOGE("[BlasHeadScan]   ring %u inst %u ref 0x%llx head 0x%llx%s\n", r, i,
+               (unsigned long long)rb.dbgBlasRefs[i], (unsigned long long)rb.dbgBlasHeads[i],
+               rb.dbgBlasHeads[i] == 0 ? "  <-- ZERO" : "");
+        }
+      }
+    }
+    LOGE("[BlasHeadScan] ==== dump end ====\n");
+  }
+
   // NV-DXVK: chain the Path B (animated template system) capture - same loss
   if(deviceLostAuxDumpFn())
   {
@@ -1280,6 +1370,7 @@ void RendererRayTraceClustersLod::deinit(Resources& res)
 
   // NV-DXVK: forensic capture teardown
   res.deviceLostDumpFn = nullptr;
+  deviceLostQueueDumpFn() = nullptr;
   nvvk::CheckError::getInstance().setCallbackFunction(nvvk::CheckError::Callback());
   for(uint32_t slot = 0; slot < kDbgCaptureSlots; slot++)
   {
@@ -1294,6 +1385,8 @@ void RendererRayTraceClustersLod::deinit(Resources& res)
   res.m_allocator.destroyBuffer(m_sceneTraversalBuffer);
   for(uint32_t ringSlot = 0; ringSlot < kBlasRingSlots; ringSlot++)
   {
+    // NV-DXVK: [HeadWatch] unregister before destroy
+    lodclusters::unregisterWatchedAsPool(m_sceneBlasDataBuffers[ringSlot].buffer);
 #if USE_LARGE_BUFFER_BLAS
     res.m_allocator.destroyLargeBuffer(m_sceneBlasDataBuffers[ringSlot]);
 #else

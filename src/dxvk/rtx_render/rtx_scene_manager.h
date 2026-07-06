@@ -176,6 +176,8 @@ public:
   
   const InstanceManager& getInstanceManager() const { return m_instanceManager; }
   const AccelManager& getAccelManager() const { return m_accelManager; }
+  // NV-DXVK: [HeadWatch] non-const access for the pre-volume in-frame probe
+  AccelManager& getAccelManagerMutable() { return m_accelManager; }
   const LightManager& getLightManager() const { return m_lightManager; }
   const GraphManager& getGraphManager() const { return m_graphManager; }
   const RayPortalManager& getRayPortalManager() const { return m_rayPortalManager; }

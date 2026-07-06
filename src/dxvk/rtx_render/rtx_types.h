@@ -930,6 +930,11 @@ struct PooledBlas : public RcObject {
   // Frame when this BLAS was last used in a TLAS
   uint32_t frameLastTouched = kInvalidFrameIndex;
 
+  // NV-DXVK: [HeadWatch] frame of the last QUEUED GPU build targeting this BLAS
+  // (kInvalidFrameIndex = never built). Lets the zero-head tripwire distinguish
+  // "referenced before first build" from "built content stomped".
+  uint32_t lastBuildFrame = kInvalidFrameIndex;
+
   // Hash of a bound opacity micromap
   // Note: only used for tracking of OMMs for static BLASes
   XXH64_hash_t opacityMicromapSourceHash = kEmptyHash;

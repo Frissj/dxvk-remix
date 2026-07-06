@@ -1045,6 +1045,15 @@ uint32_t SceneStreaming::handleCompletedRequest(VkCommandBuffer      cmd,
     m_stats.unloadCount = updateTask.unloadCount;
   }
 
+  // NV-DXVK: [StreamChurn] CLAS residency changes - an unload FREES resident
+  // CLAS ranges for reuse while a frozen Path-A cluster BLAS (built by an
+  // earlier [BlasWave]) may still reference them. Correlate with the fatal
+  // frame: churn between the last wave and the crash = UAF under the BLAS.
+  if(updateTask.loadCount || updateTask.unloadCount)
+  {
+    LOGI("[StreamChurn] frame %u: loads %u unloads %u\n", m_frameIndex, updateTask.loadCount, updateTask.unloadCount);
+  }
+
   // When we use async we can either wait until async completed (can take more than a frame)
   // or we guarantee it completes for the frame we are currently preparing within `cmd`.
   // When not using async we always know the transfer completes within the current frame.
@@ -1099,6 +1108,10 @@ void SceneStreaming::deferCachedBlasFree(nvvk::BufferSubAllocation& allocation)
   {
     return;
   }
+  // NV-DXVK: [CachedBlasAddr] free timeline (see PATCH log)
+  LOGI("[CachedBlasAddr] DEFER-FREE addr 0x%llx size %llu frame %u\n",
+       (unsigned long long)m_cachedBlasAllocator.subRange(allocation).address,
+       (unsigned long long)m_cachedBlasAllocator.subRange(allocation).range, m_frameIndex);
   m_cachedBlasPendingFree.push_back({allocation, m_frameIndex});
   allocation = {};
 }
@@ -1108,6 +1121,11 @@ void SceneStreaming::drainCachedBlasPendingFree(bool force)
   while(!m_cachedBlasPendingFree.empty()
         && (force || m_frameIndex - m_cachedBlasPendingFree.front().frameId > kCachedBlasFreeDelayFrames))
   {
+    // NV-DXVK: [CachedBlasAddr] the address becomes REUSABLE here - a fatal TLAS
+    // ref matching it AFTER this frame is a use-after-free/reuse race
+    LOGI("[CachedBlasAddr] FREE addr 0x%llx (deferred at frame %u) frame %u\n",
+         (unsigned long long)m_cachedBlasAllocator.subRange(m_cachedBlasPendingFree.front().allocation).address,
+         m_cachedBlasPendingFree.front().frameId, m_frameIndex);
     m_cachedBlasAllocator.subFree(m_cachedBlasPendingFree.front().allocation);
     m_cachedBlasPendingFree.pop_front();
   }
@@ -1217,6 +1235,14 @@ void SceneStreaming::handleBlasCaching(StreamingUpdates::TaskInfo& updateTask, c
         // setup cached build patch
         sgpatch.cachedBlasAddress       = m_cachedBlasAllocator.subRange(subAllocation).address;
         sgpatch.cachedBlasClustersCount = uint16_t(cachedClustersCount);
+
+        // NV-DXVK: [CachedBlasAddr] cached BLAS addresses are the last
+        // unattributed pool in the fatal TLAS dumps (0x121ca0xxxx refs on
+        // promoted instances). Log every patch so a fatal ref can be matched
+        // to its geometry and its full alloc/free timeline.
+        LOGI("[CachedBlasAddr] PATCH geo %u lodLevel %u addr 0x%llx clusters %u frame %u\n", sgpatch.geometryID,
+             uint32_t(sgpatch.cachedBlasLodLevel), (unsigned long long)sgpatch.cachedBlasAddress, cachedClustersCount,
+             m_frameIndex);
 
         updateTask.geometryPatches[writeIndex++] = sgpatch;
 
@@ -2246,6 +2272,14 @@ bool SceneStreaming::buildLowDetailClas(size_t firstGeometry, size_t geometryCou
     uint32_t*                                                     geometryIndices = clasGeometryIndicesHost.data();
     size_t                                                        geometryOffset  = 0;
 
+    // NV-DXVK content probe: the CLAS build over-reads (-> GPU hang) if an
+    // appended cluster exceeds the config caps the pools were sized with, or is
+    // degenerate. [LoBuild] proved the ADDRESSES are valid; this checks the
+    // per-cluster CONTENT the build actually consumes.
+    uint32_t       dbgMaxTri = 0, dbgMaxVert = 0, dbgOverCap = 0, dbgZero = 0, dbgVbufOOB = 0;
+    const uint32_t dbgTriCap  = m_clasTriangleInput.maxClusterTriangleCount;
+    const uint32_t dbgVertCap = m_clasTriangleInput.maxClusterVertexCount;
+
     // prepare build of clusters
     for(uint32_t g = 0; g < loGroupsCount; g++)
     {
@@ -2340,6 +2374,17 @@ bool SceneStreaming::buildLowDetailClas(size_t firstGeometry, size_t geometryCou
             buildInfo.baseGeometryIndexAndGeometryFlags.geometryFlags |= VK_CLUSTER_ACCELERATION_STRUCTURE_GEOMETRY_CULL_DISABLE_BIT_NV;
         }
 
+        // NV-DXVK content probe (see accumulators above the loop)
+        {
+          const uint32_t triN  = uint32_t(buildInfo.triangleCount);
+          const uint32_t vertN = uint32_t(buildInfo.vertexCount);
+          dbgMaxTri  = std::max(dbgMaxTri, triN);
+          dbgMaxVert = std::max(dbgMaxVert, vertN);
+          if(triN == 0 || vertN == 0)                 dbgZero++;
+          if(triN > dbgTriCap || vertN > dbgVertCap)  dbgOverCap++;
+          if(buildInfo.vertexBuffer < groupVA || buildInfo.indexBuffer < groupVA) dbgVbufOOB++;
+        }
+
         clusterOffset++;
       }
     }
@@ -2382,6 +2427,11 @@ bool SceneStreaming::buildLowDetailClas(size_t firstGeometry, size_t geometryCou
            notResident, seqBreaks, refOOB, (unsigned long long)refBase,
            (unsigned long long)blasBuildInfos[0].clusterReferences,
            (unsigned long long)blasBuildInfos[loGroupsCount - 1].clusterReferences);
+      LOGI("[LoBuildContent] firstGeom %zu: maxTri %u (cap %u) maxVert %u (cap %u) | overCap %u zero %u vbufOOB %u | "
+           "sceneMaxTri %u sceneMaxVert %u%s\n",
+           firstGeometry, dbgMaxTri, dbgTriCap, dbgMaxVert, dbgVertCap, dbgOverCap, dbgZero, dbgVbufOOB,
+           m_scene->m_maxClusterTriangles, m_scene->m_maxClusterVertices,
+           (dbgOverCap || dbgZero || dbgVbufOOB) ? "  *** BAD CLUSTER CONTENT ***" : "");
     }
 
     VkClusterAccelerationStructureCommandsInfoNV cmdInfo = {VK_STRUCTURE_TYPE_CLUSTER_ACCELERATION_STRUCTURE_COMMANDS_INFO_NV};
@@ -2427,6 +2477,35 @@ bool SceneStreaming::buildLowDetailClas(size_t firstGeometry, size_t geometryCou
     {
       clasAddressesMapping[c] = clasBuffer.address + clasSize;
       clasSize += clasSizesMapping[c];
+    }
+
+    // NV-DXVK: [LoBuildRef] value scan of the per-cluster CLAS addresses this
+    // build's clusters-bottom-level BLAS build will consume. [LoBuild] proved
+    // the reference POINTERS are in range; this scans the actual VALUES for 0 -
+    // the null (VA=0) the Aftermath dump traced to the driver's cluster-build
+    // compute. clasAddressesMapping IS buildAddressesHost, which the copy below
+    // (line ~2483) writes verbatim into resident.clasAddresses[firstClusterResID
+    // ..], so these are exactly the values the BLAS build reads (barring a
+    // concurrent cross-queue stomp on that resident range - which a device
+    // readback can't observe crash-safely: tempSyncSubmit calls the dump hook
+    // then exit()s on device-lost, so post-submit reads never run. Log NOW,
+    // BEFORE the faulting submit). A 0 => 0-sized cluster aliased onto
+    // clasBuffer.base, or a null clasBuffer.
+    {
+      uint32_t zeroDst = 0, firstZeroDst = ~0u;
+      for(uint32_t c = 0; c < loClustersCount; c++)
+      {
+        if(clasAddressesMapping[c] == 0)
+        {
+          zeroDst++;
+          if(firstZeroDst == ~0u) firstZeroDst = c;
+        }
+      }
+      const bool bad = (zeroDst != 0) || (clasBuffer.address == 0);
+      LOGI("[LoBuildRef] firstGeom %zu firstClusterResID %u loClusters %u | clasAddr zeroDst %u (firstIdx %d) | "
+           "clasBuf.addr 0x%llx clasSize %zu%s\n",
+           firstGeometry, firstClusterResidentID, loClustersCount, zeroDst, (zeroDst ? int(firstZeroDst) : -1),
+           (unsigned long long)clasBuffer.address, size_t(clasSize), bad ? "  *** NULL CLAS ADDR ***" : "");
     }
 
     // second run is build explicit
@@ -2499,6 +2578,39 @@ bool SceneStreaming::buildLowDetailClas(size_t firstGeometry, size_t geometryCou
 
     const uint64_t* blasAddresses = buildAddressesHost.data();
 
+    // NV-DXVK: [HeadWatch] the low-detail BLAS pool carries shared fallback refs
+    // the fatal TLAS dumps showed - watch its heads per frame too
+    registerWatchedAsPool(blasBuffer.buffer, blasBuffer.address, blasBuffer.bufferSize);
+    registerWatchedAsPool(clasBuffer.buffer, clasBuffer.address, clasBuffer.bufferSize);
+
+    // NV-DXVK: [LoBlasAddr] the device-lost RAW TLAS dump caught instances
+    // referencing a shared fallback BLAS at an address just past a CLAS range
+    // (0x1171ee7b00 pattern) - these lowDetailBlasAddress values are the only
+    // shared-per-geometry BLAS refs in the system. Log the batch's output pool
+    // and every address so a bad TLAS ref can be matched to (or proven outside)
+    // its supposed batch. Also validate: implicit-build outputs MUST lie inside
+    // blasBuffer.
+    {
+      uint32_t outOfPool = 0;
+      for(uint32_t g = 0; g < loGroupsCount; g++)
+      {
+        if(blasAddresses[g] < blasBuffer.address || blasAddresses[g] >= blasBuffer.address + blasBuffer.bufferSize)
+        {
+          outOfPool++;
+        }
+      }
+      LOGI("[LoBlasAddr] batch firstGeom %zu count %u | blasBuffer 0x%llx..0x%llx | outOfPool %u%s\n", firstGeometry,
+           loGroupsCount, (unsigned long long)blasBuffer.address,
+           (unsigned long long)(blasBuffer.address + blasBuffer.bufferSize), outOfPool,
+           outOfPool ? "  *** LOWDETAIL BLAS ADDR OUTSIDE BATCH POOL ***" : "");
+      for(uint32_t g = 0; g < loGroupsCount; g++)
+      {
+        const StreamingResident::Group& lgGroup = m_resident.getGroup(uint32_t(firstGeometry) + g);
+        LOGI("[LoBlasAddr]   geo %u (id %u) lowDetailBlas 0x%llx\n", uint32_t(firstGeometry) + g,
+             lgGroup.geometryGroup.geometryID, (unsigned long long)blasAddresses[g]);
+      }
+    }
+
     for(uint32_t g = 0; g < loGroupsCount; g++)
     {
       const StreamingResident::Group& residentGroup  = m_resident.getGroup(uint32_t(firstGeometry) + g);
@@ -2538,16 +2650,26 @@ void SceneStreaming::deinitClas()
   }
   m_shaderData.clasAllocator = {};
 
+  unregisterWatchedAsPool(m_clasLowDetailBuffer.buffer);
+  unregisterWatchedAsPool(m_clasLowDetailBlasBuffer.buffer);
   res.m_allocator.destroyBuffer(m_clasLowDetailBuffer);
   res.m_allocator.destroyBuffer(m_clasLowDetailBlasBuffer);
   // NV-DXVK P3: per-batch lowest-detail storage of appended geometries
+  // NV-DXVK: [LoBlasAddr] log destruction - a TLAS ref into one of these ranges
+  // AFTER this point is a use-after-free (in-flight frames are NOT waited on here)
   for(nvvk::Buffer& appendBuffer : m_clasLowDetailAppendBuffers)
   {
+    LOGI("[LoBlasAddr] DESTROY append clas 0x%llx..0x%llx\n", (unsigned long long)appendBuffer.address,
+         (unsigned long long)(appendBuffer.address + appendBuffer.bufferSize));
+    unregisterWatchedAsPool(appendBuffer.buffer);
     res.m_allocator.destroyBuffer(appendBuffer);
   }
   m_clasLowDetailAppendBuffers.clear();
   for(nvvk::Buffer& appendBuffer : m_clasLowDetailBlasAppendBuffers)
   {
+    LOGI("[LoBlasAddr] DESTROY append blas 0x%llx..0x%llx\n", (unsigned long long)appendBuffer.address,
+         (unsigned long long)(appendBuffer.address + appendBuffer.bufferSize));
+    unregisterWatchedAsPool(appendBuffer.buffer);
     res.m_allocator.destroyBuffer(appendBuffer);
   }
   m_clasLowDetailBlasAppendBuffers.clear();

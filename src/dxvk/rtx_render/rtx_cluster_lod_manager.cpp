@@ -1656,6 +1656,25 @@ namespace dxvk {
     // instance_assign_blas expects for skipped/culled builds
     VkAccelerationStructureInstanceKHR instanceData = blasInstance;
     instanceData.accelerationStructureReference = m_renderSystem->getGeometryRenderInfos()[plainGeometryId].lowDetailBlasAddress;
+    // NV-DXVK: [PromoBlasNull] a 0 BLAS reference on a VISIBLE instance (mask != 0)
+    // is a null fed to the driver's TLAS build (compute_01, render queue) - the
+    // deterministic Read@VA=0 device-lost, which survives useTemplates=False and
+    // fires no cluster-build probe. Unlike Path B (which sets 0 deliberately as
+    // "inactive, patched by cluster_blas_instances each frame"), this Path A /
+    // promoted fallback is lowDetailBlasAddress, which is 0 before the low-detail
+    // build lands or after deinitClas - and instance_assign_blas is SKIPPED on
+    // promotion-only frames, so the null survives into the TLAS build. Log it
+    // CPU-side, before the TLAS submit (crash-safe).
+    // NOTE: NOT gated on mask - the TLAS BUILD dereferences a slot's BLAS address
+    // to read its header regardless of mask (mask only gates traversal). The
+    // sample's "blas 0 = pass-through" assumption holds for traversal, not the
+    // build; a mask==0, blas==0 slot still faults the build on this driver.
+    if (instanceData.accelerationStructureReference == 0) {
+      Logger::err(str::format("[PromoBlasNull] geometryId 0x", std::hex, geometryId, std::dec, " plainGeom ", plainGeometryId,
+                              " promoted ", promoted ? 1 : 0, " tlasType ", tlasType, " mask 0x", std::hex,
+                              uint32_t(instanceData.mask), std::dec, " lowDetailBlas 0 (unbuilt/deinited)"
+                              "  *** NULL TLAS BLAS (pre-patch) ***"));
+    }
     m_slotInstanceData[tlasType].push_back(instanceData);
 
     if (isSssDuplicate) {

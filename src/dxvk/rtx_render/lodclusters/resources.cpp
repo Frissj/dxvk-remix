@@ -36,6 +36,13 @@
 
 #include "resources.hpp"
 
+// NV-DXVK: [TlasRefScan] device-lost forensic hook, installed by AccelManager
+// (defined in rtx_render/rtx_accel_manager.cpp). Declared here to avoid pulling
+// the rtx headers into the lodclusters port.
+namespace dxvk {
+std::function<void()>& rtxDeviceLostInstanceDumpFn();
+}
+
 namespace lodclusters {
 
 // NV-DXVK
@@ -43,6 +50,55 @@ std::function<void()>& deviceLostAuxDumpFn()
 {
   static std::function<void()> s_fn;
   return s_fn;
+}
+
+// NV-DXVK: see resources.hpp
+std::function<void()>& deviceLostQueueDumpFn()
+{
+  static std::function<void()> s_fn;
+  return s_fn;
+}
+
+// NV-DXVK: [HeadWatch] watched AS pool registry - see resources.hpp
+static std::mutex                 s_watchedAsPoolsMutex;
+static std::vector<WatchedAsPool> s_watchedAsPools;
+
+void registerWatchedAsPool(VkBuffer buffer, uint64_t address, uint64_t size)
+{
+  if(buffer == VK_NULL_HANDLE || address == 0 || size == 0)
+  {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(s_watchedAsPoolsMutex);
+  for(WatchedAsPool& pool : s_watchedAsPools)
+  {
+    if(pool.buffer == buffer)
+    {
+      pool.address = address;
+      pool.size    = size;
+      return;
+    }
+  }
+  s_watchedAsPools.push_back({buffer, address, size});
+}
+
+void unregisterWatchedAsPool(VkBuffer buffer)
+{
+  std::lock_guard<std::mutex> lock(s_watchedAsPoolsMutex);
+  for(size_t i = 0; i < s_watchedAsPools.size(); i++)
+  {
+    if(s_watchedAsPools[i].buffer == buffer)
+    {
+      s_watchedAsPools.erase(s_watchedAsPools.begin() + i);
+      return;
+    }
+  }
+}
+
+std::vector<WatchedAsPool> getWatchedAsPools()
+{
+  std::lock_guard<std::mutex> lock(s_watchedAsPoolsMutex);
+  return s_watchedAsPools;
 }
 
 std::string formatMemorySize(size_t sizeInBytes)
@@ -599,6 +655,16 @@ void Resources::tempSyncSubmit(VkCommandBuffer cmd)
   if(waitResult == VK_ERROR_DEVICE_LOST)
   {
     std::lock_guard<std::mutex> lock(m_deviceLostDumpMutex);
+    // NV-DXVK: [TlasRefScan] the AccelManager instance-buffer mirror dump runs
+    // FIRST - a second crashing thread's exit() truncated the log mid-chain
+    // once, losing the stamps/mirror dump entirely (2026-07-06 15:48 run).
+    // One-shot swap so a second observer can't double-dump.
+    if(dxvk::rtxDeviceLostInstanceDumpFn())
+    {
+      std::function<void()> fn;
+      fn.swap(dxvk::rtxDeviceLostInstanceDumpFn());
+      fn();
+    }
     if(deviceLostDumpFn)
     {
       std::function<void()> fn;
@@ -607,6 +673,11 @@ void Resources::tempSyncSubmit(VkCommandBuffer cmd)
     }
   }
   NVVK_CHECK(waitResult);
+
+  // NV-DXVK: [TlasRefScan] completion log - the crash log's LAST "[TempSubmit]
+  // submit" without a matching "done" is the fence wait that noticed the hang
+  // (NOT necessarily the work that caused it - the queue is shared).
+  LOGI("[TempSubmit] done   pool=%p tid=%06x op=%s\n", (void*)m_tempCommandPool, dbgTid(), t_tempLabel);
 
   vkDestroyFence(m_device, fence, nullptr);
   vkFreeCommandBuffers(m_device, m_tempCommandPool, 1, &cmd);

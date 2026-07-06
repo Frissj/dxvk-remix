@@ -114,7 +114,14 @@
 // for ray tracing only:
 // if USE_FORCED_INVISIBLE_CULLING is active and this setting is active as well, then instances
 // are removed from the TLAS if invisible. Otherwise they use the low detail BLAS.
-// Both options yield different sorts of artifacts, but removing yields better performance.
+// NV-DXVK: "removal" of a culled instance is done by zeroing its instance MASK
+// (traversal skips it -> no trace cost) while keeping a valid lowDetailBlasAddress.
+// The sample instead zeroed blasReference, which is only safe when the TLAS is
+// UPDATEd (its model: build frame 0, update after). Remix's AccelManager rebuilds
+// the TLAS with MODE_BUILD every frame, and a full build dereferences every
+// instance's BLAS reference regardless of mask - so a 0 reference faults (GPU
+// VA=0 device-lost, deterministic, promotion-correlated, compute_01 @ TLAS build).
+// Keep this 1 for the culling perf win; the mask (not a null ref) does the removal.
 #define FORCE_INVISIBLE_CULLED_REMOVES_INSTANCE 1
 
 /////////////////////////////////////////
@@ -379,6 +386,13 @@ struct Readback
 
   uint64_t blasActualSizes;
 
+  // NV-DXVK: [ZeroRefScan] instance_assign_blas reports any render instance whose
+  // FINAL TLAS blasReference is 0 - the null the full TLAS build reads as GPU VA=0.
+  uint     zeroRefCount;
+  uint     zeroRefInstanceId;
+  uint     zeroRefGeometryId;
+  uint     zeroRefBuildIndex;
+
 #ifdef __cplusplus
   uint32_t clusterTriangleId;
   uint32_t _packedDepth0;
@@ -403,6 +417,15 @@ struct Readback
   uint debugA[64];
   uint debugB[64];
   uint debugC[64];
+
+  // NV-DXVK: [BlasHeadScan] instance_assign_blas mirrors each render instance's
+  // FINAL TLAS blasReference and the first 8 bytes AT that address (BDA read,
+  // after the per-frame cluster BLAS builds + barriers). Proves whether the
+  // referenced BLAS memory held real content when the frame was assembled -
+  // a nonzero ref with a ZERO head is a reference into never-written/torn AS
+  // memory (the traversal VA=0). Capped at the first 64 instances.
+  uint64_t dbgBlasRefs[64];
+  uint64_t dbgBlasHeads[64];
 };
 
 

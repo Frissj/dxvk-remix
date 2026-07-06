@@ -229,6 +229,20 @@ namespace dxvk {
       dedicatedRequirements.prefersDedicatedAllocation = VK_FALSE;
     }
 
+    // NV-DXVK: [HeadWatch] AS memory isolation. Acceleration-structure buffers
+    // (merged/dynamic pooled BLASes, TLASes) were repeatedly captured going
+    // TRANSIENTLY ZERO while TLAS-referenced, always coinciding with the
+    // destruction of the suballocation NEIGHBOR in the same memory chunk (see
+    // [AccelVa] ledgers: victim BLAS zeroed the frame its adjacent BLAS/TLAS
+    // was freed; no new buffer tenant; ray traversal then reads the zeroed
+    // header -> the VA=0 device-lost in volume_restir_initial). Isolating AS
+    // buffers in DEDICATED allocations removes them from shared chunks so no
+    // foreign write/clear/aliasing can splash address-locked AS memory.
+    if (m_info.usage & VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR) {
+      dedicatedRequirements.requiresDedicatedAllocation = VK_TRUE;
+      dedicatedRequirements.prefersDedicatedAllocation  = VK_TRUE;
+    }
+
     // Use high memory priority for GPU-writable resources
     bool isGpuWritable = (m_info.access & (
       VK_ACCESS_SHADER_WRITE_BIT |

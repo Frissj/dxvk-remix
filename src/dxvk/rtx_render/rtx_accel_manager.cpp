@@ -43,6 +43,21 @@
 
 #include "rtx/pass/common_binding_indices.h"
 
+// NV-DXVK: [HeadWatch] watched AS pool registry, defined in
+// rtx_render/lodclusters/resources.cpp. Redeclared here (identical tokens) to
+// avoid pulling the lodclusters headers into AccelManager.
+namespace lodclusters {
+struct WatchedAsPool
+{
+  VkBuffer buffer  = VK_NULL_HANDLE;
+  uint64_t address = 0;
+  uint64_t size    = 0;
+};
+void registerWatchedAsPool(VkBuffer buffer, uint64_t address, uint64_t size);
+void unregisterWatchedAsPool(VkBuffer buffer);
+std::vector<WatchedAsPool> getWatchedAsPools();
+}
+
 namespace dxvk {
 
   // Make this static and not a member of AccelManager to make it safe updating the count from ~PooledBlas()
@@ -57,6 +72,12 @@ namespace dxvk {
     //    // only allocated with a 64 byte alignment.
     //    // Note: This could use the value of m_scratchAlignment, but this is duplicated to avoid potential future initialization order issues.
     , m_scratchAlignment(device->properties().khrDeviceAccelerationStructureProperties.minAccelerationStructureScratchOffsetAlignment) {
+  }
+
+  // NV-DXVK: [TlasRefScan] drop the device-lost hook so it can't dangle into a
+  // destroyed AccelManager.
+  AccelManager::~AccelManager() {
+    rtxDeviceLostInstanceDumpFn() = nullptr;
   }
 
   void AccelManager::clear() {
@@ -141,6 +162,12 @@ namespace dxvk {
     if (buildInfo.pGeometries) {
       delete[] buildInfo.pGeometries;
       buildInfo.pGeometries = nullptr;
+    }
+    // NV-DXVK: [HeadWatch] a pooled BLAS leaving the pool is EXACTLY the event
+    // under suspicion (promotion stops touching the old merged BLAS -> GC) -
+    // unregister so a fatal TLAS ref that matches NO pool names the freed BLAS.
+    if (accelStructure != nullptr) {
+      lodclusters::unregisterWatchedAsPool(accelStructure->getSliceHandle().handle);
     }
     accelerationStructureReference = 0;
     accelStructure = nullptr;
@@ -411,10 +438,17 @@ namespace dxvk {
     bufferCreateInfo.size = bufferSize;
     bufferCreateInfo.access = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR | VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
     bufferCreateInfo.stages = VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
-    bufferCreateInfo.usage = VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    // NV-DXVK: [HeadWatch] TRANSFER_SRC so the per-frame head re-read can copy
+    // from pooled (merged/dynamic) BLAS memory - the last unwatched population.
+    bufferCreateInfo.usage = VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
+                           | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     newBlas->accelStructure = m_device->createAccelStructure(bufferCreateInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR, name);
 
     newBlas->accelerationStructureReference = newBlas->accelStructure->getAccelDeviceAddress();
+
+    // NV-DXVK: [HeadWatch] watch pooled BLAS content; unregistered in ~PooledBlas
+    lodclusters::registerWatchedAsPool(newBlas->accelStructure->getSliceHandle().handle,
+                                       newBlas->accelerationStructureReference, bufferSize);
 
     return newBlas;
   }
@@ -979,6 +1013,8 @@ namespace dxvk {
         // Put the merged BLAS into the build queue
         blasToBuild.push_back(buildInfo);
         blasRangesToBuild.push_back(&blasEntry->buildRanges[0]);
+        // NV-DXVK: [HeadWatch] build timestamp (see PooledBlas::lastBuildFrame)
+        selectedBlas->lastBuildFrame = currentFrame;
 
         copyAccelerationStructureBuildGeometryInfo(buildInfo, selectedBlas->buildInfo);
       }
@@ -1366,6 +1402,8 @@ namespace dxvk {
         // Put the merged BLAS into the build queue
         blasToBuild.push_back(buildInfo);
         blasRangesToBuild.push_back(bucket->ranges.data());
+        // NV-DXVK: [HeadWatch] build timestamp (see PooledBlas::lastBuildFrame)
+        selectedBlas->lastBuildFrame = m_device->getCurrentFrameId();
       } else {
         // BLAS content is unchanged — skip the GPU build but still track the resource for read
         ctx->getCommandList()->trackResource<DxvkAccess::Read>(selectedBlas->accelStructure);
@@ -1505,7 +1543,10 @@ namespace dxvk {
     DxvkBufferCreateInfo info;
     info.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT
                | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR
-               | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+               | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+               // NV-DXVK: [TlasRefScan] copies the whole instance buffer to a host
+               // mirror for null-reference scanning - the source needs TRANSFER_SRC.
+               | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
     info.access = VK_ACCESS_TRANSFER_WRITE_BIT;
     info.size = 0;
@@ -1867,7 +1908,72 @@ namespace dxvk {
         desc.scratchData.deviceAddress += m_scratchBuffer->getDeviceAddress();
       }
       assert(blasToBuild.size() == blasRangesToBuild.size());
+
+      // NV-DXVK: [BlasInScan] CPU-side null-address scan of every classic BLAS
+      // build input. The GPU stamps proved the VA=0 fault happens AFTER the TLAS
+      // builds retire; the driver's AS-build compute (compute_01) also executes
+      // THESE builds, and a null vertex/index/AABB address here reads VA=0 the
+      // same way. Synchronous - catches the fatal frame before submission.
+      if (ClusterLodOptions::debugScanTlasInstanceRefs()) {
+        const uint32_t scanFrame = m_device->getCurrentFrameId();
+        uint32_t badInputs = 0;
+        for (size_t b = 0; b < blasToBuild.size(); ++b) {
+          const VkAccelerationStructureBuildGeometryInfoKHR& bi = blasToBuild[b];
+          for (uint32_t g = 0; g < bi.geometryCount; ++g) {
+            const VkAccelerationStructureGeometryKHR& geom = bi.pGeometries ? bi.pGeometries[g] : *bi.ppGeometries[g];
+            const uint32_t primCount = blasRangesToBuild[b][g].primitiveCount;
+            if (primCount == 0) {
+              continue;
+            }
+            if (geom.geometryType == VK_GEOMETRY_TYPE_TRIANGLES_KHR) {
+              const auto& tri = geom.geometry.triangles;
+              const bool nullVtx = (tri.vertexData.deviceAddress == 0);
+              const bool nullIdx = (tri.indexType != VK_INDEX_TYPE_NONE_KHR) && (tri.indexData.deviceAddress == 0);
+              if (nullVtx || nullIdx) {
+                ++badInputs;
+                Logger::err(str::format("[BlasInScan] frame ", scanFrame, ": build ", b, " geom ", g,
+                                        " prims=", primCount,
+                                        nullVtx ? " NULL vertexData" : "",
+                                        nullIdx ? " NULL indexData" : "",
+                                        " vtxFmt=", uint32_t(tri.vertexFormat), " idxType=", uint32_t(tri.indexType),
+                                        "  *** NULL BLAS BUILD INPUT -> build reads VA=0 ***"));
+              }
+            } else if (geom.geometryType == VK_GEOMETRY_TYPE_AABBS_KHR) {
+              if (geom.geometry.aabbs.data.deviceAddress == 0) {
+                ++badInputs;
+                Logger::err(str::format("[BlasInScan] frame ", scanFrame, ": build ", b, " geom ", g,
+                                        " prims=", primCount, " NULL aabbs.data  *** NULL BLAS BUILD INPUT ***"));
+              }
+            }
+          }
+          if (bi.dstAccelerationStructure == VK_NULL_HANDLE) {
+            ++badInputs;
+            Logger::err(str::format("[BlasInScan] frame ", scanFrame, ": build ", b, " NULL dstAccelerationStructure ***"));
+          }
+        }
+        if (badInputs != 0) {
+          Logger::err(str::format("[BlasInScan] frame ", scanFrame, ": ", badInputs, " bad input(s) across ",
+                                  blasToBuild.size(), " BLAS build(s) this frame"));
+        }
+
+        // GPU stamp: BLAS build batch reached ([4]) / completed ([5]).
+        ensureInstRefScanStamps();
+        ctx->updateBuffer(m_instRefScanStamps, 4 * sizeof(uint32_t), sizeof(uint32_t), &scanFrame);
+      }
+
       ctx->vkCmdBuildAccelerationStructuresKHR(blasToBuild.size(), blasToBuild.data(), blasRangesToBuild.data());
+
+      // NV-DXVK: [TlasRefScan] BLAS-batch-done stamp - lands only after every
+      // build in the batch retires (execution barrier), bracketing the fault.
+      if (ClusterLodOptions::debugScanTlasInstanceRefs() && m_instRefScanStamps != nullptr) {
+        ctx->emitMemoryBarrier(0,
+          VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+          VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+          VK_PIPELINE_STAGE_TRANSFER_BIT,
+          VK_ACCESS_TRANSFER_WRITE_BIT);
+        const uint32_t doneFrame = m_device->getCurrentFrameId();
+        ctx->updateBuffer(m_instRefScanStamps, 5 * sizeof(uint32_t), sizeof(uint32_t), &doneFrame);
+      }
 
       execBarriers.accessBuffer(
        m_scratchBuffer->getSliceHandle(),
@@ -1884,6 +1990,36 @@ namespace dxvk {
     if (m_vkInstanceBuffer == nullptr) {
       return;
     }
+
+    // NV-DXVK: [MergedRefScan] the full TLAS build reads VA=0 from an instance with
+    // a 0 accelerationStructureReference. [ZeroRefScan] cleared the Path-A cluster
+    // instances, so check the CPU-side merged (classic) instances here (crash-safe,
+    // before the build). Promotion-correlated -> likely an orphaned classic instance.
+    {
+      uint32_t mergedZeros = 0;
+      int      firstType = -1;
+      size_t   firstIdx = 0, firstCustom = 0;
+      for (int t = 0; t < Tlas::Count; ++t) {
+        for (size_t i = 0; i < m_mergedInstances[t].size(); i++) {
+          if (m_mergedInstances[t][i].accelerationStructureReference == 0) {
+            mergedZeros++;
+            if (firstType < 0) { firstType = t; firstIdx = i; firstCustom = m_mergedInstances[t][i].instanceCustomIndex; }
+          }
+        }
+      }
+      if (mergedZeros != 0) {
+        Logger::err(str::format("[MergedRefScan] ", mergedZeros, " merged instance(s) with NULL blasReference | first: type ",
+                                firstType, " idx ", firstIdx, " customIndex ", firstCustom,
+                                "  *** NULL TLAS REF (merged) ***"));
+      }
+    }
+
+    // NV-DXVK: [TlasRefScan] mirror + scan the FULL instance buffer (merged +
+    // PointInstancer + cluster, all TLAS types) for a null blasReference - the
+    // only region that dereferences null on the full BUILD but is invisible to
+    // the CPU-side merged/Path-A scans. Runs before the build so the log is
+    // flushed ahead of any fault.
+    scanInstanceBufferForNullRefs(ctx);
 
     ScopedGpuProfileZone(ctx, "buildTLAS");
 
@@ -2008,8 +2144,482 @@ namespace dxvk {
     // Build the TLAS
     ctx->getCommandList()->vkCmdBuildAccelerationStructuresKHR(1, &buildInfo, &pBuildOffsetInfo);
 
+    // NV-DXVK: [TlasRefScan] GPU progress stamp - only lands AFTER this build
+    // completes (execution barrier), so at device-lost the stamps tell exactly
+    // which frame's / which type's build the GPU died in.
+    if (m_instRefScanStamps != nullptr && ClusterLodOptions::debugScanTlasInstanceRefs()) {
+      ctx->emitMemoryBarrier(0,
+        VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+        VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_ACCESS_TRANSFER_WRITE_BIT);
+      const uint32_t stampFrame = m_device->getCurrentFrameId();
+      ctx->updateBuffer(m_instRefScanStamps, (1 + uint32_t(type)) * sizeof(uint32_t), sizeof(uint32_t), &stampFrame);
+    }
+
     ctx->getCommandList()->trackResource<DxvkAccess::Write>(tlas.accelStructure);
     ctx->getCommandList()->trackResource<DxvkAccess::Write>(m_scratchBuffer);
+  }
+
+  // NV-DXVK: [TlasRefScan] scan the whole Vulkan AS instance buffer for a null
+  // accelerationStructureReference. See declaration in rtx_accel_manager.h.
+  void AccelManager::scanInstanceBufferForNullRefs(Rc<DxvkContext> ctx) {
+    // [TlasRefScan] LIVENESS: log the first N calls unconditionally so we can see
+    // whether this runs, what frameId/slot it gets, and which early-return fires.
+    static uint32_t s_scanCalls = 0;
+    const bool liveLog = (s_scanCalls < 400);
+    ++s_scanCalls;
+
+    if (!ClusterLodOptions::debugScanTlasInstanceRefs()) {
+      if (liveLog) Logger::info(str::format("[TlasRefScan] LIVE call#", s_scanCalls, " -> return: option OFF"));
+      return;
+    }
+    if (m_vkInstanceBuffer == nullptr) {
+      if (liveLog) Logger::info(str::format("[TlasRefScan] LIVE call#", s_scanCalls, " -> return: instBuf NULL"));
+      return;
+    }
+
+    const uint32_t frameId = m_device->getCurrentFrameId();
+    const uint32_t cur  = frameId & 1u;
+    const uint32_t prev = cur ^ 1u;
+
+    // Snapshot this frame's region layout into the slot we are about to fill, so
+    // the (lagged) scan of it next frame can map a flat index -> region/type.
+    InstRefScanLayout& layout = m_instRefScanLayout[cur];
+    layout = InstRefScanLayout {};
+    uint32_t total = 0;
+    for (int t = 0; t < Tlas::Count; ++t) {
+      layout.merged[t]         = uint32_t(m_mergedInstances[t].size());
+      layout.pointInstancer[t] = m_pointInstancerSlotsPerType[t];
+      layout.cluster[t]        = m_clusterSlotsPerType[t];
+      total += layout.merged[t] + layout.pointInstancer[t] + layout.cluster[t];
+    }
+    layout.totalInstances = total;
+    layout.frameId = frameId;
+    layout.valid = (total != 0);
+
+    const VkDeviceSize instBytes = VkDeviceSize(total) * sizeof(VkAccelerationStructureInstanceKHR);
+
+    // (Re)allocate the host mirror for this slot if needed.
+    if (instBytes != 0 &&
+        (m_instRefScanHost[cur] == nullptr || m_instRefScanHost[cur]->info().size < instBytes)) {
+      DxvkBufferCreateInfo info;
+      info.usage  = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+      info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT;
+      info.access = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+      info.size   = align(instBytes, kBufferAlignment);
+      m_instRefScanHost[cur] = m_device->createBuffer(info,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+        DxvkMemoryStats::Category::RTXBuffer, "TlasRefScan Instance Mirror");
+    }
+
+    // GPU progress stamps (see header): created once, 0xFFFFFFFF = never reached.
+    ensureInstRefScanStamps();
+
+    // Copy exactly what the TLAS build will consume. Make the PointInstancer
+    // (compute), cluster (transfer) and AS-build (watched pool contents) writes
+    // visible to our transfer reads first.
+    if (instBytes != 0 && m_instRefScanHost[cur] != nullptr) {
+      ctx->emitMemoryBarrier(0,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+        VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_ACCESS_TRANSFER_READ_BIT);
+
+      ctx->copyBuffer(m_instRefScanHost[cur], 0, m_vkInstanceBuffer, 0, instBytes);
+
+      // Stamp: GPU reached frame N's mirror copy in the command stream.
+      ctx->updateBuffer(m_instRefScanStamps, 0, sizeof(uint32_t), &frameId);
+
+      // NV-DXVK: [HeadWatch] 1) scan LAST frame's head captures (GPU-complete by
+      // now): a nonzero ref whose head reads 0 = the AS memory the TLAS points
+      // at was stomped or never built - logged the frame it happens, pre-crash.
+      if (!m_headWatchMeta[prev].empty() && m_headWatchHost[prev] != nullptr) {
+        const uint64_t* heads = reinterpret_cast<const uint64_t*>(m_headWatchHost[prev]->mapPtr(0));
+        if (heads != nullptr) {
+          for (size_t i = 0; i < m_headWatchMeta[prev].size(); ++i) {
+            if (m_headWatchMeta[prev][i].ref != 0 && heads[i] == 0) {
+              // name the pooled BLAS if this ref belongs to one: lastBuildFrame
+              // AFTER (or never) vs the referencing frame = referenced-before-built
+              std::string poolInfo;
+              for (const auto& poolBlas : m_blasPool) {
+                if (poolBlas->accelerationStructureReference == m_headWatchMeta[prev][i].ref) {
+                  poolInfo = str::format(" | pooledBlas lastBuildFrame ", poolBlas->lastBuildFrame,
+                                         " frameLastTouched ", poolBlas->frameLastTouched,
+                                         (poolBlas->lastBuildFrame == kInvalidFrameIndex ? "  NEVER BUILT" :
+                                          (poolBlas->lastBuildFrame > m_headWatchFrame[prev] ? "  BUILT AFTER REFERENCE" : "")));
+                  break;
+                }
+              }
+              Logger::err(str::format("[HeadWatch] frame ", m_headWatchFrame[prev], ": flat ", m_headWatchMeta[prev][i].flat,
+                                      " ref 0x", std::hex, m_headWatchMeta[prev][i].ref, std::dec,
+                                      " head ZERO", poolInfo, "  *** AS CONTENT STOMPED/UNBUILT ***"));
+            }
+          }
+        }
+      }
+
+      // 2) record THIS frame's head reads: take the PREV mirror's cluster-region
+      // refs (complete host bytes) and copy the u64 at each from its watched pool.
+      m_headWatchMeta[cur].clear();
+      m_headWatchFrame[cur] = frameId;
+      const InstRefScanLayout& hwLayout = m_instRefScanLayout[prev];
+      if (hwLayout.valid && m_instRefScanHost[prev] != nullptr) {
+        const auto* prevInsts = reinterpret_cast<const VkAccelerationStructureInstanceKHR*>(m_instRefScanHost[prev]->mapPtr(0));
+        if (prevInsts != nullptr) {
+          if (m_headWatchHost[cur] == nullptr) {
+            DxvkBufferCreateInfo hinfo;
+            hinfo.usage  = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            hinfo.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT;
+            hinfo.access = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+            hinfo.size   = 64 * sizeof(uint64_t);
+            m_headWatchHost[cur] = m_device->createBuffer(hinfo,
+              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+              DxvkMemoryStats::Category::RTXBuffer, "HeadWatch Mirror");
+          }
+          const auto pools = lodclusters::getWatchedAsPools();
+          const VkCommandBuffer rawCmd = ctx->getCommandList()->getCmdBuffer(DxvkCmdBuffer::ExecBuffer);
+          const DxvkBufferSliceHandle dstSlice = m_headWatchHost[cur]->getSliceHandle();
+          uint32_t hwFlat = 0;
+          for (int t = 0; t < Tlas::Count && m_headWatchMeta[cur].size() < 64; ++t) {
+            // walk ALL regions - merged (pooled BLAS), PI and cluster. Pooled
+            // BLASes register in createPooledBlas / unregister in ~PooledBlas,
+            // so an UNMATCHED nonzero ref = the TLAS references a FREED (or
+            // foreign) acceleration structure.
+            const uint32_t hwRegions[3] = { hwLayout.merged[t], hwLayout.pointInstancer[t], hwLayout.cluster[t] };
+            for (int r = 0; r < 3; ++r) {
+              for (uint32_t j = 0; j < hwRegions[r] && m_headWatchMeta[cur].size() < 64; ++j, ++hwFlat) {
+                const uint64_t ref = prevInsts[hwFlat].accelerationStructureReference;
+                if (ref == 0) {
+                  continue;
+                }
+                bool matched = false;
+                for (const auto& pool : pools) {
+                  if (ref >= pool.address && ref + sizeof(uint64_t) <= pool.address + pool.size) {
+                    VkBufferCopy region;
+                    region.srcOffset = ref - pool.address;
+                    region.dstOffset = dstSlice.offset + sizeof(uint64_t) * m_headWatchMeta[cur].size();
+                    region.size      = sizeof(uint64_t);
+                    m_device->vkd()->vkCmdCopyBuffer(rawCmd, pool.buffer, dstSlice.handle, 1, &region);
+                    m_headWatchMeta[cur].push_back({ hwFlat, ref });
+                    matched = true;
+                    break;
+                  }
+                }
+                if (!matched) {
+                  Logger::err(str::format("[HeadWatch] frame ", frameId, ": flat ", hwFlat, " region ", r,
+                                          " ref 0x", std::hex, ref, std::dec,
+                                          " matches NO live pool  *** TLAS REFERENCES FREED/UNKNOWN AS ***"));
+                }
+              }
+            }
+          }
+          ctx->getCommandList()->trackResource<DxvkAccess::Write>(m_headWatchHost[cur]);
+        }
+      }
+
+      ctx->emitMemoryBarrier(0,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_ACCESS_TRANSFER_WRITE_BIT,
+        VK_PIPELINE_STAGE_HOST_BIT,
+        VK_ACCESS_HOST_READ_BIT);
+    }
+
+    // Install the DEVICE-LOST forensic hook once: the per-frame scan below is
+    // one frame lagged, so the fatal frame's mirror is only ever read by this.
+    if (!rtxDeviceLostInstanceDumpFn()) {
+      rtxDeviceLostInstanceDumpFn() = [this]() { dumpInstRefMirrorsOnDeviceLost(); };
+    }
+
+    // Scan LAST frame's mirror - its copy has completed (host-coherent, and the
+    // CPU is throttled ~1 frame behind the GPU, so this read is safe without a
+    // hard fence). A persistent, promotion-correlated null ref shows here in the
+    // frames leading up to the device-lost.
+    const InstRefScanLayout& scan = m_instRefScanLayout[prev];
+    if (liveLog) {
+      Logger::info(str::format("[TlasRefScan] LIVE call#", s_scanCalls, " fid=", frameId, " cur=", cur, " prev=", prev,
+                               " curTotal=", total, " curClusterO/U/S=", layout.cluster[0], "/", layout.cluster[1], "/", layout.cluster[2],
+                               " prevValid=", scan.valid, " prevHost=", (m_instRefScanHost[prev] != nullptr ? 1 : 0),
+                               " prevTotal=", scan.totalInstances));
+    }
+
+    const int hb = ClusterLodOptions::debugScanTlasInstanceRefsHeartbeatFrames();
+    const bool heartbeat = scan.valid && hb > 0 && (scan.frameId % uint32_t(hb)) == 0u;
+    scanInstRefMirrorSlot(prev, "frame", heartbeat);
+  }
+
+  // NV-DXVK: [TlasRefScan] lazily create the GPU progress-stamp buffer (see
+  // rtx_accel_manager.h for slot layout). Needed from both the BLAS build site
+  // (mergeInstancesIntoBlas, runs first each frame) and the TLAS scan.
+  void AccelManager::ensureInstRefScanStamps() {
+    if (m_instRefScanStamps != nullptr) {
+      return;
+    }
+    DxvkBufferCreateInfo sinfo;
+    sinfo.usage  = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    sinfo.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT;
+    sinfo.access = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+    sinfo.size   = kStampCount * sizeof(uint32_t);
+    m_instRefScanStamps = m_device->createBuffer(sinfo,
+      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+      DxvkMemoryStats::Category::RTXBuffer, "TlasRefScan GPU Stamps");
+    memset(m_instRefScanStamps->mapPtr(0), 0xFF, kStampCount * sizeof(uint32_t));
+  }
+
+  // NV-DXVK: [TlasRefScan] GPU progress-stamp ladder writer - see header.
+  void AccelManager::writeGpuProgressStamp(Rc<DxvkContext> ctx, GpuStamp slot, bool withBarrier) {
+    if (!ClusterLodOptions::debugScanTlasInstanceRefs()) {
+      return;
+    }
+    ensureInstRefScanStamps();
+    if (withBarrier) {
+      // Execution barrier: the stamp only lands after all previously recorded
+      // AS-build/compute/transfer work retires.
+      ctx->emitMemoryBarrier(0,
+        VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_ACCESS_TRANSFER_WRITE_BIT);
+    }
+    const uint32_t f = m_device->getCurrentFrameId();
+    ctx->updateBuffer(m_instRefScanStamps, uint32_t(slot) * sizeof(uint32_t), sizeof(uint32_t), &f);
+  }
+
+  // NV-DXVK: [TlasRefScan] scan one host mirror slot for null references and log.
+  uint32_t AccelManager::scanInstRefMirrorSlot(uint32_t slot, const char* tag, bool logClean, bool rawClusterRefs) {
+    static constexpr const char* kTypeNames[Tlas::Count] = { "Opaque", "Unordered", "SSS" };
+    static constexpr const char* kRegionNames[3] = { "merged", "PI", "cluster" };
+
+    const InstRefScanLayout& scan = m_instRefScanLayout[slot];
+    if (!scan.valid || m_instRefScanHost[slot] == nullptr) {
+      if (logClean) {
+        Logger::info(str::format("[TlasRefScan] ", tag, " slot ", slot, ": no data (valid=", scan.valid,
+                                 " host=", (m_instRefScanHost[slot] != nullptr ? 1 : 0), ")"));
+      }
+      return 0;
+    }
+    const auto* insts = reinterpret_cast<const VkAccelerationStructureInstanceKHR*>(m_instRefScanHost[slot]->mapPtr(0));
+    if (insts == nullptr) {
+      Logger::warn(str::format("[TlasRefScan] ", tag, " slot ", slot, ": mapPtr NULL"));
+      return 0;
+    }
+
+    // Raw cluster-region dump (device-lost): every entry's blasReference in hex,
+    // for diffing against [AnimTlasCapture]'s per-frame patched refs. Stale
+    // entries (never re-patched this frame) show as refs that match an OLDER
+    // animated frame's patch instead of this frame's.
+    if (rawClusterRefs) {
+      uint32_t rawFlat = 0;
+      const uint32_t kMaxRaw = 64;
+      uint32_t printed = 0;
+      std::string raw;
+      for (int t = 0; t < Tlas::Count; ++t) {
+        rawFlat += scan.merged[t] + scan.pointInstancer[t];
+        for (uint32_t j = 0; j < scan.cluster[t] && printed < kMaxRaw; ++j, ++rawFlat, ++printed) {
+          raw += str::format("\n  [", t, "/cluster ", j, "] ref=0x", std::hex, insts[rawFlat].accelerationStructureReference, std::dec,
+                             " mask=", uint32_t(insts[rawFlat].mask), " custom=", uint32_t(insts[rawFlat].instanceCustomIndex));
+        }
+      }
+      Logger::err(str::format("[TlasRefScan] ", tag, " slot ", slot, " (frame ", scan.frameId, ") RAW cluster refs:", raw));
+    }
+
+    uint32_t zeros = 0;
+    uint32_t flat = 0;
+    const uint32_t kMaxLogged = 48;
+    std::string details;
+    for (int t = 0; t < Tlas::Count; ++t) {
+      const uint32_t regionSizes[3] = { scan.merged[t], scan.pointInstancer[t], scan.cluster[t] };
+      for (int r = 0; r < 3; ++r) {
+        for (uint32_t j = 0; j < regionSizes[r]; ++j, ++flat) {
+          if (insts[flat].accelerationStructureReference == 0) {
+            ++zeros;
+            if (zeros <= kMaxLogged) {
+              details += str::format("\n  [", kTypeNames[t], "/", kRegionNames[r], "] flat=", flat, " local=", j,
+                                     " custom=", uint32_t(insts[flat].instanceCustomIndex),
+                                     " mask=", uint32_t(insts[flat].mask),
+                                     " sbt=", uint32_t(insts[flat].instanceShaderBindingTableRecordOffset),
+                                     " flags=", uint32_t(insts[flat].flags));
+            }
+          }
+        }
+      }
+    }
+
+    if (zeros != 0) {
+      Logger::err(str::format("[TlasRefScan] ", tag, " slot ", slot, " (frame ", scan.frameId, "): ", zeros, " of ", scan.totalInstances,
+                              " instance(s) have NULL accelerationStructureReference"
+                              " | merged O/U/S=", scan.merged[0], "/", scan.merged[1], "/", scan.merged[2],
+                              " PI O/U/S=", scan.pointInstancer[0], "/", scan.pointInstancer[1], "/", scan.pointInstancer[2],
+                              " cluster O/U/S=", scan.cluster[0], "/", scan.cluster[1], "/", scan.cluster[2],
+                              details,
+                              (zeros > kMaxLogged ? str::format("\n  ... (", zeros - kMaxLogged, " more)") : std::string()),
+                              "\n  *** NULL TLAS REF -> full BUILD faults at VA=0 ***"));
+    } else if (logClean) {
+      Logger::info(str::format("[TlasRefScan] ", tag, " slot ", slot, " (frame ", scan.frameId, "): clean, ", scan.totalInstances,
+                               " instances | merged O/U/S=", scan.merged[0], "/", scan.merged[1], "/", scan.merged[2],
+                               " PI O/U/S=", scan.pointInstancer[0], "/", scan.pointInstancer[1], "/", scan.pointInstancer[2],
+                               " cluster O/U/S=", scan.cluster[0], "/", scan.cluster[1], "/", scan.cluster[2]));
+    }
+    return zeros;
+  }
+
+  // NV-DXVK: [HeadWatch] in-frame bracket probe - see rtx_accel_manager.h.
+  // Records head re-reads of the SAME refs the frame's main watch covers, but
+  // immediately before the volume ReSTIR dispatches (the faulting pass). Also
+  // scans the previous frame's pre-volume probe and logs zero heads.
+  void AccelManager::recordVolumeHeadProbe(Rc<DxvkContext> ctx) {
+    if (!ClusterLodOptions::debugScanTlasInstanceRefs()) {
+      return;
+    }
+    const uint32_t frameId = m_device->getCurrentFrameId();
+    const uint32_t cur  = frameId & 1u;
+    const uint32_t prev = cur ^ 1u;
+
+    // scan last frame's pre-volume probe
+    if (!m_headWatchVolMeta[prev].empty() && m_headWatchVolHost[prev] != nullptr) {
+      const uint64_t* heads = reinterpret_cast<const uint64_t*>(m_headWatchVolHost[prev]->mapPtr(0));
+      if (heads != nullptr) {
+        for (size_t i = 0; i < m_headWatchVolMeta[prev].size(); ++i) {
+          if (m_headWatchVolMeta[prev][i].ref != 0 && heads[i] == 0) {
+            Logger::err(str::format("[HeadWatch] PRE-VOLUME frame ", m_headWatchVolFrame[prev], ": flat ", m_headWatchVolMeta[prev][i].flat,
+                                    " ref 0x", std::hex, m_headWatchVolMeta[prev][i].ref, std::dec,
+                                    " head ZERO  *** TORN BETWEEN buildTlas AND VOLUME PASS ***"));
+          }
+        }
+      }
+    }
+
+    // record this frame's probe using the main watch's ref list (same refs,
+    // read again later in the frame)
+    m_headWatchVolMeta[cur] = m_headWatchMeta[cur];
+    m_headWatchVolFrame[cur] = frameId;
+    if (m_headWatchVolMeta[cur].empty()) {
+      return;
+    }
+    if (m_headWatchVolHost[cur] == nullptr) {
+      DxvkBufferCreateInfo hinfo;
+      hinfo.usage  = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+      hinfo.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT;
+      hinfo.access = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+      hinfo.size   = 64 * sizeof(uint64_t);
+      m_headWatchVolHost[cur] = m_device->createBuffer(hinfo,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+        DxvkMemoryStats::Category::RTXBuffer, "HeadWatch PreVolume Mirror");
+    }
+
+    ctx->emitMemoryBarrier(0,
+      VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR | VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+      VK_PIPELINE_STAGE_TRANSFER_BIT,
+      VK_ACCESS_TRANSFER_READ_BIT);
+
+    const auto pools = lodclusters::getWatchedAsPools();
+    const VkCommandBuffer rawCmd = ctx->getCommandList()->getCmdBuffer(DxvkCmdBuffer::ExecBuffer);
+    const DxvkBufferSliceHandle dstSlice = m_headWatchVolHost[cur]->getSliceHandle();
+    for (size_t i = 0; i < m_headWatchVolMeta[cur].size(); ++i) {
+      const uint64_t ref = m_headWatchVolMeta[cur][i].ref;
+      for (const auto& pool : pools) {
+        if (ref >= pool.address && ref + sizeof(uint64_t) <= pool.address + pool.size) {
+          VkBufferCopy region;
+          region.srcOffset = ref - pool.address;
+          region.dstOffset = dstSlice.offset + sizeof(uint64_t) * i;
+          region.size      = sizeof(uint64_t);
+          m_device->vkd()->vkCmdCopyBuffer(rawCmd, pool.buffer, dstSlice.handle, 1, &region);
+          break;
+        }
+      }
+    }
+    ctx->getCommandList()->trackResource<DxvkAccess::Write>(m_headWatchVolHost[cur]);
+
+    ctx->emitMemoryBarrier(0,
+      VK_PIPELINE_STAGE_TRANSFER_BIT,
+      VK_ACCESS_TRANSFER_WRITE_BIT,
+      VK_PIPELINE_STAGE_HOST_BIT,
+      VK_ACCESS_HOST_READ_BIT);
+  }
+
+  // NV-DXVK: [TlasRefScan] DEVICE-LOST dump - see rtx_accel_manager.h.
+  void AccelManager::dumpInstRefMirrorsOnDeviceLost() {
+    Logger::err("[TlasRefScan] ==== DEVICE-LOST dump: scanning both instance-buffer mirrors ====");
+    // GPU progress stamps disambiguate the mirror labels: the CPU records 2-3
+    // frames ahead, so the slot labels are CPU-side frame ids while the BYTES
+    // are from the last copy the GPU actually executed. copyReached tells whose
+    // bytes we hold; the per-type build stamps tell which build died (the dying
+    // build's stamp never lands - its value stays at the previous frame or
+    // 0xFFFFFFFF for never-reached).
+    if (m_instRefScanStamps != nullptr) {
+      const uint32_t* s = reinterpret_cast<const uint32_t*>(m_instRefScanStamps->mapPtr(0));
+      if (s != nullptr) {
+        Logger::err(str::format("[TlasRefScan] GPU stamps: copyReached=", s[kStampCopyReached],
+                                " opaqueBuilt=", s[kStampOpaqueBuilt], " unorderedBuilt=", s[kStampUnorderedBuilt],
+                                " sssBuilt=", s[kStampSssBuilt],
+                                " blasReached=", s[kStampBlasReached], " blasDone=", s[kStampBlasDone],
+                                " frameBegin=", s[kStampFrameBegin],
+                                " clusterReached=", s[kStampClusterReached], " clusterDone=", s[kStampClusterDone],
+                                " (0xFFFFFFFF/4294967295 = never reached)"));
+      }
+    }
+    // Stale-mirror guard: a slot whose CPU label is NEWER than the GPU's
+    // copyReached stamp holds the PREVIOUS bytes for that slot (its copy never
+    // executed) - null hits in it are layout-mismatch artifacts, not real.
+    uint32_t copyReached = UINT32_MAX;
+    if (m_instRefScanStamps != nullptr) {
+      const uint32_t* s = reinterpret_cast<const uint32_t*>(m_instRefScanStamps->mapPtr(0));
+      if (s != nullptr) {
+        copyReached = s[kStampCopyReached];
+      }
+    }
+    for (uint32_t slot = 0; slot < 2; ++slot) {
+      if (copyReached != UINT32_MAX && m_instRefScanLayout[slot].valid && m_instRefScanLayout[slot].frameId > copyReached) {
+        Logger::err(str::format("[TlasRefScan] DEVICE-LOST slot ", slot, ": label frame ", m_instRefScanLayout[slot].frameId,
+                                " > copyReached ", copyReached, " -> BYTES ARE STALE (previous copy), ignore null hits below"));
+      }
+      scanInstRefMirrorSlot(slot, "DEVICE-LOST", true, true /* raw cluster refs for AnimTlasCapture diff */);
+    }
+
+    // NV-DXVK: [HeadWatch] last two frames of per-ref head re-reads. A nonzero
+    // ref with head 0x0 = the TLAS pointed at AS memory that held NOTHING when
+    // this frame re-read it - stomped or never built.
+    for (uint32_t slot = 0; slot < 2; ++slot) {
+      const uint64_t* heads = (m_headWatchHost[slot] != nullptr)
+        ? reinterpret_cast<const uint64_t*>(m_headWatchHost[slot]->mapPtr(0)) : nullptr;
+      Logger::err(str::format("[HeadWatch] DEVICE-LOST slot ", slot, " (frame ", m_headWatchFrame[slot], "): ",
+                              m_headWatchMeta[slot].size(), " watched ref(s)", heads ? "" : " (no data)"));
+      for (size_t i = 0; heads != nullptr && i < m_headWatchMeta[slot].size(); ++i) {
+        Logger::err(str::format("[HeadWatch]   flat ", m_headWatchMeta[slot][i].flat,
+                                " ref 0x", std::hex, m_headWatchMeta[slot][i].ref,
+                                " head 0x", heads[i], std::dec,
+                                heads[i] == 0 ? "  *** ZERO HEAD ***" : ""));
+      }
+    }
+
+    // NV-DXVK: [HeadWatch] pre-volume in-frame probes - the same refs re-read
+    // right before the ReSTIR dispatches. The FATAL frame's probe is the last
+    // read before the faulting warp launched: zero here + clean buildTlas probe
+    // = torn inside the frame.
+    for (uint32_t slot = 0; slot < 2; ++slot) {
+      const uint64_t* heads = (m_headWatchVolHost[slot] != nullptr)
+        ? reinterpret_cast<const uint64_t*>(m_headWatchVolHost[slot]->mapPtr(0)) : nullptr;
+      uint32_t zeros = 0;
+      for (size_t i = 0; heads != nullptr && i < m_headWatchVolMeta[slot].size(); ++i) {
+        if (m_headWatchVolMeta[slot][i].ref != 0 && heads[i] == 0) {
+          ++zeros;
+          Logger::err(str::format("[HeadWatch] PRE-VOLUME slot ", slot, " flat ", m_headWatchVolMeta[slot][i].flat,
+                                  " ref 0x", std::hex, m_headWatchVolMeta[slot][i].ref, std::dec,
+                                  "  *** ZERO AT VOLUME DISPATCH ***"));
+        }
+      }
+      Logger::err(str::format("[HeadWatch] PRE-VOLUME DEVICE-LOST slot ", slot, " (frame ", m_headWatchVolFrame[slot], "): ",
+                              m_headWatchVolMeta[slot].size(), " ref(s), ", zeros, " zero head(s)",
+                              heads ? "" : " (no data)"));
+    }
+    Logger::err("[TlasRefScan] ==== DEVICE-LOST dump end ====");
+  }
+
+  // NV-DXVK: [TlasRefScan] forensic hook accessor - see rtx_accel_manager.h.
+  std::function<void()>& rtxDeviceLostInstanceDumpFn() {
+    static std::function<void()> s_fn;
+    return s_fn;
   }
 
   // Check if the existing build geometry info for this blas is compatible with the new one for the purpose of updating rather than rebuilding

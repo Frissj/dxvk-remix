@@ -23,6 +23,7 @@
 
 #include <mutex>
 #include <vector>
+#include <functional>
 #include <unordered_set>
 #include <unordered_map>
 #include "../util/rc/util_rc_ptr.h"
@@ -115,6 +116,8 @@ public:
   AccelManager& operator=(AccelManager const&) = delete;
 
   explicit AccelManager(DxvkDevice* device);
+  // NV-DXVK: [TlasRefScan] clears the device-lost forensic hook.
+  ~AccelManager();
 
   // Returns a GPU buffer containing the surface data for active instances
   const Rc<DxvkBuffer> getSurfaceBuffer() const { return m_surfaceBuffer; }
@@ -228,6 +231,105 @@ private:
   template<Tlas::Type type>
   void internalBuildTlas(Rc<DxvkContext> ctx, size_t& totalScratchSize);
 
+  // NV-DXVK: [TlasRefScan] full instance-buffer null-reference scanner.
+  // Mirrors the whole m_vkInstanceBuffer to host memory and reports any
+  // VkAccelerationStructureInstanceKHR with a 0 accelerationStructureReference
+  // (the null BLAS ref that faults the full TLAS BUILD at VA=0), mapping each
+  // hit to its region (merged / PointInstancer / cluster) and TLAS type. This
+  // covers the GPU-written PI/cluster/SSS regions that the CPU-side merged and
+  // Path-A scans cannot see. Uses a ping-pong of host mirrors: frame N fills
+  // slot (N&1) and scans slot (~N&1) - last frame's fully-completed copy.
+  void scanInstanceBufferForNullRefs(Rc<DxvkContext> ctx);
+
+  // Scans one mirror slot and logs any null references (always) and, when
+  // logClean is set, a clean/no-data line too. rawClusterRefs additionally
+  // prints every cluster-region instance's accelerationStructureReference in
+  // hex (device-lost only - lets a stale entry be diffed against the animated
+  // system's [AnimTlasCapture] per-frame patch mirrors). Returns null-ref count.
+  uint32_t scanInstRefMirrorSlot(uint32_t slot, const char* tag, bool logClean, bool rawClusterRefs = false);
+
+public:
+  // NV-DXVK: [TlasRefScan] DEVICE-LOST forensic dump. The per-frame scan is one
+  // frame lagged, so when the GPU dies executing frame N's TLAS build the CPU
+  // never scans frame N's mirror - but the mirror copy PRECEDES the build in
+  // the same command list, so the fatal bytes completed and are sitting in
+  // slot (N&1). Called from DxvkSubmissionQueue on VK_ERROR_DEVICE_LOST via
+  // rtxDeviceLostInstanceDumpFn(); scans BOTH slots.
+  void dumpInstRefMirrorsOnDeviceLost();
+
+  // NV-DXVK: [TlasRefScan] GPU progress-stamp ladder. The GPU writes the current
+  // frameId into the named slot as the command stream reaches that point; at
+  // device-lost the stamp values partition exactly which phase the GPU died in
+  // (a phase's stamp still at frame N-1 while the previous phase says N = died
+  // inside that phase). withBarrier waits for all prior AS-build/compute/
+  // transfer work so a "done" stamp can't land before the phase it brackets.
+  enum GpuStamp : uint32_t {
+    kStampCopyReached = 0,     // instance-buffer mirror copy (in buildTlas)
+    kStampOpaqueBuilt,         // TLAS Opaque build retired
+    kStampUnorderedBuilt,      // TLAS Unordered build retired
+    kStampSssBuilt,            // TLAS SSS build retired
+    kStampBlasReached,         // classic BLAS batch reached
+    kStampBlasDone,            // classic BLAS batch retired
+    kStampFrameBegin,          // prepareSceneData GPU stream begin (frame 94 RT
+                               // passes retired if this shows frame 95)
+    kStampClusterReached,      // cluster dispatchBuild recording reached
+    kStampClusterDone,         // cluster dispatchBuild GPU work retired
+    kStampCount
+  };
+  void writeGpuProgressStamp(Rc<DxvkContext> ctx, GpuStamp slot, bool withBarrier);
+
+private:
+
+  // Per-slot snapshot of the instance-buffer region layout, so a lagged scan
+  // can map a flat instance index back to its region/type. Travels with the
+  // host mirror it describes.
+  struct InstRefScanLayout {
+    uint32_t merged[Tlas::Count] = {};
+    uint32_t pointInstancer[Tlas::Count] = {};
+    uint32_t cluster[Tlas::Count] = {};
+    uint32_t totalInstances = 0;
+    uint32_t frameId = UINT32_MAX;
+    bool valid = false;
+  };
+  Rc<DxvkBuffer> m_instRefScanHost[2];
+  InstRefScanLayout m_instRefScanLayout[2];
+
+  // NV-DXVK: [HeadWatch] per-frame re-read of the first 8 bytes AT every
+  // cluster-region TLAS reference (resolved against lodclusters' watched AS
+  // pools). [BlasHeadScan] proved heads are valid at assign time; the fault
+  // appears frames later - this catches the frame the content flips. Ping-pong
+  // like the mirrors: frame N records slot N&1's copies and scans slot ~N&1.
+  struct HeadWatchEntry {
+    uint32_t flat = 0;       // flat instance index in the instance buffer
+    uint64_t ref = 0;        // the blasReference whose head is being read
+  };
+  Rc<DxvkBuffer> m_headWatchHost[2];
+  std::vector<HeadWatchEntry> m_headWatchMeta[2];
+  uint32_t m_headWatchFrame[2] = {};
+
+  // [HeadWatch] in-frame bracket: a second head probe recorded IMMEDIATELY
+  // before the volume ReSTIR dispatch (the faulting pass) each frame. The
+  // buildTlas-time probe reads clean every run; if THIS one reads zero the
+  // tear happened between buildTlas and the volume pass of the same frame.
+  Rc<DxvkBuffer> m_headWatchVolHost[2];
+  std::vector<HeadWatchEntry> m_headWatchVolMeta[2];
+  uint32_t m_headWatchVolFrame[2] = {};
+
+public:
+  // Called by RtxGlobalVolumetrics right before the ReSTIR dispatches.
+  void recordVolumeHeadProbe(Rc<DxvkContext> ctx);
+private:
+
+  // GPU progress stamps: the GPU writes the frameId into these host-visible
+  // slots as it executes, so the device-lost dump knows exactly which frame's
+  // commands the GPU reached (the CPU records 2-3 frames ahead - the mirror
+  // slot LABELS alone cannot say whose bytes the GPU actually copied/built).
+  // Layout (uint32 each): [0]=mirror copy recorded-reached, [1]=Opaque build
+  // done, [2]=Unordered build done, [3]=SSS build done, [4]=classic BLAS build
+  // batch reached, [5]=classic BLAS build batch done.
+  Rc<DxvkBuffer> m_instRefScanStamps;
+  void ensureInstRefScanStamps();
+
   void buildParticleSurfaceMapping(std::vector<uint32_t>& surfaceIndexMapping);
 
   bool validateUpdateMode(const VkAccelerationStructureBuildGeometryInfoKHR& oldInfo, const VkAccelerationStructureBuildGeometryInfoKHR& newInfo);
@@ -325,6 +427,13 @@ private:
   VkDeviceSize m_scratchAlignment;
   Rc<DxvkBuffer> m_scratchBuffer;
 };
+
+// NV-DXVK: [TlasRefScan] forensic hook (same pattern as lodclusters'
+// deviceLostAuxDumpFn). AccelManager installs a lambda that dumps its
+// instance-buffer mirrors; DxvkSubmissionQueue invokes it on
+// VK_ERROR_DEVICE_LOST so the fatal frame's bytes get scanned even though
+// the CPU never reaches the next frame's lagged scan.
+std::function<void()>& rtxDeviceLostInstanceDumpFn();
 
 }  // namespace dxvk
 

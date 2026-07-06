@@ -49,7 +49,16 @@ void main()
   // update ray tracing blas address prior tlas update
   if (idx < push.instanceCount)
   {
-    push.rayInstances.d[idx].accelerationStructureReference = push.blasAddresses.d[ push.animated != 0 ? idx : push.instances.d[idx].geometryID ];
+    uint64_t blasAddr = push.blasAddresses.d[ push.animated != 0 ? idx : push.instances.d[idx].geometryID ];
+    push.rayInstances.d[idx].accelerationStructureReference = blasAddr;
+    // NV-DXVK: Remix rebuilds the TLAS with MODE_BUILD every frame and dereferences
+    // every instance's BLAS reference; a 0 here faults the build (GPU VA=0). If this
+    // pose's per-frame BLAS isn't ready (e.g. a geometry transitioning Path B->A has
+    // its pose torn down), mask the instance off so the build/traversal skip it.
+    if (blasAddr == 0)
+    {
+      push.rayInstances.d[idx].instanceCustomIndex24_mask8 &= 0x00FFFFFFu;
+    }
   }
 
   // for statistics we sum blas/cluster sizes

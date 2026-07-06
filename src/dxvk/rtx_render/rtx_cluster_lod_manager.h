@@ -59,6 +59,20 @@ namespace dxvk {
                "Debug: after processing a geometry, re-load its .nvsngeo cache entry twice (system RAM and\n"
                "memory-mapped) and verify both against the freshly processed statistics.");
 
+    RTX_OPTION("rtx.clusterLod", bool, debugScanTlasInstanceRefs, true,
+               "Debug ([TlasRefScan]): every frame, mirror the WHOLE Vulkan AS instance buffer to host memory\n"
+               "and scan every VkAccelerationStructureInstanceKHR for a 0 accelerationStructureReference - the\n"
+               "null BLAS reference that faults the full TLAS BUILD at GPU VA=0. Unlike the CPU-side merged/Path-A\n"
+               "scans this covers ALL regions (merged / PointInstancer / cluster) of ALL three TLAS types\n"
+               "(Opaque/Unordered/SSS) and maps each hit back to its region, local index and instanceCustomIndex.\n"
+               "The scan is one frame lagged (it reads the previous frame's completed copy) so a persistent 0-ref\n"
+               "shows in the frames leading up to the device-lost.");
+
+    RTX_OPTION("rtx.clusterLod", int, debugScanTlasInstanceRefsHeartbeatFrames, 128,
+               "[TlasRefScan]: when no null reference is found, log a 'clean' heartbeat with the per-region\n"
+               "instance counts every N frames so the scanner's liveness and the layout evolution are visible.\n"
+               "0 disables the heartbeat (null-reference hits are always logged).");
+
     RTX_OPTION("rtx.clusterLod", int, logStatsIntervalFrames, 600,
                "Logs the [ClusterLOD] stats lines (intake/skip/processing counts and render/streaming state)\n"
                "every N frames whenever the counts changed since the last log, so the log always carries\n"

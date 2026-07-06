@@ -319,6 +319,8 @@ namespace dxvk {
 
     // NV-DXVK start
     const char* m_debugName = nullptr;
+    // [AftermathShaderHash] one-shot guard for the creation-time hash log
+    bool m_aftermathHashLogged = false;
     // NV-DXVK end
 
     static void eliminateInput(SpirvCodeBuffer& code, uint32_t location);

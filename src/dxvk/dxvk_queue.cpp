@@ -19,6 +19,8 @@
 * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 * DEALINGS IN THE SOFTWARE.
 */
+#include <functional>
+
 #include "dxvk_device.h"
 #include "dxvk_queue.h"
 #include "dxvk_scoped_annotation.h"
@@ -27,7 +29,23 @@
 #include "GFSDK_Aftermath_GpuCrashDump.h"
 
 namespace dxvk {
-  
+
+  // NV-DXVK: [TlasRefScan] device-lost forensic hook, installed by AccelManager
+  // (defined in rtx_render/rtx_accel_manager.cpp). Declared here to avoid
+  // pulling the rtx headers into core dxvk.
+  std::function<void()>& rtxDeviceLostInstanceDumpFn();
+}
+
+// NV-DXVK: [BlasCapture] cluster-BLAS-input dump hook, installed by the
+// lodclusters renderer (renderer_raytrace_clusters_lod.cpp). When no
+// lodclusters temp submit is in flight at device-lost, the dxvk submit thread
+// is the ONLY observer - without this call the capture is never flushed.
+namespace lodclusters {
+  std::function<void()>& deviceLostQueueDumpFn();
+}
+
+namespace dxvk {
+
   DxvkSubmissionQueue::DxvkSubmissionQueue(DxvkDevice* device)
   : m_device(device),
     m_submitThread([this] () { submitCmdLists(); }),
@@ -247,6 +265,26 @@ namespace dxvk {
       } else if (status == VK_ERROR_DEVICE_LOST || entry.submit.cmdList != nullptr) {
         Logger::err(str::format("DxvkSubmissionQueue: Command submission failed: ", status));
         m_lastError = status;
+
+        // NV-DXVK: [TlasRefScan] forensic dump - scan the last two host mirrors
+        // of the TLAS instance buffer for the null accelerationStructureReference
+        // that faults the full TLAS build at GPU VA=0. The per-frame scan is one
+        // frame lagged, so the fatal frame's bytes are only recoverable here.
+        // One-shot swap: the lodclusters temp queue (resources.cpp) may notice
+        // the loss first and already have dumped - whoever wins dumps once.
+        // Accessor defined in rtx_render/rtx_accel_manager.cpp.
+        if (status == VK_ERROR_DEVICE_LOST && rtxDeviceLostInstanceDumpFn()) {
+          std::function<void()> fn;
+          fn.swap(rtxDeviceLostInstanceDumpFn());
+          fn();
+        }
+        // NV-DXVK: [BlasCapture] flush the cluster-BLAS-input capture too - the
+        // lodclusters observers (tempSyncSubmit fence / NVVK_CHECK) only fire
+        // when a temp submit is in flight at the loss. The dump itself guards
+        // against double-invocation, so no swap needed.
+        if (status == VK_ERROR_DEVICE_LOST && lodclusters::deviceLostQueueDumpFn()) {
+          lodclusters::deviceLostQueueDumpFn()();
+        }
         
         if (m_device->config().enableAftermath) {
           // Stall the pending exception until aftermath has finished writing (or hits some error)

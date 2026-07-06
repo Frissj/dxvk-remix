@@ -36,6 +36,8 @@
 #include "dxvk_scoped_annotation.h"
 #include "rtx_context.h"
 #include "rtx_imgui.h"
+// NV-DXVK: [HeadWatch] pre-volume in-frame probe
+#include "rtx_scene_manager.h"
 
 namespace dxvk {
 
@@ -681,6 +683,12 @@ namespace dxvk {
 
     auto numRestirCellsExtent = m_restirFroxelVolumeExtent;
     numRestirCellsExtent.width *= numActiveFroxelVolumes;
+
+    // NV-DXVK: [HeadWatch] in-frame bracket - re-read the heads of every TLAS
+    // cluster/merged reference RIGHT BEFORE the ReSTIR dispatches (the pass the
+    // device-lost warp always belongs to). The buildTlas-time probe reads clean
+    // every run; a zero HERE pins the tear inside this frame's own stream.
+    ctx->getSceneManager().getAccelManagerMutable().recordVolumeHeadProbe(ctx);
 
     // Compute restir
     {

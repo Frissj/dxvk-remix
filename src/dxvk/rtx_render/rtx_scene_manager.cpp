@@ -2083,6 +2083,10 @@ namespace dxvk {
   void SceneManager::prepareSceneData(Rc<RtxContext> ctx, DxvkBarrierSet& execBarriers) {
     ScopedGpuProfileZone(ctx, "Build Scene");
 
+    // NV-DXVK: [TlasRefScan] ladder stamp - frame N's GPU stream begin. If this
+    // reads N at device-lost, ALL of frame N-1 (incl. its RT passes) retired.
+    m_accelManager.writeGpuProgressStamp(ctx, AccelManager::kStampFrameBegin, false);
+
   #ifdef REMIX_DEVELOPMENT
     if (m_device->getCurrentFrameId() == RtxOptions::dumpAllInstancesOnFrame()) {
       // Print all RtInstances for debugging
@@ -2346,7 +2350,12 @@ namespace dxvk {
     // reserved cluster regions of the instance buffer. Must run after
     // prepareSceneData (instance buffer allocated) and before buildTlas.
     if (m_clusterLodManager != nullptr) {
+      // NV-DXVK: [TlasRefScan] ladder stamps bracketing the cluster GPU work
+      // (LOD traversal, CLAS/cluster-BLAS indirect builds, instance patching) -
+      // the strongest remaining suspect for the driver AS-build compute fault.
+      m_accelManager.writeGpuProgressStamp(ctx, AccelManager::kStampClusterReached, false);
       m_clusterLodManager->dispatchBuild(ctx, m_cameraManager, m_accelManager);
+      m_accelManager.writeGpuProgressStamp(ctx, AccelManager::kStampClusterDone, true);
     }
     // NV-DXVK end
 

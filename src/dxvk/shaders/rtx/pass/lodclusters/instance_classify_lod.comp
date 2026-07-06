@@ -324,17 +324,17 @@ void main()
     // renderable in some way.
     // May be overwritten at a later time in `instance_assign_blas.comp.glsl`
     
-    // We might want to remove the instance completely if not visible, or just use the low detail blas
+    // NV-DXVK: always give the build a valid BLAS reference - Remix rebuilds the
+    // TLAS with MODE_BUILD every frame and dereferences every instance's BLAS
+    // regardless of mask, so a 0 reference faults (GPU VA=0). "Remove" a culled
+    // instance by zeroing its mask below (traversal skips it, no trace cost).
+    build.tlasInstances.d[instanceID].blasReference             = geometry.lowDetailBlasAddress;
   #if USE_CULLING && USE_FORCED_INVISIBLE_CULLING && FORCE_INVISIBLE_CULLED_REMOVES_INSTANCE
     if(!isVisible && build.frameIndex != 0){
-      // first frame must always have a valid BLAS due to TLAS BUILD, other frames are TLAS UPDATE
-      build.tlasInstances.d[instanceID].blasReference             = 0;
+      // mask 8 bits (high byte of instanceCustomIndex24_mask8) -> 0: no ray hits it
+      build.tlasInstances.d[instanceID].instanceCustomIndex24_mask8 &= 0x00FFFFFFu;
     }
-    else
   #endif
-    {
-      build.tlasInstances.d[instanceID].blasReference             = geometry.lowDetailBlasAddress;
-    }
 
   }
 }
