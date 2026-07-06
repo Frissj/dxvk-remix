@@ -1920,15 +1920,49 @@ namespace dxvk {
       const VkDeviceSize probeOffset = ((frameIdx + 1) % kMaxFramesInFlight) * sizeof(GpuPrintBufferElement);
       GpuPrintBufferElement* probe = reinterpret_cast<GpuPrintBufferElement*>(rtOutput.m_gpuPrintBuffer->mapPtr(probeOffset));
 
-      if (probe && probe->threadIndex.x == 0xFEEDu && probe->threadIndex.y == 0xFACEu) {
+      if (probe && probe->threadIndex.x == 0xFEEDu
+          && (probe->threadIndex.y == 0xFACEu || probe->threadIndex.y == 0xC10Du)) {
         static uint32_t s_lastProbeFrame = 0xFFFFFFFFu;
         if (probe->frameIndex != s_lastProbeFrame) {
           s_lastProbeFrame = probe->frameIndex;
           const Vector4& wd = reinterpret_cast<Vector4&>(probe->writtenData);
-          Logger::err(str::format(
-            "[VisSurfProbe] not-ready surface hit by visibility ray: surfaceIndex=", uint32_t(wd.x),
-            " indexBufferIndex=", uint32_t(wd.y), " customIndex=", uint32_t(wd.z),
-            " frame=", probe->frameIndex, "  (positionBufferIndex was INVALID -> would VA=0 fault)"));
+          const uint32_t* padU = reinterpret_cast<const uint32_t*>(&probe->pad);
+
+          if (probe->threadIndex.y == 0xC10Du) {
+            // [ClusterDecodeProbe] stale cluster resolve in cluster_geometry.slangh
+            const uint32_t badKind = uint32_t(wd.z);
+            if (badKind == 3u) {
+              // Path B (animated cluster template): clusterTemplateGetTriangleIndices hit a
+              // null global cluster-table entry (would Read VA~0 in the reflection/gbuffer
+              // rayquery). pad[0]=table entry value (0), pad[1]=cluster-table base low32.
+              Logger::err(str::format(
+                "[ClusterDecodeProbe] Path B (animated) null cluster-table entry: clusterId=", uint32_t(wd.y),
+                " tableEntryLo=0x", std::hex, padU[0], " clusterTableAddrLo=0x", padU[1], std::dec,
+                " primitiveIndex=", uint32_t(wd.w), " frame=", probe->frameIndex,
+                "  -> CLAS address not published at trace time; returned degenerate tri"));
+            } else {
+              const char* kind = (badKind == 1) ? "clusterAddress==0 (cluster not resident)"
+                               : (badKind == 2) ? "clusterAddress garbage (insane offsets -> line 58 OOB)"
+                                                : "unknown";
+              const uint64_t tableAddr = getSceneManager().getClusterLodManager() != nullptr
+                ? getSceneManager().getClusterLodManager()->getGeometriesTableAddress() : 0;
+              Logger::err(str::format(
+                "[ClusterDecodeProbe] stale cluster resolve: geometryId=", uint32_t(wd.x),
+                " clusterId=", uint32_t(wd.y), " badKind=", badKind, " (", kind, ")",
+                " clusterAddrLo=0x", std::hex, padU[0], " preloadedClustersLo=0x", padU[1],
+                " geometriesTableAddr=0x", tableAddr, std::dec,
+                " trianglesOffset=", uint32_t(wd.w), " frame=", probe->frameIndex));
+            }
+          } else {
+            const uint32_t tag = uint32_t(wd.z);
+            const char* kind = (tag == 2) ? "surfaceIndex==SURFACE_INDEX_INVALID (surfaces[] OOB)"
+                             : (tag == 1) ? "positionBufferIndex==INVALID (geometry read OOB)"
+                                          : "unknown";
+            Logger::err(str::format(
+              "[VisSurfProbe] volume/visibility ray hit bad surface: surfaceIndex=", uint32_t(wd.x),
+              " customIndex=", uint32_t(wd.y), " tag=", tag, " (", kind, ")",
+              " frame=", probe->frameIndex, "  -> would VA=0 fault; skipped"));
+          }
         }
         // Invalidate so a stale sentinel isn't re-reported every frame.
         probe->invalidate();

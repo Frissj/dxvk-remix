@@ -1987,6 +1987,17 @@ namespace dxvk {
   }
 
   void AccelManager::buildTlas(Rc<DxvkContext> ctx) {
+    // NV-DXVK: [BuildTlasLive] unconditional entry probe (first 400 calls) - resolve why
+    // [TlasRefScan] never armed: is buildTlas reached on the frames that matter, and is the
+    // instance buffer non-null here (else the scan at ~L2022 is never called)? Diagnostic - revert.
+    {
+      static uint32_t s_btCalls = 0;
+      if (s_btCalls < 400u) {
+        ++s_btCalls;
+        Logger::info(str::format("[BuildTlasLive] call#", s_btCalls, " fid=", m_device->getCurrentFrameId(),
+                                 " instBuf=", (m_vkInstanceBuffer != nullptr ? 1 : 0)));
+      }
+    }
     if (m_vkInstanceBuffer == nullptr) {
       return;
     }

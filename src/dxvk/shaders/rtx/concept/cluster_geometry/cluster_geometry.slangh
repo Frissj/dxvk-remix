@@ -115,6 +115,22 @@ struct ClusterGeometry
   }
 };
 
+// NV-DXVK: [ClusterDecodeProbe] DIAGNOSTIC. Write the stale cluster-decode inputs to the
+// shared GpuPrintBuffer (sentinel threadIndex 0xFEED/0xC10D so the CPU readback recognizes it).
+// Packs geometryId/clusterId/badKind/trianglesOffset in writtenData and the low 32 bits of
+// clusterAddress/preloadedClusters in pad. Last-writer-wins across threads is fine - any one
+// example of a stale resolve names the culprit. Remove with the rest of the diagnostics.
+void clusterGeometryLogBad(uint badKind, uint geometryId, uint clusterId,
+                           uint64_t clusterAddress, uint64_t preloadedClusters, uint trianglesOffset)
+{
+  GpuPrintBufferElement dbg;
+  dbg.writtenData = float4(float(geometryId), float(clusterId), float(badKind), float(trianglesOffset));
+  dbg.threadIndex = u16vec2(0xFEEDu, 0xC10Du);
+  dbg.frameIndex  = cb.frameIdx;
+  dbg.pad         = uint2(uint(clusterAddress & 0xFFFFFFFFu), uint(preloadedClusters & 0xFFFFFFFFu));
+  GpuPrintBuffer[cb.gpuPrintElementIndex] = dbg;
+}
+
 // Resolves geometryId (cluster geometry table index, from the Surface) and
 // clusterId (ClusterIDNV, geometry-local in the preloaded path) to the cluster
 // header. geometriesTableAddress comes from the raytrace args (0 while no
@@ -142,6 +158,20 @@ ClusterGeometry clusterGeometryCreate(uint64_t geometriesTableAddress, uint geom
 
   const uint64_t clusterAddress = clusterGeometryLoadU64(preloadedClusters + uint64_t(clusterId) * 8);
 
+  // NV-DXVK: [ClusterDecodeProbe] DIAGNOSTIC (not a fix). The raw Ptr loads below VA=0'd the
+  // device (Aftermath mapped it to clusterGeometryLoadU8 @ line 58): clusterAddress =
+  // preloadedClusters[clusterId] is stale/garbage. We don't yet know WHICH resolving input is
+  // wrong, so log them - geometryId, clusterId, clusterAddress, preloadedClusters (+ table addr
+  // CPU-side) - to GpuPrintBuffer, and return an invalid ClusterGeometry so the frame survives
+  // and the write flushes (a faulting dispatch loses it). The real fix is upstream: whatever
+  // lets a hit resolve a stale clusterAddress. badKind: 1 = clusterAddress==0 (not resident),
+  // 2 = garbage-but-mapped (insane offsets past the header decode).
+  if (clusterAddress == 0)
+  {
+    clusterGeometryLogBad(1u, geometryId, clusterId, clusterAddress, preloadedClusters, 0u);
+    return clusterGeometry;
+  }
+
   // shaderio::Cluster header (16 bytes)
   const uint headerWord0 = clusterGeometryLoadU32(clusterAddress + 0);
   const uint headerWord1 = clusterGeometryLoadU32(clusterAddress + 4);
@@ -155,6 +185,17 @@ ClusterGeometry clusterGeometryCreate(uint64_t geometriesTableAddress, uint geom
   clusterGeometry.stateBits = uint8_t((headerWord1 >> 16) & 0xFFu);
   clusterGeometry.verticesOffset = clusterGeometryLoadU32(clusterAddress + 8);
   clusterGeometry.trianglesOffset = clusterGeometryLoadU32(clusterAddress + 12);
+
+  // A valid cluster's byte offsets are small (< one cluster's worth). Garbage from a stale
+  // clusterAddress decodes to huge offsets - the exact thing that OOBs the later Ptr<uint8_t>
+  // load at line 58. Catch it here, log, and bail before that read faults.
+  if (clusterGeometry.verticesOffset > 0x100000u || clusterGeometry.trianglesOffset > 0x100000u)
+  {
+    clusterGeometryLogBad(2u, geometryId, clusterId, clusterAddress, preloadedClusters,
+                          clusterGeometry.trianglesOffset);
+    ClusterGeometry invalid;
+    return invalid;  // clusterAddress stays 0 -> isValid false -> callers skip
+  }
 
   return clusterGeometry;
 }
@@ -229,6 +270,24 @@ uint3 clusterTemplateGetTriangleIndices(uint64_t tableAddress, uint clusterId, u
   }
 
   const uint64_t trianglesAddress = clusterGeometryLoadU64(tableAddress + uint64_t(clusterId) * 8);
+
+  // NV-DXVK: [ClusterDecodeProbe] DIAGNOSTIC (Path B / animated). The Aftermath dump
+  // (Game_66126-193312, VA=0x0 Read during "Reflection PSR") faulted HERE, not in the
+  // preloaded clusterGeometryCreate above: a reflection ray hit an animated template
+  // cluster whose global cluster-table entry is 0 - the CLAS device address was never
+  // published (or was zeroed) by the time the trace resolved it (ring-slot-1 first-use
+  // publish-ordering gap). Without this guard the U32 loads below deref
+  // trianglesAddress(0) + primitiveIndex*12 -> Read VA~0. Log the null table entry
+  // (badKind 3 -> CPU readback names clusterId + the table base) and return degenerate
+  // indices so the frame survives and the print flushes. NOT the fix - the fix is
+  // upstream: publish the cluster's address into the table before its BLAS/TLAS
+  // instance goes live to the tracer.
+  if (trianglesAddress == 0)
+  {
+    clusterGeometryLogBad(3u, 0u, clusterId, trianglesAddress, tableAddress, primitiveIndex);
+    return uint3(0, 0, 0);
+  }
+
   const uint64_t indicesAddress = trianglesAddress + uint64_t(primitiveIndex) * 12;
 
   return uint3(

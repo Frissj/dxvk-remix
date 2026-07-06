@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <unordered_map>
 #include <unordered_set>
+#include <fstream>
+#include <filesystem>
 #include "dxvk_scoped_annotation.h"
 
 // NV-DXVK: [AftermathShaderHash] SPIR-V hash matching Aftermath crash-dump
@@ -212,6 +214,22 @@ namespace dxvk {
       if (GFSDK_Aftermath_SUCCEED(GFSDK_Aftermath_GetShaderHashSpirv(GFSDK_Aftermath_Version_API, &sc, &h))) {
         Logger::info(str::format("[AftermathShaderHash] ", h.hash, " = ", debugName(),
                                  " (", spirvCode.size(), " bytes)"));
+
+        // NV-DXVK: [AftermathSpvDump] dump the FINAL (binding-remapped) SPIR-V that the
+        // driver actually compiles, named by the Aftermath shader hash, so nv-aftermath-format
+        // -B <dir> can match by hash and (with -g2 debug info) map a device-lost PC to a source
+        // line. The on-disk compile-output .spv is PRE-remap and hashes differently, hence the
+        // decoder's "No mapping". Gated to volume shaders (the only ones built with debug info).
+        // Diagnostic - revert with the shader -g2 change.
+        const std::string dn = debugName();
+        if (dn.find("volume") != std::string::npos || dn.find("gbuffer_rayquery") != std::string::npos) {
+          try {
+            const std::filesystem::path dir = "C:/Users/Friss/aftermath_spv";
+            std::filesystem::create_directories(dir);
+            std::ofstream(dir / (std::to_string(h.hash) + ".spv"), std::ios::binary)
+              .write(reinterpret_cast<const char*>(spirvCode.data()), std::streamsize(spirvCode.size()));
+          } catch (...) {}
+        }
       }
     }
 

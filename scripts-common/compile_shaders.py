@@ -249,6 +249,19 @@ def createSlangTask(inputFile, variantSpec):
             + f'-matrix-layout-column-major ' \
             + f'-Wno-30081 '
 
+    # NV-DXVK: the -debug flag only added '-g' to glslangFlags (GLSL shaders); the slangc
+    # command emitted NO debug info, so .slang shaders had no OpLine/source and Aftermath +
+    # the validation layer could not map a fault PC to a source line. Emit SPIR-V debug info
+    # ONLY for the volume shaders we are currently mapping - applying -g2 to every shader
+    # exposed a latent slang SPIR-V type mismatch in integrate_indirect_closesthit (the
+    # optimizer normally hides it), which is unrelated to this diagnostic. Surgical + revert
+    # when done.
+    # NV-DXVK: also gbuffer_rayquery - the Reflection PSR gbuffer rayquery (compute_01) is the
+    # shader Aftermath (Game_66126-19572) VA=0's in; needs -g2 to map PC 0x1ff0 to a source line.
+    _gsrc = inputFile.replace('\\', '/').lower()
+    if 'volume' in _gsrc or 'gbuffer_rayquery' in _gsrc:
+        command1 += f'-g2 '
+
     # Add SER capability only for variants that use Shader Execution Reordering
     if 'RT_SHADER_EXECUTION_REORDERING' in variantSpec:
         command1 += f'-capability spvShaderInvocationReorderNV '
