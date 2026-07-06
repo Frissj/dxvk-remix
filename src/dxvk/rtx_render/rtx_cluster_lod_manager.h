@@ -546,11 +546,17 @@ namespace dxvk {
     // device-lost instance hook (armed at first use). Names the null/stale
     // accelerationStructureReference the reflection-PSR ray traversal VA=0's on.
     // Diagnostic - revert with the rest.
+    // 2-slot ring (frame parity): slot being GPU-written this frame vs slot completed
+    // last frame; the live scan reads the completed one (CPU throttled >=1 frame behind
+    // the GPU, same lag assumption as [TlasRefScan]).
     Rc<DxvkBuffer> m_dbgSceneAnimInstHost;
-    uint32_t m_dbgSceneAnimInstCount = 0;
-    uint32_t m_dbgSceneAnimInstFrame = 0;
+    VkDeviceSize m_dbgSceneAnimInstStride = 0;
+    uint32_t m_dbgSceneAnimInstCount[2] = {};
+    uint32_t m_dbgSceneAnimInstFrame[2] = {};
+    uint32_t m_dbgSceneAnimInstLastSlot = 0;
     bool m_dbgSceneAnimInstArmed = false;
     void dumpSceneAnimInstOnDeviceLost();
+    void scanSceneAnimInstMirror(uint32_t slot);
 
     // P3/P4: captured from the options when the render system starts (the
     // streaming configuration and kernel variant selection are init-time;

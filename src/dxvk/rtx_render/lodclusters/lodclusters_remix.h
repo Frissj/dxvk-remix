@@ -763,6 +763,10 @@ namespace lodclusters_remix {
     // index remap via raytrace_args. Thread-safe (may grow on the worker).
     uint64_t getClusterTableAddress() const;
 
+    // NV-DXVK: [SceneAnimInstScan] current pose-BLAS ring pool ranges (lo/hi per pool,
+    // up to maxCount); returns the count written. Diagnostic - revert.
+    uint32_t getPoseBlasPools(uint64_t* lo, uint64_t* hi, uint32_t maxCount) const;
+
     bool getStats(AnimatedStats& outStats) const;
 
     // chrono report of the per-frame GPU/CPU section timers around the Path B

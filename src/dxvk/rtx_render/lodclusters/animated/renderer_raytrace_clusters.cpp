@@ -329,6 +329,16 @@ struct ClusterTemplateSystem::Impl
   uint32_t     dbgClasHeadCount[kRingSlots] = {};
   uint32_t     dbgClasHeadFrame[kRingSlots] = {};
 
+  // NV-DXVK: [ClasSizeScan] host mirror of dstSizesBuffer (per-CLAS size the instantiate
+  // op writes; 0 = destination NEVER WRITTEN that frame -> the pose BLAS references
+  // whatever recycled bytes sit there: the ghost-Path-A-CLAS mechanism behind the
+  // foreign clusterId 4096+ probe hits). Copied after the instantiate each frame
+  // (segment per ring slot), scanned CPU-side kRingSlots frames lagged at the next
+  // reuse of the slot (GPU guaranteed complete). Diagnostic - revert with the rest.
+  nvvk::Buffer dbgClasSizeHost;
+  uint32_t     dbgClasSizeCount[kRingSlots] = {};
+  uint32_t     dbgClasSizeFrame[kRingSlots] = {};
+
   // NV-DXVK: [AnimTlasCapture] host mirrors of what the TLAS actually carries:
   // the GPU-built pose BLAS addresses (blasAddressesBuffer) and the PATCHED
   // TlasInstances, per ring slot. The device-lost dump validates every address
@@ -474,7 +484,9 @@ struct ClusterTemplateSystem::Impl
                                              | VK_BUFFER_USAGE_2_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
 
     deferDestroy(dstSizesBuffer);
-    NVVK_CHECK(res.createBuffer(dstSizesBuffer, sizeof(uint32_t) * clusterCapacity, kDeviceUsage));
+    // NV-DXVK: [ClasSizeScan] + TRANSFER_SRC so the per-CLAS sizes can be mirrored to host
+    NVVK_CHECK(res.createBuffer(dstSizesBuffer, sizeof(uint32_t) * clusterCapacity,
+                                kDeviceUsage | VK_BUFFER_USAGE_2_TRANSFER_SRC_BIT));
 
     // NV-DXVK: [ClasHeadCapture] mirror sized with the same capacity (u64 per
     // cluster, one segment per ring slot). Recreated on growth like the rest;
@@ -486,6 +498,14 @@ struct ClusterTemplateSystem::Impl
                                             VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT));
     memset(dbgClasHeadCount, 0, sizeof(dbgClasHeadCount));
     memset(dbgClasHeadFrame, 0, sizeof(dbgClasHeadFrame));
+
+    // NV-DXVK: [ClasSizeScan] mirror, one u32 per cluster per ring slot
+    deferDestroy(dbgClasSizeHost);
+    NVVK_CHECK(res.m_allocator.createBuffer(dbgClasSizeHost, sizeof(uint32_t) * clusterCapacity * kRingSlots,
+                                            VK_BUFFER_USAGE_2_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                                            VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT));
+    memset(dbgClasSizeCount, 0, sizeof(dbgClasSizeCount));
+    memset(dbgClasSizeFrame, 0, sizeof(dbgClasSizeFrame));
 
     // NV-DXVK: [AnimTlasCapture] mirrors (see member comment), capacity-sized
     deferDestroy(dbgBlasAddrHost);
@@ -901,6 +921,7 @@ void ClusterTemplateSystem::deinit()
   // (captures impl), then the mirror buffers
   lodclusters::deviceLostAuxDumpFn() = nullptr;
   impl.res.m_allocator.destroyBuffer(impl.dbgClasHeadHost);
+  impl.res.m_allocator.destroyBuffer(impl.dbgClasSizeHost);
   impl.res.m_allocator.destroyBuffer(impl.dbgBlasAddrHost);
   impl.res.m_allocator.destroyBuffer(impl.dbgTlasInstHost);
 
@@ -1845,6 +1866,37 @@ bool ClusterTemplateSystem::recordFrame(VkCommandBuffer                         
   const nvvk::Buffer& ring     = impl.ringBuffers[ringIndex];
   uint8_t*            mapping  = ring.mapping;
 
+  // NV-DXVK: [ClasSizeScan] scan the mirror segment this slot wrote kRingSlots frames
+  // ago (GPU complete - the frame is long retired) BEFORE this frame reuses the slot.
+  // A zero size = the instantiate op never wrote that CLAS destination, so the pose
+  // BLAS referenced recycled memory (ghost foreign CLAS -> clusterId 4096+ hits).
+  if (impl.dbgClasSizeHost.mapping && impl.dbgClasSizeCount[ringIndex] > 0)
+  {
+    const uint32_t* sizes = reinterpret_cast<const uint32_t*>(impl.dbgClasSizeHost.mapping)
+                            + size_t(impl.clusterCapacity) * ringIndex;
+    uint32_t zeros = 0;
+    int      firstZero = -1;
+    for(uint32_t c = 0; c < impl.dbgClasSizeCount[ringIndex]; c++)
+    {
+      if(sizes[c] == 0)
+      {
+        zeros++;
+        if(firstZero < 0) { firstZero = int(c); }
+      }
+    }
+    if(zeros > 0)
+    {
+      LOGE("[ClasSizeScan] slot %u (frame %u): %u of %u CLAS sizes ZERO, first idx %d  *** INSTANTIATE SKIPPED "
+           "DESTINATIONS - pose BLAS referenced unwritten (recycled) CLAS memory ***\n",
+           ringIndex, impl.dbgClasSizeFrame[ringIndex], zeros, impl.dbgClasSizeCount[ringIndex], firstZero);
+    }
+    else if((impl.dbgClasSizeFrame[ringIndex] % 256) == 0)
+    {
+      LOGI("[ClasSizeScan] slot %u (frame %u): %u CLAS sizes all nonzero\n", ringIndex,
+           impl.dbgClasSizeFrame[ringIndex], impl.dbgClasSizeCount[ringIndex]);
+    }
+  }
+
   // ---- per-frame input fill (sample: initRayTracingTemplateInstantiations /
   //      initRayTracingClusters fill loops; per-frame here because Remix's
   //      skinned output buffers ping-pong every frame) ----
@@ -2105,6 +2157,19 @@ bool ClusterTemplateSystem::recordFrame(VkCommandBuffer                         
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1,
                          &headBarrier, 0, nullptr, 0, nullptr);
 
+    // NV-DXVK: [ClasSizeScan] mirror this frame's per-CLAS sizes (covered by the same
+    // ASBUILD->TRANSFER barrier above); scanned lagged at the slot's next reuse.
+    if(impl.dbgClasSizeHost.buffer && totalClusters > 0)
+    {
+      VkBufferCopy szRegion;
+      szRegion.srcOffset = 0;
+      szRegion.dstOffset = sizeof(uint32_t) * VkDeviceSize(impl.clusterCapacity) * ringIndex;
+      szRegion.size      = sizeof(uint32_t) * totalClusters;
+      vkCmdCopyBuffer(cmd, impl.dstSizesBuffer.buffer, impl.dbgClasSizeHost.buffer, 1, &szRegion);
+      impl.dbgClasSizeCount[ringIndex] = totalClusters;
+      impl.dbgClasSizeFrame[ringIndex] = impl.frameCounter;
+    }
+
     const VkDeviceSize        mirrorBase = sizeof(uint64_t) * VkDeviceSize(impl.clusterCapacity) * ringIndex;
     uint32_t                  mirrorOffset = 0;
     std::vector<VkBufferCopy> headRegions;
@@ -2307,6 +2372,26 @@ VkBuffer ClusterTemplateSystem::getTlasInstancesBuffer() const
 uint64_t ClusterTemplateSystem::getClusterTableAddress() const
 {
   return m_impl->clusterTableAddress.load();
+}
+
+// NV-DXVK: [SceneAnimInstScan] expose the current pose-BLAS ring pool ranges so the
+// scene-TLAS mirror scan can validate every animated instance's BLAS ref against the
+// pools it is SUPPOSED to live in ([HeadWatch] can't: a ref recycled into another
+// system's registered pool matches a live pool and passes). Diagnostic - revert.
+uint32_t ClusterTemplateSystem::getPoseBlasPools(uint64_t* lo, uint64_t* hi, uint32_t maxCount) const
+{
+  const Impl& impl = *m_impl;
+  uint32_t n = 0;
+  for(const nvvk::Buffer& pool : impl.blasImplicitBuffers)
+  {
+    if(pool.buffer && n < maxCount)
+    {
+      lo[n] = pool.address;
+      hi[n] = pool.address + pool.bufferSize;
+      n++;
+    }
+  }
+  return n;
 }
 
 bool ClusterTemplateSystem::getStats(AnimatedStats& outStats) const
