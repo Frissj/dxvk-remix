@@ -1911,6 +1911,30 @@ namespace dxvk {
       }
     }
 
+    // NV-DXVK: [VisSurfProbe] unconditional readback (independent of the gpuPrint debug knob)
+    // of the not-ready-surface probe written by visibility.slangh handleVisibilityVertex. The
+    // sentinel threadIndex (0xFEED, 0xFACE) marks a surface hit by a visibility ray whose
+    // positionBufferIndex was INVALID - the volume_restir_initial VA=0 cause. Read the oldest
+    // ring element (guaranteed written by now). Remove with the shader probe once diagnosed.
+    {
+      const VkDeviceSize probeOffset = ((frameIdx + 1) % kMaxFramesInFlight) * sizeof(GpuPrintBufferElement);
+      GpuPrintBufferElement* probe = reinterpret_cast<GpuPrintBufferElement*>(rtOutput.m_gpuPrintBuffer->mapPtr(probeOffset));
+
+      if (probe && probe->threadIndex.x == 0xFEEDu && probe->threadIndex.y == 0xFACEu) {
+        static uint32_t s_lastProbeFrame = 0xFFFFFFFFu;
+        if (probe->frameIndex != s_lastProbeFrame) {
+          s_lastProbeFrame = probe->frameIndex;
+          const Vector4& wd = reinterpret_cast<Vector4&>(probe->writtenData);
+          Logger::err(str::format(
+            "[VisSurfProbe] not-ready surface hit by visibility ray: surfaceIndex=", uint32_t(wd.x),
+            " indexBufferIndex=", uint32_t(wd.y), " customIndex=", uint32_t(wd.z),
+            " frame=", probe->frameIndex, "  (positionBufferIndex was INVALID -> would VA=0 fault)"));
+        }
+        // Invalidate so a stale sentinel isn't re-reported every frame.
+        probe->invalidate();
+      }
+    }
+
     if (!debugView.isActive()) {
       return;
     }

@@ -62,7 +62,33 @@ vec3 handleVisibilityVertex<let VisibilityMode : uint>(Ray ray, RayHitInfo rayHi
     }
   }
 
-  Surface surface = surfaces[uint(rayInteraction.surfaceIndex)]; 
+  Surface surface = surfaces[uint(rayInteraction.surfaceIndex)];
+
+  // NV-DXVK: [VisSurfProbe] verification for the volume_restir_initial VA=0 device-lost.
+  // The position read in surfaceInteractionCreate is UNGUARDED ("Position buffer is always
+  // required for now") - it does BUFFER_ARRAY(geometries, positionBufferIndex, ...) even
+  // when positionBufferIndex == BINDING_INDEX_INVALID (0xFFFF), fetching an out-of-range
+  // bindless slot -> VA=0 MMU fault. Hypothesis: during streaming a just-added instance is
+  // referenced by the current TLAS before its geometry buffers land, so a visibility ray
+  // hits a surface whose positionBufferIndex is still INVALID. Capture the offending surface
+  // to the (already-bound) GpuPrintBuffer and skip the read so the frame SURVIVES and the
+  // write is visible (a faulting dispatch would lose it). If this stops the crash + logs a
+  // surface, the hypothesis is confirmed; replace with the proper ordering fix afterwards.
+  if (!usePreviousTLAS && surface.positionBufferIndex == BINDING_INDEX_INVALID)
+  {
+    GpuPrintBufferElement dbg;
+    dbg.writtenData = float4(float(rayInteraction.surfaceIndex),
+                             float(uint(surface.indexBufferIndex)),
+                             float(rayHitInfo.customIndex & 0xFFFFFF),
+                             float(cb.frameIdx & 0xFFFFFF));
+    dbg.threadIndex = u16vec2(0xFEEDu, 0xFACEu); // probe sentinel (isValid: x != 32767)
+    dbg.frameIndex  = cb.frameIdx;
+    dbg.pad         = uint2(0u, 0u);
+    GpuPrintBuffer[cb.gpuPrintElementIndex] = dbg;
+
+    // Not-ready surface: treat as fully transmissive and skip the faulting read.
+    return vec3(1.0f);
+  }
 
   // Since during visibility testing, we dont need all the data, we can just explicitly
   //   initialize these values and  help the compiler generate more optimal code paths.

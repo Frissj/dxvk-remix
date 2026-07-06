@@ -309,6 +309,14 @@ struct ClusterTemplateSystem::Impl
   nvvk::Buffer readbackBuffer;      // device AnimatedReadback
   nvvk::Buffer readbackHostBuffer;  // host ring of AnimatedReadback
 
+  // NV-DXVK: [AnimStamp] host-visible per-stage GPU progress stamps. vkCmdFillBuffer
+  // writes (frameCounter+1) into slot N right after a barrier orders it behind stage
+  // N's GPU work, so on device-lost the mapping already holds the furthest frame that
+  // reached each stage (no late copy to lose). Distinguishes "the slot-1 instantiate/
+  // BLAS ran but emitted zero" from "it never executed before the trace faulted".
+  // slots: 0 recordBegin, 1 afterInstantiate, 2 afterBlasBuild, 3 afterPatch (0 = never).
+  nvvk::Buffer dbgAnimStampHost;
+
   // NV-DXVK: [ClasHeadCapture] host mirror (ring of kRingSlots segments, u64
   // per cluster) of the FIRST 8 BYTES of every CLAS destination slot this
   // frame's pose BLAS build references. [AnimCapture] proved all the ADDRESS
@@ -729,6 +737,16 @@ bool ClusterTemplateSystem::init(const RenderDeviceInfo& deviceInfo, const Anima
       impl.readbackHostBuffer, sizeof(AnimatedReadback) * Impl::kRingSlots, VK_BUFFER_USAGE_2_TRANSFER_DST_BIT,
       VMA_MEMORY_USAGE_AUTO_PREFER_HOST, VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT));
 
+  // NV-DXVK: [AnimStamp] host-visible stage stamps (see member comment). Zero the
+  // mapping so an unreached stage reads 0 ("never"); reached stages hold frameCounter+1.
+  NVVK_CHECK(impl.res.m_allocator.createBuffer(
+      impl.dbgAnimStampHost, sizeof(uint32_t) * 8, VK_BUFFER_USAGE_2_TRANSFER_DST_BIT,
+      VMA_MEMORY_USAGE_AUTO_PREFER_HOST, VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT));
+  if(impl.dbgAnimStampHost.mapping)
+  {
+    std::memset(impl.dbgAnimStampHost.mapping, 0, sizeof(uint32_t) * 8);
+  }
+
   // NV-DXVK: [ClasHeadCapture] device-lost scan registration (see Impl member
   // comment; the mirror buffer itself is created/grown in ensureFrameCapacities).
   // Chained from debugDumpBlasInputCapture via deviceLostAuxDumpFn, so every
@@ -737,6 +755,21 @@ bool ClusterTemplateSystem::init(const RenderDeviceInfo& deviceInfo, const Anima
     Impl* pImpl = m_impl.get();
     lodclusters::deviceLostAuxDumpFn() = [pImpl]() {
       LOGE("[ClasHeadCapture] ==== device lost - scanning referenced CLAS head mirrors ====\n");
+
+      // NV-DXVK: [AnimStamp] which stage each in-flight frame's GPU work reached. Compare
+      // against the bad frame (the [ClasHeadCapture]/[AnimTlasCapture] slot flagged below):
+      // instantiate<badFrame -> the CLAS instantiate never ran before the trace faulted
+      // (ordering); instantiate==badFrame but the head is still zero -> it ran but emitted
+      // an empty CLAS (build/input bug). Same logic for blasBuild/patch.
+      if(pImpl->dbgAnimStampHost.mapping)
+      {
+        const uint32_t* st = reinterpret_cast<const uint32_t*>(pImpl->dbgAnimStampHost.mapping);
+        auto fr = [](uint32_t v) -> int { return v == 0u ? -1 : int(v) - 1; };
+        LOGE("[AnimStamp] recordFrameCounter=%u | reached frame per stage: recordBegin=%d instantiate=%d "
+             "blasBuild=%d patch=%d  (-1 = never reached)\n",
+             pImpl->frameCounter, fr(st[0]), fr(st[1]), fr(st[2]), fr(st[3]));
+      }
+
       const uint64_t* heads = reinterpret_cast<const uint64_t*>(pImpl->dbgClasHeadHost.mapping);
       if(heads == nullptr)
       {
@@ -934,6 +967,7 @@ void ClusterTemplateSystem::deinit()
   }
   impl.res.m_allocator.destroyBuffer(impl.readbackBuffer);
   impl.res.m_allocator.destroyBuffer(impl.readbackHostBuffer);
+  impl.res.m_allocator.destroyBuffer(impl.dbgAnimStampHost);
   for(nvvk::Buffer& ring : impl.ringBuffers)
   {
     impl.res.m_allocator.destroyBuffer(ring);
@@ -1995,6 +2029,22 @@ bool ClusterTemplateSystem::recordFrame(VkCommandBuffer                         
 
   vkCmdFillBuffer(cmd, impl.readbackBuffer.buffer, 0, sizeof(AnimatedReadback), 0);
 
+  // NV-DXVK: [AnimStamp] write (frameCounter+1) into a stamp slot AFTER a barrier orders
+  // the fill behind stage N's GPU work. On device-lost the host mapping shows the furthest
+  // frame that reached each stage (see member comment). Barriers here are diagnostic-only.
+  auto animStamp = [&](VkPipelineStageFlags srcStage, VkAccessFlags srcAccess, uint32_t slot) {
+    if(!impl.dbgAnimStampHost.buffer)
+    {
+      return;
+    }
+    VkMemoryBarrier sb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    sb.srcAccessMask   = srcAccess;
+    sb.dstAccessMask   = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, srcStage, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &sb, 0, nullptr, 0, nullptr);
+    vkCmdFillBuffer(cmd, impl.dbgAnimStampHost.buffer, sizeof(uint32_t) * slot, sizeof(uint32_t), impl.frameCounter + 1u);
+  };
+  animStamp(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, 0);  // slot 0: this frame began recording/executing
+
   // wait for animation update (gpu_skinning writes from this submission's
   // earlier commands / prior submissions) and our staging writes
   VkMemoryBarrier memBarrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -2040,6 +2090,9 @@ bool ClusterTemplateSystem::recordFrame(VkCommandBuffer                         
     vkCmdBuildClusterAccelerationStructureIndirectNV(cmd, &cmdInfo);
   }
 
+  // NV-DXVK: [AnimStamp] slot 1 - the CLAS instantiate/build completed on the GPU.
+  animStamp(VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR, 1);
+
   // NV-DXVK: [ClasHeadCapture] mirror the head u64 of every CLAS destination
   // slot the BLAS build below will reference - AFTER the instantiate op wrote
   // (or failed to write) them. Zero head at device-lost = the pose BLAS
@@ -2073,7 +2126,15 @@ bool ClusterTemplateSystem::recordFrame(VkCommandBuffer                         
       for(uint32_t c = 0; c < hgeom.numClusters; c++)
       {
         VkBufferCopy r;
-        r.srcOffset = VkDeviceSize(impl.singleExplicitClusterSize) * c;
+        // NV-DXVK: read each CLAS head from the SAME offset the build wrote it to,
+        // or the mirror samples the wrong bytes and fabricates "zero heads". Templates
+        // pack CLAS densely at instantiationOffsets[c] (see the instantiate dst, the
+        // "clasBase + instantiationOffsets[c]" fill above); the explicit path uses the
+        // fixed worst-case stride. singleExplicitClusterSize is only set in explicit
+        // mode (it is 0 under useTemplates), so the old unconditional stride collapsed
+        // every template-mode read to offset 0 - re-sampling pose set's first CLAS.
+        r.srcOffset = impl.config.useTemplates ? VkDeviceSize(hgeom.instantiationOffsets[c])
+                                               : VkDeviceSize(impl.singleExplicitClusterSize) * c;
         r.dstOffset = mirrorBase + sizeof(uint64_t) * VkDeviceSize(mirrorOffset + c);
         r.size      = sizeof(uint64_t);
         headRegions.push_back(r);
@@ -2135,6 +2196,9 @@ bool ClusterTemplateSystem::recordFrame(VkCommandBuffer                         
     vkCmdBuildClusterAccelerationStructureIndirectNV(cmd, &cmdInfo);
   }
 
+  // NV-DXVK: [AnimStamp] slot 2 - the implicit pose-BLAS build completed on the GPU.
+  animStamp(VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR, 2);
+
   memBarrier.srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR
                              | VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_TRANSFER_WRITE_BIT;
   memBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
@@ -2175,6 +2239,10 @@ bool ClusterTemplateSystem::recordFrame(VkCommandBuffer                         
                        sizeof(animatedclusters::shaderio::ClusterBlasConstants), &blasConstants);
     vkCmdDispatch(cmd, (blasConstants.sumCount + CLUSTER_BLAS_WORKGROUP_SIZE - 1) / CLUSTER_BLAS_WORKGROUP_SIZE, 1, 1);
   }
+
+  // NV-DXVK: [AnimStamp] slot 3 - the slot-patch kernel (writes TLAS instance refs from
+  // the built BLAS addresses) completed on the GPU.
+  animStamp(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, 3);
 
   // patched TlasInstances are copied out by the caller; readback goes to host
   memBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
