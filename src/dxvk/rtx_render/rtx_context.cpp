@@ -1930,16 +1930,36 @@ namespace dxvk {
 
           if (probe->threadIndex.y == 0xC10Du) {
             // [ClusterDecodeProbe] stale cluster resolve in cluster_geometry.slangh
-            const uint32_t badKind = uint32_t(wd.z);
-            if (badKind == 3u) {
+            // badKind 3 packs the surface's positionBufferIndex in bits [23:8] (see
+            // clusterTemplateGetTriangleIndices); kinds 1/2 use the raw value.
+            const uint32_t badKindRaw = uint32_t(wd.z);
+            const uint32_t badKind = badKindRaw & 0xFFu;
+            if (badKind == 5u) {
+              // template hit with a NULL Path B table binding (raytrace args lost the table)
+              Logger::err(str::format(
+                "[ClusterDecodeProbe] Path B TABLE BINDING NULL on committed template hit: clusterId=", uint32_t(wd.y),
+                " surfClusterGeomId=0x", std::hex, uint32_t(wd.x), std::dec,
+                " posBufferIndex=", ((badKindRaw >> 8) & 0xFFFFu),
+                " primitiveIndex=", uint32_t(wd.w), " frame=", probe->frameIndex,
+                "  *** template instances tracing with no cluster table bound ***"));
+            } else if (badKind == 3u) {
+              const uint32_t posBufferIndex = (badKindRaw >> 8) & 0xFFFFu;
+              // pad[0]=table addr HIGH 32, pad[1]=LOW 32 (see clusterTemplateGetTriangleIndices)
+              const uint64_t tracedTableAddr = (uint64_t(padU[0]) << 32) | uint64_t(padU[1]);
+              const uint64_t currentTableAddr = getSceneManager().getClusterLodManager() != nullptr
+                ? getSceneManager().getClusterLodManager()->getAnimatedClusterTableAddress() : 0;
               // Path B (animated cluster template): clusterTemplateGetTriangleIndices hit a
               // null global cluster-table entry (would Read VA~0 in the reflection/gbuffer
               // rayquery). pad[0]=table entry value (0), pad[1]=cluster-table base low32.
               Logger::err(str::format(
                 "[ClusterDecodeProbe] Path B (animated) null cluster-table entry: clusterId=", uint32_t(wd.y),
-                " tableEntryLo=0x", std::hex, padU[0], " clusterTableAddrLo=0x", padU[1], std::dec,
+                " surfClusterGeomId=0x", std::hex, uint32_t(wd.x), std::dec,
+                " posBufferIndex=", posBufferIndex,
+                " tracedTable=0x", std::hex, tracedTableAddr,
+                " currentTable=0x", currentTableAddr, std::dec,
+                (tracedTableAddr != currentTableAddr && currentTableAddr != 0 ? "  *** STALE TABLE BINDING ***" : ""),
                 " primitiveIndex=", uint32_t(wd.w), " frame=", probe->frameIndex,
-                "  -> CLAS address not published at trace time; returned degenerate tri"));
+                "  -> foreign ClusterID in Path B table; surfClusterGeomId!=0 = transitioned Path A surface"));
             } else {
               const char* kind = (badKind == 1) ? "clusterAddress==0 (cluster not resident)"
                                : (badKind == 2) ? "clusterAddress garbage (insane offsets -> line 58 OOB)"

@@ -222,7 +222,7 @@ namespace dxvk {
         // decoder's "No mapping". Gated to volume shaders (the only ones built with debug info).
         // Diagnostic - revert with the shader -g2 change.
         const std::string dn = debugName();
-        if (dn.find("volume") != std::string::npos || dn.find("gbuffer_rayquery") != std::string::npos) {
+        if (dn.find("volume") != std::string::npos || dn.find("rayquery") != std::string::npos) {
           try {
             const std::filesystem::path dir = "C:/Users/Friss/aftermath_spv";
             std::filesystem::create_directories(dir);

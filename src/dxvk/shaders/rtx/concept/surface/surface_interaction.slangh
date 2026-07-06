@@ -271,7 +271,13 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
       (uint64_t(cb.animatedClusterTableAddressHi) << 32) | uint64_t(cb.animatedClusterTableAddressLo);
 
     clusterIndices = clusterTemplateGetTriangleIndices(
-      animatedClusterTableAddress, rayInteraction.clusterId, rayInteraction.primitiveIndex);
+      animatedClusterTableAddress, rayInteraction.clusterId, rayInteraction.primitiveIndex,
+      // NV-DXVK: diagnostic - Path B surfaces never write clusterGeometryId, so a valid
+      // Path A id surfacing in the null-table probe identifies a transitioned instance.
+      // Masked to the 18-bit geometry index: the probe packs through float (24-bit mantissa).
+      surface.clusterGeometryId & 0x3FFFF,
+      // geometry fingerprint valid on Path B surfaces (classic buffer indices stay live)
+      surface.positionBufferIndex);
   }
 
   // Compute vertex indicies

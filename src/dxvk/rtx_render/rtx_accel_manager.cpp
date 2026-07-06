@@ -1998,9 +1998,17 @@ namespace dxvk {
                                  " instBuf=", (m_vkInstanceBuffer != nullptr ? 1 : 0)));
       }
     }
-    if (m_vkInstanceBuffer == nullptr) {
-      return;
-    }
+    // NV-DXVK: do NOT early-return when the instance buffer is null (first injected
+    // frame with 0 merged instances - e.g. an all-cluster scene, whose cluster slots
+    // are reserved after prepareSceneData's sizing). Returning here leaves
+    // getTLAS(Opaque/Unordered).accelStructure NULL, but bindCommonRayTracingResources
+    // binds them unconditionally (rtx_context.cpp ~1446) - a null AS descriptor is
+    // only legal with nullDescriptor (see the SSS comment below), and the trace then
+    // traverses a garbage TLAS: the LegoBatman first-frame Read VA=0 device-lost
+    // (validation: "invalid VkAccelerationStructureKHR 0x0"). Instead fall through and
+    // build EMPTY TLASes (internalBuildTlas clamps the instance count to 0 when the
+    // buffer is null) so the descriptors get valid handles, matching the SSS
+    // precedent. The frame renders nothing, which is correct for frame one.
 
     // NV-DXVK: [MergedRefScan] the full TLAS build reads VA=0 from an instance with
     // a 0 accelerationStructureReference. [ZeroRefScan] cleared the Path-A cluster
@@ -2091,7 +2099,10 @@ namespace dxvk {
     // This wraps a device pointer to the above uploaded instances.
     VkAccelerationStructureGeometryInstancesDataKHR instancesVk { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR };
     instancesVk.arrayOfPointers = VK_FALSE;
-    instancesVk.data.deviceAddress = m_vkInstanceBuffer->getDeviceAddress();
+    // NV-DXVK: null instance buffer (first frame, see buildTlas) -> build an EMPTY
+    // TLAS: address 0 is never read because the range's primitiveCount is clamped
+    // to 0 below. This gives the unconditional AS descriptor binds a valid handle.
+    instancesVk.data.deviceAddress = m_vkInstanceBuffer != nullptr ? m_vkInstanceBuffer->getDeviceAddress() : 0;
 
     // Rewind address to tlas start (normal + PointInstancer + cluster slots per preceding type)
     for (size_t n = 0; n < type; ++n) {
@@ -2113,7 +2124,13 @@ namespace dxvk {
     buildInfo.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
     buildInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
 
-    const uint32_t numInstances = uint32_t(m_mergedInstances[type].size() + m_pointInstancerSlotsPerType[type] + m_clusterSlotsPerType[type]);
+    // NV-DXVK: clamp to 0 when the instance buffer is null - the slot counts can
+    // already be nonzero (cluster slots reserved this frame, buffer allocated next),
+    // and a nonzero count with a null instance address faults the TLAS build the
+    // same way the null descriptor faulted the trace.
+    const uint32_t numInstances = m_vkInstanceBuffer != nullptr
+      ? uint32_t(m_mergedInstances[type].size() + m_pointInstancerSlotsPerType[type] + m_clusterSlotsPerType[type])
+      : 0u;
     VkAccelerationStructureBuildSizesInfoKHR sizeInfo { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR };
     vkd->vkGetAccelerationStructureBuildSizesKHR(vkd->device(), VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &buildInfo, &numInstances, &sizeInfo);
 

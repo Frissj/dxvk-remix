@@ -203,6 +203,17 @@ ClusterGeometry clusterGeometryCreate(uint64_t geometriesTableAddress, uint geom
 // Cluster-local uint8 triangle indices (Cluster_getTriangleIndices)
 uint3 clusterGeometryGetTriangleIndices(ClusterGeometry clusterGeometry, uint primitiveIndex)
 {
+  // NV-DXVK: the badKind guards in clusterGeometryCreate return an INVALID struct
+  // (clusterAddress 0) - but surface_interaction calls this getter without checking
+  // isValid, so the read below computed 0 + 0 + prim*3 and faulted VA~0 (Aftermath
+  // Game_66126-215143 maps the device-lost to the LoadU8 at line 58), ALSO losing the
+  // probe's GpuPrint write with the frame. Return degenerate indices instead so the
+  // frame survives and [ClusterDecodeProbe] finally flushes the stale resolve inputs.
+  if (clusterGeometry.clusterAddress == 0)
+  {
+    return uint3(0, 0, 0);
+  }
+
   const uint64_t indicesAddress =
     clusterGeometry.clusterAddress + clusterGeometry.trianglesOffset + uint64_t(primitiveIndex) * 3;
 
@@ -216,6 +227,12 @@ uint3 clusterGeometryGetTriangleIndices(ClusterGeometry clusterGeometry, uint pr
 // vec3 object-space position (Cluster_getVertexPositions)
 vec3 clusterGeometryGetPosition(ClusterGeometry clusterGeometry, uint vertexIndex)
 {
+  // NV-DXVK: same invalid-struct guard as GetTriangleIndices (callers don't check isValid)
+  if (clusterGeometry.clusterAddress == 0)
+  {
+    return vec3(0, 0, 0);
+  }
+
   const uint64_t positionAddress =
     clusterGeometry.clusterAddress + clusterGeometry.verticesOffset + uint64_t(vertexIndex) * 12;
 
@@ -228,6 +245,12 @@ vec3 clusterGeometryGetPosition(ClusterGeometry clusterGeometry, uint vertexInde
 // packed normal(+tangent) attribute word (Cluster_getVertexNormals)
 uint clusterGeometryGetPackedNormal(ClusterGeometry clusterGeometry, uint vertexIndex)
 {
+  // NV-DXVK: same invalid-struct guard (callers don't check isValid)
+  if (clusterGeometry.clusterAddress == 0)
+  {
+    return 0;
+  }
+
   const uint64_t normalsAddress = clusterGeometry.clusterAddress + clusterGeometry.verticesOffset
     + uint64_t(clusterGeometry.vertexCount) * 12 + uint64_t(vertexIndex) * 4;
 
@@ -238,6 +261,12 @@ uint clusterGeometryGetPackedNormal(ClusterGeometry clusterGeometry, uint vertex
 // present, the packed normal/tangent word; 8-byte aligned)
 vec2 clusterGeometryGetTexcoord0(ClusterGeometry clusterGeometry, uint vertexIndex)
 {
+  // NV-DXVK: same invalid-struct guard (callers don't check isValid)
+  if (clusterGeometry.clusterAddress == 0)
+  {
+    return vec2(0, 0);
+  }
+
   const uint elementsPerVertex = clusterGeometry.hasNormals ? 4u : 3u;
 
   uint64_t texcoordsAddress = clusterGeometry.clusterAddress
@@ -262,10 +291,26 @@ vec2 clusterGeometryGetTexcoord0(ClusterGeometry clusterGeometry, uint vertexInd
 
 // Returns the original (global) uint32 vertex indices of a template-cluster
 // hit. tableAddress comes from the raytrace args (0 while Path B inactive).
-uint3 clusterTemplateGetTriangleIndices(uint64_t tableAddress, uint clusterId, uint primitiveIndex)
+// NV-DXVK: dbgSurfaceGeomId is DIAGNOSTIC-only (surface.clusterGeometryId of the
+// routed surface) - Path B never writes that field, so a valid Path A id here on a
+// null-table hit means the surface/instance transitioned Path A<->B and the hit
+// BLAS belongs to the OTHER path (foreign ClusterID 4096+ in the Path B table).
+// dbgPosBufferIndex: the surface's positionBufferIndex - identifies the geometry even on
+// Path B surfaces (which never write clusterGeometryId). Packed with badKind into wd.z:
+// (3 | posBufIdx << 8) stays < 2^24 so the float packing is exact.
+uint3 clusterTemplateGetTriangleIndices(uint64_t tableAddress, uint clusterId, uint primitiveIndex, uint dbgSurfaceGeomId, uint dbgPosBufferIndex)
 {
   if (tableAddress == 0 || clusterId == CLUSTER_ID_INVALID)
   {
+    // NV-DXVK: badKind 5 - a committed template hit while the Path B table binding is 0:
+    // instances are tracing but the raytrace args lost the table (ordering/lifetime bug).
+    // Silent before; log so the branch is visible. CLUSTER_ID_INVALID alone is not logged
+    // (that is the normal non-cluster case for this helper's guard).
+    if (tableAddress == 0 && clusterId != CLUSTER_ID_INVALID)
+    {
+      clusterGeometryLogBad(5u | ((dbgPosBufferIndex & 0xFFFFu) << 8), dbgSurfaceGeomId, clusterId,
+                            0, 0, primitiveIndex);
+    }
     return uint3(0, 0, 0);
   }
 
@@ -284,7 +329,11 @@ uint3 clusterTemplateGetTriangleIndices(uint64_t tableAddress, uint clusterId, u
   // instance goes live to the tracer.
   if (trianglesAddress == 0)
   {
-    clusterGeometryLogBad(3u, 0u, clusterId, trianglesAddress, tableAddress, primitiveIndex);
+    // pad[0] would hold the table entry's low bits - always 0 here, so pass the table
+    // address HIGH 32 bits instead: pad[0]+pad[1] = the full 64-bit table address the
+    // hit actually read, comparable CPU-side against the manager's current table.
+    clusterGeometryLogBad(3u | ((dbgPosBufferIndex & 0xFFFFu) << 8), dbgSurfaceGeomId, clusterId,
+                          tableAddress >> 32, tableAddress, primitiveIndex);
     return uint3(0, 0, 0);
   }
 

@@ -256,10 +256,12 @@ def createSlangTask(inputFile, variantSpec):
     # exposed a latent slang SPIR-V type mismatch in integrate_indirect_closesthit (the
     # optimizer normally hides it), which is unrelated to this diagnostic. Surgical + revert
     # when done.
-    # NV-DXVK: also gbuffer_rayquery - the Reflection PSR gbuffer rayquery (compute_01) is the
-    # shader Aftermath (Game_66126-19572) VA=0's in; needs -g2 to map PC 0x1ff0 to a source line.
+    # NV-DXVK: ALL rayquery compute passes (gbuffer/integrate/volume) get -g2 so any future
+    # Aftermath fault PC maps to source without another full shader rebuild. 'rayquery'
+    # deliberately excludes integrate_indirect_closesthit (RT-pipeline hit shader), where
+    # -g2 exposes a latent slang SPIR-V type bug (see handoff).
     _gsrc = inputFile.replace('\\', '/').lower()
-    if 'volume' in _gsrc or 'gbuffer_rayquery' in _gsrc:
+    if 'volume' in _gsrc or 'rayquery' in _gsrc:
         command1 += f'-g2 '
 
     # Add SER capability only for variants that use Shader Execution Reordering

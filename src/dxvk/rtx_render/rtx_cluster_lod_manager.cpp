@@ -2089,6 +2089,72 @@ namespace dxvk {
     m_device->vkd()->vkCmdCopyBuffer(cmd, sourceBuffer, instanceBufferSlice.handle, uint32_t(regions.size()), regions.data());
 
     ctx->getCommandList()->trackResource<DxvkAccess::Write>(instanceBuffer);
+
+    // NV-DXVK: [SceneAnimInstScan] mirror the animated OPAQUE instances exactly as fed
+    // into the scene TLAS above - same source, same main cmd, so the mirror lands
+    // before the reflection-PSR trace that faults, and the device-lost hook dumps it.
+    // The opaque animated instances are the first numOpaqueB of sourceBuffer (srcOffset 0,
+    // matching the Opaque copy region built above). Diagnostic - revert.
+    if (numOpaqueB > 0) {
+      const VkDeviceSize needBytes = kInstanceSize * VkDeviceSize(numOpaqueB);
+      if (m_dbgSceneAnimInstHost == nullptr || m_dbgSceneAnimInstHost->info().size < needBytes) {
+        DxvkBufferCreateInfo bi;
+        bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        bi.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        bi.access = VK_ACCESS_TRANSFER_WRITE_BIT;
+        bi.size = needBytes;
+        m_dbgSceneAnimInstHost = m_device->createBuffer(bi,
+          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+          DxvkMemoryStats::Category::RTXBuffer, "SceneAnimInst Mirror");
+      }
+      VkBufferCopy mr;
+      mr.srcOffset = 0;
+      mr.dstOffset = 0;
+      mr.size = needBytes;
+      m_device->vkd()->vkCmdCopyBuffer(cmd, sourceBuffer, m_dbgSceneAnimInstHost->getSliceHandle().handle, 1, &mr);
+      ctx->getCommandList()->trackResource<DxvkAccess::Write>(m_dbgSceneAnimInstHost);
+      m_dbgSceneAnimInstCount = numOpaqueB;
+      m_dbgSceneAnimInstFrame = m_device->getCurrentFrameId();
+      if (!m_dbgSceneAnimInstArmed) {
+        m_dbgSceneAnimInstArmed = true;
+        rtxDeviceLostInstanceDumpFn() = [this]() { dumpSceneAnimInstOnDeviceLost(); };
+      }
+    }
+  }
+
+  // NV-DXVK: [SceneAnimInstScan] device-lost dump - reads the last-captured animated
+  // OPAQUE scene-TLAS instances and names any with a null accelerationStructureReference
+  // (the reflection-PSR traversal VA=0). Non-null refs should be compared against the
+  // [AnimTlasCapture] pool ranges printed alongside - a ref outside them = stale/freed
+  // BLAS pool. Diagnostic - revert.
+  void ClusterLodManager::dumpSceneAnimInstOnDeviceLost() {
+    if (m_dbgSceneAnimInstHost == nullptr || m_dbgSceneAnimInstCount == 0) {
+      Logger::err("[SceneAnimInstScan] no mirror captured (device lost before first animated instance copy)");
+      return;
+    }
+    const auto* inst = reinterpret_cast<const VkAccelerationStructureInstanceKHR*>(m_dbgSceneAnimInstHost->mapPtr(0));
+    if (inst == nullptr) {
+      Logger::err("[SceneAnimInstScan] mirror mapPtr NULL");
+      return;
+    }
+    Logger::err(str::format("[SceneAnimInstScan] ==== device lost: scene-TLAS animated OPAQUE instances (frame ",
+      m_dbgSceneAnimInstFrame, ", count ", m_dbgSceneAnimInstCount, ") - the refs the reflection-PSR ray traverses ===="));
+    uint32_t zeros = 0;
+    for (uint32_t i = 0; i < m_dbgSceneAnimInstCount; ++i) {
+      const uint64_t ref = inst[i].accelerationStructureReference;
+      const uint32_t mask = inst[i].mask;
+      const uint32_t custom = inst[i].instanceCustomIndex;
+      const bool isNull = (ref == 0);
+      if (isNull) {
+        ++zeros;
+      }
+      if (isNull || i < 8u) {
+        Logger::err(str::format("[SceneAnimInstScan]   inst ", i, " ref=0x", std::hex, ref, std::dec,
+          " mask=", mask, " custom=", custom, isNull ? "  *** NULL BLAS REF (traced -> VA=0) ***" : ""));
+      }
+    }
+    Logger::err(str::format("[SceneAnimInstScan] ", zeros, " of ", m_dbgSceneAnimInstCount,
+      " animated opaque instances have NULL blasReference (compare non-null refs to [AnimTlasCapture] pool ranges) ==== dump end ===="));
   }
 
   uint64_t ClusterLodManager::getGeometriesTableAddress() const {

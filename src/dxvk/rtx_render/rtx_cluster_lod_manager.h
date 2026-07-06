@@ -537,6 +537,21 @@ namespace dxvk {
     std::vector<VkAccelerationStructureInstanceKHR> m_slotInstanceDataB[Tlas::Count];
     std::vector<SssDuplicate> m_sssDuplicatesB;      // flat index into the B Opaque block
 
+    // NV-DXVK: [SceneAnimInstScan] crash-safe mirror of the animated OPAQUE cluster
+    // instances AS FED INTO THE SCENE TLAS (patch-kernel output copied into
+    // AccelManager's instance buffer, on the main render cmd). This is the ONLY
+    // capture on the fatal frame's path: buildTlas/[TlasRefScan] runs once early with
+    // a null instance buffer and never sees these; [AnimTlasCapture] mirrors the
+    // template cmd which (ring-slot-1 first use) may never execute. Dumped from the
+    // device-lost instance hook (armed at first use). Names the null/stale
+    // accelerationStructureReference the reflection-PSR ray traversal VA=0's on.
+    // Diagnostic - revert with the rest.
+    Rc<DxvkBuffer> m_dbgSceneAnimInstHost;
+    uint32_t m_dbgSceneAnimInstCount = 0;
+    uint32_t m_dbgSceneAnimInstFrame = 0;
+    bool m_dbgSceneAnimInstArmed = false;
+    void dumpSceneAnimInstOnDeviceLost();
+
     // P3/P4: captured from the options when the render system starts (the
     // streaming configuration and kernel variant selection are init-time;
     // the options document this)
