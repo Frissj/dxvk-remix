@@ -56,6 +56,8 @@ RayInteraction rayInteractionCreate(Ray ray, RayHitInfo rayHitInfo)
   rayInteraction.materialType = calculateMaterialType(rayHitInfo);
   rayInteraction.isViewModel = (rayHitInfo.customIndex & CUSTOM_INDEX_IS_VIEW_MODEL) != 0;
   rayInteraction.frontHit = rayHitInfo.frontHit;
+  rayInteraction.dbgInstanceIndex = rayHitInfo.dbgInstanceIndex;  // [ClusterDecodeProbe]
+  rayInteraction.dbgGeometryIndex = rayHitInfo.geometryIndex;     // [ClusterDecodeProbe] surface-decode check
 
   return rayInteraction;
 }

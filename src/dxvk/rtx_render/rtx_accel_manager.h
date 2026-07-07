@@ -186,6 +186,20 @@ public:
   uint32_t getSurfaceCount() const { return uint32_t(m_reorderedSurfaces.size() + m_ghostSurfaces.size()); }
   const std::vector<RtInstance*>& getOrderedInstances() const { return m_reorderedSurfaces; }
 
+  // NV-DXVK: [DecodeSurfProbe] lag-correct per-(frame,surfaceIndex) routing record so the
+  // [ClusterDecodeProbe] readback (GpuPrint ring lag) can resolve what a failing hit's surface
+  // ACTUALLY was on the frame it fired. Only cluster instances are recorded; a miss => that
+  // surfaceIndex was not a cluster surface that frame (customIndex mismatch). Diagnostic - revert.
+  struct DbgSurfMeta { uint8_t isTemplate = 0; uint8_t isLod = 0; uint32_t clusterGeomId = 0; uint16_t posBuf = 0; };
+  bool getDbgSurfMeta(uint32_t frame, uint32_t surfaceIndex, DbgSurfMeta& out) const {
+    const auto& slot = m_dbgSurfMeta[frame % kDbgSurfRing];
+    if (m_dbgSurfMetaFrame[frame % kDbgSurfRing] != frame || surfaceIndex >= slot.size()) {
+      return false;
+    }
+    out = slot[surfaceIndex];
+    return true;
+  }
+
   // Returns true if the last mergeInstancesIntoBlas call took the fast-skip
   // path (scene generation unchanged).  When true, m_reorderedSurfaces and
   // all BLAS/surface data are identical to the previous frame, so callers
@@ -358,6 +372,11 @@ private:
   bool validateUpdateMode(const VkAccelerationStructureBuildGeometryInfoKHR& oldInfo, const VkAccelerationStructureBuildGeometryInfoKHR& newInfo);
 
   std::vector<RtInstance*> m_reorderedSurfaces;
+
+  // NV-DXVK: [DecodeSurfProbe] ring of per-surface routing metadata (see getDbgSurfMeta).
+  static constexpr uint32_t kDbgSurfRing = 8;
+  std::vector<DbgSurfMeta> m_dbgSurfMeta[kDbgSurfRing];
+  uint32_t m_dbgSurfMetaFrame[kDbgSurfRing] = {};
   std::vector<uint32_t> m_reorderedSurfacesFirstIndexOffset;
 
   // NV-DXVK: [GhostSurface] this frame's ghost records + the cluster manager that

@@ -734,6 +734,18 @@ namespace lodclusters_remix {
     // clusters a pose set instantiates per frame (budget accounting)
     uint32_t getPoseSetClusterCount(uint32_t poseSetId) const;
 
+    // NV-DXVK: [ClusterDecodeProbe] for a pose set, the [base, base+count) global cluster-id range
+    // its clusters were baked with (globalClusterBase+c). Lets the readback compare a failing hit's
+    // committed clusterId to what THIS geometry should have produced: committed inside the range but
+    // a null table entry -> publish-ordering race; committed outside -> the cluster carries a
+    // foreign id (bake/routing divergence). Returns false for an inactive/invalid pose set.
+    bool getPoseSetClusterIdRange(uint32_t poseSetId, uint32_t& outBase, uint32_t& outCount) const;
+
+    // NV-DXVK: [ClusterDecodeProbe] total populated animated cluster-table records (== sum of all
+    // registered geometries' numClusters). A committed clusterId >= this is beyond EVERY animated
+    // cluster -> foreign id; < this with a null entry -> unpublished (publish race).
+    uint32_t getAnimatedClusterTableCount() const;
+
     // frame tick: processes deferred destruction
     void beginFrame(uint32_t frameId);
 
@@ -778,6 +790,21 @@ namespace lodclusters_remix {
     // and the memory a pose BLAS references. Overlap with Path A CLAS memory = the
     // foreign clusterId 4096+ root. Returns the count written. Diagnostic - revert.
     uint32_t getPoseClasRanges(uint64_t* lo, uint64_t* hi, uint32_t maxCount) const;
+
+    // NV-DXVK: [TplAlias] ranges of every registered geometry's TEMPLATE buffer - the memory
+    // the instantiate reads clusterTemplateAddress from (with clusterIdOffset=0, the committed
+    // clusterId IS the template's baked id). If a template buffer OVERLAPS Path A resident CLAS
+    // memory, the instantiate copies a resident cluster's baked id (4096+) into the pose CLAS -
+    // the last unchecked path for a genuine Path B instance to commit a resident clusterId
+    // (pose CLAS buffers were already cleared by [ClasAlias]; templates never were). Returns the
+    // count written. Diagnostic - revert.
+    uint32_t getTemplateBufferRanges(uint64_t* lo, uint64_t* hi, uint32_t maxCount) const;
+
+    // NV-DXVK: DIAGNOSTIC (revert) - constant added to the per-frame Path B instantiate
+    // clusterIdOffset (normally 0). Pushed from rtx.clusterLod.animated.dbgClusterIdOffsetSentinel
+    // each frame to test whether the committed resident clusterId 4096+ originates from this
+    // instantiate. See the option doc in rtx_cluster_lod_manager.h.
+    void setDbgClusterIdOffsetSentinel(uint32_t sentinel);
 
     bool getStats(AnimatedStats& outStats) const;
 

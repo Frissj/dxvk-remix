@@ -1947,23 +1947,216 @@ namespace dxvk {
                 "  *** template instances tracing with no cluster table bound ***"));
             } else if (badKind == 3u) {
               const uint32_t posBufferIndex = (badKindRaw >> 8) & 0xFFFFu;
-              // pad[0]=table addr HIGH 32, pad[1]=LOW 32 (see clusterTemplateGetTriangleIndices)
-              const uint64_t tracedTableAddr = (uint64_t(padU[0]) << 32) | uint64_t(padU[1]);
+              // wd.x now carries the committed hit's surfaceIndex (see clusterTemplateGetTriangleIndices)
+              const uint32_t surfaceIndex = uint32_t(wd.x);
+              // pad[0]=committed InstanceIndex (low 16) + committed GeometryIndex (high 16); pad[1]=table addr LOW 32
+              const uint32_t committedInstanceIndex = padU[0] & 0xFFFFu;
+              const uint32_t committedGeometryIndex = (padU[0] >> 16) & 0xFFFFu;
+              // classify the committed InstanceIndex into the cluster region's Path A vs Path B
+              // block. If the hit instance is in the Path A (promoted/resident) block but the
+              // surface says Path B -> customIndex/BLAS crossing at the TLAS slot level.
+              std::string instStr;
+              {
+                ClusterLodManager* clm = getSceneManager().getClusterLodManager();
+                const AccelManager& am2 = getSceneManager().getAccelManager();
+                if (clm != nullptr) {
+                  constexpr size_t kInstSize = sizeof(VkAccelerationStructureInstanceKHR);
+                  // InstanceIndex is per-TLAS-type; check EVERY type's cluster region so any hit
+                  // is classified. (The same index maps to different instances in different TLAS
+                  // types; we report the first type whose block contains it.)
+                  const char* typeName[] = { "Opaque", "Unordered", "SSS" };
+                  const char* verdict = "  *** InstanceIndex not in ANY cluster region (a NON-cluster/merged instance was hit under a Path B surface) ***";
+                  int hitType = -1; uint32_t hitStart = 0, hitNumA = 0, hitNumB = 0; bool inA = false;
+                  for (uint32_t t = 0; t < uint32_t(Tlas::Count); t++) {
+                    const uint32_t start = uint32_t(am2.getClusterRegionByteOffset(t) / kInstSize);
+                    uint32_t numA = 0, numB = 0;
+                    clm->getClusterPathSlotCounts(t, numA, numB);
+                    if (committedInstanceIndex >= start && committedInstanceIndex < start + numA) {
+                      hitType = int(t); hitStart = start; hitNumA = numA; hitNumB = numB; inA = true;
+                      verdict = "  *** hit is a PATH A (promoted/resident) instance but surface is Path B -> TLAS-slot CROSSING ***";
+                      break;
+                    }
+                    if (committedInstanceIndex >= start + numA && committedInstanceIndex < start + numA + numB) {
+                      hitType = int(t); hitStart = start; hitNumA = numA; hitNumB = numB; inA = false;
+                      verdict = "  *** hit is a genuine PATH B instance (its BLAS yielded a resident CLAS) ***";
+                      break;
+                    }
+                  }
+                  // Pin the crossing: read what the CPU actually wrote into THIS committed slot.
+                  // localIndex is the region-local index within the Path A or Path B block.
+                  std::string bindStr;
+                  if (hitType >= 0) {
+                    const uint32_t localIndex = inA
+                      ? (committedInstanceIndex - hitStart)
+                      : (committedInstanceIndex - hitStart - hitNumA);
+                    uint32_t slotCustom = 0;
+                    RtInstance* slotInst = nullptr;
+                    if (clm->getRegionSlotBinding(uint32_t(hitType), localIndex, inA, slotCustom, slotInst)) {
+                      const uint32_t instSurf = slotInst != nullptr ? slotInst->getSurfaceIndex() : ~0u;
+                      // slotCustom == decoded surfaceIndex -> the committed slot genuinely carries
+                      // this (template) surface: the crossing is in the customIndex WRITE (a Path A
+                      // slot was bound to a Path B surface). slotCustom != decoded -> the
+                      // committedInstanceIndex->slot MAPPING is off (numA/numB vs GPU region order).
+                      const char* bindVerdict = (slotCustom == surfaceIndex)
+                        ? "  *** slot's WRITTEN customIndex == decoded surface -> customIndex-WRITE crossing (Path A slot bound to Path B surface) ***"
+                        : "  *** slot's WRITTEN customIndex != decoded surface -> committedInstanceIndex<->slot MAPPING mismatch (region order != numA/numB) ***";
+                      const char* instVerdict = (slotInst != nullptr && instSurf != slotCustom)
+                        ? "  [inst.surfaceIndex != written customIndex -> TLAS-write diverged from instance surface]" : "";
+                      bindStr = str::format(" | slotLocalIdx=", localIndex, " writtenCustom=", slotCustom,
+                                            " instSurfaceIndex=", instSurf, bindVerdict, instVerdict);
+                    } else {
+                      bindStr = str::format(" | slotLocalIdx=", localIndex, " (out of range - counts lagged vs region)");
+                    }
+                  }
+                  // DECISIVE: reverse-lookup which block OWNS the decoded surfaceIndex. This does
+                  // not depend on the (proven-unreliable) committedInstanceIndex mapping - it asks
+                  // "which slot list has an instance whose customIndex == the surface we actually
+                  // decoded?" Path A ownership -> the hit surface belongs to a promoted/resident
+                  // instance (real crossing); Path B ownership -> a genuine Path B instance's BLAS
+                  // yielded a resident CLAS (driver/build-level).
+                  std::string ownStr;
+                  {
+                    int ownType = -1, ownA = -1, ownB = -1;
+                    for (uint32_t t = 0; t < uint32_t(Tlas::Count); t++) {
+                      int a = -1, b = -1;
+                      clm->findRegionSlotByCustomIndex(t, surfaceIndex, a, b);
+                      if (a >= 0 || b >= 0) { ownType = int(t); ownA = a; ownB = b; break; }
+                    }
+                    const char* ownVerdict =
+                      (ownA >= 0 && ownB >= 0) ? "  *** decoded surface OWNED BY BOTH Path A AND Path B -> surface shared across paths (true crossing) ***"
+                    : (ownA >= 0)              ? "  *** decoded surface OWNED BY Path A (promoted/resident) instance -> real customIndex crossing ***"
+                    : (ownB >= 0)              ? "  *** decoded surface OWNED BY Path B instance -> GENUINE Path B BLAS yielded resident CLAS (driver/build-level) ***"
+                                               : "  *** decoded surface owned by NO cluster slot this frame (lag or non-cluster surface) ***";
+                    ownStr = ownType >= 0
+                      ? str::format(" | surfaceOwner: type=", typeName[ownType], " pathA_localIdx=", ownA, " pathB_localIdx=", ownB, ownVerdict)
+                      : str::format(" | surfaceOwner: NONE", ownVerdict);
+
+                    // EXPECTED vs COMMITTED: for a Path B-owned failing hit, what id range SHOULD this
+                    // cluster carry? committed inside [base, base+count) but null table = publish race;
+                    // committed outside = foreign id (bake/routing divergence). tableTotal disambiguates
+                    // "beyond every animated cluster" (foreign) from "valid id, unpublished".
+                    if (ownType >= 0 && ownB >= 0) {
+                      uint32_t base = 0, count = 0;
+                      const bool haveRange = clm->getPathBExpectedClusterRange(uint32_t(ownType), uint32_t(ownB), base, count);
+                      const uint32_t tableTotal = clm->getAnimatedClusterTableTotal();
+                      const uint32_t committedClusterId = uint32_t(wd.y);
+                      const bool inExpected = haveRange && committedClusterId >= base && committedClusterId < base + count;
+                      const bool inTable = committedClusterId < tableTotal;
+                      const char* idVerdict =
+                          !haveRange ? "  [expected range unresolved]"
+                        : inExpected ? "  *** committed IN expected range but table entry null -> PUBLISH-ORDERING RACE (id correct, unpublished) ***"
+                        : inTable    ? "  *** committed OUTSIDE this geometry's range but < tableTotal -> WRONG-CLUSTER routing (another geometry's id) ***"
+                                     : "  *** committed >= tableTotal -> FOREIGN id beyond every animated cluster (bake/stale divergence) ***";
+                      ownStr = str::format(ownStr, " | expected=[", base, ",", base + count, ") committed=", committedClusterId,
+                                           " tableTotal=", tableTotal, idVerdict);
+                    }
+
+                    // [PosBufDual] mechanism test: is the failing surface's mesh dual-routed this
+                    // frame - a Path A (promoted/resident, CLAS id 4096+) instance coexisting with a
+                    // Path B (deforming) instance of the same posBuf? Both>0 => the resident CLAS the
+                    // ray committed belongs to the promoted sibling of this Path B surface.
+                    {
+                      uint32_t nA = 0, nB = 0;
+                      clm->countSlotsByPosBuf(posBufferIndex, nA, nB);
+                      ownStr = str::format(ownStr, " | PosBufDual: posBuf=", posBufferIndex, " pathA_slots=", nA, " pathB_slots=", nB,
+                                           (nA > 0 && nB > 0) ? "  *** DUAL-ROUTED: resident + Path B of same mesh coexist -> ray committed the promoted sibling's resident CLAS ***"
+                                         : (nA > 0)           ? "  *** posBuf on Path A only (no live Path B sibling this frame - lag or promoted-only) ***"
+                                                              : "  *** posBuf on Path B only -> NOT a promoted-sibling crossing; resident CLAS from elsewhere ***");
+                    }
+
+                    // [PatchRef] the smoking-gun test: read the PATCHED blasReference the GPU wrote
+                    // for THIS failing Path B slot. In a pose pool = correct (the resident CLAS came
+                    // from traversal elsewhere); OUTSIDE all pose pools = the per-frame patch bound a
+                    // foreign (resident) BLAS onto the Path B slot -> ray hits a resident CLAS.
+                    // [GeomIdx] surface-decode check: surfaceIndex = (customIndex & MASK) + geometryIndex.
+                    // A nonzero committed GeometryIndex on a cluster hit offsets the decoded surface off
+                    // its real instance -> the "Path B surface" may be a mis-decode of a genuine resident
+                    // cluster hit (customIndex & MASK == surfaceIndex - geometryIndex).
+                    ownStr = str::format(ownStr, " | GeomIdx: committedGeometryIndex=", committedGeometryIndex,
+                                         " customIndexSurfMask=", (surfaceIndex >= committedGeometryIndex ? surfaceIndex - committedGeometryIndex : surfaceIndex),
+                                         (committedGeometryIndex != 0
+                                            ? "  *** nonzero GeometryIndex -> surfaceIndex OFFSET; decoded Path B surface may be a mis-decode of a resident cluster hit ***"
+                                            : "  [geometryIndex 0 -> surfaceIndex == customIndex&MASK, decode is direct]"));
+
+                    // [MaskSurf] when geometryIndex offset the decode, look up what the UN-offset
+                    // surface (customIndex & MASK == surfaceIndex - geometryIndex) actually is. If it
+                    // is owned by a Path A / resident slot and is NOT a template (isTemplate=0), the
+                    // +geometryIndex mis-decode moved a genuine resident cluster hit onto the adjacent
+                    // Path B template surface -> ROOT = calculateSurfaceIndex adding geometryIndex for
+                    // cluster hits. If the mask surface is itself Path B/template, the +offset is benign
+                    // and the decoded surface is genuinely this instance's.
+                    if (committedGeometryIndex != 0 && surfaceIndex >= committedGeometryIndex) {
+                      const uint32_t maskSurf = surfaceIndex - committedGeometryIndex;
+                      int mA = -1, mB = -1, mType = -1;
+                      for (uint32_t t = 0; t < uint32_t(Tlas::Count); t++) {
+                        int a = -1, b = -1;
+                        clm->findRegionSlotByCustomIndex(t, maskSurf, a, b);
+                        if (a >= 0 || b >= 0) { mType = int(t); mA = a; mB = b; break; }
+                      }
+                      AccelManager::DbgSurfMeta mmeta;
+                      const bool mHave = getSceneManager().getAccelManager().getDbgSurfMeta(probe->frameIndex, maskSurf, mmeta);
+                      ownStr = str::format(ownStr, " | MaskSurf: idx=", maskSurf,
+                                           " ownerA=", mA, " ownerB=", mB,
+                                           mHave ? str::format(" isTemplate=", uint32_t(mmeta.isTemplate), " isLod=", uint32_t(mmeta.isLod),
+                                                               " posBuf=", uint32_t(mmeta.posBuf)) : std::string(" (no surf meta)"),
+                                           (mHave && mmeta.isTemplate == 0 && mA >= 0)
+                                             ? "  *** mask surface is Path A / NON-template -> +geometryIndex MIS-DECODED a resident hit onto the template surface (ROOT) ***"
+                                           : (mHave && mmeta.isTemplate == 0)
+                                             ? "  *** mask surface is NON-template -> decoded template surface is the wrong one (offset mis-decode) ***"
+                                             : "  [mask surface also template/unresolved -> offset likely benign]");
+                    }
+
+                    if (ownType >= 0 && ownB >= 0) {
+                      uint64_t ref = 0; bool inPool = false; uint32_t poolCount = 0;
+                      const bool haveRef = clm->readPathBSlotPatchedBlasRef(uint32_t(ownType), uint32_t(ownB), ref, inPool, poolCount);
+                      if (haveRef) {
+                        ownStr = str::format(ownStr, " | PatchRef: blas=0x", std::hex, ref, std::dec, " posePools=", poolCount,
+                                             ref == 0    ? "  *** NULL blasReference (unpatched slot) ***"
+                                           : inPool      ? "  *** patched ref IS a pose BLAS (correct) -> resident CLAS reached by traversal, not a bad patch ***"
+                                                         : "  *** patched ref OUTSIDE all pose pools -> FOREIGN BLAS bound onto Path B slot (bad cluster_blas_instances patch) ***");
+                      } else {
+                        ownStr = str::format(ownStr, " | PatchRef: unavailable (SSS/lag/mirror miss)");
+                      }
+                    }
+                  }
+                  instStr = hitType >= 0
+                    ? str::format(" | committedInstanceIndex=", committedInstanceIndex, " in ", typeName[hitType],
+                                  " cluster region (start=", hitStart, " numA=", hitNumA, " numB=", hitNumB, ")", verdict, bindStr, ownStr)
+                    : str::format(" | committedInstanceIndex=", committedInstanceIndex, verdict, ownStr);
+                }
+              }
               const uint64_t currentTableAddr = getSceneManager().getClusterLodManager() != nullptr
                 ? getSceneManager().getClusterLodManager()->getAnimatedClusterTableAddress() : 0;
-              // Path B (animated cluster template): clusterTemplateGetTriangleIndices hit a
-              // null global cluster-table entry (would Read VA~0 in the reflection/gbuffer
-              // rayquery). pad[0]=table entry value (0), pad[1]=cluster-table base low32.
+              // classify the committed surface as LIVE (< live-surface count) or GHOST (in the
+              // [liveCount, liveCount+ghostCount) band appended by uploadSurfaceData). Counts are
+              // this-frame's (GpuPrint ring lag ~1-3 frames); the live/ghost split is a wide band
+              // so the classification is robust to that lag.
+              const AccelManager& am = getSceneManager().getAccelManager();
+              const uint32_t liveSurfaceCount = uint32_t(am.getOrderedInstances().size());
+              const uint32_t ghostSurfaceCount = uint32_t(am.getGhostSurfaces().size());
+              const bool isGhost = surfaceIndex >= liveSurfaceCount;
+              const bool isGhostInBand = surfaceIndex >= liveSurfaceCount
+                && surfaceIndex < liveSurfaceCount + ghostSurfaceCount;
+              // [DecodeSurfProbe] ground truth: what this surfaceIndex ACTUALLY was on the
+              // frame the hit fired (lag-correct ring lookup).
+              AccelManager::DbgSurfMeta meta;
+              const bool haveMeta = am.getDbgSurfMeta(probe->frameIndex, surfaceIndex, meta);
+              const std::string metaStr = haveMeta
+                ? str::format(" | DecodeSurf: isTemplate=", uint32_t(meta.isTemplate), " isLod=", uint32_t(meta.isLod),
+                              " clusterGeomId=0x", std::hex, meta.clusterGeomId, std::dec, " posBuf=", uint32_t(meta.posBuf),
+                              (meta.isTemplate == 0 ? "  *** NOT Path B this frame -> surface flag/customIndex mismatch ***"
+                                                    : "  *** genuine live Path B ***"))
+                : std::string(" | DecodeSurf: NO cluster record for this (frame,surfaceIndex) -> non-cluster surface or lag>ring");
               Logger::err(str::format(
                 "[ClusterDecodeProbe] Path B (animated) null cluster-table entry: clusterId=", uint32_t(wd.y),
                 " TLAS=", (prevTlasHit ? "PREV" : "CURRENT"),
-                " surfClusterGeomId=0x", std::hex, uint32_t(wd.x), std::dec,
+                " surfaceIndex=", surfaceIndex, " (liveCount=", liveSurfaceCount, " ghostCount=", ghostSurfaceCount, ")",
+                (isGhost ? (isGhostInBand ? "  *** GHOST SURFACE (current-TLAS reach) ***"
+                                          : "  *** surfaceIndex ABOVE live+ghost (stale/OOB) ***")
+                         : "  *** LIVE Path B surface -> its BLAS is a resident CLAS ***"),
                 " posBufferIndex=", posBufferIndex,
-                " tracedTable=0x", std::hex, tracedTableAddr,
-                " currentTable=0x", currentTableAddr, std::dec,
-                (tracedTableAddr != currentTableAddr && currentTableAddr != 0 ? "  *** STALE TABLE BINDING ***" : ""),
-                " primitiveIndex=", uint32_t(wd.w), " frame=", probe->frameIndex,
-                "  -> foreign ClusterID in Path B table (PREV = ghost-mapping hole, CURRENT = TLAS entry bug)"));
+                " tableLo=0x", std::hex, padU[1], " currentTable=0x", currentTableAddr, std::dec,
+                " primitiveIndex=", uint32_t(wd.w), " frame=", probe->frameIndex, metaStr, instStr));
             } else {
               const char* kind = (badKind == 1) ? "clusterAddress==0 (cluster not resident)"
                                : (badKind == 2) ? "clusterAddress garbage (insane offsets -> line 58 OOB)"

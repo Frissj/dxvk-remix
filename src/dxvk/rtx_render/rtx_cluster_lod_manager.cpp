@@ -648,6 +648,7 @@ namespace dxvk {
 
     for (auto& entry : m_promoCandidates) {
       PromotionCandidate& candidate = entry.second;
+      candidate.anyInstanceDemoted = false;  // recomputed by the demotion loop below
       const lodclusters_remix::PromotionStateView& state = m_promoStates[candidate.stateSlot];
 
       switch (candidate.phase) {
@@ -720,6 +721,17 @@ namespace dxvk {
         promoInstance.demoted = false;
         Logger::info(str::format("[ClusterLOD] promotion: instance (slot ", promoInstance.stateSlot,
                                  ") RE-PROMOTED to Path A (rigid streak rebuilt)"));
+      }
+
+      // NV-DXVK: atomicDemotion fix - aggregate the CURRENT demoted state up to the
+      // geometry so isClusterInstance can keep the whole mesh single-path.
+      if (promoInstance.demoted && slotEntry.first != nullptr) {
+        const XXH64_hash_t hash =
+          slotEntry.first->input.getGeometryData().getHashForRule(RtxOptions::geometryAssetHashRule());
+        const auto candIt = m_promoCandidates.find(hash);
+        if (candIt != m_promoCandidates.end()) {
+          candIt->second.anyInstanceDemoted = true;
+        }
       }
     }
   }
@@ -1466,7 +1478,22 @@ namespace dxvk {
           && ClusterLodOptions::Promotion::enable() && !m_promoCandidates.empty()) {
         const XXH64_hash_t geometryHash = blasEntry->input.getGeometryData().getHashForRule(RtxOptions::geometryAssetHashRule());
         const auto candidate = m_promoCandidates.find(geometryHash);
-        if (candidate != m_promoCandidates.end()
+        // atomicDemotion fix: if ANY instance of this geometry is demoted, keep the WHOLE
+        // mesh on Path B (single-path) so the resident Path A CLAS and the Path B surface
+        // never coexist for one topology. Proven root: [DualRoute].
+        const bool atomicSuppress = ClusterLodOptions::Promotion::atomicDemotion()
+          && candidate != m_promoCandidates.end() && candidate->second.anyInstanceDemoted;
+        if (atomicSuppress) {
+          static uint32_t s_atomicLogs = 0;
+          if (s_atomicLogs < 2000) {
+            s_atomicLogs++;
+            Logger::info(str::format("[PromoAtomic] geometry 0x", std::hex, geometryHash, std::dec,
+                                     " promotion SUPPRESSED (sibling instance demoted) -> whole mesh Path B, frame ",
+                                     m_device->getCurrentFrameId()));
+          }
+        }
+        if (!atomicSuppress
+            && candidate != m_promoCandidates.end()
             && candidate->second.phase == PromotionCandidate::Phase::Promoted) {
           const auto found = m_geometryIdByHash.find(geometryHash);
           if (found != m_geometryIdByHash.end()
@@ -1488,11 +1515,31 @@ namespace dxvk {
               // solving (buildPromotionEntries) so it can re-promote
               if (slotIt != m_promoSlotByBlas.end() && !slotIt->second.demoted) {
                 outGeometryId = kPromotedTag | (slotIt->second.stateSlot << kPromotedSlotShift) | found->second;
-                recordTopoRoute(topologyKey, 1u, instance, found->second);  // Path A (promoted)
+                recordTopoRoute(topologyKey, 1u, instance, found->second, 2u);  // Path A (promoted)
                 return true;
               }
             }
           }
+        }
+      }
+
+      // FIX (rtx.clusterLod.promotion.deformingPromotedToClassic): if this TOPOLOGY has a
+      // Path A (promoted/resident) instance this-or-last frame, a sibling renders its Path A
+      // resident CLAS (id 4096+). Rendering THIS deforming instance on Path B would let a ray
+      // commit that resident id under the Path B surface. Topology-keyed (not the instance's
+      // own hash) so it also catches DIFFERENT meshes conflated by the deformation-invariant
+      // topology key ([DualRoute] proved both). Route it CLASSIC - rigid instances KEEP promotion.
+      if (ClusterLodOptions::Promotion::deformingPromotedToClassic()) {
+        const auto paIt = m_topoPathAFrame.find(topologyKey);
+        if (paIt != m_topoPathAFrame.end() && (currentFrame - paIt->second) <= 2u) {
+          static uint32_t s_defClassicLogs = 0;
+          if (s_defClassicLogs < 2000) {
+            s_defClassicLogs++;
+            Logger::info(str::format("[DeformClassic] topo=0x", std::hex, topologyKey, std::dec,
+                                     " deforming instance -> CLASSIC (topology is on Path A; avoids resident CLAS +"
+                                     " Path B surface coexistence), frame ", currentFrame));
+          }
+          return false;  // classic
         }
       }
 
@@ -1501,7 +1548,7 @@ namespace dxvk {
       {
         const bool routedB = isClusterTemplateInstance(instance, blasEntry, outGeometryId);
         if (routedB) {
-          recordTopoRoute(topologyKey, 2u, instance, outGeometryId);
+          recordTopoRoute(topologyKey, 2u, instance, outGeometryId, 3u);  // Path B (deforming)
         }
         return routedB;
       }
@@ -1544,7 +1591,7 @@ namespace dxvk {
         }
 
         outGeometryId = found->second;
-        recordTopoRoute(topologyKey, 1u, instance, found->second);  // Path A (resident)
+        recordTopoRoute(topologyKey, 1u, instance, found->second, 1u);  // Path A (resident-static)
         return true;
       }
     }
@@ -1575,7 +1622,7 @@ namespace dxvk {
     {
       const bool routedB = isClusterTemplateInstance(instance, blasEntry, outGeometryId);
       if (routedB) {
-        recordTopoRoute(topologyKey, 2u, instance, outGeometryId);  // Path B (interim)
+        recordTopoRoute(topologyKey, 2u, instance, outGeometryId, 4u);  // Path B (interim)
       }
       return routedB;
     }
@@ -1693,17 +1740,32 @@ namespace dxvk {
   // NV-DXVK: [DualRoute] record this frame's path decision for a topology and log the
   // first frame it is seen on BOTH paths (the resident-A + template-B coexistence that
   // produces the foreign clusterId 4096+). path: 1 = Path A, 2 = Path B.
-  void ClusterLodManager::recordTopoRoute(uint64_t topologyKey, uint8_t path, const RtInstance* instance, uint32_t outGeometryId) {
+  void ClusterLodManager::recordTopoRoute(uint64_t topologyKey, uint8_t path, const RtInstance* instance, uint32_t outGeometryId, uint8_t source) {
     TopoRoute& tr = m_topoRouteThisFrame[topologyKey];
     const uint32_t posBuf = instance != nullptr ? uint32_t(instance->surface.positionBufferIndex) : 0u;
+    // asset hash (unique per mesh) to distinguish "same mesh split" from "two different
+    // meshes conflated by the deformation-invariant topology key".
+    const BlasEntry* be = instance != nullptr ? instance->getBlas() : nullptr;
+    const uint64_t geomHash = be != nullptr
+      ? uint64_t(be->input.getGeometryData().getHashForRule(RtxOptions::geometryAssetHashRule())) : 0u;
     if (path == 1u) {
       tr.aInstance = instance;
       tr.residentGeometryId = outGeometryId;
       tr.aPosBuf = posBuf;
+      tr.aSource = source;
+      tr.aGeomHash = geomHash;
+      // deformingPromotedToClassic signal: this topology has a Path A instance this frame.
+      m_topoPathAFrame[topologyKey] = m_device->getCurrentFrameId();
     } else {
       tr.bInstance = instance;
       tr.bOutGeometryId = outGeometryId;
       tr.bPosBuf = posBuf;
+      tr.bSource = source;
+      tr.bGeomHash = geomHash;
+      // atomicDemotion fix signal: this topology is deforming this frame (Path B).
+      if (source == 3u) {
+        m_topoDeformingFrame[topologyKey] = m_device->getCurrentFrameId();
+      }
     }
 
     if (tr.aInstance != nullptr && tr.bInstance != nullptr && !tr.loggedDual) {
@@ -1711,12 +1773,17 @@ namespace dxvk {
       m_dualRouteEvents++;
       // one full line per NEW offending topology (the periodic heartbeat carries the rate).
       if (m_dualRouteSeenKeys.insert(topologyKey).second) {
+        const char* aSrc = tr.aSource == 2u ? "PROMOTED" : (tr.aSource == 1u ? "resident-static" : "?");
+        const char* bSrc = tr.bSource == 3u ? "deforming(skinned/captured)" : (tr.bSource == 4u ? "interim" : "?");
         Logger::err(str::format(
           "[DualRoute] NEW topo=0x", std::hex, topologyKey, std::dec,
           " on BOTH paths frame ", m_device->getCurrentFrameId(),
-          " | A inst=", tr.aInstance, " residentGeomId=", tr.residentGeometryId, " posBuf=", tr.aPosBuf,
-          " | B inst=", tr.bInstance, " outId=0x", std::hex, tr.bOutGeometryId, std::dec, " posBuf=", tr.bPosBuf,
-          "  *** resident Path A CLAS (id 4096+) + Path B surface coexist -> foreign clusterId ***"));
+          " | A(", aSrc, ") inst=", tr.aInstance, " geomHash=0x", std::hex, tr.aGeomHash, std::dec,
+          " residentGeomId=", tr.residentGeometryId, " posBuf=", tr.aPosBuf,
+          " | B(", bSrc, ") inst=", tr.bInstance, " geomHash=0x", std::hex, tr.bGeomHash,
+          " outId=0x", tr.bOutGeometryId, std::dec, " posBuf=", tr.bPosBuf,
+          (tr.aGeomHash == tr.bGeomHash ? "  *** SAME mesh split across paths ***"
+                                        : "  *** DIFFERENT meshes CONFLATED by weak topology key ***")));
       }
     }
   }
@@ -2200,6 +2267,61 @@ namespace dxvk {
       }
     }
 
+    // NV-DXVK: [UvBindProbe] DIAGNOSTIC (revert). The visible "black" Path B geometry renders with
+    // correct positions AND correct vertex colors but no/wrong texture -> position, UV and color all
+    // key off the same clusterId-remapped idx[] in the hit shader, so a wrong idx would corrupt all
+    // three. Correct geo+color => idx is fine => the defect is UV-SPECIFIC: texcoordBufferIndex,
+    // texgenMode, or textureTransform on the surface record. Dump those for Path B (template)
+    // surfaces vs a Path A (cluster) surface, and FLAG any template surface with a bound position
+    // but an invalid texcoord binding (the "right geo, black texture" signature).
+    {
+      const uint32_t frameId = m_device->getCurrentFrameId();
+      static uint32_t s_uvFlagLogs = 0;
+      auto dumpSurf = [&](const char* tag, const RtInstance* inst) {
+        if (inst == nullptr) { return; }
+        const RtSurface& s = inst->surface;
+        Logger::err(str::format(
+          "[UvBindProbe] ", tag, " frame ", frameId,
+          " isTemplate=", s.isClusterTemplate ? 1 : 0,
+          " posIdx=", s.positionBufferIndex, " texIdx=", s.texcoordBufferIndex, " colIdx=", s.color0BufferIndex,
+          (s.texcoordBufferIndex == kSurfaceInvalidBufferIndex ? " *TEXCOORD-INVALID*" : ""),
+          " texgen=", uint32_t(s.texgenMode),
+          " xformIdentity=", (s.textureTransform == Matrix4()) ? 1 : 0,
+          " xform00=", s.textureTransform[0][0], " xform11=", s.textureTransform[1][1],
+          " xformTx=", s.textureTransform[3][0], " xformTy=", s.textureTransform[3][1]));
+      };
+      // unconditional flag: a template surface with a valid position but no texcoord binding
+      for (const size_t tt : { size_t(Tlas::Opaque), size_t(Tlas::Unordered) }) {
+        for (size_t i = 0; i < m_slotsB[tt].size(); i++) {
+          const RtInstance* inst = m_slotsB[tt][i].instance;
+          if (inst != nullptr
+              && inst->surface.positionBufferIndex != kSurfaceInvalidBufferIndex
+              && (inst->surface.texcoordBufferIndex == kSurfaceInvalidBufferIndex
+                  || inst->surface.texgenMode != TexGenMode::None)
+              && s_uvFlagLogs < 40) {
+            s_uvFlagLogs++;
+            dumpSurf("FLAG-B", inst);
+          }
+        }
+      }
+      // periodic sample: first few Path B template surfaces + first Path A cluster surface for contrast
+      if ((frameId % 120u) == 0u) {
+        uint32_t shown = 0;
+        for (const size_t tt : { size_t(Tlas::Opaque), size_t(Tlas::Unordered) }) {
+          for (size_t i = 0; i < m_slotsB[tt].size() && shown < 6; i++, shown++) {
+            dumpSurf("sample-B", m_slotsB[tt][i].instance);
+          }
+        }
+        for (const size_t tt : { size_t(Tlas::Opaque), size_t(Tlas::Unordered) }) {
+          if (!m_slots[tt].empty()) { dumpSurf("sample-A", m_slots[tt][0].instance); break; }
+        }
+      }
+    }
+
+    // NV-DXVK: DIAGNOSTIC (revert) - push the instantiate clusterIdOffset sentinel so the
+    // committed-clusterId origin test is runtime-toggleable without a rebuild.
+    m_templateSystemMT->setDbgClusterIdOffsetSentinel(uint32_t(ClusterLodOptions::Animated::dbgClusterIdOffsetSentinel()));
+
     const std::chrono::steady_clock::time_point recordStart = std::chrono::steady_clock::now();
     const bool recorded = m_templateSystemMT->recordFrame(cmd, poses.data(), poseCount, slotPoseIndex.data(),
                                                           tlasInstances.data(), countB);
@@ -2324,6 +2446,12 @@ namespace dxvk {
         uint32_t fc = 0;
         const uint32_t pc = m_templateSystemMT != nullptr ? m_templateSystemMT->getPoseBlasPools(tmpLo, tmpHi, 8, &fc) : 0;
         m_dbgSceneAnimInstExpectedPool[curSlot] = pc > 0 ? (fc + pc - 1u) % pc : 0u;
+        // snapshot the FULL pool ranges live-at-capture so the scan is lag-immune
+        m_dbgSceneAnimInstPoolCount[curSlot] = pc;
+        for (uint32_t p = 0; p < pc && p < 8; p++) {
+          m_dbgSceneAnimInstPoolLo[curSlot][p] = tmpLo[p];
+          m_dbgSceneAnimInstPoolHi[curSlot][p] = tmpHi[p];
+        }
       }
       m_dbgSceneAnimInstLastSlot = curSlot;
       if (!m_dbgSceneAnimInstArmed) {
@@ -2350,9 +2478,11 @@ namespace dxvk {
       return;
     }
 
-    uint64_t poolLo[8], poolHi[8];
-    uint32_t animFrameCounter = 0;
-    const uint32_t poolCount = m_templateSystemMT->getPoseBlasPools(poolLo, poolHi, 8, &animFrameCounter);
+    // use the pool ranges SNAPSHOTTED at capture time (lag-immune) instead of the live
+    // pools, which may have grown/reallocated between capture and this scan.
+    const uint64_t* poolLo = m_dbgSceneAnimInstPoolLo[slot];
+    const uint64_t* poolHi = m_dbgSceneAnimInstPoolHi[slot];
+    const uint32_t poolCount = m_dbgSceneAnimInstPoolCount[slot];
     if (poolCount == 0) {
       return;
     }
@@ -2361,7 +2491,6 @@ namespace dxvk {
     // old any-pool check while being STALE - a 1..3-frame-old patch whose pose set may
     // already be gone (CLAS memory recycled -> the foreign clusterId 4096+ hits on
     // TLAS=CURRENT).
-    (void)animFrameCounter;
     const uint32_t expectedPool = m_dbgSceneAnimInstExpectedPool[slot] % poolCount;
 
     // NV-DXVK: [ClasAlias] this frame's Path A resident/low-detail CLAS ranges. The
@@ -2388,6 +2517,18 @@ namespace dxvk {
     }
     const uint32_t poseClasCount = poseClasTotal;  // full coverage, no cap
     const bool clasRangesTruncated = (paTotal > kPaCap);
+
+    // [TplAlias] the geometry TEMPLATE buffers - the memory the instantiate reads
+    // clusterTemplateAddress from (clusterIdOffset=0 -> committed clusterId == template's baked
+    // id). NEVER cleared by [ClasAlias] (which only checked pose CLAS buffers/pools). If a
+    // template buffer overlaps Path A resident CLAS memory, the instantiate copies a resident
+    // id (4096+) into a genuine Path B pose CLAS - the last unchecked path.
+    const uint32_t tplTotal = m_templateSystemMT != nullptr
+      ? m_templateSystemMT->getTemplateBufferRanges(nullptr, nullptr, 0) : 0;
+    std::vector<uint64_t> tplLo(tplTotal), tplHi(tplTotal);
+    if (tplTotal > 0) {
+      m_templateSystemMT->getTemplateBufferRanges(tplLo.data(), tplHi.data(), tplTotal);
+    }
 
     uint32_t outside = 0, zeroVisible = 0, wrongSlot = 0;
     int firstBad = -1, firstWrong = -1;
@@ -2459,9 +2600,11 @@ namespace dxvk {
         s_badLogs++;
         Logger::err(str::format(
           "[SceneAnimInstScan] frame ", m_dbgSceneAnimInstFrame[slot], ": ", outside, " ref(s) OUTSIDE all ",
-          poolCount, " pose-BLAS pools, ", zeroVisible, " visible NULL ref(s) of ", m_dbgSceneAnimInstCount[slot],
+          poolCount, " pose-BLAS pools (SNAPSHOTTED live-at-capture -> lag-immune), ", zeroVisible,
+          " visible NULL ref(s) of ", m_dbgSceneAnimInstCount[slot],
           " | first bad inst ", firstBad, " ref=0x", std::hex, firstBadRef, std::dec,
-          "  *** ANIMATED INSTANCE TRACES FOREIGN/FREED BLAS MEMORY (1-frame-post-growth transient is expected; persistent = the bug) ***"));
+          "  *** DANGLING REF: scene TLAS instance references a pose-BLAS pool already dead at capture"
+          " (kept-but-not-rebuilt instance whose pool was freed by a capacity grow) -> resident clusterId ***"));
       }
     } else {
       static uint32_t s_lastCleanFrame = 0;
@@ -2495,6 +2638,34 @@ namespace dxvk {
             if (firstClasBuf < 0) { firstClasBuf = int(c); firstClasRange = int(r); }
           }
         }
+      }
+      // [TplAlias] the never-checked link: TEMPLATE buffers vs Path A CLAS memory. The
+      // instantiate reads clusterTemplateAddress from these; an overlap means it copies a
+      // resident cluster's baked id (4096+) into a genuine Path B pose CLAS.
+      uint32_t tplOverlapsPathA = 0;
+      int firstTplBuf = -1, firstTplRange = -1;
+      for (uint32_t c = 0; c < tplTotal; c++) {
+        for (uint32_t r = 0; r < paCount; r++) {
+          if (tplLo[c] < paHi[r] && paLo[r] < tplHi[c]) {
+            tplOverlapsPathA++;
+            if (firstTplBuf < 0) { firstTplBuf = int(c); firstTplRange = int(r); }
+          }
+        }
+      }
+      if (tplOverlapsPathA > 0) {
+        static uint32_t s_tplAliasLogs = 0;
+        if (s_tplAliasLogs < 40 || (m_dbgSceneAnimInstFrame[slot] % 64) == 0) {
+          s_tplAliasLogs++;
+          Logger::err(str::format(
+            "[TplAlias] frame ", m_dbgSceneAnimInstFrame[slot], ": ", tplOverlapsPathA,
+            " TEMPLATE-buffer/Path-A CLAS OVERLAP(s) (first tplBuf ", firstTplBuf, " range ", firstTplRange,
+            ") tplRanges=", tplTotal, " paRanges=", paCount, "/", paTotal,
+            "  *** TEMPLATE MEMORY == Path A CLAS MEMORY -> instantiate copies resident id 4096+ into Path B pose CLAS ***"));
+        }
+      } else if (tplTotal > 0 && paCount > 0 && (m_dbgSceneAnimInstFrame[slot] % 300) == 0) {
+        Logger::info(str::format(
+          "[TplAlias] frame ", m_dbgSceneAnimInstFrame[slot], ": clean - no template buffer in Path A CLAS memory (",
+          tplTotal, " template ranges, ", paCount, "/", paTotal, " Path A ranges checked)"));
       }
       if (refInPathA > 0 || poolOverlapsPathA > 0 || clasOverlapsPathA > 0) {
         static uint32_t s_aliasLogs = 0;
@@ -2590,6 +2761,74 @@ namespace dxvk {
       return 0;
     }
     return m_templateSystemMT->getClusterTableAddress();
+  }
+
+  bool ClusterLodManager::getPathBExpectedClusterRange(size_t tlasType, uint32_t localIdxB,
+                                                       uint32_t& outBase, uint32_t& outCount) const {
+    outBase = 0;
+    outCount = 0;
+    if (m_templateSystemMT == nullptr || localIdxB >= m_slotsB[tlasType].size()) {
+      return false;
+    }
+    const uint32_t framePoseIndex = m_slotsB[tlasType][localIdxB].geometryId;  // Path B slot stores the plain pose index
+    if (framePoseIndex >= m_framePoses.size()) {
+      return false;
+    }
+    return m_templateSystemMT->getPoseSetClusterIdRange(m_framePoses[framePoseIndex].poseSetId, outBase, outCount);
+  }
+
+  uint32_t ClusterLodManager::getAnimatedClusterTableTotal() const {
+    return m_templateSystemMT != nullptr ? m_templateSystemMT->getAnimatedClusterTableCount() : 0;
+  }
+
+  bool ClusterLodManager::readPathBSlotPatchedBlasRef(size_t tlasType, uint32_t localIdxB,
+                                                      uint64_t& outRef, bool& outInPosePool, uint32_t& outPoolCount) const {
+    outRef = 0;
+    outInPosePool = false;
+    outPoolCount = 0;
+    if (m_dbgSceneAnimInstHost == nullptr || m_templateSystemMT == nullptr) {
+      return false;
+    }
+    // mirror flat order matches recordFrame: [m_slotsB[Opaque]...][m_slotsB[Unordered]...]. SSS
+    // Path B is not recorded into the scene-anim mirror.
+    uint32_t flatIndex;
+    if (tlasType == size_t(Tlas::Opaque)) {
+      flatIndex = localIdxB;
+    } else if (tlasType == size_t(Tlas::Unordered)) {
+      flatIndex = uint32_t(m_slotsB[size_t(Tlas::Opaque)].size()) + localIdxB;
+    } else {
+      return false;
+    }
+    const uint32_t slot = m_dbgSceneAnimInstLastSlot;
+    if (flatIndex >= m_dbgSceneAnimInstCount[slot]) {
+      return false;
+    }
+    const auto* inst = reinterpret_cast<const VkAccelerationStructureInstanceKHR*>(
+      m_dbgSceneAnimInstHost->mapPtr(m_dbgSceneAnimInstStride * slot));
+    if (inst == nullptr) {
+      return false;
+    }
+    outRef = inst[flatIndex].accelerationStructureReference;
+    // classify against pose-BLAS pool ranges (the correct home for a Path B ref)
+    uint64_t poolLo[16], poolHi[16];
+    outPoolCount = m_templateSystemMT->getPoseBlasPools(poolLo, poolHi, 16, nullptr);
+    for (uint32_t p = 0; p < outPoolCount && p < 16; p++) {
+      if (outRef != 0 && outRef >= poolLo[p] && outRef < poolHi[p]) { outInPosePool = true; break; }
+    }
+    return true;
+  }
+
+  void ClusterLodManager::countSlotsByPosBuf(uint32_t posBuf, uint32_t& outPathA, uint32_t& outPathB) const {
+    outPathA = 0;
+    outPathB = 0;
+    for (uint32_t t = 0; t < uint32_t(Tlas::Count); t++) {
+      for (const ClusterSlot& s : m_slots[t]) {
+        if (s.instance != nullptr && uint32_t(s.instance->surface.positionBufferIndex) == posBuf) { outPathA++; }
+      }
+      for (const ClusterSlot& s : m_slotsB[t]) {
+        if (s.instance != nullptr && uint32_t(s.instance->surface.positionBufferIndex) == posBuf) { outPathB++; }
+      }
+    }
   }
 
 }  // namespace dxvk

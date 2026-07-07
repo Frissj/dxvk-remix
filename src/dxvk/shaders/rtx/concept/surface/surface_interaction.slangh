@@ -279,7 +279,13 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
       // geometry fingerprint (bits 15:0) + THE ONE-BIT DISCRIMINATOR (bit 16):
       // usePreviousPositions marks previous-TLAS visibility hits - tells us which TLAS
       // the misrouted hit was traced from (prev = ghost-mapping hole, current = entry bug)
-      (surface.positionBufferIndex & 0xFFFFu) | (usePreviousPositions ? 0x10000u : 0u));
+      (surface.positionBufferIndex & 0xFFFFu) | (usePreviousPositions ? 0x10000u : 0u),
+      // committed hit's surfaceIndex (the exact TLAS instance) - CPU classifies live vs ghost
+      rayInteraction.surfaceIndex,
+      // committed InstanceIndex (low 16) + committed GeometryIndex (high 16), packed into pad[0].
+      // GeometryIndex reveals whether surfaceIndex was mis-decoded from a genuine cluster hit
+      // (surfaceIndex = (customIndex & MASK) + geometryIndex).
+      (rayInteraction.dbgInstanceIndex & 0xFFFFu) | ((rayInteraction.dbgGeometryIndex & 0xFFFFu) << 16));
   }
 
   // Compute vertex indicies

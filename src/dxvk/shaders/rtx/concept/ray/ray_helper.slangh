@@ -49,6 +49,11 @@ struct RayHitInfo
   uint clusterId;
   bool hasHit;
   bool frontHit;
+  // NV-DXVK: [ClusterDecodeProbe] DIAGNOSTIC - the SEQUENTIAL TLAS instance index of the
+  // committed hit (CommittedInstanceIndex, distinct from customIndex/InstanceID). CPU maps it
+  // to the cluster-region Path A vs Path B block to prove whether the hit instance matches the
+  // customIndex's surface (crossing check). Default 0xFFFFFFFF.
+  uint dbgInstanceIndex;
 };
 
 uint calculateSurfaceIndex(RayHitInfo rayHitInfo) 
@@ -70,12 +75,14 @@ variableName.customIndex = InstanceID();                                        
 variableName.geometryIndex = GeometryIndex();                                     \
 variableName.clusterId = getHitClusterIdNV();                                     \
 variableName.hasHit = true;                                                       \
-variableName.frontHit = HitKind() == HIT_KIND_TRIANGLE_FRONT_FACE;
+variableName.frontHit = HitKind() == HIT_KIND_TRIANGLE_FRONT_FACE;                \
+variableName.dbgInstanceIndex = InstanceIndex();
 
 #define RAY_HIT_INFO_CREATE_TRACE_RAY_MISS(variableName) \
 RayHitInfo variableName;                                 \
 variableName.hasHit = false;                             \
-variableName.clusterId = CLUSTER_ID_INVALID;
+variableName.clusterId = CLUSTER_ID_INVALID;             \
+variableName.dbgInstanceIndex = 0xFFFFFFFFu;
 
 #define RAY_HIT_INFO_CREATE_RAY_QUERY_CANDIDATE(variableName, rayQuery)                             \
 variableName.hasHit = true;                                                                         \
@@ -85,7 +92,8 @@ variableName.primitiveIndex = rayQuery.CandidatePrimitiveIndex();               
 variableName.customIndex = rayQuery.CandidateInstanceID();                                          \
 variableName.geometryIndex = rayQuery.CandidateGeometryIndex();                                     \
 variableName.clusterId = rayQueryGetCandidateClusterIdNV(rayQuery);                                 \
-variableName.frontHit = rayQuery.CandidateTriangleFrontFace();
+variableName.frontHit = rayQuery.CandidateTriangleFrontFace();                                       \
+variableName.dbgInstanceIndex = rayQuery.CandidateInstanceIndex();
 
 #define RAY_HIT_INFO_CREATE_RAY_QUERY_COMMITTED(variableName, rayQuery)                             \
 RayHitInfo variableName;                                                                            \
@@ -96,4 +104,5 @@ variableName.primitiveIndex = rayQuery.CommittedPrimitiveIndex();               
 variableName.customIndex = rayQuery.CommittedInstanceID();                                          \
 variableName.geometryIndex = rayQuery.CommittedGeometryIndex();                                     \
 variableName.clusterId = variableName.hasHit ? rayQueryGetCommittedClusterIdNV(rayQuery) : CLUSTER_ID_INVALID; \
-variableName.frontHit = rayQuery.CommittedTriangleFrontFace();
+variableName.frontHit = rayQuery.CommittedTriangleFrontFace();                                      \
+variableName.dbgInstanceIndex = variableName.hasHit ? rayQuery.CommittedInstanceIndex() : 0xFFFFFFFFu;

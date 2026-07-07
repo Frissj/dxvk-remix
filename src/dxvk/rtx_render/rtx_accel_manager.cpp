@@ -782,6 +782,25 @@ namespace dxvk {
         m_reorderedSurfacesFirstIndexOffset.push_back(0);
         instance->setSurfaceIndex(surfaceIndex);
         instance->clearBlasDirty();
+
+        // NV-DXVK: [DecodeSurfProbe] record this surface's ACTUAL routing this frame (flags
+        // set by recordClusterInstance above) so the lagged ClusterDecodeProbe can resolve it.
+        {
+          const uint32_t frame = m_device->getCurrentFrameId();
+          std::vector<DbgSurfMeta>& metaSlot = m_dbgSurfMeta[frame % kDbgSurfRing];
+          if (m_dbgSurfMetaFrame[frame % kDbgSurfRing] != frame) {
+            metaSlot.clear();
+            m_dbgSurfMetaFrame[frame % kDbgSurfRing] = frame;
+          }
+          if (surfaceIndex >= metaSlot.size()) {
+            metaSlot.resize(surfaceIndex + 1);
+          }
+          DbgSurfMeta& meta = metaSlot[surfaceIndex];
+          meta.isTemplate = instance->surface.isClusterTemplate ? 1u : 0u;
+          meta.isLod = instance->surface.isClusterLod ? 1u : 0u;
+          meta.clusterGeomId = uint32_t(instance->surface.clusterGeometryId);
+          meta.posBuf = uint16_t(instance->surface.positionBufferIndex);
+        }
         continue;
       } else {
         // hit-side routing flags must not persist when an instance flips back to classic

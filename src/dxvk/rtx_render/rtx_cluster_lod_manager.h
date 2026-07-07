@@ -320,6 +320,17 @@ namespace dxvk {
       RTX_OPTION("rtx.clusterLod.animated", bool, useImplicitTemplates, false,
                  "Builds templates in implicit-destination mode followed by a move compaction, instead of an\n"
                  "explicit build with a COMPUTE_SIZES pre-query (sample effective default: explicit).");
+      RTX_OPTION("rtx.clusterLod.animated", int, dbgClusterIdOffsetSentinel, 0,
+                 "DIAGNOSTIC (revert). Adds this constant to the per-frame Path B instantiate clusterIdOffset\n"
+                 "(normally 0, so the committed clusterId == the template's baked globalClusterBase+c, <=1792).\n"
+                 "Recommended value 32768 (0x8000): it shifts every committed id into a clearly-tagged band\n"
+                 "while staying inside the >=65536-entry cluster table (the renderer clamps it to\n"
+                 "clusterTableCapacity - clusterTableCount - 1 so it can never OOB-fault the hit-side lookup;\n"
+                 "1000000 device-lost at frame 76 by reading +8MB of unmapped memory before this clamp).\n"
+                 "Read the failing surfaces' [ClusterDecodeProbe] clusterId: if it becomes (base + sentinel)\n"
+                 "with base <=1792, the resident 4096+ did NOT come from this instantiate; if it becomes\n"
+                 "(4096 + sentinel), the driver baked a resident id despite the CPU input. Everything goes\n"
+                 "black while non-zero (shifted ids miss the populated table) - diagnosis only.");
       RTX_OPTION("rtx.clusterLod.animated", float, templateBboxBloatPercentage, 0.5f,
                  "instantiationBoundingBoxLimit bloat as a fraction of the geometry's bind-pose bbox diagonal -\n"
                  "the animation may move vertices this far outside the reference bbox. Negative disables the limit.");
@@ -378,6 +389,25 @@ namespace dxvk {
       RTX_OPTION("rtx.clusterLod.promotion", int, gateLagFrames, 6,
                  "Frames between dispatching the full-mesh gate sweep and reading its verdict (covers the\n"
                  "readback ring lag).");
+      RTX_OPTION("rtx.clusterLod.promotion", bool, atomicDemotion, false,
+                 "SUPERSEDED by deformingPromotedToClassic (the collision is rigid-promoted + deforming siblings,\n"
+                 "not promoted + demoted - demotions were zero). Kept for comparison. Per-instance demotion lets one instance of\n"
+                 "a mesh stay promoted (Path A resident CLAS, id 4096+) while a sibling instance demotes to Path B\n"
+                 "(deforming) - so the SAME topology sits on BOTH paths in one frame and a ray commits the Path A\n"
+                 "id under the Path B surface ([DualRoute] proved this). When true, demotion is atomic per\n"
+                 "GEOMETRY: if ANY instance of a mesh is demoted, NONE of its instances promote - the whole mesh\n"
+                 "renders Path B - so each topology is single-path. Set false to restore per-instance demotion\n"
+                 "and reproduce the symptom for comparison.");
+      RTX_OPTION("rtx.clusterLod.promotion", bool, deformingPromotedToClassic, false,
+                 "Workaround (default OFF while the CommittedInstanceID/surfaceIndex probe diagnoses the\n"
+                 "coexistence so deforming can stay on Path B). Routes deforming instances of a promoted topology\n"
+                 "to classic. Set true to apply the workaround. proven by [DualRoute] (same\n"
+                 "geomHash on both paths). When a mesh is promoted, a rigid instance renders its Path A resident\n"
+                 "CLAS (id 4096+) while a DEFORMING instance of the SAME mesh renders Path B - the two coexist in\n"
+                 "the cluster TLAS and a ray commits the Path A id under the Path B surface. When true, the\n"
+                 "deforming instances of a promoted mesh render CLASSIC instead of Path B, so that mesh has no\n"
+                 "Path B surface to mis-resolve - while its rigid instances KEEP their Path A promotion (unlike\n"
+                 "the coarse atomicDemotion). Set false to reproduce the symptom.");
       RTX_OPTION("rtx.clusterLod.promotion", int, fullSweepIntervalFrames, 32,
                  "Steady-state full-mesh residual sweep cadence per PROMOTED instance (plan 7.7, risk R20):\n"
                  "the sparse per-frame solve can miss a VS animating a small vertex subset, so every promoted\n"
@@ -489,6 +519,82 @@ namespace dxvk {
     // P4b: device address of the global animated cluster table (0 if none);
     // consumed by the hit-side Path B primitive remap via raytrace_args
     uint64_t getAnimatedClusterTableAddress() const;
+
+    // NV-DXVK: [ClusterDecodeProbe] Path A (m_slots) vs Path B (m_slotsB) slot counts for a
+    // TLAS type this frame, so the readback can classify a committed InstanceIndex into the
+    // Path A block [start, start+numA) or Path B block [start+numA, +numB) of the cluster region.
+    void getClusterPathSlotCounts(size_t tlasType, uint32_t& numPathA, uint32_t& numPathB) const {
+      numPathA = uint32_t(m_slots[tlasType].size());
+      numPathB = uint32_t(m_slotsB[tlasType].size());
+    }
+
+    // NV-DXVK: [ClusterDecodeProbe] for a committed region slot, return the CPU-written
+    // instanceCustomIndex (what the CPU actually bound into that TLAS slot) plus the slot's
+    // RtInstance*, so the readback can compare both against the shader-decoded surfaceIndex and
+    // pin whether the crossing is in the customIndex WRITE (slotCustom == template surface) or in
+    // the committedInstanceIndex->slot MAPPING (slotCustom != decoded surface). pathA selects the
+    // m_slots/m_slotInstanceData (Path A) block vs m_slotsB/m_slotInstanceDataB (Path B) block;
+    // localIndex is the region-local index within that block. Returns false if out of range.
+    bool getRegionSlotBinding(size_t tlasType, uint32_t localIndex, bool pathA,
+                              uint32_t& outCustomIndex, RtInstance*& outInstance) const {
+      const auto& slots = pathA ? m_slots[tlasType] : m_slotsB[tlasType];
+      const auto& data  = pathA ? m_slotInstanceData[tlasType] : m_slotInstanceDataB[tlasType];
+      if (localIndex >= slots.size() || localIndex >= data.size()) {
+        return false;
+      }
+      outCustomIndex = data[localIndex].instanceCustomIndex;
+      outInstance = slots[localIndex].instance;
+      return true;
+    }
+
+    // NV-DXVK: [ClusterDecodeProbe] reverse lookup - find which block actually OWNS a given
+    // customIndex (== the shader-decoded surfaceIndex of the committed hit). This answers Path A
+    // vs Path B for the REAL hit surface WITHOUT relying on committedInstanceIndex->slot mapping
+    // (which the writtenCustom!=decoded result proved unreliable). Each instance carries a unique
+    // surface index, so at most one block owns it. Returns the region-local index within m_slots
+    // (Path A) via localIdxA and within m_slotsB (Path B) via localIdxB, or -1 if absent.
+    void findRegionSlotByCustomIndex(size_t tlasType, uint32_t customIndex,
+                                     int& localIdxA, int& localIdxB) const {
+      localIdxA = -1;
+      localIdxB = -1;
+      const auto& da = m_slotInstanceData[tlasType];
+      for (uint32_t i = 0; i < da.size(); i++) {
+        if (da[i].instanceCustomIndex == customIndex) { localIdxA = int(i); break; }
+      }
+      const auto& db = m_slotInstanceDataB[tlasType];
+      for (uint32_t i = 0; i < db.size(); i++) {
+        if (db[i].instanceCustomIndex == customIndex) { localIdxB = int(i); break; }
+      }
+    }
+
+    // NV-DXVK: [ClusterDecodeProbe] for a Path B region slot, resolve the [base, base+count) global
+    // cluster-id range its geometry was baked with (via m_slotsB -> framePoseIndex -> m_framePoses ->
+    // poseSet -> geometry.globalClusterBase). Lets the readback compare a failing hit's committed
+    // clusterId to what THIS cluster should carry: inside range + null table = publish race; outside
+    // = foreign id (bake/routing divergence). Also returns the total populated table count via
+    // getAnimatedClusterTableCount() on the template system. Returns false if unresolvable.
+    bool getPathBExpectedClusterRange(size_t tlasType, uint32_t localIdxB,
+                                      uint32_t& outBase, uint32_t& outCount) const;
+    uint32_t getAnimatedClusterTableTotal() const;
+
+    // NV-DXVK: [PosBufDual] the mechanism test. For a failing hit's positionBufferIndex, count how
+    // many Path A (m_slots: promoted/resident cluster instances) vs Path B (m_slotsB: deforming
+    // template instances) live slots carry the SAME posBuf this frame. Both > 0 => the same mesh is
+    // dual-routed - a resident instance (its CLAS baked with a 4096+ resident id) coexists with a
+    // Path B instance, and a ray on the Path B surface can commit the resident CLAS. This is the
+    // coexistence the "committed resident id under a Path B surface" data implies; counting it
+    // directly confirms/refutes it at the moment of the failing hit. Also reports whether ANY Path A
+    // slot shares the posBuf's geometry surface index (surface sharing vs distinct instances).
+    void countSlotsByPosBuf(uint32_t posBuf, uint32_t& outPathA, uint32_t& outPathB) const;
+
+    // NV-DXVK: [PatchRef] read the PATCHED blasReference the GPU wrote for a Path B region slot
+    // (from the scene-anim mirror, flat order = m_slotsB Opaque then Unordered), and test whether
+    // it lands inside a pose-BLAS pool (its correct home) or outside (foreign - the per-frame
+    // cluster_blas_instances patch wrote a non-pose BLAS onto the slot, so a ray traversing this
+    // Path B instance reaches a resident CLAS -> committed clusterId 4096+). outRef=0 => unpatched.
+    // Returns false if the slot isn't in the mirror (SSS Path B, or count/lag mismatch).
+    bool readPathBSlotPatchedBlasRef(size_t tlasType, uint32_t localIdxB,
+                                     uint64_t& outRef, bool& outInPosePool, uint32_t& outPoolCount) const;
 
   private:
     struct ClusterSlot {
@@ -608,16 +714,30 @@ namespace dxvk {
       uint32_t bOutGeometryId = 0;             // Path B tagged id (pose set)
       uint32_t aPosBuf = 0;
       uint32_t bPosBuf = 0;
+      uint8_t aSource = 0;                     // 1=resident-static, 2=promoted
+      uint8_t bSource = 0;                     // 3=deforming(skinned/captured), 4=interim
+      uint64_t aGeomHash = 0;                  // asset hash of the A instance (unique per mesh)
+      uint64_t bGeomHash = 0;                  // asset hash of the B instance
       bool loggedDual = false;                 // one detection per topology per frame
     };
     std::unordered_map<uint64_t, TopoRoute> m_topoRouteThisFrame;
+    // NV-DXVK: atomicDemotion fix (real signal) - last frame each topology had a DEFORMING
+    // (Path B) instance. If a topology deforms, promotion of its rigid siblings is suppressed
+    // so the topology stays single-path (no promoted Path A CLAS + Path B surface coexistence).
+    // Persistent; pruned periodically. [DualRoute] proved every collision is PROMOTED + deforming.
+    std::unordered_map<uint64_t, uint32_t> m_topoDeformingFrame;
+    // NV-DXVK: deformingPromotedToClassic (topology-keyed) - last frame each topology had a
+    // Path A (promoted OR resident) instance. If a topology is on Path A, its deforming
+    // instances render classic - catches SAME-mesh splits AND different meshes conflated by
+    // the deformation-invariant topology key (both proven by [DualRoute]). Persistent; pruned.
+    std::unordered_map<uint64_t, uint32_t> m_topoPathAFrame;
     // persistent across frames: distinct dual-routed topologies already logged in full
     // (bounds the log to one line per NEW offender) + cumulative event count.
     std::unordered_set<uint64_t> m_dualRouteSeenKeys;
     uint64_t m_dualRouteEvents = 0;
     // records this frame's path decision for a topology and logs [DualRoute] on the first
     // frame a topology is seen on both paths. path: 1 = Path A, 2 = Path B.
-    void recordTopoRoute(uint64_t topologyKey, uint8_t path, const RtInstance* instance, uint32_t outGeometryId);
+    void recordTopoRoute(uint64_t topologyKey, uint8_t path, const RtInstance* instance, uint32_t outGeometryId, uint8_t source);
 
     // NV-DXVK: [SceneAnimInstScan] crash-safe mirror of the animated OPAQUE cluster
     // instances AS FED INTO THE SCENE TLAS (patch-kernel output copied into
@@ -638,6 +758,13 @@ namespace dxvk {
     // ring pool the capture's pose BLASes were built into (recorded at capture time so
     // skipped recordFrames cannot skew the expected-pool comparison at scan time)
     uint32_t m_dbgSceneAnimInstExpectedPool[2] = {};
+    // NV-DXVK: pose-BLAS pool ranges SNAPSHOTTED at capture time (per ring slot), so the
+    // scan classifies refs against the pools that were live WHEN the refs were captured -
+    // not the (possibly grown) current pools. This makes the OUTSIDE-all-pools verdict
+    // reliable: an OUTSIDE ref genuinely points at a pool freed before capture = dangling.
+    uint64_t m_dbgSceneAnimInstPoolLo[2][8] = {};
+    uint64_t m_dbgSceneAnimInstPoolHi[2][8] = {};
+    uint32_t m_dbgSceneAnimInstPoolCount[2] = {};
     uint32_t m_dbgSceneAnimInstLastSlot = 0;
     bool m_dbgSceneAnimInstArmed = false;
     void dumpSceneAnimInstOnDeviceLost();
@@ -680,6 +807,9 @@ namespace dxvk {
       uint32_t stateSlot = 0;
       enum class Phase : uint32_t { Probing, GateScheduled, GateRunning, Promoted, Rejected } phase = Phase::Probing;
       uint32_t gateFrames = 0;
+      // NV-DXVK: atomicDemotion fix - true this frame if ANY instance of this geometry is
+      // demoted; recomputed each updatePromotionStates. When set, no instance promotes.
+      bool anyInstanceDemoted = false;
     };
     // main-thread after adoption in onFrameBegin
     std::unordered_map<uint64_t, PromotionCandidate> m_promoCandidates;

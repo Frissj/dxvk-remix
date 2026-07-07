@@ -298,7 +298,11 @@ vec2 clusterGeometryGetTexcoord0(ClusterGeometry clusterGeometry, uint vertexInd
 // dbgPosBufferIndex: the surface's positionBufferIndex - identifies the geometry even on
 // Path B surfaces (which never write clusterGeometryId). Packed with badKind into wd.z:
 // (3 | posBufIdx << 8) stays < 2^24 so the float packing is exact.
-uint3 clusterTemplateGetTriangleIndices(uint64_t tableAddress, uint clusterId, uint primitiveIndex, uint dbgSurfaceGeomId, uint dbgPosBufferIndex)
+// NV-DXVK: dbgSurfaceIndex = the committed hit's rayInteraction.surfaceIndex (the exact TLAS
+// instance's surface). CPU-side compares it to the live-surface count: >= live count => the hit
+// resolved a GHOST surface (isClusterTemplate carried from the previous frame) reachable on the
+// CURRENT TLAS; < live count => a genuine live Path B surface whose BLAS is a resident CLAS.
+uint3 clusterTemplateGetTriangleIndices(uint64_t tableAddress, uint clusterId, uint primitiveIndex, uint dbgSurfaceGeomId, uint dbgPosBufferIndex, uint dbgSurfaceIndex, uint dbgInstanceIndex)
 {
   if (tableAddress == 0 || clusterId == CLUSTER_ID_INVALID)
   {
@@ -335,8 +339,13 @@ uint3 clusterTemplateGetTriangleIndices(uint64_t tableAddress, uint clusterId, u
     // dbgPosBufferIndex bit 16 = prev-TLAS hit (usePreviousPositions) -> badKind bit 7,
     // keeping the packed value < 2^24 so the float encoding stays exact.
     const uint prevTlasBit = (dbgPosBufferIndex & 0x10000u) != 0 ? 0x80u : 0u;
-    clusterGeometryLogBad(3u | prevTlasBit | ((dbgPosBufferIndex & 0xFFFFu) << 8), dbgSurfaceGeomId, clusterId,
-                          tableAddress >> 32, tableAddress, primitiveIndex);
+    // pack the committed surfaceIndex into the geometryId slot (Path B never writes
+    // clusterGeometryId, so dbgSurfaceGeomId is 0 here anyway); the CPU readback prints it
+    // as surfaceIndex and classifies live-vs-ghost.
+    // pad[0] now carries the committed InstanceIndex (sequential TLAS slot) instead of the
+    // table-high bits (tracedTable==currentTable already confirmed); pad[1] = table low.
+    clusterGeometryLogBad(3u | prevTlasBit | ((dbgPosBufferIndex & 0xFFFFu) << 8), dbgSurfaceIndex, clusterId,
+                          dbgInstanceIndex, tableAddress, primitiveIndex);
     return uint3(0, 0, 0);
   }
 

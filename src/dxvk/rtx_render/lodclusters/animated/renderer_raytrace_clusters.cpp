@@ -365,6 +365,10 @@ struct ClusterTemplateSystem::Impl
   uint32_t frameCounter = 0;
   bool     anyFrameRecorded = false;
 
+  // NV-DXVK: DIAGNOSTIC (revert) - constant added to the Path B instantiate clusterIdOffset
+  // (normally 0). Pushed from rtx.clusterLod.animated.dbgClusterIdOffsetSentinel each frame.
+  uint32_t dbgClusterIdOffsetSentinel = 0;
+
   // deferred destruction: buffers a recorded frame may still reference are
   // destroyed only after every conceivable in-flight frame completed
   static constexpr uint32_t kDestroyDelayFrames = 8;
@@ -1960,6 +1964,31 @@ uint32_t ClusterTemplateSystem::getPoseSetClusterCount(uint32_t poseSetId) const
   return impl.geometries[poseSet.geometryIndex] ? impl.geometries[poseSet.geometryIndex]->numClusters : 0;
 }
 
+bool ClusterTemplateSystem::getPoseSetClusterIdRange(uint32_t poseSetId, uint32_t& outBase, uint32_t& outCount) const
+{
+  const Impl& impl = *m_impl;
+  outBase = 0;
+  outCount = 0;
+  if(poseSetId >= impl.poseSets.size() || !impl.poseSets[poseSetId].active)
+  {
+    return false;
+  }
+  const Impl::PoseSet& poseSet = impl.poseSets[poseSetId];
+  if(poseSet.geometryIndex >= impl.geometries.size() || !impl.geometries[poseSet.geometryIndex])
+  {
+    return false;
+  }
+  const Impl::GeometryData& geometry = *impl.geometries[poseSet.geometryIndex];
+  outBase  = geometry.globalClusterBase;
+  outCount = geometry.numClusters;
+  return true;
+}
+
+uint32_t ClusterTemplateSystem::getAnimatedClusterTableCount() const
+{
+  return m_impl->clusterTableCount;
+}
+
 void ClusterTemplateSystem::beginFrame(uint32_t frameId)
 {
   Impl& impl = *m_impl;
@@ -2057,6 +2086,23 @@ bool ClusterTemplateSystem::recordFrame(VkCommandBuffer                         
 
   const uint64_t ringDstAddressesVa = ring.address + impl.ringDstAddressesOffset;
 
+  // NV-DXVK: DIAGNOSTIC (revert) - clamp the instantiate clusterIdOffset sentinel so the shifted
+  // committed clusterId (globalClusterBase+c+offset, max base+c == clusterTableCount) stays INSIDE
+  // the cluster table (>=65536 records). The hit-side lookup clusterTable[clusterId] has no bounds
+  // check, so an id past the table (e.g. the 1000000 that device-lost at frame 76) faults on
+  // unmapped memory instead of returning null. A uniform clamp keeps every geometry's shift the
+  // same so the additive test stays interpretable.
+  uint32_t effClusterIdOffsetSentinel = impl.dbgClusterIdOffsetSentinel;
+  if(effClusterIdOffsetSentinel != 0 && impl.clusterTableCapacity > 0)
+  {
+    const uint32_t headroom = impl.clusterTableCount + 1u;  // highest base+c in use, +1
+    const uint32_t maxSafe  = impl.clusterTableCapacity > headroom ? (impl.clusterTableCapacity - headroom) : 0u;
+    if(effClusterIdOffsetSentinel > maxSafe)
+    {
+      effClusterIdOffsetSentinel = maxSafe;
+    }
+  }
+
   uint32_t clusterOffset = 0;
 
   for(uint32_t p = 0; p < poseCount; p++)
@@ -2079,7 +2125,11 @@ bool ClusterTemplateSystem::recordFrame(VkCommandBuffer                         
         VkClusterAccelerationStructureInstantiateClusterInfoNV& instInfo = instantiationInfos[clusterOffset + c];
 
         instInfo                        = {};
-        instInfo.clusterIdOffset        = 0;  // stored in template
+        // clusterIdOffset is normally 0 (committed clusterId == template's baked globalClusterBase+c).
+        // dbgClusterIdOffsetSentinel (DIAGNOSTIC, default 0) shifts it to prove whether the committed
+        // resident clusterId 4096+ actually originates from this instantiate. Clamped above so the
+        // shifted id can't OOB-fault the hit-side cluster table.
+        instInfo.clusterIdOffset        = effClusterIdOffsetSentinel;  // stored in template (+sentinel diag, clamped)
         instInfo.geometryIndexOffset    = 0;
         instInfo.clusterTemplateAddress = geometry.templateAddresses[c];
 
@@ -2609,6 +2659,30 @@ uint32_t ClusterTemplateSystem::getPoseClasRanges(uint64_t* lo, uint64_t* hi, ui
         }
         total++;
       }
+    }
+  }
+  return total;
+}
+
+void ClusterTemplateSystem::setDbgClusterIdOffsetSentinel(uint32_t sentinel)
+{
+  m_impl->dbgClusterIdOffsetSentinel = sentinel;
+}
+
+uint32_t ClusterTemplateSystem::getTemplateBufferRanges(uint64_t* lo, uint64_t* hi, uint32_t maxCount) const
+{
+  const Impl& impl = *m_impl;
+  uint32_t total = 0;
+  for(const auto& geometry : impl.geometries)
+  {
+    if(geometry && geometry->templatesBuffer.buffer && geometry->templatesBuffer.address)
+    {
+      if(total < maxCount)
+      {
+        lo[total] = geometry->templatesBuffer.address;
+        hi[total] = geometry->templatesBuffer.address + geometry->templatesBuffer.bufferSize;
+      }
+      total++;
     }
   }
   return total;

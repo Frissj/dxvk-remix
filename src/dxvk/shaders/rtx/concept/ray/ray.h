@@ -98,7 +98,16 @@ struct RayInteraction : MinimalRayInteraction
   //   Bits 25..31 : reserved
   // Default: all flags = 0.
   uint _surfaceAndFlags = SURFACE_INDEX_INVALID;
-   
+
+  // NV-DXVK: [ClusterDecodeProbe] DIAGNOSTIC - sequential TLAS instance index of the committed
+  // hit (distinct from surfaceIndex/customIndex). Not serialized; only used by the probe.
+  uint dbgInstanceIndex = 0xFFFFFFFFu;
+
+  // NV-DXVK: [ClusterDecodeProbe] DIAGNOSTIC - committed GeometryIndex() of the hit. surfaceIndex =
+  // (customIndex & MASK) + geometryIndex, so a nonzero geometryIndex on a cluster hit would offset
+  // the decoded surface off its real instance (a mis-decode that fakes a "Path B surface"). Probe-only.
+  uint dbgGeometryIndex = 0u;
+
   property uint surfaceIndex
   {
     get { return _surfaceAndFlags & CUSTOM_INDEX_SURFACE_MASK; }
