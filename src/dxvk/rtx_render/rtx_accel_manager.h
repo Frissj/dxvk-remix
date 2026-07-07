@@ -166,7 +166,24 @@ public:
   // Returns the number of live BLAS objects
   static uint32_t getBlasCount();
 
-  uint32_t getSurfaceCount() const { return m_reorderedSurfaces.size(); }
+  // NV-DXVK: [GhostSurface] extra surface records appended after the live surfaces for
+  // instances whose cluster-path affiliation changed this frame - previous-TLAS rays
+  // resolve last frame's BLAS hits through them (surfaceMapping redirect) with the OLD
+  // routing flags. Metadata only: no TLAS entry, live for one frame. See
+  // ClusterLodManager::GhostSurfaceRequest for the mechanism.
+  struct GhostSurface {
+    RtInstance* instance = nullptr;
+    uint32_t prevSurfaceIndex = 0;
+    bool isClusterLod = false;
+    bool isClusterTemplate = false;
+    uint32_t clusterGeometryId = 0;
+  };
+  const std::vector<GhostSurface>& getGhostSurfaces() const { return m_ghostSurfaces; }
+
+  // Note: includes the ghost surface records (they occupy surface + material slots
+  // after the live surfaces; filled in uploadSurfaceData / the scene manager's
+  // surface material upload).
+  uint32_t getSurfaceCount() const { return uint32_t(m_reorderedSurfaces.size() + m_ghostSurfaces.size()); }
   const std::vector<RtInstance*>& getOrderedInstances() const { return m_reorderedSurfaces; }
 
   // Returns true if the last mergeInstancesIntoBlas call took the fast-skip
@@ -191,6 +208,12 @@ public:
   // Byte offset of the given TLAS type's cluster region within m_vkInstanceBuffer.
   // Layout per type: [normal instances][PointInstancer slots][cluster slots].
   size_t getClusterRegionByteOffset(size_t tlasType) const;
+
+  // NV-DXVK: [ClusterSlotReserve] DIAGNOSTIC. The number of cluster slots this
+  // TLAS type RESERVES and TRAVERSES (set at merge, incremented once per cluster
+  // instance). The bug hypothesis: this exceeds what Path A + Path B actually
+  // WRITE each frame, leaving stale tail slots. Revert with the probe.
+  uint32_t getClusterSlotCount(size_t tlasType) const { return m_clusterSlotsPerType[tlasType]; }
 
 private:
   struct SurfaceInfo {
@@ -336,6 +359,11 @@ private:
 
   std::vector<RtInstance*> m_reorderedSurfaces;
   std::vector<uint32_t> m_reorderedSurfacesFirstIndexOffset;
+
+  // NV-DXVK: [GhostSurface] this frame's ghost records + the cluster manager that
+  // produced the requests (stashed by mergeInstancesIntoBlas for uploadSurfaceData)
+  std::vector<GhostSurface> m_ghostSurfaces;
+  class ClusterLodManager* m_ghostSourceClusterLod = nullptr;
   std::vector<uint32_t> m_reorderedSurfacesPrimitiveIDPrefixSum;              // Exclusive prefix sum for this frame's surface primitive count array
   std::vector<uint32_t> m_reorderedSurfacesPrimitiveIDPrefixSumLastFrame;     // Exclusive prefix sum for last frame's surface primitive count array
   std::vector<VkAccelerationStructureInstanceKHR> m_mergedInstances[Tlas::Count];

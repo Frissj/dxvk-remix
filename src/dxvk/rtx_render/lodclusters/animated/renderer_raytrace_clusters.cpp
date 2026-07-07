@@ -1342,6 +1342,30 @@ bool ClusterTemplateSystem::buildGeometryTemplates(uint64_t token)
                 bboxesBuffer.address + sizeof(TemplateBbox) * c;
       }
 
+      // NV-DXVK: [PathBIdProbe] DIAGNOSTIC (cpp-only, no shader change). Log the exact
+      // ClusterID range this TEMPLATE bakes (templateInfo.clusterID = globalClusterBase + c,
+      // inherited unchanged by the instantiate since clusterIdOffset=0). Path B ids MUST be
+      // 0..clusterTableCount-1 (<=1793 this session). A range reaching >=4096 here proves
+      // OUTCOME A: Path B genuinely bakes a Path-A-resident id -> the bug is id assignment,
+      // not routing. Silence across a reproducing run (with the heartbeat confirming builds
+      // ran) refutes A -> OUTCOME B (routing / TLAS-region aliasing). Low-volume: one line
+      // per template build (~491/run, 0 re-registrations).
+      {
+        const uint32_t idLo = data->globalClusterBase;
+        const uint32_t idHi = data->globalClusterBase + numClusters;  // exclusive
+        if(idHi > 4096u)
+        {
+          LOGE("[PathBIdProbe] TEMPLATE '%s' base=%u numClusters=%u idRange=[%u,%u) "
+               "*** FOREIGN >=4096 -> OUTCOME A (Path B id assignment) ***\n",
+               data->name.c_str(), data->globalClusterBase, numClusters, idLo, idHi);
+        }
+        else
+        {
+          LOGI("[PathBIdProbe] TEMPLATE '%s' base=%u numClusters=%u idRange=[%u,%u)\n",
+               data->name.c_str(), data->globalClusterBase, numClusters, idLo, idHi);
+        }
+      }
+
       // actual count of current geometry
       inputs.maxAccelerationStructureCount = numClusters;
 
@@ -1425,7 +1449,13 @@ bool ClusterTemplateSystem::buildGeometryTemplates(uint64_t token)
         buildSum += ((const uint32_t*)sizesBuffer.mapping)[c];
       }
       // allocate outputs and setup dst addresses
-      impl.res.m_allocator.createBuffer(data->templatesBuffer, buildSum, VK_BUFFER_USAGE_RAY_TRACING_BIT_NV);
+      // NV-DXVK: [TplWriteCheck] + TRANSFER usage so the sentinel fill + readback can
+      // verify the move/build actually wrote every template slot (fresh VMA memory is
+      // RECYCLED bytes - an unwritten slot silently serves foreign Path A CLAS data as
+      // a "template", instantiating CLAS with foreign baked ClusterIDs 4096+).
+      impl.res.m_allocator.createBuffer(data->templatesBuffer, buildSum,
+                                        VK_BUFFER_USAGE_RAY_TRACING_BIT_NV | VK_BUFFER_USAGE_2_TRANSFER_DST_BIT
+                                            | VK_BUFFER_USAGE_2_TRANSFER_SRC_BIT);
 
       data->templateAddresses.resize(numClusters);
 
@@ -1460,6 +1490,18 @@ bool ClusterTemplateSystem::buildGeometryTemplates(uint64_t token)
         }
 
         cmd = impl.res.createTempCmdBuffer();
+
+        // NV-DXVK: [TplWriteCheck] sentinel-fill the fresh templates buffer BEFORE the
+        // move; the post-move readback below flags any template slot the move left
+        // untouched (still sentinel = recycled foreign bytes would have been served).
+        vkCmdFillBuffer(cmd, data->templatesBuffer.buffer, 0, VK_WHOLE_SIZE, 0xDEADBEEFu);
+        {
+          VkMemoryBarrier fb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+          fb.srcAccessMask   = VK_ACCESS_TRANSFER_WRITE_BIT;
+          fb.dstAccessMask   = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR | VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+          vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                               0, 1, &fb, 0, nullptr, 0, nullptr);
+        }
 
         inputs.opType               = VK_CLUSTER_ACCELERATION_STRUCTURE_OP_TYPE_MOVE_OBJECTS_NV;
         inputs.opMode               = VK_CLUSTER_ACCELERATION_STRUCTURE_OP_MODE_EXPLICIT_DESTINATIONS_NV;
@@ -1504,7 +1546,54 @@ bool ClusterTemplateSystem::buildGeometryTemplates(uint64_t token)
           }
         }
 
+        // NV-DXVK: [TplWriteCheck] readback the first u64 of every template slot after
+        // the move (ASBUILD -> TRANSFER) - still-sentinel = the move never wrote it.
+        nvvk::Buffer tplProbeHost;
+        impl.res.m_allocator.createBuffer(tplProbeHost, sizeof(uint64_t) * numClusters, VK_BUFFER_USAGE_2_TRANSFER_DST_BIT,
+                                          VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                                          VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
+        if(tplProbeHost.buffer)
+        {
+          VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+          mb.srcAccessMask   = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+          mb.dstAccessMask   = VK_ACCESS_TRANSFER_READ_BIT;
+          vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               0, 1, &mb, 0, nullptr, 0, nullptr);
+          std::vector<VkBufferCopy> probeRegions(numClusters);
+          for(uint32_t c = 0; c < numClusters; c++)
+          {
+            probeRegions[c].srcOffset = data->templateAddresses[c] - data->templatesBuffer.address;
+            probeRegions[c].dstOffset = sizeof(uint64_t) * c;
+            probeRegions[c].size      = sizeof(uint64_t);
+          }
+          vkCmdCopyBuffer(cmd, data->templatesBuffer.buffer, tplProbeHost.buffer, numClusters, probeRegions.data());
+        }
+
         impl.res.tempSyncSubmit(cmd);
+
+        // NV-DXVK: [TplWriteCheck] evaluate after the synchronous submit
+        if(tplProbeHost.buffer && tplProbeHost.mapping)
+        {
+          constexpr uint64_t kSentinel = 0xDEADBEEFDEADBEEFull;
+          const uint64_t*    heads     = reinterpret_cast<const uint64_t*>(tplProbeHost.mapping);
+          uint32_t           unwritten = 0;
+          int                firstUnwritten = -1;
+          for(uint32_t c = 0; c < numClusters; c++)
+          {
+            if(heads[c] == kSentinel)
+            {
+              unwritten++;
+              if(firstUnwritten < 0) firstUnwritten = int(c);
+            }
+          }
+          if(unwritten > 0)
+          {
+            LOGE("[TplWriteCheck] '%s': %u of %u template slots UNWRITTEN by the move (first idx %d, base %u) "
+                 " *** INSTANTIATE WOULD SERVE RECYCLED FOREIGN BYTES AS TEMPLATE ***\n",
+                 data->name.c_str(), unwritten, numClusters, firstUnwritten, data->globalClusterBase);
+          }
+        }
+        impl.res.m_allocator.destroyBuffer(tplProbeHost);
       }
       else
       {
@@ -1523,6 +1612,18 @@ bool ClusterTemplateSystem::buildGeometryTemplates(uint64_t token)
         inputs.flags  = impl.templateBuildFlags;
 
         cmd = impl.res.createTempCmdBuffer();
+
+        // NV-DXVK: [TplWriteCheck] sentinel-fill the fresh templates buffer BEFORE the
+        // explicit build - the post-build readback flags any template slot the build
+        // left untouched (recycled foreign bytes would otherwise be served as template).
+        vkCmdFillBuffer(cmd, data->templatesBuffer.buffer, 0, VK_WHOLE_SIZE, 0xDEADBEEFu);
+        {
+          VkMemoryBarrier fb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+          fb.srcAccessMask   = VK_ACCESS_TRANSFER_WRITE_BIT;
+          fb.dstAccessMask   = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR | VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+          vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                               0, 1, &fb, 0, nullptr, 0, nullptr);
+        }
 
         cmdInfo.input = inputs;
         vkCmdBuildClusterAccelerationStructureIndirectNV(cmd, &cmdInfo);
@@ -1551,7 +1652,53 @@ bool ClusterTemplateSystem::buildGeometryTemplates(uint64_t token)
           }
         }
 
+        // NV-DXVK: [TplWriteCheck] readback the first u64 of every template slot after
+        // the explicit build (ASBUILD -> TRANSFER); still-sentinel = never written.
+        nvvk::Buffer tplProbeHost;
+        impl.res.m_allocator.createBuffer(tplProbeHost, sizeof(uint64_t) * numClusters, VK_BUFFER_USAGE_2_TRANSFER_DST_BIT,
+                                          VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                                          VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
+        if(tplProbeHost.buffer)
+        {
+          VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+          mb.srcAccessMask   = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+          mb.dstAccessMask   = VK_ACCESS_TRANSFER_READ_BIT;
+          vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               0, 1, &mb, 0, nullptr, 0, nullptr);
+          std::vector<VkBufferCopy> probeRegions(numClusters);
+          for(uint32_t c = 0; c < numClusters; c++)
+          {
+            probeRegions[c].srcOffset = data->templateAddresses[c] - data->templatesBuffer.address;
+            probeRegions[c].dstOffset = sizeof(uint64_t) * c;
+            probeRegions[c].size      = sizeof(uint64_t);
+          }
+          vkCmdCopyBuffer(cmd, data->templatesBuffer.buffer, tplProbeHost.buffer, numClusters, probeRegions.data());
+        }
+
         impl.res.tempSyncSubmit(cmd);
+
+        if(tplProbeHost.buffer && tplProbeHost.mapping)
+        {
+          constexpr uint64_t kSentinel = 0xDEADBEEFDEADBEEFull;
+          const uint64_t*    heads     = reinterpret_cast<const uint64_t*>(tplProbeHost.mapping);
+          uint32_t           unwritten = 0;
+          int                firstUnwritten = -1;
+          for(uint32_t c = 0; c < numClusters; c++)
+          {
+            if(heads[c] == kSentinel)
+            {
+              unwritten++;
+              if(firstUnwritten < 0) firstUnwritten = int(c);
+            }
+          }
+          if(unwritten > 0)
+          {
+            LOGE("[TplWriteCheck] '%s': %u of %u template slots UNWRITTEN by the explicit build (first idx %d, base %u) "
+                 " *** INSTANTIATE WOULD SERVE RECYCLED FOREIGN BYTES AS TEMPLATE ***\n",
+                 data->name.c_str(), unwritten, numClusters, firstUnwritten, data->globalClusterBase);
+          }
+        }
+        impl.res.m_allocator.destroyBuffer(tplProbeHost);
       }
 
       if(success)
@@ -1949,6 +2096,8 @@ bool ClusterTemplateSystem::recordFrame(VkCommandBuffer                         
       auto* buildInfos =
           reinterpret_cast<VkClusterAccelerationStructureBuildTriangleClusterInfoNV*>(mapping + impl.ringSrcInfosOffset);
 
+      // NV-DXVK: [PathBIdProbe] first-offender guard for the per-frame direct-build path.
+      bool pbLoggedForeign = false;
       for(uint32_t c = 0; c < geometry.numClusters; c++)
       {
         const animatedclusters::shaderio::Cluster&                 cluster   = geometry.clusters[c];
@@ -1958,6 +2107,18 @@ bool ClusterTemplateSystem::recordFrame(VkCommandBuffer                         
 
         // REMIX: clusterID indexes the global animated cluster table
         buildInfo.clusterID     = geometry.globalClusterBase + c;
+
+        // NV-DXVK: [PathBIdProbe] DIAGNOSTIC (cpp-only). A direct-build id >=4096 is a
+        // Path-A-resident id in a Path B CLAS -> OUTCOME A (id assignment). See the
+        // template-build probe above for the A-vs-B logic.
+        if(geometry.globalClusterBase + c >= 4096u && !pbLoggedForeign)
+        {
+          pbLoggedForeign = true;
+          LOGE("[PathBIdProbe] DIRECT '%s' bakes FOREIGN clusterId=%u base=%u c=%u numClusters=%u "
+               "*** OUTCOME A (Path B id assignment) ***\n",
+               geometry.name.c_str(), geometry.globalClusterBase + c, geometry.globalClusterBase, c,
+               geometry.numClusters);
+        }
         buildInfo.vertexCount   = cluster.numVertices;
         buildInfo.triangleCount = cluster.numTriangles;
 
@@ -2004,6 +2165,14 @@ bool ClusterTemplateSystem::recordFrame(VkCommandBuffer                         
     const uint64_t dstBase = ringDstAddressesVa;
     const uint64_t dstEnd  = ringDstAddressesVa + sizeof(uint64_t) * uint64_t(totalClusters);
     uint32_t       zeroClasBase = 0, zeroTemplate = 0, zeroVertex = 0, zeroDst = 0, refOOB = 0;
+    // NV-DXVK: [AnimCapture] dstOOBuf - CLAS destination outside the pose's OWN clas
+    // buffer. Every entry-level TLAS validation is clean yet rays commit PATH A
+    // resident ClusterIDs (4096+) through Path B surfaces on the CURRENT TLAS - the
+    // last unchecked link is this one: a dst past the pose's clasBuffer (stale base /
+    // offset overflow / size mismatch) makes the instantiate WRITE into neighboring
+    // VMA memory (Path A CLAS pools - corrupting them, "surfaces missing") and the
+    // pose BLAS REFERENCE that foreign memory (the 4096+ ids).
+    uint32_t       dstOOBuf = 0;
     int            firstBadPose = -1, firstBadCluster = -1;
     uint32_t       scanOffset = 0;
     for(uint32_t p = 0; p < poseCount; p++)
@@ -2012,6 +2181,7 @@ bool ClusterTemplateSystem::recordFrame(VkCommandBuffer                         
       const Impl::PoseSet&      sposeSet = impl.poseSets[spose.poseSetId];
       const Impl::GeometryData& sgeom    = *impl.geometries[sposeSet.geometryIndex];
       const uint64_t            sclasBase = sposeSet.clasBuffers[ringIndex].address;
+      const uint64_t            sclasEnd  = sclasBase + sposeSet.clasBuffers[ringIndex].bufferSize;
 
       if(sclasBase == 0)             { zeroClasBase++; if(firstBadPose < 0) { firstBadPose = int(p); } }
       if(spose.positionsAddress == 0) { zeroVertex++;   if(firstBadPose < 0) { firstBadPose = int(p); } }
@@ -2023,9 +2193,24 @@ bool ClusterTemplateSystem::recordFrame(VkCommandBuffer                         
           zeroTemplate++;
           if(firstBadPose < 0) { firstBadPose = int(p); firstBadCluster = int(c); }
         }
-        if(dstAddresses[scanOffset + c] == 0)
+        const uint64_t dst = dstAddresses[scanOffset + c];
+        if(dst == 0)
         {
           zeroDst++;
+          if(firstBadPose < 0) { firstBadPose = int(p); firstBadCluster = int(c); }
+        }
+        else if(sclasBase != 0 && (dst < sclasBase || dst >= sclasEnd))
+        {
+          dstOOBuf++;
+          if(dstOOBuf == 1)
+          {
+            LOGE("[AnimCapture] dstOOBuf DETAIL: pose %u geom '%s' cluster %u/%u | dst 0x%llx NOT IN clasBuf 0x%llx..0x%llx "
+                 "(size %llu) | instantiationOffset %u sumInstantiationSizes %llu\n",
+                 p, sgeom.name.c_str(), c, sgeom.numClusters, (unsigned long long)dst, (unsigned long long)sclasBase,
+                 (unsigned long long)sclasEnd, (unsigned long long)sposeSet.clasBuffers[ringIndex].bufferSize,
+                 impl.config.useTemplates ? sgeom.instantiationOffsets[c] : 0u,
+                 (unsigned long long)sgeom.sumInstantiationSizes);
+          }
           if(firstBadPose < 0) { firstBadPose = int(p); firstBadCluster = int(c); }
         }
       }
@@ -2040,13 +2225,14 @@ bool ClusterTemplateSystem::recordFrame(VkCommandBuffer                         
       scanOffset += sgeom.numClusters;
     }
 
-    const bool bad = zeroClasBase || zeroTemplate || zeroVertex || zeroDst || refOOB;
+    const bool bad = zeroClasBase || zeroTemplate || zeroVertex || zeroDst || refOOB || dstOOBuf;
     if(bad)
     {
       LOGE("[AnimCapture] frame %u ringIdx %u poses %u totalClusters %u useTemplates %d | zeroClasBase %u zeroTemplate %u "
-           "zeroVertex %u zeroDst %u refOOB %u | firstBadPose %d firstBadCluster %d  *** NULL CLUSTER-BUILD ADDR ***\n",
+           "zeroVertex %u zeroDst %u refOOB %u dstOOBuf %u | firstBadPose %d firstBadCluster %d  *** BAD CLUSTER-BUILD ADDR%s ***\n",
            impl.frameCounter, ringIndex, poseCount, totalClusters, int(impl.config.useTemplates), zeroClasBase, zeroTemplate,
-           zeroVertex, zeroDst, refOOB, firstBadPose, firstBadCluster);
+           zeroVertex, zeroDst, refOOB, dstOOBuf, firstBadPose, firstBadCluster,
+           dstOOBuf ? " (dst OUTSIDE pose clasBuffer -> writes/reads foreign memory)" : "");
     }
     else if((impl.frameCounter % 256) == 0)
     {
@@ -2378,9 +2564,15 @@ uint64_t ClusterTemplateSystem::getClusterTableAddress() const
 // scene-TLAS mirror scan can validate every animated instance's BLAS ref against the
 // pools it is SUPPOSED to live in ([HeadWatch] can't: a ref recycled into another
 // system's registered pool matches a live pool and passes). Diagnostic - revert.
-uint32_t ClusterTemplateSystem::getPoseBlasPools(uint64_t* lo, uint64_t* hi, uint32_t maxCount) const
+uint32_t ClusterTemplateSystem::getPoseBlasPools(uint64_t* lo, uint64_t* hi, uint32_t maxCount, uint32_t* outFrameCounter) const
 {
   const Impl& impl = *m_impl;
+  if(outFrameCounter != nullptr)
+  {
+    // number of completed recordFrame calls; the LAST recorded frame used ring slot
+    // (frameCounter - 1) % kRingSlots and its pose BLASes live in that pool
+    *outFrameCounter = impl.frameCounter;
+  }
   uint32_t n = 0;
   for(const nvvk::Buffer& pool : impl.blasImplicitBuffers)
   {
@@ -2392,6 +2584,34 @@ uint32_t ClusterTemplateSystem::getPoseBlasPools(uint64_t* lo, uint64_t* hi, uin
     }
   }
   return n;
+}
+
+// Returns the TOTAL live-clasBuffer count (may exceed maxCount); writes only up to
+// maxCount so the caller can detect truncation and never trust a silently-capped result.
+uint32_t ClusterTemplateSystem::getPoseClasRanges(uint64_t* lo, uint64_t* hi, uint32_t maxCount) const
+{
+  const Impl& impl = *m_impl;
+  uint32_t total = 0;
+  for(const Impl::PoseSet& poseSet : impl.poseSets)
+  {
+    if(!poseSet.active)
+    {
+      continue;
+    }
+    for(const nvvk::Buffer& clasBuffer : poseSet.clasBuffers)
+    {
+      if(clasBuffer.buffer && clasBuffer.address)
+      {
+        if(total < maxCount)
+        {
+          lo[total] = clasBuffer.address;
+          hi[total] = clasBuffer.address + clasBuffer.bufferSize;
+        }
+        total++;
+      }
+    }
+  }
+  return total;
 }
 
 bool ClusterTemplateSystem::getStats(AnimatedStats& outStats) const

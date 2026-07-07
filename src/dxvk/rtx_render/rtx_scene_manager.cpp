@@ -2316,6 +2316,18 @@ namespace dxvk {
           surfaceIndex++;
         }
 
+        // NV-DXVK: [GhostSurface] parallel material entries for the ghost surface
+        // records (surfaceMaterials is indexed by surface index; ghosts occupy the
+        // slots right after the live surfaces - see AccelManager::uploadSurfaceData).
+        // Each ghost duplicates its instance's material.
+        for (const auto& ghost : m_accelManager.getGhostSurfaces()) {
+          const auto& gsurf = ghost.instance->surface;
+          assert(gsurf.surfaceMaterialIndex < m_surfaceMaterialCache.getObjectTable().size());
+          auto&& surfaceMaterial = m_surfaceMaterialCache.getObjectTable()[gsurf.surfaceMaterialIndex];
+          surfaceMaterial.writeGPUData(surfaceMaterialsGPUData.data(), dataOffset, surfaceIndex);
+          surfaceIndex++;
+        }
+
         if (m_startInMediumMaterialIndex_inCache != kInvalidMaterialCacheIndex) {
           auto&& surfaceMaterial = m_surfaceMaterialCache.getObjectTable()[m_startInMediumMaterialIndex_inCache];
           surfaceMaterial.writeGPUData(surfaceMaterialsGPUData.data(), dataOffset, surfaceIndex);

@@ -435,6 +435,28 @@ namespace dxvk {
     // reserved cluster TLAS slots per type this frame (AccelManager buffer sizing)
     uint32_t getClusterSlotCount(size_t tlasType) const;
 
+    // NV-DXVK: [GhostSurface] previous-TLAS rays hit LAST frame's BLAS for an instance
+    // but resolve it through THIS frame's surface (via surfaceMapping). When the
+    // instance's cluster-path affiliation changed between the frames (Path A <-> Path B,
+    // e.g. static geometry detected as deforming at load), the current surface's routing
+    // flags misdecode the old hit's committed ClusterID - the root of the foreign
+    // clusterId 4096+ resolves and the pre-guard VA=0 device-losts. The fix: for each
+    // transitioned instance, AccelManager appends a GHOST surface record (copy of the
+    // live surface with LAST frame's routing flags/geometryId) and points
+    // surfaceMapping[prevIdx] at it, so previous-frame hits decode with the semantics of
+    // the BLAS they actually hit. Ghosts are metadata only (no TLAS entry, one frame).
+    struct GhostSurfaceRequest {
+      RtInstance* instance = nullptr;
+      uint32_t prevSurfaceIndex = 0;
+      bool prevIsClusterLod = false;
+      bool prevIsClusterTemplate = false;
+      uint32_t prevClusterGeometryId = 0;
+    };
+
+    // clears this frame's ghost requests (call at the start of instance recording)
+    void beginInstanceRecording();
+    const std::vector<GhostSurfaceRequest>& getGhostSurfaceRequests() const { return m_ghostRequests; }
+
     // After AccelManager::prepareSceneData + dispatchPointInstancerCulling and
     // before buildTlas: records the per-frame cluster build (traversal, CLAS/BLAS,
     // instance_assign_blas) and copies the patched TlasInstances into
@@ -537,6 +559,26 @@ namespace dxvk {
     std::vector<VkAccelerationStructureInstanceKHR> m_slotInstanceDataB[Tlas::Count];
     std::vector<SssDuplicate> m_sssDuplicatesB;      // flat index into the B Opaque block
 
+    // NV-DXVK: [GhostSurface] per-instance cluster-path affiliation of the last recorded
+    // frame (1 = Path A, 2 = Path B) + the surface's clusterGeometryId at that time;
+    // recordClusterInstance compares against it to detect transitions. Entries pruned
+    // when stale (instance not cluster-recorded for a while).
+    struct PathAffiliation {
+      uint8_t path = 0;
+      uint32_t clusterGeometryId = 0;
+      uint32_t frame = 0;
+    };
+    std::unordered_map<const RtInstance*, PathAffiliation> m_pathAffiliation;
+    std::vector<GhostSurfaceRequest> m_ghostRequests;
+
+    // NV-DXVK: [PathCollision] per-frame posBufferIndex -> path (1=A,2=B). The persistent
+    // foreign-clusterId misroutes are a Path B surface committing a Path A resident
+    // ClusterID (4096+, impossible from Path B whose ids are <1794): the SAME geometry
+    // is present as BOTH a Path A resident instance and a Path B template instance this
+    // frame, colliding in the shared cluster TLAS region. If a posBufferIndex appears on
+    // both paths in one frame, that is the collision. Cleared each beginInstanceRecording.
+    std::unordered_map<uint32_t, uint8_t> m_posBufPathThisFrame;
+
     // NV-DXVK: [SceneAnimInstScan] crash-safe mirror of the animated OPAQUE cluster
     // instances AS FED INTO THE SCENE TLAS (patch-kernel output copied into
     // AccelManager's instance buffer, on the main render cmd). This is the ONLY
@@ -553,6 +595,9 @@ namespace dxvk {
     VkDeviceSize m_dbgSceneAnimInstStride = 0;
     uint32_t m_dbgSceneAnimInstCount[2] = {};
     uint32_t m_dbgSceneAnimInstFrame[2] = {};
+    // ring pool the capture's pose BLASes were built into (recorded at capture time so
+    // skipped recordFrames cannot skew the expected-pool comparison at scan time)
+    uint32_t m_dbgSceneAnimInstExpectedPool[2] = {};
     uint32_t m_dbgSceneAnimInstLastSlot = 0;
     bool m_dbgSceneAnimInstArmed = false;
     void dumpSceneAnimInstOnDeviceLost();

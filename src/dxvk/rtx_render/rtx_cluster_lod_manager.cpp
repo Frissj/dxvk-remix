@@ -30,6 +30,8 @@
 
 #include "rtx_cluster_lod_manager.h"
 #include "rtx_cluster_lod_geometry_provider.h"
+// NV-DXVK: [GhostSurface] SURFACE_INDEX_INVALID for the transition ghost requests
+#include "rtx/pass/common_binding_indices.h"
 #include "rtx_hashing.h"
 #include "rtx_accel_manager.h"
 #include "rtx_camera_manager.h"
@@ -1614,11 +1616,86 @@ namespace dxvk {
     return true;
   }
 
+  void ClusterLodManager::beginInstanceRecording() {
+    m_ghostRequests.clear();
+    m_posBufPathThisFrame.clear();
+
+    // prune affiliation entries for instances that stopped being cluster-recorded
+    // (destroyed or gone classic) so the map does not grow unboundedly
+    const uint32_t frameId = m_device->getCurrentFrameId();
+    if ((frameId % 512u) == 0u) {
+      for (auto it = m_pathAffiliation.begin(); it != m_pathAffiliation.end();) {
+        if (frameId - it->second.frame > 512u) {
+          it = m_pathAffiliation.erase(it);
+        } else {
+          ++it;
+        }
+      }
+    }
+  }
+
   void ClusterLodManager::recordClusterInstance(RtInstance* instance,
                                                 uint32_t geometryId,
                                                 size_t tlasType,
                                                 bool isSssDuplicate,
                                                 const VkAccelerationStructureInstanceKHR& blasInstance) {
+    // NV-DXVK: [GhostSurface] detect a cluster-path transition (A <-> B) on this
+    // instance. The previous-frame TLAS still holds its OLD path's BLAS, so a ghost
+    // surface with the OLD routing is requested for prev-TLAS hit decoding (see header).
+    // Only if the instance was recorded LAST frame (a gap means it is not in the
+    // previous TLAS) and has a previous surface index for the mapping to redirect.
+    {
+      const uint8_t currentPath = (geometryId & kPathBTag) ? 2u : 1u;
+      const uint32_t frameId = m_device->getCurrentFrameId();
+      PathAffiliation& aff = m_pathAffiliation[instance];
+      const uint32_t prevSurfaceIndex = instance->getPreviousSurfaceIndex();
+      if (aff.path != 0 && aff.path != currentPath && aff.frame + 1 == frameId
+          && prevSurfaceIndex != SURFACE_INDEX_INVALID) {
+        GhostSurfaceRequest req;
+        req.instance = instance;
+        req.prevSurfaceIndex = prevSurfaceIndex;
+        req.prevIsClusterLod = (aff.path == 1u);
+        req.prevIsClusterTemplate = (aff.path == 2u);
+        req.prevClusterGeometryId = aff.clusterGeometryId;
+        m_ghostRequests.push_back(req);
+
+        // NV-DXVK: [PathFlap] per-transition identity + direction. Repeated lines for
+        // the SAME inst with alternating direction = the routing ladder is FLAPPING
+        // (mutation classification / hash alternating between the deforming-B branch
+        // and the resident-A ladder) - the upstream disease behind the persistent
+        // foreign-clusterId misroutes ([ClusterDecodeProbe] posBufferIndex cross-links
+        // to posBuf here). Throttled; diagnostic - revert.
+        static uint32_t s_flapLogs = 0;
+        if (s_flapLogs < 200) {
+          s_flapLogs++;
+          Logger::info(str::format("[PathFlap] inst=", instance,
+                                   " dir=", (aff.path == 1u ? "A->B" : "B->A"),
+                                   " posBuf=", uint32_t(instance->surface.positionBufferIndex),
+                                   " prevIdx=", prevSurfaceIndex, " frame=", frameId));
+        }
+      }
+      aff.path = currentPath;
+      aff.frame = frameId;
+      // clusterGeometryId refreshed below by the per-path branches (0 for Path B)
+      aff.clusterGeometryId = 0;
+
+      // NV-DXVK: [PathCollision] same geometry (posBufferIndex) on BOTH paths this frame?
+      const uint32_t posBuf = uint32_t(instance->surface.positionBufferIndex);
+      auto pcIt = m_posBufPathThisFrame.find(posBuf);
+      if (pcIt != m_posBufPathThisFrame.end() && pcIt->second != currentPath) {
+        static uint32_t s_collisionLogs = 0;
+        if (s_collisionLogs < 100) {
+          s_collisionLogs++;
+          Logger::err(str::format("[PathCollision] posBuf=", posBuf,
+                                  " present on BOTH Path A AND Path B this frame (frame ", frameId,
+                                  ") - Path B surface can commit the resident Path A ClusterID (4096+)"
+                                  "  *** SAME GEOMETRY DUAL-ROUTED ***"));
+        }
+      } else {
+        m_posBufPathThisFrame[posBuf] = currentPath;
+      }
+    }
+
     // ---- P4b Path B (cluster templates) ----
     if (geometryId & kPathBTag) {
       const uint32_t framePoseIndex = geometryId & ~kPathBTag;
@@ -1691,6 +1768,10 @@ namespace dxvk {
     instance->surface.isClusterLod = true;
     instance->surface.isClusterTemplate = false;
     instance->surface.clusterGeometryId = plainGeometryId | (promoStateSlotPlusOne << 18);
+
+    // NV-DXVK: [GhostSurface] remember the Path A decode id for a potential A->B
+    // transition ghost next frame
+    m_pathAffiliation[instance].clusterGeometryId = instance->surface.clusterGeometryId;
   }
 
   uint32_t ClusterLodManager::getClusterSlotCount(size_t tlasType) const {
@@ -1977,6 +2058,29 @@ namespace dxvk {
     const uint32_t countB = numOpaqueB + numUnorderedB;
     const uint32_t poseCount = uint32_t(m_framePoses.size());
 
+    // NV-DXVK: [ClusterSlotReserve] DIAGNOSTIC (cpp-only). Confirm the foreign-ClusterID
+    // root: the TLAS is built over m_clusterSlotsPerType[type] slots, but this frame only
+    // Path A (m_slots) + Path B (m_slotsB) slots are written. If reserved > written, the
+    // tail slots keep last frame's bytes -> recycled blasReference -> a Path B surface
+    // commits a Path A resident CLAS (id 4096+). Fires only on the mismatching frames;
+    // cross-reference the frame number against the [ClusterDecodeProbe] symptom frames.
+    {
+      const uint32_t reservedOpaque = accelManager.getClusterSlotCount(Tlas::Opaque);
+      const uint32_t reservedUnordered = accelManager.getClusterSlotCount(Tlas::Unordered);
+      const uint32_t writtenOpaque = uint32_t(m_slots[Tlas::Opaque].size()) + numOpaqueB;
+      const uint32_t writtenUnordered = uint32_t(m_slots[Tlas::Unordered].size()) + numUnorderedB;
+      if (reservedOpaque != writtenOpaque || reservedUnordered != writtenUnordered) {
+        Logger::err(str::format(
+          "[ClusterSlotReserve] frame ", m_device->getCurrentFrameId(),
+          " STALE TAIL: opaque reserved=", reservedOpaque, " written=", writtenOpaque,
+          " (A=", m_slots[Tlas::Opaque].size(), " B=", numOpaqueB, ")",
+          " | unordered reserved=", reservedUnordered, " written=", writtenUnordered,
+          " (A=", m_slots[Tlas::Unordered].size(), " B=", numUnorderedB, ")",
+          " -> ", (reservedOpaque - writtenOpaque), " opaque + ", (reservedUnordered - writtenUnordered),
+          " unordered stale slots traversed with recycled blasReference"));
+      }
+    }
+
     // stats latch (see dispatchBuild)
     m_statsSlotsPathB = countB;
 
@@ -2090,19 +2194,20 @@ namespace dxvk {
 
     ctx->getCommandList()->trackResource<DxvkAccess::Write>(instanceBuffer);
 
-    // NV-DXVK: [SceneAnimInstScan] mirror the animated OPAQUE instances exactly as fed
-    // into the scene TLAS above - same source, same main cmd, so the mirror lands
-    // before the reflection-PSR trace that faults, and the device-lost hook dumps it.
-    // The opaque animated instances are the first numOpaqueB of sourceBuffer (srcOffset 0,
-    // matching the Opaque copy region built above). Diagnostic - revert.
-    if (numOpaqueB > 0) {
+    // NV-DXVK: [SceneAnimInstScan] mirror ALL animated instances (OPAQUE block then
+    // UNORDERED block, contiguous in sourceBuffer starting at srcOffset 0) exactly as
+    // fed into the scene TLAS above - same source, same main cmd; device-lost hook
+    // dumps it. The unordered block was a blind spot: the persistent foreign-clusterId
+    // probe hits track translucent geometries ("surfaces missing sometimes").
+    // Diagnostic - revert.
+    if (countB > 0) {
       const uint32_t frameId = m_device->getCurrentFrameId();
       const uint32_t curSlot = frameId & 1u;
 
       // live scan of the OTHER slot (completed last frame) BEFORE overwriting meta
       scanSceneAnimInstMirror(curSlot ^ 1u);
 
-      const VkDeviceSize needStride = kInstanceSize * VkDeviceSize(numOpaqueB);
+      const VkDeviceSize needStride = kInstanceSize * VkDeviceSize(countB);
       if (m_dbgSceneAnimInstHost == nullptr || m_dbgSceneAnimInstStride < needStride) {
         // grow-only stride (already kInstanceSize-aligned); 2x headroom halves realloc churn
         m_dbgSceneAnimInstStride = needStride * 2;
@@ -2120,11 +2225,19 @@ namespace dxvk {
       VkBufferCopy mr;
       mr.srcOffset = 0;
       mr.dstOffset = mirrorSlice.offset + m_dbgSceneAnimInstStride * curSlot;
-      mr.size = kInstanceSize * VkDeviceSize(numOpaqueB);
+      mr.size = kInstanceSize * VkDeviceSize(countB);
       m_device->vkd()->vkCmdCopyBuffer(cmd, sourceBuffer, mirrorSlice.handle, 1, &mr);
       ctx->getCommandList()->trackResource<DxvkAccess::Write>(m_dbgSceneAnimInstHost);
-      m_dbgSceneAnimInstCount[curSlot] = numOpaqueB;
+      m_dbgSceneAnimInstCount[curSlot] = countB;
       m_dbgSceneAnimInstFrame[curSlot] = frameId;
+      // remember which ring pool THIS capture's patch targeted (recordFrame for this
+      // frame just completed, so its ring slot = (counter - 1) % poolCount)
+      {
+        uint64_t tmpLo[8], tmpHi[8];
+        uint32_t fc = 0;
+        const uint32_t pc = m_templateSystemMT != nullptr ? m_templateSystemMT->getPoseBlasPools(tmpLo, tmpHi, 8, &fc) : 0;
+        m_dbgSceneAnimInstExpectedPool[curSlot] = pc > 0 ? (fc + pc - 1u) % pc : 0u;
+      }
       m_dbgSceneAnimInstLastSlot = curSlot;
       if (!m_dbgSceneAnimInstArmed) {
         m_dbgSceneAnimInstArmed = true;
@@ -2151,14 +2264,53 @@ namespace dxvk {
     }
 
     uint64_t poolLo[8], poolHi[8];
-    const uint32_t poolCount = m_templateSystemMT->getPoseBlasPools(poolLo, poolHi, 8);
+    uint32_t animFrameCounter = 0;
+    const uint32_t poolCount = m_templateSystemMT->getPoseBlasPools(poolLo, poolHi, 8, &animFrameCounter);
     if (poolCount == 0) {
       return;
     }
+    // the capture's entries were patched into the ring pool recorded at CAPTURE time
+    // (immune to skipped recordFrames). A ref inside a DIFFERENT ring pool passed the
+    // old any-pool check while being STALE - a 1..3-frame-old patch whose pose set may
+    // already be gone (CLAS memory recycled -> the foreign clusterId 4096+ hits on
+    // TLAS=CURRENT).
+    (void)animFrameCounter;
+    const uint32_t expectedPool = m_dbgSceneAnimInstExpectedPool[slot] % poolCount;
 
-    uint32_t outside = 0, zeroVisible = 0;
-    int firstBad = -1;
-    uint64_t firstBadRef = 0;
+    // NV-DXVK: [ClasAlias] this frame's Path A resident/low-detail CLAS ranges. The
+    // decisive test: if a Path B pose ref (or the pose pools themselves) fall inside
+    // Path A CLAS memory, the allocator handed the same physical bytes to both paths
+    // -> a Path B surface commits a Path A resident CLAS (foreign clusterId 4096+).
+    // Path A ranges are few (resident + low-detail + append buffers); 64 covers them
+    // with headroom. The accessor returns the TOTAL so truncation is still detected.
+    constexpr uint32_t kPaCap = 64;
+    uint64_t paLo[kPaCap], paHi[kPaCap];
+    const uint32_t paTotal = m_renderSystem != nullptr
+      ? m_renderSystem->getPathAClasRanges(paLo, paHi, kPaCap) : 0;
+    const uint32_t paCount = std::min(paTotal, kPaCap);
+
+    // [ClasAlias] the Path B CLAS-content buffers (where baked clusterIDs live and what
+    // pose BLASes reference) - NOT the BLAS pools. Overlap with Path A CLAS memory is the
+    // direct test for the foreign clusterId 4096+. These number in the thousands, so
+    // size exactly via the two-call pattern (maxCount 0 -> writes nothing, returns total).
+    const uint32_t poseClasTotal = m_templateSystemMT != nullptr
+      ? m_templateSystemMT->getPoseClasRanges(nullptr, nullptr, 0) : 0;
+    std::vector<uint64_t> poseClasLo(poseClasTotal), poseClasHi(poseClasTotal);
+    if (poseClasTotal > 0) {
+      m_templateSystemMT->getPoseClasRanges(poseClasLo.data(), poseClasHi.data(), poseClasTotal);
+    }
+    const uint32_t poseClasCount = poseClasTotal;  // full coverage, no cap
+    const bool clasRangesTruncated = (paTotal > kPaCap);
+
+    uint32_t outside = 0, zeroVisible = 0, wrongSlot = 0;
+    int firstBad = -1, firstWrong = -1;
+    uint64_t firstBadRef = 0, firstWrongRef = 0;
+    uint32_t firstWrongPool = 0, firstWrongCustom = 0;
+    // [ClasAlias] refs whose blasReference lands inside a Path A CLAS range
+    uint32_t refInPathA = 0;
+    int firstPathAInst = -1;
+    uint64_t firstPathARef = 0;
+    uint32_t firstPathACustom = 0;
     for (uint32_t i = 0; i < m_dbgSceneAnimInstCount[slot]; i++) {
       const uint64_t ref = inst[i].accelerationStructureReference;
       if (ref == 0) {
@@ -2168,13 +2320,49 @@ namespace dxvk {
         }
         continue;
       }
-      bool inPool = false;
+      int poolIdx = -1;
       for (uint32_t p = 0; p < poolCount; p++) {
-        if (ref >= poolLo[p] && ref < poolHi[p]) { inPool = true; break; }
+        if (ref >= poolLo[p] && ref < poolHi[p]) { poolIdx = int(p); break; }
       }
-      if (!inPool) {
+      if (poolIdx < 0) {
         outside++;
         if (firstBad < 0) { firstBad = int(i); firstBadRef = ref; }
+      } else if (uint32_t(poolIdx) != expectedPool) {
+        wrongSlot++;
+        if (firstWrong < 0) {
+          firstWrong = int(i);
+          firstWrongRef = ref;
+          firstWrongPool = uint32_t(poolIdx);
+          firstWrongCustom = inst[i].instanceCustomIndex;
+        }
+      }
+
+      // [ClasAlias] independent of pool bookkeeping: does this ref point into
+      // Path A CLAS memory? (a BLAS ref should never live in a CLAS heap - if it
+      // does, pose-BLAS and resident-CLAS allocations alias.)
+      for (uint32_t r = 0; r < paCount; r++) {
+        if (ref >= paLo[r] && ref < paHi[r]) {
+          refInPathA++;
+          if (firstPathAInst < 0) {
+            firstPathAInst = int(i);
+            firstPathARef = ref;
+            firstPathACustom = inst[i].instanceCustomIndex;
+          }
+          break;
+        }
+      }
+    }
+
+    if (wrongSlot > 0) {
+      static uint32_t s_wrongLogs = 0;
+      if (s_wrongLogs < 40 || (m_dbgSceneAnimInstFrame[slot] % 64) == 0) {
+        s_wrongLogs++;
+        Logger::err(str::format(
+          "[SceneAnimInstScan] frame ", m_dbgSceneAnimInstFrame[slot], ": ", wrongSlot, " ref(s) in the WRONG ring pool",
+          " (expected pool ", expectedPool, ") of ", m_dbgSceneAnimInstCount[slot],
+          " | first inst ", firstWrong, " custom=", firstWrongCustom,
+          " ref=0x", std::hex, firstWrongRef, std::dec, " pool ", firstWrongPool,
+          "  *** STALE PATCH - entry not re-patched this frame ***"));
       }
     }
 
@@ -2193,7 +2381,67 @@ namespace dxvk {
       if (m_dbgSceneAnimInstFrame[slot] >= s_lastCleanFrame + 300) {
         s_lastCleanFrame = m_dbgSceneAnimInstFrame[slot];
         Logger::info(str::format("[SceneAnimInstScan] frame ", m_dbgSceneAnimInstFrame[slot], ": ",
-                                 m_dbgSceneAnimInstCount[slot], " animated opaque refs all inside pose-BLAS pools"));
+                                 m_dbgSceneAnimInstCount[slot], " animated (opaque+unordered) refs all inside pose-BLAS pools"));
+      }
+    }
+
+    // NV-DXVK: [ClasAlias] verdict - does Path B pose memory share bytes with Path A
+    // CLAS memory? Overlap = poolLo < paHi && paLo < poolHi.
+    {
+      uint32_t poolOverlapsPathA = 0;
+      int firstOverlapPool = -1, firstOverlapRange = -1;
+      for (uint32_t p = 0; p < poolCount; p++) {
+        for (uint32_t r = 0; r < paCount; r++) {
+          if (poolLo[p] < paHi[r] && paLo[r] < poolHi[p]) {
+            poolOverlapsPathA++;
+            if (firstOverlapPool < 0) { firstOverlapPool = int(p); firstOverlapRange = int(r); }
+          }
+        }
+      }
+      // the decisive one: Path B CLAS-content buffers vs Path A CLAS memory
+      uint32_t clasOverlapsPathA = 0;
+      int firstClasBuf = -1, firstClasRange = -1;
+      for (uint32_t c = 0; c < poseClasCount; c++) {
+        for (uint32_t r = 0; r < paCount; r++) {
+          if (poseClasLo[c] < paHi[r] && paLo[r] < poseClasHi[c]) {
+            clasOverlapsPathA++;
+            if (firstClasBuf < 0) { firstClasBuf = int(c); firstClasRange = int(r); }
+          }
+        }
+      }
+      if (refInPathA > 0 || poolOverlapsPathA > 0 || clasOverlapsPathA > 0) {
+        static uint32_t s_aliasLogs = 0;
+        if (s_aliasLogs < 40 || (m_dbgSceneAnimInstFrame[slot] % 64) == 0) {
+          s_aliasLogs++;
+          Logger::err(str::format(
+            "[ClasAlias] frame ", m_dbgSceneAnimInstFrame[slot],
+            ": ", refInPathA, " anim ref(s) INSIDE Path A CLAS memory (first inst ", firstPathAInst,
+            " custom=", firstPathACustom, " ref=0x", std::hex, firstPathARef, std::dec, ")",
+            " | ", poolOverlapsPathA, " pose-pool/Path-A OVERLAP(s) (pool ", firstOverlapPool,
+            " range ", firstOverlapRange, ")",
+            " | ", clasOverlapsPathA, " pose-CLASbuf/Path-A OVERLAP(s) (clasBuf ", firstClasBuf,
+            " range ", firstClasRange, ") paRanges=", paCount, "/", paTotal,
+            " poseClasRanges=", poseClasCount, "/", poseClasTotal,
+            "  *** ALLOCATOR ALIASING: Path B CLAS memory == Path A CLAS memory -> foreign clusterId 4096+ ***"));
+        }
+      } else if (clasRangesTruncated) {
+        // a "clean" result here would be UNSOUND - we didn't check every range
+        static uint32_t s_truncLogs = 0;
+        if (s_truncLogs < 40 || (m_dbgSceneAnimInstFrame[slot] % 64) == 0) {
+          s_truncLogs++;
+          Logger::err(str::format(
+            "[ClasAlias] frame ", m_dbgSceneAnimInstFrame[slot], ": RANGE LIST TRUNCATED - checked ",
+            paCount, "/", paTotal, " Path A and ", poseClasCount, "/", poseClasTotal,
+            " pose-CLAS ranges; overlap verdict UNRELIABLE, raise the cap"));
+        }
+      } else if (paCount > 0) {
+        static uint32_t s_aliasCleanFrame = 0;
+        if (m_dbgSceneAnimInstFrame[slot] >= s_aliasCleanFrame + 300) {
+          s_aliasCleanFrame = m_dbgSceneAnimInstFrame[slot];
+          Logger::info(str::format(
+            "[ClasAlias] frame ", m_dbgSceneAnimInstFrame[slot], ": clean - no pose ref/pool/CLASbuf in Path A memory (ALL ",
+            paTotal, " Path A, ", poseClasTotal, " pose-CLAS ranges checked) -> aliasing REFUTED; foreign clusterId is a routing bug"));
+        }
       }
     }
   }
@@ -2233,7 +2481,7 @@ namespace dxvk {
       }
     }
     Logger::err(str::format("[SceneAnimInstScan] ", zeros, " of ", count,
-      " animated opaque instances have NULL blasReference (compare non-null refs to [AnimTlasCapture] pool ranges) ==== dump end ===="));
+      " animated (opaque+unordered) instances have NULL blasReference (compare non-null refs to [AnimTlasCapture] pool ranges) ==== dump end ===="));
   }
 
   uint64_t ClusterLodManager::getGeometriesTableAddress() const {

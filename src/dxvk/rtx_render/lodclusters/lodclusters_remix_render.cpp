@@ -1063,6 +1063,16 @@ uint64_t ClusterRenderSystem::getGeometriesTableAddress() const
   return impl.rscene->getShaderGeometriesBuffer().address;
 }
 
+uint32_t ClusterRenderSystem::getPathAClasRanges(uint64_t* lo, uint64_t* hi, uint32_t maxCount) const
+{
+  Impl& impl = *m_impl;
+  if(!impl.renderer)
+  {
+    return 0;
+  }
+  return impl.renderer->getDbgClasRanges(lo, hi, maxCount);
+}
+
 uint64_t ClusterRenderSystem::getPromotionStateAddress() const
 {
   // 96 B per slot: M rows (row-major 3x4) at +0, prevM rows at +48

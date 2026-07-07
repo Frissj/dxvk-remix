@@ -1933,7 +1933,10 @@ namespace dxvk {
             // badKind 3 packs the surface's positionBufferIndex in bits [23:8] (see
             // clusterTemplateGetTriangleIndices); kinds 1/2 use the raw value.
             const uint32_t badKindRaw = uint32_t(wd.z);
-            const uint32_t badKind = badKindRaw & 0xFFu;
+            // bit 7 of the badKind byte = the hit came from the PREVIOUS TLAS
+            // (usePreviousPositions visibility ray) - the prev-vs-current discriminator
+            const bool prevTlasHit = (badKindRaw & 0x80u) != 0;
+            const uint32_t badKind = badKindRaw & 0x7Fu;
             if (badKind == 5u) {
               // template hit with a NULL Path B table binding (raytrace args lost the table)
               Logger::err(str::format(
@@ -1953,13 +1956,14 @@ namespace dxvk {
               // rayquery). pad[0]=table entry value (0), pad[1]=cluster-table base low32.
               Logger::err(str::format(
                 "[ClusterDecodeProbe] Path B (animated) null cluster-table entry: clusterId=", uint32_t(wd.y),
+                " TLAS=", (prevTlasHit ? "PREV" : "CURRENT"),
                 " surfClusterGeomId=0x", std::hex, uint32_t(wd.x), std::dec,
                 " posBufferIndex=", posBufferIndex,
                 " tracedTable=0x", std::hex, tracedTableAddr,
                 " currentTable=0x", currentTableAddr, std::dec,
                 (tracedTableAddr != currentTableAddr && currentTableAddr != 0 ? "  *** STALE TABLE BINDING ***" : ""),
                 " primitiveIndex=", uint32_t(wd.w), " frame=", probe->frameIndex,
-                "  -> foreign ClusterID in Path B table; surfClusterGeomId!=0 = transitioned Path A surface"));
+                "  -> foreign ClusterID in Path B table (PREV = ghost-mapping hole, CURRENT = TLAS entry bug)"));
             } else {
               const char* kind = (badKind == 1) ? "clusterAddress==0 (cluster not resident)"
                                : (badKind == 2) ? "clusterAddress garbage (insane offsets -> line 58 OOB)"

@@ -66,6 +66,22 @@ public:
   // NV-DXVK: Remix-facing accessors (see ClusterLodManager)
   virtual const nvvk::Buffer& getTlasInstancesBuffer() const override { return m_tlasInstancesBuffer; }
 
+  // NV-DXVK: [ClasAlias] DIAGNOSTIC. Expose this frame's Path A CLAS ranges
+  // (m_dbgClasRanges, populated each recordFrame from sceneStreaming.appendClasRanges).
+  // Returns the TOTAL range count (may exceed maxCount); writes only up to maxCount
+  // so the caller can detect truncation and never trust a silently-capped result.
+  virtual uint32_t getDbgClasRanges(uint64_t* lo, uint64_t* hi, uint32_t maxCount) const override {
+    uint32_t written = 0;
+    for (const std::pair<uint64_t, uint64_t>& range : m_dbgClasRanges) {
+      if (written < maxCount) {
+        lo[written] = range.first;
+        hi[written] = range.second;
+        written++;
+      }
+    }
+    return uint32_t(m_dbgClasRanges.size());
+  }
+
   // NV-DXVK P2.5: whether the init-time sizing still fits the (appended-to)
   // scene: geometry capacity for the sharing buffers and the per-BLAS cluster
   // maximum the BLAS pool and scratch were sized with.

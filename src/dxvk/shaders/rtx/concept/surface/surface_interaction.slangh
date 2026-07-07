@@ -276,8 +276,10 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
       // Path A id surfacing in the null-table probe identifies a transitioned instance.
       // Masked to the 18-bit geometry index: the probe packs through float (24-bit mantissa).
       surface.clusterGeometryId & 0x3FFFF,
-      // geometry fingerprint valid on Path B surfaces (classic buffer indices stay live)
-      surface.positionBufferIndex);
+      // geometry fingerprint (bits 15:0) + THE ONE-BIT DISCRIMINATOR (bit 16):
+      // usePreviousPositions marks previous-TLAS visibility hits - tells us which TLAS
+      // the misrouted hit was traced from (prev = ghost-mapping hole, current = entry bug)
+      (surface.positionBufferIndex & 0xFFFFu) | (usePreviousPositions ? 0x10000u : 0u));
   }
 
   // Compute vertex indicies

@@ -186,6 +186,12 @@ public:
   uint32_t getMaxTraversalTasks() const { return m_maxTraversalTasks; }
   uint32_t getMaxBlasBuilds() const { return m_maxBlasBuilds; }
 
+  // NV-DXVK: [ClasAlias] DIAGNOSTIC. This frame's Path A resident + low-detail CLAS
+  // memory ranges (lo/hi pairs), captured in the LOD renderer's recordFrame. Empty
+  // unless the LOD renderer overrides. Used to test whether Path B pose pools share
+  // physical memory with Path A CLAS (allocator aliasing -> foreign clusterId 4096+).
+  virtual uint32_t getDbgClasRanges(uint64_t* lo, uint64_t* hi, uint32_t maxCount) const { return 0; }
+
   // NV-DXVK: Remix uploads the per-frame shaderio::RenderInstance array into
   // this buffer (sized for config.maxRenderInstances at init).
   const nvvk::Buffer& getRenderInstanceBuffer() const { return m_renderInstanceBuffer; }

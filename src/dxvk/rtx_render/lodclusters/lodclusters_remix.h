@@ -566,6 +566,10 @@ namespace lodclusters_remix {
     // Remix's hit-side cluster fetch (raytrace_args)
     uint64_t getGeometriesTableAddress() const;
 
+    // NV-DXVK: [ClasAlias] DIAGNOSTIC. This frame's Path A resident/low-detail CLAS
+    // memory ranges (lo/hi pairs). Returns the count written (<= maxCount).
+    uint32_t getPathAClasRanges(uint64_t* lo, uint64_t* hi, uint32_t maxCount) const;
+
     // ---- P4c rigid-capture promotion (plan 7.7 spec) ----
 
     // fixed number of persistent promotion state slots (system scope -
@@ -764,8 +768,16 @@ namespace lodclusters_remix {
     uint64_t getClusterTableAddress() const;
 
     // NV-DXVK: [SceneAnimInstScan] current pose-BLAS ring pool ranges (lo/hi per pool,
-    // up to maxCount); returns the count written. Diagnostic - revert.
-    uint32_t getPoseBlasPools(uint64_t* lo, uint64_t* hi, uint32_t maxCount) const;
+    // up to maxCount, ring order); returns the count written. outFrameCounter (optional)
+    // receives the completed-recordFrame count - the last recorded frame's pose BLASes
+    // live in pool (count-1) % kRingSlots. Diagnostic - revert.
+    uint32_t getPoseBlasPools(uint64_t* lo, uint64_t* hi, uint32_t maxCount, uint32_t* outFrameCounter = nullptr) const;
+
+    // NV-DXVK: [ClasAlias] ranges of every live pose-set CLAS buffer (across all ring
+    // slots) - the memory the instantiated Path B CLAS (with baked clusterID) live in,
+    // and the memory a pose BLAS references. Overlap with Path A CLAS memory = the
+    // foreign clusterId 4096+ root. Returns the count written. Diagnostic - revert.
+    uint32_t getPoseClasRanges(uint64_t* lo, uint64_t* hi, uint32_t maxCount) const;
 
     bool getStats(AnimatedStats& outStats) const;
 

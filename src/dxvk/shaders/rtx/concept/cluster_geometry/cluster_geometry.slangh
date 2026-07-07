@@ -332,7 +332,10 @@ uint3 clusterTemplateGetTriangleIndices(uint64_t tableAddress, uint clusterId, u
     // pad[0] would hold the table entry's low bits - always 0 here, so pass the table
     // address HIGH 32 bits instead: pad[0]+pad[1] = the full 64-bit table address the
     // hit actually read, comparable CPU-side against the manager's current table.
-    clusterGeometryLogBad(3u | ((dbgPosBufferIndex & 0xFFFFu) << 8), dbgSurfaceGeomId, clusterId,
+    // dbgPosBufferIndex bit 16 = prev-TLAS hit (usePreviousPositions) -> badKind bit 7,
+    // keeping the packed value < 2^24 so the float encoding stays exact.
+    const uint prevTlasBit = (dbgPosBufferIndex & 0x10000u) != 0 ? 0x80u : 0u;
+    clusterGeometryLogBad(3u | prevTlasBit | ((dbgPosBufferIndex & 0xFFFFu) << 8), dbgSurfaceGeomId, clusterId,
                           tableAddress >> 32, tableAddress, primitiveIndex);
     return uint3(0, 0, 0);
   }

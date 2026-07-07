@@ -666,6 +666,13 @@ namespace dxvk {
       mergedInst.clear();
     }
 
+    // NV-DXVK: [GhostSurface] fresh transition tracking for this frame's routing
+    m_ghostSurfaces.clear();
+    m_ghostSourceClusterLod = clusterLodManager;
+    if (clusterLodManager != nullptr) {
+      clusterLodManager->beginInstanceRecording();
+    }
+
     if (instances.size() > CUSTOM_INDEX_SURFACE_MASK) {
       ONCE(Logger::err(str::format("DxvkRaytrace: instance count (", instances.size(),
         ") exceeds the maximum surface index (", CUSTOM_INDEX_SURFACE_MASK,
@@ -1713,8 +1720,37 @@ namespace dxvk {
     auto& surfacesGPUData = uploadSurfaceDataFuncState.surfacesGPUData;
     auto& surfaceIndexMapping = uploadSurfaceDataFuncState.surfaceIndexMapping;
 
-    // Surface buffer
-    const auto surfacesGPUSize = m_reorderedSurfaces.size() * kSurfaceGPUSize;
+    // NV-DXVK: [GhostSurface] resolve this frame's cluster-path transition requests
+    // (recorded during mergeInstancesIntoBlas routing) into ghost records appended
+    // after the live surfaces. Note: with cluster LOD active the fast-skip path is
+    // disabled, so this rebuild (and the mapping redirect below) runs every frame -
+    // a ghost lives exactly one frame.
+    m_ghostSurfaces.clear();
+    if (m_ghostSourceClusterLod != nullptr) {
+      for (const auto& req : m_ghostSourceClusterLod->getGhostSurfaceRequests()) {
+        GhostSurface ghost;
+        ghost.instance = req.instance;
+        ghost.prevSurfaceIndex = req.prevSurfaceIndex;
+        ghost.isClusterLod = req.prevIsClusterLod;
+        ghost.isClusterTemplate = req.prevIsClusterTemplate;
+        ghost.clusterGeometryId = req.prevClusterGeometryId;
+        m_ghostSurfaces.push_back(ghost);
+      }
+      if (!m_ghostSurfaces.empty()) {
+        // throttled: proves the fix is exercising (transitions occurred and ghosts were
+        // emitted) - pairs with [ClusterDecodeProbe] going silent as the acceptance test
+        static uint32_t s_ghostLogs = 0;
+        if (s_ghostLogs < 20) {
+          s_ghostLogs++;
+          Logger::info(str::format("[GhostSurface] ", m_ghostSurfaces.size(),
+                                   " cluster-path transition(s) this frame -> ghost surface records appended, "
+                                   "first prevIdx ", m_ghostSurfaces[0].prevSurfaceIndex));
+        }
+      }
+    }
+
+    // Surface buffer (live surfaces + one appended record per ghost)
+    const auto surfacesGPUSize = (m_reorderedSurfaces.size() + m_ghostSurfaces.size()) * kSurfaceGPUSize;
 
     // Allocate the instance buffer and copy its contents from host to device memory
     // STORAGE_BUFFER_BIT is required for the GPU PointInstancer culling shader
@@ -1752,11 +1788,32 @@ namespace dxvk {
 
       // Find the size of the surface mapping buffer
       // Skip SURFACE_INDEX_INVALID (new instances with no previous-frame data) to avoid
-      // oversizing the mapping vector 
+      // oversizing the mapping vector
       const uint32_t prevIdx = currentInstance.getPreviousSurfaceIndex();
       if (prevIdx != SURFACE_INDEX_INVALID) {
         maxPreviousSurfaceIndex = std::max(maxPreviousSurfaceIndex, prevIdx);
       }
+    }
+
+    // NV-DXVK: [GhostSurface] serialize the ghost records after the live surfaces: a
+    // copy of the transitioned instance's LIVE surface (same geometry buffers, same
+    // material, current transforms) with LAST frame's cluster routing restored, so a
+    // previous-TLAS hit on the old-path BLAS decodes with the semantics it was built
+    // with. Only reachable through the surfaceMapping redirect below.
+    for (uint32_t g = 0; g < uint32_t(m_ghostSurfaces.size()); ++g) {
+      const GhostSurface& ghost = m_ghostSurfaces[g];
+      RtSurface ghostSurface = ghost.instance->surface;
+      ghostSurface.isClusterLod = ghost.isClusterLod;
+      ghostSurface.isClusterTemplate = ghost.isClusterTemplate;
+      ghostSurface.clusterGeometryId = ghost.clusterGeometryId;
+
+      // same split-geometry firstIndex fixup the live record got
+      const uint32_t liveIndex = ghost.instance->getSurfaceIndex();
+      if (liveIndex < m_reorderedSurfacesFirstIndexOffset.size()) {
+        ghostSurface.firstIndex += m_reorderedSurfacesFirstIndexOffset[liveIndex];
+      }
+
+      ghostSurface.writeGPUData(surfacesGPUData.data(), dataOffset, m_reorderedSurfaces.size() + g);
     }
 
     // The GPU's SharedSurfaceIndex texture may reference any surface index from the
@@ -1766,7 +1823,9 @@ namespace dxvk {
     if (previousFrameSurfaceCount > 0) {
       maxPreviousSurfaceIndex = std::max(maxPreviousSurfaceIndex, previousFrameSurfaceCount - 1);
     }
-    previousFrameSurfaceCount = static_cast<uint32_t>(m_reorderedSurfaces.size());
+    // NV-DXVK: [GhostSurface] ghosts occupy indices beyond the live surfaces; include
+    // them so next frame's mapping covers any GPU-side reference to a ghost index
+    previousFrameSurfaceCount = static_cast<uint32_t>(m_reorderedSurfaces.size() + m_ghostSurfaces.size());
 
     assert(dataOffset == surfacesGPUSize);
     assert(surfacesGPUData.size() == surfacesGPUSize);
@@ -1802,6 +1861,18 @@ namespace dxvk {
           surfaceIndexMapping[surface.getPreviousSurfaceIndex()] = surfaceIndex;
         }
         surface.setPreviousSurfaceIndex(surfaceIndex);
+      }
+    }
+
+    // NV-DXVK: [GhostSurface] redirect the transitioned instances' previous-frame
+    // indices to their ghost records (overrides the live-index assignment the loop
+    // above just made): previous-TLAS hits on the OLD path's BLAS must decode with
+    // the OLD routing, which only the ghost carries. Next frame the mapping is
+    // rebuilt without the redirect (the ghost expires with it).
+    for (uint32_t g = 0; g < uint32_t(m_ghostSurfaces.size()); ++g) {
+      const uint32_t prevIdx = m_ghostSurfaces[g].prevSurfaceIndex;
+      if (prevIdx < surfaceIndexMapping.size()) {
+        surfaceIndexMapping[prevIdx] = uint32_t(m_reorderedSurfaces.size()) + g;
       }
     }
 
