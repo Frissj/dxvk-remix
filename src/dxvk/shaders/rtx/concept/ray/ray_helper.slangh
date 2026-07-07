@@ -56,9 +56,18 @@ struct RayHitInfo
   uint dbgInstanceIndex;
 };
 
-uint calculateSurfaceIndex(RayHitInfo rayHitInfo) 
+uint calculateSurfaceIndex(RayHitInfo rayHitInfo)
 {
-  return (rayHitInfo.customIndex & CUSTOM_INDEX_SURFACE_MASK) + rayHitInfo.geometryIndex;    
+  // NV-DXVK: RTX Mega Geometry - a cluster instance (clusterId != CLUSTER_ID_INVALID) is a SINGLE
+  // RT surface. Its GeometryIndex() is the cluster's per-material sub-geometry (multi-material
+  // clusters emit one BLAS geometry per material; material is resolved per-triangle via
+  // localMaterialID), NOT a surface offset. Only classic merged-geometry draws use geometryIndex to
+  // select among consecutive surfaces. Adding it for a cluster hit decoded the ADJACENT surface -
+  // which for a resident multi-material cluster landed on the neighbouring Path B template surface,
+  // ran the animated-table decode with the hit's resident clusterId (4096+, not in the animated
+  // table) -> null -> degenerate indices -> black / wrong-UV geometry. Skip the offset for clusters.
+  const uint surfaceBase = rayHitInfo.customIndex & CUSTOM_INDEX_SURFACE_MASK;
+  return (rayHitInfo.clusterId != CLUSTER_ID_INVALID) ? surfaceBase : (surfaceBase + rayHitInfo.geometryIndex);
 }
 
 uint calculateMaterialType(RayHitInfo rayHitInfo) 
