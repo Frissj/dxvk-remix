@@ -1449,6 +1449,8 @@ namespace dxvk {
     // (user decision 2026-07-03: captured -> Path B; the pose reads the
     // capture-derived modifiedGeometryData, matching classic by construction).
     const RasterGeometry& geometryData = blasEntry->input.getGeometryData();
+    // [DualRoute] topology identity shared by this mesh's Path A and Path B forms.
+    const uint64_t topologyKey = ClusterLodGeometryProvider::makeTopologyKey(geometryData);
     const bool skinned = blasEntry->input.getSkinningState().numBones > 0 && geometryData.numBonesPerVertex > 0;
     const bool captured = blasEntry->input.preCaptureVertexData != nullptr;
     const uint32_t currentFrame = m_device->getCurrentFrameId();
@@ -1486,6 +1488,7 @@ namespace dxvk {
               // solving (buildPromotionEntries) so it can re-promote
               if (slotIt != m_promoSlotByBlas.end() && !slotIt->second.demoted) {
                 outGeometryId = kPromotedTag | (slotIt->second.stateSlot << kPromotedSlotShift) | found->second;
+                recordTopoRoute(topologyKey, 1u, instance, found->second);  // Path A (promoted)
                 return true;
               }
             }
@@ -1493,7 +1496,15 @@ namespace dxvk {
         }
       }
 
-      return isClusterTemplateInstance(instance, blasEntry, outGeometryId);
+      // skinned/captured/updatedInPlace is genuinely deforming -> always Path B, never
+      // subject to routing hysteresis (holding it classic would render the bind pose).
+      {
+        const bool routedB = isClusterTemplateInstance(instance, blasEntry, outGeometryId);
+        if (routedB) {
+          recordTopoRoute(topologyKey, 2u, instance, outGeometryId);
+        }
+        return routedB;
+      }
     }
 
     // ---- P4c ladder: Path A when resident, interim templates while it loads ----
@@ -1521,8 +1532,37 @@ namespace dxvk {
           return false;
         }
 
+        // FIX (rtx.clusterLod.render.animatedTopologyExcludesPathA): if this topology is
+        // ALSO animated-registered, a sibling instance renders it Path B (template surface).
+        // Rendering THIS static instance Path A puts the resident CLAS (id 4096+) in the same
+        // cluster TLAS region as that Path B surface -> a ray commits the Path A id under the
+        // Path B surface (foreign clusterId). Route it classic so the topology is single-path.
+        // Root proven by [DualRoute].
+        if (ClusterLodOptions::Render::animatedTopologyExcludesPathA()
+            && m_animatedGeometryByKey.count(topologyKey) != 0) {
+          return false;
+        }
+
         outGeometryId = found->second;
+        recordTopoRoute(topologyKey, 1u, instance, found->second);  // Path A (resident)
         return true;
+      }
+    }
+
+    // NV-DXVK: routing hysteresis (rtx.clusterLod.render.pathHysteresisFrames). A static
+    // instance that was Path A (resident) within N frames must NOT drop to the interim
+    // Path B template on a transient residency-lookup miss (generation swap / streaming
+    // churn) - that A->B flip is what lets the fresh Path B surface commit the lingering
+    // Path A resident CLAS (foreign clusterId 4096+). Hold it on classic until residency
+    // restabilizes. 0 disables (default, so [DualRoute] can still reproduce the symptom).
+    {
+      const int holdFrames = ClusterLodOptions::Render::pathHysteresisFrames();
+      if (holdFrames > 0) {
+        const auto affIt = m_pathAffiliation.find(instance);
+        if (affIt != m_pathAffiliation.end() && affIt->second.path == 1u
+            && (currentFrame - affIt->second.frame) <= uint32_t(holdFrames)) {
+          return false;
+        }
       }
     }
 
@@ -1532,7 +1572,13 @@ namespace dxvk {
     // and the first frames before the registration lands. Once the geometry
     // joins the generation the branch above wins and the interim pose sets
     // age out via the normal 60-frame pose GC.
-    return isClusterTemplateInstance(instance, blasEntry, outGeometryId);
+    {
+      const bool routedB = isClusterTemplateInstance(instance, blasEntry, outGeometryId);
+      if (routedB) {
+        recordTopoRoute(topologyKey, 2u, instance, outGeometryId);  // Path B (interim)
+      }
+      return routedB;
+    }
   }
 
   bool ClusterLodManager::isClusterTemplateInstance(const RtInstance* instance, const BlasEntry* blasEntry, uint32_t& outGeometryId) {
@@ -1619,10 +1665,20 @@ namespace dxvk {
   void ClusterLodManager::beginInstanceRecording() {
     m_ghostRequests.clear();
     m_posBufPathThisFrame.clear();
+    m_topoRouteThisFrame.clear();
 
     // prune affiliation entries for instances that stopped being cluster-recorded
     // (destroyed or gone classic) so the map does not grow unboundedly
     const uint32_t frameId = m_device->getCurrentFrameId();
+
+    // NV-DXVK: [DualRoute] periodic rate heartbeat so an overnight run shows the ongoing
+    // dual-route rate and distinct-offender count even after every key has been logged.
+    if ((frameId % 300u) == 0u && m_dualRouteEvents > 0) {
+      Logger::info(str::format("[DualRoute] heartbeat frame ", frameId, ": ", m_dualRouteEvents,
+                               " total dual-route events across ", m_dualRouteSeenKeys.size(),
+                               " distinct topologies so far"));
+    }
+
     if ((frameId % 512u) == 0u) {
       for (auto it = m_pathAffiliation.begin(); it != m_pathAffiliation.end();) {
         if (frameId - it->second.frame > 512u) {
@@ -1630,6 +1686,37 @@ namespace dxvk {
         } else {
           ++it;
         }
+      }
+    }
+  }
+
+  // NV-DXVK: [DualRoute] record this frame's path decision for a topology and log the
+  // first frame it is seen on BOTH paths (the resident-A + template-B coexistence that
+  // produces the foreign clusterId 4096+). path: 1 = Path A, 2 = Path B.
+  void ClusterLodManager::recordTopoRoute(uint64_t topologyKey, uint8_t path, const RtInstance* instance, uint32_t outGeometryId) {
+    TopoRoute& tr = m_topoRouteThisFrame[topologyKey];
+    const uint32_t posBuf = instance != nullptr ? uint32_t(instance->surface.positionBufferIndex) : 0u;
+    if (path == 1u) {
+      tr.aInstance = instance;
+      tr.residentGeometryId = outGeometryId;
+      tr.aPosBuf = posBuf;
+    } else {
+      tr.bInstance = instance;
+      tr.bOutGeometryId = outGeometryId;
+      tr.bPosBuf = posBuf;
+    }
+
+    if (tr.aInstance != nullptr && tr.bInstance != nullptr && !tr.loggedDual) {
+      tr.loggedDual = true;
+      m_dualRouteEvents++;
+      // one full line per NEW offending topology (the periodic heartbeat carries the rate).
+      if (m_dualRouteSeenKeys.insert(topologyKey).second) {
+        Logger::err(str::format(
+          "[DualRoute] NEW topo=0x", std::hex, topologyKey, std::dec,
+          " on BOTH paths frame ", m_device->getCurrentFrameId(),
+          " | A inst=", tr.aInstance, " residentGeomId=", tr.residentGeometryId, " posBuf=", tr.aPosBuf,
+          " | B inst=", tr.bInstance, " outId=0x", std::hex, tr.bOutGeometryId, std::dec, " posBuf=", tr.bPosBuf,
+          "  *** resident Path A CLAS (id 4096+) + Path B surface coexist -> foreign clusterId ***"));
       }
     }
   }
@@ -1666,7 +1753,7 @@ namespace dxvk {
         // foreign-clusterId misroutes ([ClusterDecodeProbe] posBufferIndex cross-links
         // to posBuf here). Throttled; diagnostic - revert.
         static uint32_t s_flapLogs = 0;
-        if (s_flapLogs < 200) {
+        if (s_flapLogs < 20000) {  // raised from 200 for overnight coverage
           s_flapLogs++;
           Logger::info(str::format("[PathFlap] inst=", instance,
                                    " dir=", (aff.path == 1u ? "A->B" : "B->A"),

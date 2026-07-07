@@ -229,6 +229,21 @@ namespace dxvk {
                  "cache-hit bursts.");
       RTX_OPTION("rtx.clusterLod.render", int, traversalPersistentThreads, 2048,
                  "Thread count used by the persistent traversal kernel.");
+      RTX_OPTION("rtx.clusterLod.render", bool, animatedTopologyExcludesPathA, false,
+                 "THE fix for the foreign-clusterId (4096+) symptom, proven by [DualRoute]: a mesh topology\n"
+                 "that is animated-registered (a skinned/deforming instance renders it Path B) must not ALSO\n"
+                 "have a static sibling instance rendered Path A resident - the resident CLAS (id 4096+) and\n"
+                 "the Path B surface then coexist in the shared cluster TLAS region and a ray commits the\n"
+                 "Path A id under the Path B surface. When true, a static instance whose topology is animated\n"
+                 "is routed to the classic BLAS instead of Path A, making the topology single-path. Default\n"
+                 "false so the symptom + [DualRoute] can be observed; set true to apply the fix.");
+      RTX_OPTION("rtx.clusterLod.render", int, pathHysteresisFrames, 0,
+                 "Routing hysteresis for the foreign-clusterId (4096+) fix. When >0, a static instance that\n"
+                 "was Path A (resident) within this many frames is held on the classic BLAS instead of dropping\n"
+                 "to the interim Path B template on a transient residency-lookup miss (generation swap /\n"
+                 "streaming churn). That A->B flip is what lets a fresh Path B surface commit the lingering\n"
+                 "Path A resident CLAS. 0 disables (default, so the [DualRoute] diagnostic can reproduce the\n"
+                 "symptom). Skinned/captured geometry is genuinely deforming and is never subject to this.");
     };
 
     // lodclusters::StreamingConfig mirror (P3). Read when the cluster render
@@ -578,6 +593,31 @@ namespace dxvk {
     // frame, colliding in the shared cluster TLAS region. If a posBufferIndex appears on
     // both paths in one frame, that is the collision. Cleared each beginInstanceRecording.
     std::unordered_map<uint32_t, uint8_t> m_posBufPathThisFrame;
+
+    // NV-DXVK: [DualRoute] THE decisive per-frame diagnostic for the foreign-clusterId
+    // (4096+) symptom. Keyed by TOPOLOGY - the common identity of a mesh across its Path A
+    // resident CLAS and its Path B pose (posBufferIndex is a WEAK cross-path key: the
+    // skinned B-form and static A-form use different position buffers). Records which
+    // path(s) each topology took this frame; a topology on BOTH paths in one frame is the
+    // resident Path A CLAS (id 4096+) coexisting with a fresh Path B surface, so a ray can
+    // commit the Path A id under the Path B surface. Cleared each beginInstanceRecording.
+    struct TopoRoute {
+      const RtInstance* aInstance = nullptr;   // an instance routed Path A (resident)
+      const RtInstance* bInstance = nullptr;   // an instance routed Path B (template/pose)
+      uint32_t residentGeometryId = 0;         // Path A cluster-generation geometry id
+      uint32_t bOutGeometryId = 0;             // Path B tagged id (pose set)
+      uint32_t aPosBuf = 0;
+      uint32_t bPosBuf = 0;
+      bool loggedDual = false;                 // one detection per topology per frame
+    };
+    std::unordered_map<uint64_t, TopoRoute> m_topoRouteThisFrame;
+    // persistent across frames: distinct dual-routed topologies already logged in full
+    // (bounds the log to one line per NEW offender) + cumulative event count.
+    std::unordered_set<uint64_t> m_dualRouteSeenKeys;
+    uint64_t m_dualRouteEvents = 0;
+    // records this frame's path decision for a topology and logs [DualRoute] on the first
+    // frame a topology is seen on both paths. path: 1 = Path A, 2 = Path B.
+    void recordTopoRoute(uint64_t topologyKey, uint8_t path, const RtInstance* instance, uint32_t outGeometryId);
 
     // NV-DXVK: [SceneAnimInstScan] crash-safe mirror of the animated OPAQUE cluster
     // instances AS FED INTO THE SCENE TLAS (patch-kernel output copied into
