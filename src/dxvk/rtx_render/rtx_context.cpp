@@ -1921,7 +1921,7 @@ namespace dxvk {
       GpuPrintBufferElement* probe = reinterpret_cast<GpuPrintBufferElement*>(rtOutput.m_gpuPrintBuffer->mapPtr(probeOffset));
 
       if (probe && probe->threadIndex.x == 0xFEEDu
-          && (probe->threadIndex.y == 0xFACEu || probe->threadIndex.y == 0xC10Du)) {
+          && (probe->threadIndex.y == 0xFACEu || probe->threadIndex.y == 0xC10Du || probe->threadIndex.y == 0xC10Eu)) {
         static uint32_t s_lastProbeFrame = 0xFFFFFFFFu;
         if (probe->frameIndex != s_lastProbeFrame) {
           s_lastProbeFrame = probe->frameIndex;
@@ -2170,6 +2170,21 @@ namespace dxvk {
                 " geometriesTableAddr=0x", tableAddr, std::dec,
                 " trianglesOffset=", uint32_t(wd.w), " frame=", probe->frameIndex));
             }
+          } else if (probe->threadIndex.y == 0xC10Eu) {
+            // [TexcoordProbe] Path B template hit's fetched per-vertex texcoord.x (3 verts) +
+            // idx[0] + clusterId. Collapsed (all equal) => flat UV (the "no UV / vertex colour"
+            // look) from degenerate/single-vertex idx; varying => real UV fetched fine and the
+            // black is downstream (material/texture binding), not the texcoord fetch.
+            const float tc0 = wd.x, tc1 = wd.y, tc2 = wd.z;
+            const uint32_t tcSurfaceIndex = uint32_t(wd.w);
+            const float spread = std::max(std::max(std::fabs(tc0 - tc1), std::fabs(tc1 - tc2)), std::fabs(tc0 - tc2));
+            const bool collapsed = spread < 1e-6f;
+            Logger::err(str::format(
+              "[TexcoordProbe] Path B template hit: texcoordX=[", tc0, ", ", tc1, ", ", tc2, "] spread=", spread,
+              " idx0=", padU[0], " clusterId=", padU[1], " surfaceIndex=", tcSurfaceIndex, " frame=", probe->frameIndex,
+              (collapsed
+                 ? "  *** COLLAPSED texcoords (flat UV -> untextured/vertex-colour look) -> idx degenerate/single-vertex ***"
+                 : "  *** VARYING texcoords (real UV fetched) -> UV fetch is fine; black is downstream (material/texture), not the fetch ***")));
           } else {
             const uint32_t tag = uint32_t(wd.z);
             const char* kind = (tag == 2) ? "surfaceIndex==SURFACE_INDEX_INVALID (surfaces[] OOB)"

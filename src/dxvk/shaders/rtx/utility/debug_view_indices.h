@@ -295,6 +295,19 @@
 #define DEBUG_VIEW_CLUSTER_LOD_TRIANGLE 923
 #define DEBUG_VIEW_CLUSTER_LOD_BLAS 924
 
+// NV-DXVK: RTX Mega Geometry cluster surface-record identity + material resolution views.
+// Built to isolate the Path B "textured -> flat vertex-colour" flip: 925-927 answer WHICH
+// surface record a cluster hit resolved (and whether it is a stale ghost), 928-932 answer why
+// that record's material failed to apply its albedo texture.
+#define DEBUG_VIEW_CLUSTER_GHOST_SURFACE 925
+#define DEBUG_VIEW_CLUSTER_SURFACE_INDEX 926
+#define DEBUG_VIEW_CLUSTER_PATH_CLASS 927
+#define DEBUG_VIEW_CLUSTER_ALBEDO_TEXTURE_INDEX 928
+#define DEBUG_VIEW_CLUSTER_ALBEDO_LOD0 929
+#define DEBUG_VIEW_CLUSTER_MATERIAL_CONSTANT 930
+#define DEBUG_VIEW_CLUSTER_TEXTURE_GRADIENT 931
+#define DEBUG_VIEW_CLUSTER_MATERIAL_ANOMALY 932
+
 enum class CompositeDebugView : uint32_t {
   Disabled = 0,
   FinalRenderWithMaterialProperties,

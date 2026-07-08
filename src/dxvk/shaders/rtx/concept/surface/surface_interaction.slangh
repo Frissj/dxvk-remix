@@ -726,6 +726,22 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
       texcoords[i] = transformedTextureCoordinate;
     }
 
+    // NV-DXVK: [TexcoordProbe] DIAGNOSTIC (revert). The pervasive "flip to vertex colour (no UV)"
+    // on Path B geometry: are the fetched texcoords COLLAPSED (all 3 equal -> flat -> samples one
+    // texel -> looks untextured) or REAL-but-wrong (varying, but pointing at the wrong texture)?
+    // Capture the 3 per-vertex texcoord.x + idx[0] + clusterId for a template hit. Gated sparsely
+    // (primitiveIndex low bits) to limit contention; last-writer-wins yields ~1 sample/frame.
+    // Sentinel 0xC10E distinguishes it CPU-side (see rtx_context.cpp readback).
+    if (isTemplateHit && (rayInteraction.primitiveIndex & 0xFu) == 0u)
+    {
+      GpuPrintBufferElement tcDbg;
+      tcDbg.writtenData = float4(texcoords[0].x, texcoords[1].x, texcoords[2].x, float(rayInteraction.surfaceIndex));
+      tcDbg.threadIndex = u16vec2(0xFEEDu, 0xC10Eu);
+      tcDbg.frameIndex  = cb.frameIdx;
+      tcDbg.pad         = uint2(idx[0], rayInteraction.clusterId);
+      GpuPrintBuffer[cb.gpuPrintElementIndex] = tcDbg;
+    }
+
     const vec2 interpolatedTextureCoordinates = interpolateHitAttribute(texcoords, bary);
     // Note: This is done due to input data from source applications potentially containing NaNs/Infs and thus needing to be sanitized before being
     // used in Remix. This is done here rather than earlier when texture coordinates are read from the buffer to only sanitize once rather than for

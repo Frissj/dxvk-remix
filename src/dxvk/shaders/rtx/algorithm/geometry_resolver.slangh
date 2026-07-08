@@ -751,6 +751,62 @@ void geometryResolverVertexOutputDebugView(
     }
 
     break;
+  // NV-DXVK: RTX Mega Geometry - cluster surface-record identity views. A cluster hit resolves its
+  // surface purely from the instance's customIndex (calculateSurfaceIndex skips geometryIndex for
+  // clusters), so a wrong/stale surface record yields correct geometry from the BLAS but the wrong
+  // material - exactly the "geometry is fine, texture is gone" signature. rtx_accel_manager.cpp
+  // synthesizes GHOST surfaces that carry isClusterTemplate from the previous frame; a ray hitting
+  // one reads a stale record. surfaceIndex >= cb.surfaceCount identifies such a hit.
+  case DEBUG_VIEW_CLUSTER_GHOST_SURFACE:
+    if (surface.isClusterLod || surface.isClusterTemplate)
+    {
+      // RED = surfaceIndex outside the live surface set (a ghost/stale record).
+      // GREEN = a live surface record.
+      storeInDebugView(pixelCoordinate, rayInteraction.surfaceIndex >= cb.surfaceCount
+        ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0));
+    }
+    else
+    {
+      const bool checker = (((pixelCoordinate.x >> 3) & 1) ^ ((pixelCoordinate.y >> 3) & 1)) != 0;
+      storeInDebugView(pixelCoordinate, vec3(checker ? 0.5 : 0.25));
+    }
+
+    break;
+  case DEBUG_VIEW_CLUSTER_SURFACE_INDEX:
+    if (surface.isClusterLod || surface.isClusterTemplate)
+    {
+      // Hash-color of the resolved surface index (RED = ghost, i.e. outside the live set). If a
+      // building's color CHANGES at the flip, the surface record resolved for those pixels was
+      // swapped; if it stays constant, the record is stable and the fault is inside the material.
+      storeInDebugView(pixelCoordinate, rayInteraction.surfaceIndex >= cb.surfaceCount
+        ? vec3(1.0, 0.0, 0.0)
+        : r5g6b5ToColor(uint16_t(uintHash(rayInteraction.surfaceIndex))));
+    }
+    else
+    {
+      const bool checker = (((pixelCoordinate.x >> 3) & 1) ^ ((pixelCoordinate.y >> 3) & 1)) != 0;
+      storeInDebugView(pixelCoordinate, vec3(checker ? 0.5 : 0.25));
+    }
+
+    break;
+  case DEBUG_VIEW_CLUSTER_PATH_CLASS:
+    // CYAN = Path B cluster template (deforming/captured), MAGENTA = Path A resident cluster LOD.
+    // Tells you which cluster path a surface is actually on at the moment it flips.
+    if (surface.isClusterTemplate)
+    {
+      storeInDebugView(pixelCoordinate, vec3(0.0, 1.0, 1.0));
+    }
+    else if (surface.isClusterLod)
+    {
+      storeInDebugView(pixelCoordinate, vec3(1.0, 0.0, 1.0));
+    }
+    else
+    {
+      const bool checker = (((pixelCoordinate.x >> 3) & 1) ^ ((pixelCoordinate.y >> 3) & 1)) != 0;
+      storeInDebugView(pixelCoordinate, vec3(checker ? 0.5 : 0.25));
+    }
+
+    break;
   // NV-DXVK end
   case DEBUG_VIEW_CUSTOM_INDEX:
 

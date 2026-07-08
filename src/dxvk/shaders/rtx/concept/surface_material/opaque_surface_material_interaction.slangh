@@ -541,6 +541,24 @@ void overrideMaterialInteractionForEye(
     opaqueSurfaceMaterial.emissiveIntensity;
 }
 
+// NV-DXVK: RTX Mega Geometry cluster material debug views - stable pseudo-random color for an
+// integer id ("same id -> same color"), so a value CHANGE is visible as a color change on screen.
+// Self-contained (noise.slangh's uintHash is not guaranteed to be included before this header).
+vec3 clusterDebugIdColor(uint id)
+{
+  uint h = (id + 1u) * 2654435761u;   // Knuth multiplicative hash
+  h ^= h >> 15;
+  return vec3(float(h & 0xFFu), float((h >> 8) & 0xFFu), float((h >> 16) & 0xFFu)) * (1.0f / 255.0f);
+}
+
+// NV-DXVK: classic (non-cluster) surfaces in the cluster debug views draw a checkerboard, so an
+// inactive-looking view is distinguishable from a dead one (same idiom as the Cluster LOD views).
+vec3 clusterDebugCheckerboard(uint2 pixelCoordinate)
+{
+  const bool checker = (((pixelCoordinate.x >> 3) & 1) ^ ((pixelCoordinate.y >> 3) & 1)) != 0;
+  return vec3(checker ? 0.5f : 0.25f);
+}
+
 // Opaque Surface Material Interaction Functions
 
 OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
@@ -675,9 +693,98 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   }
 
 #if defined(RAY_TRACING_PRIMARY_RAY)
-  if (cb.debugView == DEBUG_VIEW_RAW_ALBEDO) 
+  if (cb.debugView == DEBUG_VIEW_RAW_ALBEDO)
   {
     storeInDebugView(getDispatchRaysIndex().xy, albedo.xyz);
+  }
+
+  // NV-DXVK: RTX Mega Geometry - material-side cluster debug views. These isolate WHY a cluster
+  // (Path A resident or Path B template) surface renders its flat constant instead of its albedo
+  // texture. Classic surfaces draw a checkerboard so an inactive view is distinguishable from a
+  // dead one. Note albedoOpacityLoaded is NOT a residency signal: the read helper returns false
+  // ONLY when the texture index is BINDING_INDEX_INVALID, so a bad-mip / non-resident read still
+  // reports "loaded" - hence these views probe the index, the sampler, the gradient and the
+  // texel content directly rather than trusting that boolean.
+  if (cb.debugView == DEBUG_VIEW_CLUSTER_ALBEDO_TEXTURE_INDEX ||
+      cb.debugView == DEBUG_VIEW_CLUSTER_ALBEDO_LOD0 ||
+      cb.debugView == DEBUG_VIEW_CLUSTER_MATERIAL_CONSTANT ||
+      cb.debugView == DEBUG_VIEW_CLUSTER_TEXTURE_GRADIENT ||
+      cb.debugView == DEBUG_VIEW_CLUSTER_MATERIAL_ANOMALY)
+  {
+    const uint2 debugPixel = getDispatchRaysIndex().xy;
+
+    if (!surface.isClusterTemplate && !surface.isClusterLod)
+    {
+      storeInDebugView(debugPixel, clusterDebugCheckerboard(debugPixel));
+    }
+    else
+    {
+      const vec2 uv = surfaceInteraction.textureCoordinates;
+      const vec2 gX = surfaceInteraction.textureGradientX;
+      const vec2 gY = surfaceInteraction.textureGradientY;
+      const float gLen = max(length(gX), length(gY));
+      const bool hasAlbedoTex = opaqueSurfaceMaterial.albedoOpacityTextureIndex != BINDING_INDEX_INVALID;
+      const bool uvBad = any(isnan(uv)) || any(isinf(uv));
+      const bool badNum = uvBad || any(isnan(gX)) || any(isinf(gX)) || any(isnan(gY)) || any(isinf(gY));
+
+      if (cb.debugView == DEBUG_VIEW_CLUSTER_ALBEDO_TEXTURE_INDEX)
+      {
+        // Hash-color of the bound albedo texture index. A building whose color CHANGES at the flip
+        // had its albedo binding SWAPPED (wrong surface/material resolved); unchanged color means
+        // the binding is stable and the fault is downstream. BLACK = no albedo texture bound.
+        storeInDebugView(debugPixel, hasAlbedoTex
+          ? clusterDebugIdColor(uint(opaqueSurfaceMaterial.albedoOpacityTextureIndex))
+          : vec3(0.0f));
+      }
+      else if (cb.debugView == DEBUG_VIEW_CLUSTER_ALBEDO_LOD0)
+      {
+        // Re-sample the albedo at LOD0 (gradient zeroed) ignoring the computed mip. A flat/flipped
+        // surface that GAINS DETAIL here has good texture data and a broken gradient/mip; one that
+        // stays flat has bad texture CONTENT (non-resident / wrong texture). BLUE = cannot sample.
+        if (!hasAlbedoTex || uvBad)
+        {
+          storeInDebugView(debugPixel, vec3(0.0f, 0.0f, 1.0f));
+        }
+        else
+        {
+          SurfaceInteraction lod0Interaction = surfaceInteraction;
+          lod0Interaction.textureGradientX = vec2(0.0f);
+          lod0Interaction.textureGradientY = vec2(0.0f);
+          vec4 lod0Sample = vec4(0.0f);
+          surfaceMaterialInteractionTextureReadHelper(
+            opaqueSurfaceMaterial.albedoOpacityTextureIndex, opaqueSurfaceMaterial.samplerIndex,
+            lod0Interaction, lod0Sample);
+          storeInDebugView(debugPixel, lod0Sample.rgb);
+        }
+      }
+      else if (cb.debugView == DEBUG_VIEW_CLUSTER_MATERIAL_CONSTANT)
+      {
+        // The exact untextured "vertex-colour" fallback. If a flipped building in the normal render
+        // matches this view, it is definitively showing the material constant, not its texture.
+        storeInDebugView(debugPixel, opaqueSurfaceMaterial.albedoOpacityConstant.rgb);
+      }
+      else if (cb.debugView == DEBUG_VIEW_CLUSTER_TEXTURE_GRADIENT)
+      {
+        // Grayscale texture-gradient magnitude = mip pressure. A gradient that climbs at the flip
+        // forces a tiny mip -> the texture's flat average colour. RED = NaN/Inf gradient or uv.
+        storeInDebugView(debugPixel, badNum ? vec3(1.0f, 0.0f, 0.0f) : vec3(saturate(gLen * 10.0f)));
+      }
+      else // DEBUG_VIEW_CLUSTER_MATERIAL_ANOMALY
+      {
+        // One-shot classifier, first match wins:
+        //   BLUE   = albedo texture index INVALID (binding lost / material has none)
+        //   RED    = NaN/Inf in texcoord or texture gradient (bad worldPositions re-fetch)
+        //   GREEN  = gradient magnitude huge  -> forced tiny mip -> flat average colour
+        //   YELLOW = gradient magnitude ~zero -> collapsed footprint / degenerate triangle
+        //   GREY   = none of the above (a stable, sane record - the fault is elsewhere)
+        vec3 anomaly = vec3(0.15f);
+        if (!hasAlbedoTex)         { anomaly = vec3(0.0f, 0.0f, 1.0f); }
+        else if (badNum)           { anomaly = vec3(1.0f, 0.0f, 0.0f); }
+        else if (gLen > 0.2f)      { anomaly = vec3(0.0f, 1.0f, 0.0f); }
+        else if (gLen < 1.0e-6f)   { anomaly = vec3(1.0f, 1.0f, 0.0f); }
+        storeInDebugView(debugPixel, anomaly);
+      }
+    }
   }
 
   if (cb.debugView == DEBUG_VIEW_OPAQUE_RAW_ALBEDO_RESOLUTION_CHECKERS) 
