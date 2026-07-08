@@ -11,6 +11,7 @@ import time
 import threading
 import ctypes
 import depfile
+import shader_cache
 
 report_lock = threading.Lock()
 task_lock = threading.Lock()
@@ -33,16 +34,65 @@ parser.add_argument('-force', action='store_true', dest='force')
 parser.add_argument('-parallel', action='store_true', dest='parallel')
 parser.add_argument('-binary', action='store_true', dest='binary')
 parser.add_argument('-debug', action='store_true', dest='debug')
+# NV-DXVK: see shaderDebugInfoMatchers below. Overridable via the environment so
+# an Aftermath session does not need a meson reconfigure (which would change the
+# RUNTIME_SHADER_RECOMPILATION_PYTHON_ARGUMENTS define and rebuild all of C++).
+parser.add_argument('-shader-debug-info', type=str, dest='shaderDebugInfo', default='none')
 args = parser.parse_args()
 
 # Set to True to generate Slang repro file when compiling shaders
 generateSlangRepro = False
+
+# NV-DXVK: Slang debug info (-g2) embeds a full SPIR-V <-> source mapping, which is
+# what lets Aftermath resolve a fault PC to a line. It is extraordinarily expensive:
+# measured on gbuffer_rayquery_debug with slangc 2025.10.4, one variant goes from
+# 5.9s / 1.17 MB to 65.7s / 8.98 MB - 11x slower and 8x fatter. The SPIR-V is then
+# expanded to a C array by shader_xxd.py (~3.3x the binary as text) and #included
+# into rtx_pathtracer_gbuffer.cpp, so the cost is paid three times over: once in
+# slangc, once in cl.exe, once in link.exe.
+#
+# This used to be unconditionally on for any source path containing 'volume' or
+# 'rayquery' (222 of ~600 units), which by itself accounted for 95% of all emitted
+# SPIR-V and turned a ~2 minute shader build into a ~30 minute one. It is now
+# opt-in. Note -g1 is NOT a cheaper tier: it produces byte-identical output to -g2
+# in this slangc, so there is no middle ground to offer.
+#
+#   none                     (default) no debug info
+#   all                      every shader
+#   <substr>[,<substr>...]   shaders whose source path contains any substring,
+#                            e.g. 'rayquery,volume' restores the old behaviour
+shaderDebugInfoSpec = (os.environ.get('REMIX_SHADER_DEBUG_INFO') or args.shaderDebugInfo).strip().lower()
+shaderDebugInfoMatchers = [] if shaderDebugInfoSpec in ('', 'none') else \
+                          [s.strip() for s in shaderDebugInfoSpec.split(',') if s.strip()]
+shaderDebugInfoAll = shaderDebugInfoSpec == 'all'
+
+def wantsShaderDebugInfo(inputFile):
+    if shaderDebugInfoAll:
+        return True
+    if not shaderDebugInfoMatchers:
+        return False
+    source = inputFile.replace('\\', '/').lower()
+    return any(matcher in source for matcher in shaderDebugInfoMatchers)
+
+if shaderDebugInfoAll or shaderDebugInfoMatchers:
+    print(f'[shader-debug-info] enabled for "{shaderDebugInfoSpec}" - expect a ~10x slower shader build')
 
 includePaths = ' '.join([f'-I{path}' for path in args.includes])
 slangDll = os.path.join(os.path.dirname(args.slangc), 'slang.dll')
 
 tools = [args.glslang, args.slangc, slangDll, __file__]
 newestTool = max([os.path.getmtime(x) for x in tools])
+
+# Note: __file__ is deliberately absent from the cache's tool signature. Editing
+# this script invalidates every task's mtime check above (conservative, correct),
+# but whatever this script *does* is already captured by the command line that
+# ends up in the cache key - so an edit here costs 600 cache lookups, not 600
+# recompiles.
+cache = shader_cache.Cache(
+    toolPaths = [args.glslang, args.slangc, slangDll],
+    outputDir = args.output,
+    scriptDir = os.path.dirname(os.path.realpath(__file__)),
+    log = print)
 
 # Note: -Os (Optimize Size) used here as while one might typically expect optimizing for size to comprimise speed optimizations,
 # the glslang optimizer actually just enables more optimizations when this option is specified, meaning it is probably good to enable
@@ -69,6 +119,12 @@ class Task:
     inputs = []
     commands = []
     customName = None
+    # Cache metadata, filled in by createBasicTask / the two task factories.
+    cacheable = False
+    cacheCommand = ''
+    sourceFile = None
+    depFile = None
+    depTarget = None
 
     def needsBuild(self):
         if args.force:
@@ -160,7 +216,17 @@ def runTasks(tasks):
 
         if task is None:
             break
-            
+
+        # needsBuild() said this task is dirty by mtime, which a `git checkout` or
+        # an edit-and-revert makes true without changing any content. Ask the
+        # content-addressed cache before paying for a compile.
+        try:
+            if cache.restore(task):
+                printFromThread(f'[cached] {task.getName()}')
+                continue
+        except Exception:
+            pass  # a broken cache must never fail a build
+
         # Workaround for occasional crashes of slangc.exe on the build farm
         # Not necessary anymore
         maxAttempts = 1
@@ -183,6 +249,11 @@ def runTasks(tasks):
 
         if exitCode != 0:
             terminate = True
+        else:
+            try:
+                cache.store(task)
+            except Exception:
+                pass  # best effort; the artifacts on disk are already correct
 
 def getShaderName(inputFile):
     return os.path.splitext(os.path.basename(inputFile))[0]
@@ -196,6 +267,9 @@ def createBasicTask(inputFile, destFile, targetName, depFile):
     except:
         task.inputs = []
     task.outputs = [destFile, depFile]
+    task.sourceFile = inputFile
+    task.depFile = depFile
+    task.depTarget = targetName
     return task
 
 def createGlslangTask(inputFile, variantSpec):
@@ -224,6 +298,8 @@ def createGlslangTask(inputFile, variantSpec):
     command = f'{args.glslang} {glslangFlags} {includePaths} {stageOverride}{variantDefines} -V {variableName} -o {destFile} ' \
             + f'--depfile {depFile} {inputFile}'
     task.commands = [command]
+    task.cacheCommand = command
+    task.cacheable = True
     return task
 
 def createSlangTask(inputFile, variantSpec):
@@ -250,18 +326,15 @@ def createSlangTask(inputFile, variantSpec):
             + f'-Wno-30081 '
 
     # NV-DXVK: the -debug flag only added '-g' to glslangFlags (GLSL shaders); the slangc
-    # command emitted NO debug info, so .slang shaders had no OpLine/source and Aftermath +
-    # the validation layer could not map a fault PC to a source line. Emit SPIR-V debug info
-    # ONLY for the volume shaders we are currently mapping - applying -g2 to every shader
-    # exposed a latent slang SPIR-V type mismatch in integrate_indirect_closesthit (the
-    # optimizer normally hides it), which is unrelated to this diagnostic. Surgical + revert
-    # when done.
-    # NV-DXVK: ALL rayquery compute passes (gbuffer/integrate/volume) get -g2 so any future
-    # Aftermath fault PC maps to source without another full shader rebuild. 'rayquery'
-    # deliberately excludes integrate_indirect_closesthit (RT-pipeline hit shader), where
-    # -g2 exposes a latent slang SPIR-V type bug (see handoff).
-    _gsrc = inputFile.replace('\\', '/').lower()
-    if 'volume' in _gsrc or 'rayquery' in _gsrc:
+    # command emits NO debug info by default, so .slang shaders have no OpLine/source and
+    # Aftermath + the validation layer cannot map a fault PC to a source line.
+    #
+    # Opt in with REMIX_SHADER_DEBUG_INFO (see shaderDebugInfoMatchers at the top of this
+    # file). 'rayquery,volume' restores the behaviour this used to have unconditionally.
+    # Caution: -g2 on the whole tree exposes a latent slang SPIR-V type mismatch in
+    # integrate_indirect_closesthit (the optimizer normally hides it), so prefer narrowing
+    # to the pass you are actually debugging over using 'all'.
+    if wantsShaderDebugInfo(inputFile):
         command1 += f'-g2 '
 
     # Add SER capability only for variants that use Shader Execution Reordering
@@ -287,6 +360,16 @@ def createSlangTask(inputFile, variantSpec):
         command2 = f'"{sys.executable}" {shader_xxd} -i {destFile} -o {headerFile}'
 
         task.commands = [command1, command2]
+
+        # NV-DXVK: the .h is a real output of this task - it is what C++ #includes.
+        # It used to be absent from task.outputs, so a .h deleted while its .spv
+        # survived (interrupted build, partial wipe) left needsBuild() reporting
+        # "up to date" forever and every dependent TU failing with C1083. That is
+        # what the [smart heal] orphan pass in build-remixMegaGeo.bat works around.
+        task.outputs.append(headerFile)
+
+    task.cacheCommand = ' && '.join(task.commands)
+    task.cacheable = True
 
     return task
 
@@ -690,9 +773,17 @@ if len(tasks):
         thread = threading.Thread(target = runTasks, args = (tasks,))
         thread.start()
         threads.append(thread)
-        
+
     for thread in threads:
         thread.join()
+
+    if cache.enabled:
+        print(cache.summary())
+        if not terminate:
+            try:
+                cache.prune()
+            except Exception:
+                pass
 
 if terminate:
     sys.exit(1)

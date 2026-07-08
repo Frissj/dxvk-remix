@@ -139,6 +139,20 @@ goto :meson_setup_done
 echo Reusing existing meson configuration (pass "reconfigure" to force setup).
 :meson_setup_done
 
+rem NV-DXVK: SPIR-V debug info (-g2) is OFF by default in compile_shaders.py
+rem because it makes matching shaders ~11x slower to compile and ~8x fatter,
+rem which is what turned a ~2min shader build into ~30min. It is only needed to
+rem map an Aftermath GPU fault PC (or a validation-layer message) back to a
+rem shader source line. Pass "debuginfo" to turn it back on for a crash-hunting
+rem session WITHOUT any meson reconfigure (it is a runtime env var read by
+rem compile_shaders.py, not a compile define, so no C++ rebuild). Narrow the
+rem scope with REMIX_SHADER_DEBUG_INFO yourself (e.g. "gbuffer,volume") if you
+rem know which pass faults; "rayquery,volume" reproduces the old always-on set.
+if /i "%1"=="debuginfo" (
+    if not defined REMIX_SHADER_DEBUG_INFO set "REMIX_SHADER_DEBUG_INFO=rayquery,volume"
+    echo [debuginfo] REMIX_SHADER_DEBUG_INFO=!REMIX_SHADER_DEBUG_INFO! ^(shaders matching this will compile with -g2^)
+)
+
 rem NV-DXVK: Hash-based shader source change detection.
 rem Ninja tracks .slang-to-.spv dependencies, but it doesn't always pick up
 rem changes to transitive .h / .slangh includes. Rather than wrestling with
@@ -161,7 +175,19 @@ rem 800+" (~10min). Pass "full" to wipe .spv only; pass "clean" to wipe
 rem .spv AND DXVK pipeline caches.
 if /i "%1"=="full"  goto :do_shader_hash_check
 if /i "%1"=="clean" goto :do_shader_hash_check
-goto :smart_shader_heal
+rem NV-DXVK: :smart_shader_heal used to run on EVERY build. It did two jobs:
+rem   (1) orphan heal - rebuild any unit whose .h vanished while its .spv
+rem       survived. That bug is fixed at the source: compile_shaders.py now
+rem       lists the .h in the task's outputs, so its own needsBuild() detects a
+rem       missing .h, and the content cache restores .spv+.h together anyway.
+rem   (2) transitive-include rebuild via a full-tree SHA256 every build. Also
+rem       redundant: compile_shaders.py parses each unit's .d depfile into its
+rem       inputs and rebuilds on any changed include on its own.
+rem Both are now dead weight (the SHA256 sweep alone cost several seconds/build),
+rem so the normal path skips straight to ninja. Pass "heal" to force the old
+rem sweep if you ever suspect the shader outputs are inconsistent.
+if /i "%1"=="heal"  goto :smart_shader_heal
+goto :shader_hash_done
 :do_shader_hash_check
 echo.
 echo Checking shader source hashes for changes...
