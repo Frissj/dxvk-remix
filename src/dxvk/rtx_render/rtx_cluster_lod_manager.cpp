@@ -2185,6 +2185,7 @@ namespace dxvk {
     frameParams.promotionEntries = m_framePromoEntries.empty() ? nullptr : m_framePromoEntries.data();
     frameParams.promotionEntryCount = uint32_t(m_framePromoEntries.size());
     frameParams.promotionResidualEpsilon = std::max(1e-5f, ClusterLodOptions::Promotion::residualEpsilon());
+    frameParams.promotionStaticMotionEpsilon = std::max(1e-6f, ClusterLodOptions::Promotion::staticMotionEpsilon());
 
     // P4: HiZ occlusion feed. This runs from SceneManager::prepareSceneData,
     // BEFORE injectRTX re-points m_primaryDepth at this frame's target - so
