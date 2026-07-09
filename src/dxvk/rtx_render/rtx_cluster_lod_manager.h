@@ -891,6 +891,25 @@ namespace dxvk {
     uint32_t m_frameOverflowCount = 0;
     uint32_t m_peakInstanceCount = 0;
 
+    // NV-DXVK: [SwapProbe] per-frame routing census to LOCATE the 1-frame visible
+    // gap at a full generation rebuild (the flicker). Cheap always-on counters
+    // (2 int adds per instance), logged ONLY across a rebuild window. A dip in
+    // pathA on the swap frame vs the frame before = instances that were resident
+    // last frame but routed classic / Path B / dropped this frame = the gap. The
+    // classic column shows where they went. Diagnostic - revert with the P5 fix.
+    uint32_t m_swapProbeClassified = 0;  // isClusterInstance calls this frame
+    uint32_t m_swapProbePathA = 0;       // recorded Path A (resident/promoted) this frame
+    uint32_t m_swapProbePathB = 0;       // recorded Path B (deforming) this frame
+    struct SwapProbeSample {
+      uint32_t frame = 0, classified = 0, pathA = 0, pathB = 0, classic = 0;
+      bool swapFrame = false;            // a full rebuild activated this frame
+    };
+    static constexpr uint32_t kSwapProbeRing = 8;
+    SwapProbeSample m_swapProbeRing[kSwapProbeRing] = {};
+    uint32_t m_swapProbeRingHead = 0;
+    uint32_t m_swapProbeSwapFrame = 0;   // frame the last full rebuild activated
+    uint32_t m_swapProbeDumpAtFrame = 0; // dump the ring once currentFrame reaches this (0 = idle)
+
     // periodic stats logging (rtx.clusterLod.logStatsIntervalFrames): last
     // frame a stats line was considered, and the counters it printed - a new
     // line is only emitted when they changed

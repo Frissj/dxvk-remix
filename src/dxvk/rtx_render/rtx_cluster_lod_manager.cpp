@@ -824,7 +824,18 @@ namespace dxvk {
         if (blasEntry == nullptr) {
           continue;
         }
-        const XXH64_hash_t hash = blasEntry->input.getGeometryData().getHashForRule(RtxOptions::geometryAssetHashRule());
+        // Key the candidate lookup off the CACHED ingest-time hash on the promotion
+        // slot, NOT getHashForRule on the current geometry. For captured draws the
+        // asset hash churns every moving frame, so re-deriving it here made this
+        // find() MISS during motion - the solve/patch entry dropped out, so the
+        // instance's transform + M/prevM continuity went stale and its motion
+        // vectors blew up (the pin kept it routed Path A, but unsolved). The pinned
+        // routing and this per-frame solve MUST use the same stable key.
+        const auto slotIt = m_promoSlotByBlas.find(blasEntry);
+        if (slotIt == m_promoSlotByBlas.end()) {
+          continue;
+        }
+        const XXH64_hash_t hash = slotIt->second.geometryHash;
         const auto found = m_promoCandidates.find(hash);
         if (found == m_promoCandidates.end()) {
           continue;
@@ -1296,6 +1307,12 @@ namespace dxvk {
 
     m_generationCount++;
 
+    // [SwapProbe] arm the routing census across this full-rebuild swap frame so the
+    // per-frame pathA/pathB/classic ring gets dumped (see onFrameBegin). Appends do
+    // NOT arm it - they are seamless; only full rebuilds (device-idle swap) flicker.
+    m_swapProbeSwapFrame = currentFrame;
+    m_swapProbeDumpAtFrame = currentFrame + 3;
+
     // instances flip classic -> cluster: every cached BLAS bucket that contained
     // them is stale, and the full-skip fast path must not reuse last frame's TLAS
     // instance list (risk R8)
@@ -1328,6 +1345,40 @@ namespace dxvk {
 
     if (!ClusterLodOptions::enable()) {
       return;
+    }
+
+    // [SwapProbe] snapshot LAST frame's routing census into the ring, then reset for
+    // this frame. Dumped a few frames after a full-rebuild swap so we see pathA
+    // before / at / after it. A dip in pathA on the swap row = the visible gap; the
+    // classic column (= classified - pathA - pathB) shows where those instances went.
+    {
+      const uint32_t nowFrame = m_device->getCurrentFrameId();
+      const uint32_t prevFrame = nowFrame - 1u;
+      SwapProbeSample& s = m_swapProbeRing[m_swapProbeRingHead];
+      s.frame = prevFrame;
+      s.classified = m_swapProbeClassified;
+      s.pathA = m_swapProbePathA;
+      s.pathB = m_swapProbePathB;
+      s.classic = (m_swapProbeClassified > m_swapProbePathA + m_swapProbePathB)
+                ? (m_swapProbeClassified - m_swapProbePathA - m_swapProbePathB) : 0u;
+      s.swapFrame = (m_swapProbeSwapFrame != 0u && prevFrame == m_swapProbeSwapFrame);
+      m_swapProbeRingHead = (m_swapProbeRingHead + 1u) % kSwapProbeRing;
+      m_swapProbeClassified = m_swapProbePathA = m_swapProbePathB = 0u;
+
+      if (m_swapProbeDumpAtFrame != 0u && nowFrame >= m_swapProbeDumpAtFrame) {
+        Logger::info(str::format("[SwapProbe] full-rebuild swap at frame ", m_swapProbeSwapFrame,
+                                 " - per-frame routing census (a pathA dip on the SWAP row is the gap):"));
+        for (uint32_t i = 0; i < kSwapProbeRing; i++) {
+          const SwapProbeSample& e = m_swapProbeRing[(m_swapProbeRingHead + i) % kSwapProbeRing];
+          if (e.classified == 0u && e.pathA == 0u && e.pathB == 0u) {
+            continue;  // unused / pre-roll ring slot
+          }
+          Logger::info(str::format("[SwapProbe]   frame ", e.frame, e.swapFrame ? "  <== SWAP" : "",
+                                   " : classified ", e.classified, " pathA ", e.pathA,
+                                   " pathB ", e.pathB, " classic ", e.classic));
+        }
+        m_swapProbeDumpAtFrame = 0u;  // one dump per swap
+      }
     }
 
     // chrono: previous frame's isClusterInstance total (accumulated across the
@@ -1449,6 +1500,8 @@ namespace dxvk {
     if (blasEntry == nullptr) {
       return false;
     }
+
+    m_swapProbeClassified++;  // [SwapProbe] one per classifiable instance this frame
 
     // ---- P4b Path B routing (plan 7.1) ----
     // Deforming geometry must never take Path A (its static CLAS would render
@@ -1843,6 +1896,7 @@ namespace dxvk {
     // previous TLAS) and has a previous surface index for the mapping to redirect.
     {
       const uint8_t currentPath = (geometryId & kPathBTag) ? 2u : 1u;
+      if (currentPath == 1u) { m_swapProbePathA++; } else { m_swapProbePathB++; }  // [SwapProbe]
       const uint32_t frameId = m_device->getCurrentFrameId();
       PathAffiliation& aff = m_pathAffiliation[instance];
       const uint32_t prevSurfaceIndex = instance->getPreviousSurfaceIndex();
