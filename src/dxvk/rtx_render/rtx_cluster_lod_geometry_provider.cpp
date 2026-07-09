@@ -62,7 +62,29 @@ namespace dxvk {
     const XXH64_hash_t indicesHash = geometryData.hashes[HashComponents::Indices];
     const uint64_t key = XXH64(&indicesHash, sizeof(indicesHash), geometryData.vertexCount);
     const uint64_t streamSeed = (uint64_t(geometryData.topology) << 32) | geometryData.indexCount;
-    return XXH64(&key, sizeof(key), streamSeed);
+    uint64_t topo = XXH64(&key, sizeof(key), streamSeed);
+
+    // NV-DXVK: disambiguate DIFFERENT meshes that collide on the index-pattern key
+    // (the "*** DIFFERENT meshes CONFLATED by weak topology key ***" [DualRoute]
+    // errors; a conflation wrongly forces one mesh classic because an unrelated one
+    // sharing the key deforms). The object-space bounding box is a rigid- and
+    // vertex-order-invariant shape fingerprint that is:
+    //  - identical at the ingest and draw sites - both read the SAME finalized
+    //    DrawCallState geometry (finalizePendingFutures resolves the bbox before
+    //    submitDrawState), so the bytes match exactly; no quantization needed.
+    //  - stable across camera motion (object space), unlike the asset hash.
+    //  - identical between a mesh's static Path A form and its deforming Path B form
+    //    (same input/bind geometry), so the intended SAME-mesh cross-path detection
+    //    is preserved.
+    // When bbox finalization is disabled the box is invalid at both sites, so this
+    // falls back cleanly to the index-only key.
+    if (geometryData.boundingBox.isValid()) {
+      const float bboxKey[6] = {
+        geometryData.boundingBox.minPos.x, geometryData.boundingBox.minPos.y, geometryData.boundingBox.minPos.z,
+        geometryData.boundingBox.maxPos.x, geometryData.boundingBox.maxPos.y, geometryData.boundingBox.maxPos.z };
+      topo = XXH64(bboxKey, sizeof(bboxKey), topo);
+    }
+    return topo;
   }
 
   ClusterLodGeometryProvider::ClusterLodGeometryProvider(ConfigProvider configProvider, VerifyProvider verifyProvider,

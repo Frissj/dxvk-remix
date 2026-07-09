@@ -841,6 +841,20 @@ namespace dxvk {
       uint32_t sweepLagFrames = 0;
       bool sweepPending = false;
       bool demoted = false;
+      // NV-DXVK: pinned Path A residency. Once an instance PROMOTES, its identity
+      // is this stable BlasEntry* (the draw-call cache keeps the same BlasEntry
+      // across camera moves - topological bucket + material-match reuse), NOT the
+      // asset hash. This game's captured draws produce an asset hash that is
+      // unstable frame-to-frame under camera motion, so re-deriving residency from
+      // it every frame is exactly what dropped promoted meshes back to Path B on
+      // any camera move. Cached at establish time so the per-frame route reads the
+      // id straight off the slot instead of an m_geometryIdByHash lookup by the
+      // churning hash. residentGeometryId == ~0u means "not yet pinned"; geometryHash
+      // is the ingest-time key (stable) for the atomicDemotion candidate lookup;
+      // blasFrameCreated guards against BlasEntry* address reuse.
+      uint32_t residentGeometryId = ~0u;
+      uint64_t geometryHash = 0;
+      uint32_t blasFrameCreated = 0;
     };
     std::unordered_map<const BlasEntry*, PromoInstance> m_promoSlotByBlas;
     // per-frame kernel work items (built in dispatchBuild, consumed by

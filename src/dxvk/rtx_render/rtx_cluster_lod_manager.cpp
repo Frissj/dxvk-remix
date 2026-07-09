@@ -1470,9 +1470,47 @@ namespace dxvk {
                              && blasEntry->frameLastUpdated != blasEntry->frameCreated;
 
     if (skinned || captured || updatedInPlace) {
+      // ---- pinned Path A fast-path ----
+      // Once an instance has PROMOTED, it is identified by its stable BlasEntry*,
+      // NOT the asset hash. The draw-call cache keeps the same BlasEntry across
+      // camera moves (topological bucket + material-match reuse, rtx_draw_call_cache.cpp),
+      // but this game's captured-draw asset hash is unstable frame-to-frame, so the
+      // m_geometryIdByHash lookup below MISSES on every camera-move frame and dropped
+      // the mesh to Path B. Here we route straight off the cached residentGeometryId,
+      // deliberately IGNORING updatedInPlace: a changed asset hash on an already-rigid
+      // promoted instance is the transform moving, not deformation. Genuine deformation
+      // is still caught downstream by the async promotion solve (updatePromotionStates
+      // sets slot.demoted on a non-rigid solve, state.flags & 4u) - the position hash
+      // was never the right deformation signal because it also fires on rigid motion.
+      if (!skinned && ClusterLodOptions::Promotion::enable()
+          && m_renderSystem != nullptr && m_renderSystem->hasGeneration()) {
+        auto pinIt = m_promoSlotByBlas.find(blasEntry);
+        if (pinIt != m_promoSlotByBlas.end()
+            && !pinIt->second.demoted
+            && pinIt->second.residentGeometryId != ~0u
+            && pinIt->second.blasFrameCreated == blasEntry->frameCreated) {
+          // atomicDemotion honored via the CACHED ingest-time key (stable), not the
+          // churning current hash - so sibling-deform suppression still works mid-motion.
+          const auto pinCandidate = m_promoCandidates.find(pinIt->second.geometryHash);
+          const bool atomicSuppress = ClusterLodOptions::Promotion::atomicDemotion()
+            && pinCandidate != m_promoCandidates.end() && pinCandidate->second.anyInstanceDemoted;
+          const uint32_t usedSlots = uint32_t(m_slots[Tlas::Opaque].size() + m_slots[Tlas::Unordered].size());
+          if (!atomicSuppress && usedSlots < m_renderSystem->getMaxRenderInstances()
+              && (!ClusterLodOptions::Render::routeTrivialToClassic()
+                  || m_trivialGeometryIds.count(pinIt->second.residentGeometryId) == 0)) {
+            outGeometryId = kPromotedTag | (pinIt->second.stateSlot << kPromotedSlotShift) | pinIt->second.residentGeometryId;
+            recordTopoRoute(topologyKey, 1u, instance, pinIt->second.residentGeometryId, 2u);  // Path A (promoted, pinned)
+            return true;
+          }
+        }
+      }
+
       // ---- P4c rigid-capture promotion (plan 7.7): PROMOTED captured
       // instances render Path A LOD clusters; the promotion kernel patches
       // their worldMatrix/TLAS transform from the per-frame solve ----
+      // (ESTABLISH path: still gated on !updatedInPlace + a live hash match so a
+      // mesh only enters Path A on a frame it has proven rigid; the pin above then
+      // holds it there across subsequent camera-driven hash churn.)
       if (captured && !skinned && !updatedInPlace
           && m_renderSystem != nullptr && m_renderSystem->hasGeneration()
           && ClusterLodOptions::Promotion::enable() && !m_promoCandidates.empty()) {
@@ -1514,6 +1552,11 @@ namespace dxvk {
               // Path B below while its siblings stay promoted; its slot keeps
               // solving (buildPromotionEntries) so it can re-promote
               if (slotIt != m_promoSlotByBlas.end() && !slotIt->second.demoted) {
+                // Cache the stable identity so the pinned fast-path above can route
+                // this instance every subsequent frame WITHOUT the churning-hash lookup.
+                slotIt->second.residentGeometryId = found->second;
+                slotIt->second.geometryHash = geometryHash;
+                slotIt->second.blasFrameCreated = blasEntry->frameCreated;
                 outGeometryId = kPromotedTag | (slotIt->second.stateSlot << kPromotedSlotShift) | found->second;
                 recordTopoRoute(topologyKey, 1u, instance, found->second, 2u);  // Path A (promoted)
                 return true;
