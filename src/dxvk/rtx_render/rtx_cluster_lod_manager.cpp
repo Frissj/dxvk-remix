@@ -642,6 +642,30 @@ namespace dxvk {
       return;
     }
 
+    // [MotionProbe] The churn question: are promoted instances reporting ZERO motion
+    // (static-skip, PROMO_FLAG_SKIPPED=8) or FULL-SOLVING a new M every frame (motion)?
+    // A static scene where most promoted slots FULL-SOLVE = their capture is changing
+    // frame-to-frame (real object motion, or camera-relative capture) -> that solved
+    // M/prevM delta IS the motion-vector churn. Logged every 30 frames. Diagnostic.
+    {
+      uint32_t promoted = 0, skipped = 0, solving = 0, demoted = 0;
+      float maxResidual = 0.0f;
+      for (const auto& slotEntry : m_promoSlotByBlas) {
+        const lodclusters_remix::PromotionStateView& st = m_promoStates[slotEntry.second.stateSlot];
+        promoted++;
+        if (slotEntry.second.demoted) { demoted++; continue; }
+        if ((st.flags & 8u /*PROMO_FLAG_SKIPPED*/) != 0u) { skipped++; }
+        else { solving++; maxResidual = std::max(maxResidual, st.residualRel); }
+      }
+      const uint32_t fid = m_device->getCurrentFrameId();
+      if (promoted > 0 && (fid % 30u) == 0u) {
+        Logger::info(str::format("[MotionProbe] frame ", fid, ": promoted ", promoted,
+                                 " | static/zero-motion ", skipped, " | FULL-SOLVING(motion) ", solving,
+                                 " | demoted ", demoted, " | maxResidualRel ", maxResidual,
+                                 " (epsilon ", ClusterLodOptions::Promotion::residualEpsilon(), ")"));
+      }
+    }
+
     const uint32_t rigidFrames = uint32_t(std::max(1, ClusterLodOptions::Promotion::rigidFrames()));
     const float epsilon = std::max(1e-5f, ClusterLodOptions::Promotion::residualEpsilon());
     const uint32_t gateLag = uint32_t(std::max(2, ClusterLodOptions::Promotion::gateLagFrames()));
