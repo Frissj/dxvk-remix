@@ -386,15 +386,6 @@ namespace dxvk {
                  "Maximum solve/gate residual relative to the geometry's bounding radius for a frame to count\n"
                  "as rigid. Non-rigid VS output (skinning in shader, foliage sway, billboards) fails this and\n"
                  "keeps the mesh on Path B.");
-      RTX_OPTION("rtx.clusterLod.promotion", float, staticMotionEpsilon, 0.0005f,
-                 "Separate, TIGHTER threshold (relative to bounding radius) for the per-frame zero-motion skip:\n"
-                 "if last frame's solved M still reproduces this frame's capture within this bound, the instance\n"
-                 "is treated as STATIC and reports zero motion (prevM = M). This must NOT be conflated with\n"
-                 "residualEpsilon (rigidity slack): the game's capture is camera-relative, so a camera pan moves\n"
-                 "every static object's captured positions - if the skip fired at the loose rigidity bound those\n"
-                 "objects would report zero motion while visibly moving on screen, so their motion vectors under-\n"
-                 "report and TAA/DLSS smear them. Tight here => camera/object motion full-solves (correct M/prevM\n"
-                 "parallax); only a truly still frame skips. Set == residualEpsilon to restore the old behavior.");
       RTX_OPTION("rtx.clusterLod.promotion", int, gateLagFrames, 6,
                  "Frames between dispatching the full-mesh gate sweep and reading its verdict (covers the\n"
                  "readback ring lag).");

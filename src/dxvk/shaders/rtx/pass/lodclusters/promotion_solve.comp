@@ -128,7 +128,7 @@ struct PromoStatus
   uint  rigidStreak;
   uint  flags;
   uint  lastFrame;
-  uint  _pad0;
+  float _pad0;   // [MotionProbe] per-frame transform translation delta (world units)
   uint  _pad1;
   uint  _pad2;
 };
@@ -163,7 +163,6 @@ layout(push_constant, scalar) uniform PushData
   uint     riFlipWindingOffset;    // dword holding flipWinding|twoSided|multiMaterial|opaqueStatus bytes
   float    residualEpsilon;        // relative to probe radius
   uint     gateEntryIndex;         // MODE_GATE: which entry this dispatch runs
-  float    motionEpsilon;          // TIGHT zero-motion skip bound (decoupled from residualEpsilon)
 }
 push;
 
@@ -319,14 +318,16 @@ void main()
         maxDev = max(maxDev, length(fit - cap));
       }
 
-      // Gate the ZERO-MOTION skip on the TIGHT motionEpsilon, NOT the loose rigidity
-      // residualEpsilon. The capture is camera-relative, so a camera pan moves every
-      // static object's captured positions; at the loose bound those objects skipped
-      // (reported zero motion) while visibly moving on screen -> under-reported motion
-      // vectors -> TAA/DLSS smear. Tight bound => any camera/object motion falls through
-      // to the full solve below, whose M/prevM delta is the correct parallax; only a
-      // genuinely still frame skips here.
-      if(finite && checkN > 0u && (maxDev / max(probe.radius, 1e-6)) <= push.motionEpsilon)
+      // PERF skip: if last frame's cached M still reproduces this frame's capture within
+      // the rigidity bound, the instance is effectively static - reuse the cached M and
+      // skip the full 96-sample solve. Gated on residualEpsilon (does the cached M still
+      // fit), the bound this skip used before the smear work. The promotion motion-vector
+      // smear that once justified a separate tighter threshold here is fixed properly in
+      // surface_interaction (a promoted hit's previous position now uses the GPU-solved
+      // prevM instead of the CPU matrix), so no decoupled motion epsilon is needed. When
+      // this fires the cached M still fits, so placement doesn't visibly lag and the
+      // zero motion it reports (prevM = M) is correct for a static instance.
+      if(finite && checkN > 0u && (maxDev / max(probe.radius, 1e-6)) <= push.residualEpsilon)
       {
         // static this frame: prevM = M (zero motion), keep the streak, patch
         for(uint k = 0; k < 12; k++)
@@ -337,6 +338,7 @@ void main()
         st.rigidStreak = st.rigidStreak + 1u;
         st.lastFrame   = push.frameId;
         st.flags       = (st.flags & ~PROMO_FLAG_DEMOTED) | PROMO_FLAG_RIGID | PROMO_FLAG_SKIPPED;
+        st._pad0       = 0.0;  // [MotionProbe] static-skip => prevM==M => zero motion by construction
         statuses.s[entry.stateSlot] = st;
 
         // --- INLINE patch (mirrors the full-solve patch at the end of main) ---
@@ -512,6 +514,14 @@ void main()
   // clear SKIPPED too - this frame did the full solve (diagnostic counter)
   status.flags       = (status.flags & ~(PROMO_FLAG_RIGID | PROMO_FLAG_DEMOTED | PROMO_FLAG_SKIPPED))
                      | (rigid ? PROMO_FLAG_RIGID : PROMO_FLAG_DEMOTED);
+  // [MotionProbe] RAW per-frame transform translation delta (world units) = exactly the
+  // motion the render applies to this promoted instance via M/prevM. Nonzero on a
+  // camera-still frame => the solve is manufacturing motion; matches parallax => source ok.
+  {
+    const vec3 curT  = vec3(M[3], M[7], M[11]);
+    const vec3 prevT = vec3(matrices.m[mBase + 12 + 3], matrices.m[mBase + 12 + 7], matrices.m[mBase + 12 + 11]);
+    status._pad0 = length(curT - prevT);
+  }
   statuses.s[entry.stateSlot] = status;
 
   // ---- patch a promoted instance's slot: ALWAYS write when assigned - a

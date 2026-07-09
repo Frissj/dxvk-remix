@@ -648,21 +648,24 @@ namespace dxvk {
     // frame-to-frame (real object motion, or camera-relative capture) -> that solved
     // M/prevM delta IS the motion-vector churn. Logged every 30 frames. Diagnostic.
     {
-      uint32_t promoted = 0, skipped = 0, solving = 0, demoted = 0;
-      float maxResidual = 0.0f;
-      for (const auto& slotEntry : m_promoSlotByBlas) {
-        const lodclusters_remix::PromotionStateView& st = m_promoStates[slotEntry.second.stateSlot];
-        promoted++;
-        if (slotEntry.second.demoted) { demoted++; continue; }
-        if ((st.flags & 8u /*PROMO_FLAG_SKIPPED*/) != 0u) { skipped++; }
-        else { solving++; maxResidual = std::max(maxResidual, st.residualRel); }
-      }
       const uint32_t fid = m_device->getCurrentFrameId();
-      if (promoted > 0 && (fid % 30u) == 0u) {
-        Logger::info(str::format("[MotionProbe] frame ", fid, ": promoted ", promoted,
-                                 " | static/zero-motion ", skipped, " | FULL-SOLVING(motion) ", solving,
-                                 " | demoted ", demoted, " | maxResidualRel ", maxResidual,
-                                 " (epsilon ", ClusterLodOptions::Promotion::residualEpsilon(), ")"));
+      if ((fid % 30u) == 0u) {
+        // RAW dump: for the first promoted instances, the ACTUAL per-frame transform
+        // translation delta (world units) the render applies as their motion vector,
+        // plus their solve state. motionDelta must be ~0 when the camera is STILL; a
+        // large value on a still frame = the solve is manufacturing motion (the smear).
+        uint32_t shown = 0;
+        for (const auto& slotEntry : m_promoSlotByBlas) {
+          if (shown >= 12u) { break; }
+          const lodclusters_remix::PromotionStateView& st = m_promoStates[slotEntry.second.stateSlot];
+          const char* mode = slotEntry.second.demoted ? "DEMOTED"
+                           : ((st.flags & 8u) != 0u ? "static" : "SOLVING");
+          Logger::info(str::format("[MotionProbe] frame ", fid, " slot ", slotEntry.second.stateSlot,
+                                   " geom 0x", std::hex, slotEntry.second.geometryHash, std::dec,
+                                   " : motionDelta ", st.motionDelta, " (world units) | ", mode,
+                                   " residualRel ", st.residualRel, " rigidStreak ", st.rigidStreak));
+          shown++;
+        }
       }
     }
 
@@ -2044,6 +2047,18 @@ namespace dxvk {
     instance->surface.isClusterTemplate = false;
     instance->surface.clusterGeometryId = plainGeometryId | (promoStateSlotPlusOne << 18);
 
+    // A PROMOTED instance's real transform is the GPU-solved M, which changes every
+    // frame the (camera-relative) capture moves. But its CPU objectToWorld is static,
+    // so the instance manager flagged it isStatic (rtx_instance_manager.cpp:1159), and
+    // surface_interaction only reads prevM when !isStatic - so the promoted prevM pass
+    // was skipped and the previous position was computed from the CURRENT M, collapsing
+    // the motion vector to camera-parallax-on-the-moved-position => TAA/DLSS smear. Force
+    // it non-static so the prevM path runs (prevM is maintained by the per-frame solve;
+    // on a genuinely still frame the solve sets prevM==M, so motion is zero anyway).
+    if (promoted) {
+      instance->surface.isStatic = false;
+    }
+
     // NV-DXVK: [GhostSurface] remember the Path A decode id for a potential A->B
     // transition ghost next frame
     m_pathAffiliation[instance].clusterGeometryId = instance->surface.clusterGeometryId;
@@ -2071,6 +2086,38 @@ namespace dxvk {
     m_statsSlotsUnordered = numUnordered;
 
     const uint32_t countB = uint32_t(m_slotsB[Tlas::Opaque].size() + m_slotsB[Tlas::Unordered].size());
+
+    // [CamProbe] Hard-data check for the smear ROOT: the capture un-projects with the
+    // per-draw D3DTS matrices (rtx_transforms), but the render uses the RtCamera. If
+    // those differ, a static object's captured world position (D3DTS un-project) is
+    // not where the render (RtCamera) puts it, and the mismatch tracks the camera ->
+    // the promoted M wobbles -> smear. Log the max element difference for a couple of
+    // promoted instances while panning; a nonzero, camera-correlated diff = confirmed.
+    if ((m_device->getCurrentFrameId() % 30u) == 0u) {
+      const RtCamera& cam = cameraManager.getMainCamera();
+      const Matrix4& camW2V = cam.getWorldToViewf(false);
+      const Matrix4& camV2P = cam.getViewToProjectionf();
+      uint32_t shown = 0;
+      for (const ClusterSlot& slot : m_slots[Tlas::Opaque]) {
+        if (shown >= 3u) { break; }
+        if ((slot.geometryId & kPromotedTag) == 0u || slot.instance == nullptr) { continue; }
+        const BlasEntry* be = slot.instance->getBlas();
+        if (be == nullptr) { continue; }
+        const Matrix4& dW2V = be->input.getTransformData().worldToView;
+        const Matrix4& dV2P = be->input.getTransformData().viewToProjection;
+        float maxW2V = 0.0f, maxV2P = 0.0f;
+        for (int c = 0; c < 4; c++) {
+          for (int r = 0; r < 4; r++) {
+            maxW2V = std::max(maxW2V, std::abs(camW2V[c][r] - dW2V[c][r]));
+            maxV2P = std::max(maxV2P, std::abs(camV2P[c][r] - dV2P[c][r]));
+          }
+        }
+        Logger::info(str::format("[CamProbe] frame ", m_device->getCurrentFrameId(),
+                                 " promoted: |RtCam.worldToView - draw.D3DTS_worldToView|max ", maxW2V,
+                                 " | |viewToProjection|max ", maxV2P));
+        shown++;
+      }
+    }
 
     // P4c: this frame's promotion solve/gate/patch work items (needs the slot
     // lists, which are final here). Probing runs even when no Path A instance
@@ -2185,7 +2232,6 @@ namespace dxvk {
     frameParams.promotionEntries = m_framePromoEntries.empty() ? nullptr : m_framePromoEntries.data();
     frameParams.promotionEntryCount = uint32_t(m_framePromoEntries.size());
     frameParams.promotionResidualEpsilon = std::max(1e-5f, ClusterLodOptions::Promotion::residualEpsilon());
-    frameParams.promotionStaticMotionEpsilon = std::max(1e-6f, ClusterLodOptions::Promotion::staticMotionEpsilon());
 
     // P4: HiZ occlusion feed. This runs from SceneManager::prepareSceneData,
     // BEFORE injectRTX re-points m_primaryDepth at this frame's target - so

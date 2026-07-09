@@ -673,7 +673,33 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
       prevObjectPosition = interpolateHitAttribute(prevPositions, bary);
     }
 
-    const vec3 prevPosition = mul(surface.prevObjectToWorld, vec4(prevObjectPosition, 1.0f));
+    vec3 prevPosition;
+    if (isPromotedHit)
+    {
+      // NV-DXVK: a PROMOTED hit's transform is GPU-solved every frame; surface.prevObjectToWorld
+      // is the CPU-static matrix the promotion path documents as meaningless for these instances
+      // (see the isPromotedHit block above). hitPosition was already built from the GPU CURRENT M
+      // (worldPositions, +0), so pairing it with the CPU prev matrix mixed two unrelated lineages
+      // and injected the vertex-capture reconstruction wobble as phantom motion - the Path A
+      // promotion motion-vector smear. The correct previous transform is last frame's solved M,
+      // maintained at +48 in the promotion state buffer (promotion_solve.comp keeps prevM = last
+      // frame's M). Applying it here gives hit/prev a shared lineage, so the wobble cancels against
+      // the previous-frame camera in geometry_resolver and static promoted geometry stops smearing.
+      const uint64_t promotionStateAddress =
+        (uint64_t(cb.promotionStateAddressHi) << 32) | uint64_t(cb.promotionStateAddressLo);
+      const uint64_t prevRowsAddress = promotionStateAddress + uint64_t(promoStateSlotPlusOne - 1) * 96 + 48;
+      const float4 promoPrevRow0 = *(Ptr<float4>(prevRowsAddress + 0));
+      const float4 promoPrevRow1 = *(Ptr<float4>(prevRowsAddress + 16));
+      const float4 promoPrevRow2 = *(Ptr<float4>(prevRowsAddress + 32));
+      const vec4 prevObjPos = vec4(prevObjectPosition, 1.0f);
+      prevPosition = vec3(dot(promoPrevRow0, prevObjPos),
+                          dot(promoPrevRow1, prevObjPos),
+                          dot(promoPrevRow2, prevObjPos));
+    }
+    else
+    {
+      prevPosition = mul(surface.prevObjectToWorld, vec4(prevObjectPosition, 1.0f));
+    }
 
     surfaceInteraction.motion = prevPosition - hitPosition;
   }

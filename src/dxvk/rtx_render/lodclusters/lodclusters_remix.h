@@ -385,7 +385,6 @@ namespace lodclusters_remix {
     const struct PromotionEntry* promotionEntries = nullptr;
     uint32_t promotionEntryCount = 0;
     float promotionResidualEpsilon = 0.005f;
-    float promotionStaticMotionEpsilon = 0.0005f;  // tight zero-motion skip; see rtx.clusterLod.promotion.staticMotionEpsilon
   };
 
   // P4c: one promotion work item (40 bytes, mirrored by promotion_solve.comp
@@ -410,6 +409,7 @@ namespace lodclusters_remix {
     uint32_t rigidStreak = 0;
     uint32_t flags = 0;               // bit0 rigid, bit2 demoted (last solve non-rigid)
     uint32_t lastFrame = 0;           // renderer frameIndex of the last solve
+    float motionDelta = 0.0f;         // [MotionProbe] |M.t - prevM.t| this frame (world units)
   };
 
   // P3: semaphores the caller must attach to the queue submission that
