@@ -512,6 +512,12 @@ namespace dxvk {
     // consumed by the path tracer's hit-side cluster fetch via raytrace_args
     uint64_t getGeometriesTableAddress() const;
 
+    // device address of the streaming-resident cluster address table
+    // (SceneStreaming.resident.clusters), indexed by resident ClusterID; 0 unless
+    // streaming is active. The hit-side cluster fetch needs it because the shaderio
+    // Geometry's preloadedClusters array is null while streaming (raytrace_args)
+    uint64_t getResidentClustersAddress() const;
+
     // P4c: device address of the promotion matrices array (M/prevM per state
     // slot; 0 while inactive) - consumed by promoted surfaces via raytrace_args
     uint64_t getPromotionStateAddress() const;

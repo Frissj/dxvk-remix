@@ -424,6 +424,14 @@ struct RaytraceArgs {
   uint clusterGeometriesTableAddressLo;
   uint clusterGeometriesTableAddressHi;
 
+  // NV-DXVK: streaming-resident cluster address table (shaderio SceneStreaming.resident.clusters):
+  // one uint64 per resident ClusterID holding its shaderio::Cluster device address. preloadedClusters
+  // in the shaderio::Geometry is null while streaming, so cluster-surface hits resolve their cluster
+  // (attributeBits + vertex data) through this global table indexed by the hit ClusterID. 0 while
+  // preloaded / no active generation. See cluster_geometry.slangh.
+  uint clusterResidentClustersAddressLo;
+  uint clusterResidentClustersAddressHi;
+
   // NV-DXVK: RTX Mega Geometry Path B (P4b, deforming geometry).
   // Device address (BDA) of the global animated cluster table: one uint64 per
   // cluster holding the device address of the cluster's triangles inside its

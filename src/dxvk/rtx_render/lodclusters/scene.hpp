@@ -41,7 +41,11 @@ namespace lodclusters {
 // Controls the scene's data generation during loading and processing.
 struct SceneConfig
 {
-  static const uint32_t version = 3;
+  // NV-DXVK: bumped 3 -> 4 when makeSnapshot began decoding non-float32 vertex formats
+  // (rtx_cluster_lod_geometry_provider.cpp). Cached .nvsngeo clusters built before that carry no
+  // texcoords/normals for such formats (attributeBits=0 -> Path A rendered without UVs); bumping the
+  // version changes the cache digest so every stale cache is regenerated with the decoded attributes.
+  static const uint32_t version = 4;
 
   // cluster and cluster group settings
   uint32_t clusterVertices    = 128;

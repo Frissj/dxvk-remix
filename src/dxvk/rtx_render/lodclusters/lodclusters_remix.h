@@ -566,6 +566,11 @@ namespace lodclusters_remix {
     // Remix's hit-side cluster fetch (raytrace_args)
     uint64_t getGeometriesTableAddress() const;
 
+    // device address of the streaming-resident cluster address table
+    // (SceneStreaming.resident.clusters) indexed by resident ClusterID; 0 unless
+    // streaming is active. Needed because preloadedClusters is null while streaming
+    uint64_t getResidentClustersAddress() const;
+
     // NV-DXVK: [ClasAlias] DIAGNOSTIC. This frame's Path A resident/low-detail CLAS
     // memory ranges (lo/hi pairs). Returns the count written (<= maxCount).
     uint32_t getPathAClasRanges(uint64_t* lo, uint64_t* hi, uint32_t maxCount) const;

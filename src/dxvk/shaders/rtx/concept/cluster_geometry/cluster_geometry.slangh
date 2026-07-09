@@ -135,7 +135,8 @@ void clusterGeometryLogBad(uint badKind, uint geometryId, uint clusterId,
 // clusterId (ClusterIDNV, geometry-local in the preloaded path) to the cluster
 // header. geometriesTableAddress comes from the raytrace args (0 while no
 // cluster render generation is active).
-ClusterGeometry clusterGeometryCreate(uint64_t geometriesTableAddress, uint geometryId, uint clusterId)
+ClusterGeometry clusterGeometryCreate(uint64_t geometriesTableAddress, uint geometryId, uint clusterId,
+                                      uint64_t residentClustersAddress)
 {
   ClusterGeometry clusterGeometry;
 
@@ -144,19 +145,37 @@ ClusterGeometry clusterGeometryCreate(uint64_t geometriesTableAddress, uint geom
     return clusterGeometry;
   }
 
-  // Geometry table entry -> preloaded cluster address array -> cluster
-  const uint64_t geometryAddress =
-    geometriesTableAddress + uint64_t(geometryId) * CLUSTER_GEOMETRY_SIZEOF_SHADERIO_GEOMETRY;
-
-  const uint64_t preloadedClusters =
-    clusterGeometryLoadU64(geometryAddress + CLUSTER_GEOMETRY_OFFSETOF_PRELOADED_CLUSTERS);
-
-  if (preloadedClusters == 0)
+  // Resolve the hit cluster's shaderio::Cluster address. The cluster LOD system has two residency
+  // layouts (see the shaderio::Geometry struct): the PRELOADED path keeps a per-geometry
+  // preloadedClusters[] array; the STREAMING path keeps a single global resident cluster-address
+  // table (SceneStreaming.resident.clusters) indexed by the same ClusterID the CLAS build tagged
+  // (see blas_clusters_insert.comp). preloadedClusters is null while streaming, so before this
+  // branch every streamed hit fell through the preloadedClusters==0 guard and returned an
+  // attribute-less default -> Path A rendered its BLAS silhouette with no texcoords/normals.
+  // residentClustersAddress != 0 iff streaming is active (see rtx_context.cpp).
+  uint64_t clusterAddress;
+  uint64_t clusterArrayBase;
+  if (residentClustersAddress != 0)
   {
-    return clusterGeometry;
+    clusterArrayBase = residentClustersAddress;
+    clusterAddress   = clusterGeometryLoadU64(residentClustersAddress + uint64_t(clusterId) * 8);
   }
+  else
+  {
+    // Geometry table entry -> preloaded cluster address array -> cluster
+    const uint64_t geometryAddress =
+      geometriesTableAddress + uint64_t(geometryId) * CLUSTER_GEOMETRY_SIZEOF_SHADERIO_GEOMETRY;
 
-  const uint64_t clusterAddress = clusterGeometryLoadU64(preloadedClusters + uint64_t(clusterId) * 8);
+    clusterArrayBase =
+      clusterGeometryLoadU64(geometryAddress + CLUSTER_GEOMETRY_OFFSETOF_PRELOADED_CLUSTERS);
+
+    if (clusterArrayBase == 0)
+    {
+      return clusterGeometry;
+    }
+
+    clusterAddress = clusterGeometryLoadU64(clusterArrayBase + uint64_t(clusterId) * 8);
+  }
 
   // NV-DXVK: [ClusterDecodeProbe] DIAGNOSTIC (not a fix). The raw Ptr loads below VA=0'd the
   // device (Aftermath mapped it to clusterGeometryLoadU8 @ line 58): clusterAddress =
@@ -168,7 +187,7 @@ ClusterGeometry clusterGeometryCreate(uint64_t geometriesTableAddress, uint geom
   // 2 = garbage-but-mapped (insane offsets past the header decode).
   if (clusterAddress == 0)
   {
-    clusterGeometryLogBad(1u, geometryId, clusterId, clusterAddress, preloadedClusters, 0u);
+    clusterGeometryLogBad(1u, geometryId, clusterId, clusterAddress, clusterArrayBase, 0u);
     return clusterGeometry;
   }
 
@@ -191,7 +210,7 @@ ClusterGeometry clusterGeometryCreate(uint64_t geometriesTableAddress, uint geom
   // load at line 58. Catch it here, log, and bail before that read faults.
   if (clusterGeometry.verticesOffset > 0x100000u || clusterGeometry.trianglesOffset > 0x100000u)
   {
-    clusterGeometryLogBad(2u, geometryId, clusterId, clusterAddress, preloadedClusters,
+    clusterGeometryLogBad(2u, geometryId, clusterId, clusterAddress, clusterArrayBase,
                           clusterGeometry.trianglesOffset);
     ClusterGeometry invalid;
     return invalid;  // clusterAddress stays 0 -> isValid false -> callers skip

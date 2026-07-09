@@ -30,6 +30,7 @@
 #include <cstring>
 #include <cfloat>
 #include <algorithm>
+#include <atomic>
 
 #include <nvutils/logger.hpp>
 #include <nvutils/parallel_work.hpp>
@@ -442,6 +443,25 @@ void Scene::loadGeometryRemix(ProcessingInfo& processingInfo, uint64_t geometryI
 
   // test if this mesh exists in the cache
   bool isCached = checkCache(geometry.lodInfo, geometryIndex);
+
+  // [BuildAttr] RAW one-shot dump: authoritative build-time truth for the intended cluster
+  // attributes, independent of the cache and of what is on screen. Answers "does a FRESH build
+  // whose snapshot carries texcoords actually set the TEX_0 bit?" - the question [SnapAttr]
+  // (snapshot side) and [PathAProbe] (render side, cache-polluted) can't answer between them.
+  //   cached=1 -> attributeBits here are the INTENDED bits; the real cluster bits come from the
+  //               loaded .nvsngeo, so a stale file can still render attribute-less (see version)
+  //   cached=0 -> this IS the freshly built cluster's attributeBits; tex0=1 here == UVs baked in
+  {
+    static std::atomic<int> s_buildAttrDumps { 0 };
+    if(s_buildAttrDumps.fetch_add(1) < 64)
+    {
+      LOGE("[BuildAttr] %s cached=%d enabledAttr=0x%x attrBits=0x%x tex0=%d nrm=%d inTex0=%d inNrm=%d\n",
+           input.name.c_str(), isCached ? 1 : 0, m_config.enabledAttributes, geometry.attributeBits,
+           (geometry.attributeBits & shaderio::CLUSTER_ATTRIBUTE_VERTEX_TEX_0) ? 1 : 0,
+           (geometry.attributeBits & shaderio::CLUSTER_ATTRIBUTE_VERTEX_NORMAL) ? 1 : 0,
+           input.texcoords0 ? 1 : 0, input.normals ? 1 : 0);
+    }
+  }
 
   // invalid cache
   if(m_cacheFileView.isValid() && !isCached)

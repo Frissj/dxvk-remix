@@ -1063,6 +1063,19 @@ uint64_t ClusterRenderSystem::getGeometriesTableAddress() const
   return impl.rscene->getShaderGeometriesBuffer().address;
 }
 
+uint64_t ClusterRenderSystem::getResidentClustersAddress() const
+{
+  Impl& impl = *m_impl;
+  // Streaming-only: the resident cluster-address table (SceneStreaming.resident.clusters) maps a
+  // hit's resident ClusterID to its shaderio::Cluster. The preloaded path has no such table (it
+  // uses the per-geometry preloadedClusters instead), so return 0 and the hit shader falls back.
+  if(!impl.hasGeneration || !impl.rscene->useStreaming)
+  {
+    return 0;
+  }
+  return impl.rscene->sceneStreaming.getShaderStreamingData().resident.clusters;
+}
+
 uint32_t ClusterRenderSystem::getPathAClasRanges(uint64_t* lo, uint64_t* hi, uint32_t maxCount) const
 {
   Impl& impl = *m_impl;

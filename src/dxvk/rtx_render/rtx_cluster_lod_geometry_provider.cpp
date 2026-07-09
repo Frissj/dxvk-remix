@@ -23,7 +23,9 @@
 #include "rtx_cluster_lod_geometry_provider.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstring>
 #include <thread>
 #include <utility>
 
@@ -290,6 +292,98 @@ namespace dxvk {
     return std::exchange(m_readyGeometries, {});
   }
 
+  // NV-DXVK: format-aware vertex attribute decode for the cluster snapshot. The classic (Path B)
+  // path renders in the game's native vertex format; the snapshot previously accepted only
+  // R32*_SFLOAT and SILENTLY dropped every other format, so resident (Path A) clusters were built
+  // with attributeBits=0 (no texcoords, no normals) and rendered without UVs. These decode the
+  // common vertex formats so Path A matches Path B on any game. Unsupported formats return 0 and the
+  // caller clusters without that (optional) attribute, logging once - same graceful fallback as before.
+  namespace {
+    inline float clusterHalfToFloat(uint16_t h) {
+      const uint32_t sign = uint32_t(h & 0x8000u) << 16;
+      const uint32_t exp  = (h >> 10) & 0x1Fu;
+      const uint32_t mant = h & 0x3FFu;
+      uint32_t bits;
+      if (exp == 0u) {
+        if (mant == 0u) {
+          bits = sign;                                  // signed zero
+        } else {
+          uint32_t e = 0u, m = mant;                    // subnormal half -> normalized float
+          while ((m & 0x400u) == 0u) { m <<= 1; e++; }
+          m &= 0x3FFu;
+          bits = sign | ((127u - 15u - e) << 23) | (m << 13);
+        }
+      } else if (exp == 0x1Fu) {
+        bits = sign | 0x7F800000u | (mant << 13);       // Inf / NaN
+      } else {
+        bits = sign | ((exp - 15u + 127u) << 23) | (mant << 13);
+      }
+      float f;
+      std::memcpy(&f, &bits, sizeof(f));
+      return f;
+    }
+
+    // Byte size of one vertex element of `fmt`. 0 == a format the decoder does not handle.
+    size_t clusterFormatElementBytes(VkFormat fmt) {
+      switch (fmt) {
+      case VK_FORMAT_R32_SFLOAT:               return 4;
+      case VK_FORMAT_R32G32_SFLOAT:            return 8;
+      case VK_FORMAT_R32G32B32_SFLOAT:         return 12;
+      case VK_FORMAT_R32G32B32A32_SFLOAT:      return 16;
+      case VK_FORMAT_R16_SFLOAT:               return 2;
+      case VK_FORMAT_R16G16_SFLOAT:            return 4;
+      case VK_FORMAT_R16G16B16A16_SFLOAT:      return 8;
+      case VK_FORMAT_R8G8_UNORM:
+      case VK_FORMAT_R8G8_SNORM:               return 2;
+      case VK_FORMAT_R8G8B8A8_UNORM:
+      case VK_FORMAT_R8G8B8A8_SNORM:
+      case VK_FORMAT_B8G8R8A8_UNORM:
+      case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+      case VK_FORMAT_A2B10G10R10_SNORM_PACK32: return 4;
+      case VK_FORMAT_R16G16_UNORM:
+      case VK_FORMAT_R16G16_SNORM:             return 4;
+      case VK_FORMAT_R16G16B16A16_UNORM:
+      case VK_FORMAT_R16G16B16A16_SNORM:       return 8;
+      default:                                 return 0;
+      }
+    }
+
+    // Decode one vertex element of `fmt` at `p` into out[0..3] (unwritten channels stay untouched).
+    // Returns the number of channels written, 0 if the format is unsupported.
+    uint32_t clusterDecodeVertex(const uint8_t* p, VkFormat fmt, float out[4]) {
+      auto s8  = [](uint8_t b) { return std::max(int8_t(b) / 127.0f, -1.0f); };
+      auto s16 = [](uint16_t b) { return std::max(int16_t(b) / 32767.0f, -1.0f); };
+      switch (fmt) {
+      case VK_FORMAT_R32_SFLOAT:          { auto s=(const float*)p; out[0]=s[0]; return 1; }
+      case VK_FORMAT_R32G32_SFLOAT:       { auto s=(const float*)p; out[0]=s[0]; out[1]=s[1]; return 2; }
+      case VK_FORMAT_R32G32B32_SFLOAT:    { auto s=(const float*)p; out[0]=s[0]; out[1]=s[1]; out[2]=s[2]; return 3; }
+      case VK_FORMAT_R32G32B32A32_SFLOAT: { auto s=(const float*)p; out[0]=s[0]; out[1]=s[1]; out[2]=s[2]; out[3]=s[3]; return 4; }
+      case VK_FORMAT_R16_SFLOAT:          { auto s=(const uint16_t*)p; out[0]=clusterHalfToFloat(s[0]); return 1; }
+      case VK_FORMAT_R16G16_SFLOAT:       { auto s=(const uint16_t*)p; out[0]=clusterHalfToFloat(s[0]); out[1]=clusterHalfToFloat(s[1]); return 2; }
+      case VK_FORMAT_R16G16B16A16_SFLOAT: { auto s=(const uint16_t*)p; for (int i=0;i<4;i++) out[i]=clusterHalfToFloat(s[i]); return 4; }
+      case VK_FORMAT_R8G8_UNORM:          { out[0]=p[0]/255.0f; out[1]=p[1]/255.0f; return 2; }
+      case VK_FORMAT_R8G8B8A8_UNORM:      { for (int i=0;i<4;i++) out[i]=p[i]/255.0f; return 4; }
+      case VK_FORMAT_B8G8R8A8_UNORM:      { out[0]=p[2]/255.0f; out[1]=p[1]/255.0f; out[2]=p[0]/255.0f; out[3]=p[3]/255.0f; return 4; }
+      case VK_FORMAT_R8G8_SNORM:          { out[0]=s8(p[0]); out[1]=s8(p[1]); return 2; }
+      case VK_FORMAT_R8G8B8A8_SNORM:      { for (int i=0;i<4;i++) out[i]=s8(p[i]); return 4; }
+      case VK_FORMAT_R16G16_UNORM:        { auto s=(const uint16_t*)p; out[0]=s[0]/65535.0f; out[1]=s[1]/65535.0f; return 2; }
+      case VK_FORMAT_R16G16B16A16_UNORM:  { auto s=(const uint16_t*)p; for (int i=0;i<4;i++) out[i]=s[i]/65535.0f; return 4; }
+      case VK_FORMAT_R16G16_SNORM:        { auto s=(const uint16_t*)p; out[0]=s16(s[0]); out[1]=s16(s[1]); return 2; }
+      case VK_FORMAT_R16G16B16A16_SNORM:  { auto s=(const uint16_t*)p; for (int i=0;i<4;i++) out[i]=s16(s[i]); return 4; }
+      case VK_FORMAT_A2B10G10R10_UNORM_PACK32: {
+        uint32_t u; std::memcpy(&u, p, 4);
+        out[0]=(u & 0x3FFu)/1023.0f; out[1]=((u>>10)&0x3FFu)/1023.0f; out[2]=((u>>20)&0x3FFu)/1023.0f; return 3;
+      }
+      case VK_FORMAT_A2B10G10R10_SNORM_PACK32: {
+        uint32_t u; std::memcpy(&u, p, 4);
+        auto s10=[](uint32_t x){ int v=int(x & 0x3FFu); if (v & 0x200) v-=1024; return std::max(v/511.0f, -1.0f); };
+        out[0]=s10(u); out[1]=s10(u>>10); out[2]=s10(u>>20); return 3;
+      }
+      default: return 0;
+      }
+    }
+  }
+
   ClusterLodGeometryProvider::SnapshotResult ClusterLodGeometryProvider::makeSnapshot(
       const DrawCallState& drawCallState,
       uint64_t geometryHash,
@@ -345,7 +439,8 @@ namespace dxvk {
     }
 
     const VkFormat positionFormat = positionBuffer.vertexFormat();
-    if (positionFormat != VK_FORMAT_R32G32B32_SFLOAT && positionFormat != VK_FORMAT_R32G32B32A32_SFLOAT) {
+    const size_t positionElementBytes = clusterFormatElementBytes(positionFormat);
+    if (positionElementBytes == 0) {
       ONCE(Logger::info(str::format("[ClusterLOD] geometry 0x", std::hex, geometryHash, " skipped: unsupported position format ", std::dec, positionFormat, " (count of all such skips is in the stats log)")));
       return SnapshotResult::SkipFormat;
     }
@@ -371,7 +466,7 @@ namespace dxvk {
         return SnapshotResult::SkipNoCpuData;
       }
     }
-    if (size_t(positionBuffer.offsetFromSlice()) + size_t(positionBuffer.stride()) * (vertexCount - 1) + 3 * sizeof(float) > positionBuffer.length()) {
+    if (size_t(positionBuffer.offsetFromSlice()) + size_t(positionBuffer.stride()) * (vertexCount - 1) + positionElementBytes > positionBuffer.length()) {
       ONCE(Logger::warn(str::format("[ClusterLOD] geometry 0x", std::hex, geometryHash, " skipped: position buffer smaller than vertexCount x stride implies (stays classic; count of all such skips is in the stats log)")));
       return SnapshotResult::SkipNoCpuData;
     }
@@ -452,69 +547,109 @@ namespace dxvk {
       return SnapshotResult::SkipTooSmall;
     }
 
-    // positions -> tightly packed vec3
+    // positions -> tightly packed vec3 (format-decoded; positions are realistically float32/float16)
     {
       const size_t strideBytes = positionBuffer.stride();
 
       outSnapshot.positions.resize(size_t(vertexCount) * 3);
       for (uint32_t v = 0; v < vertexCount; v++) {
-        const float* src = (const float*) (positionPtr + strideBytes * v);
-        outSnapshot.positions[size_t(v) * 3 + 0] = src[0];
-        outSnapshot.positions[size_t(v) * 3 + 1] = src[1];
-        outSnapshot.positions[size_t(v) * 3 + 2] = src[2];
+        float c[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        clusterDecodeVertex(positionPtr + strideBytes * v, positionFormat, c);
+        outSnapshot.positions[size_t(v) * 3 + 0] = c[0];
+        outSnapshot.positions[size_t(v) * 3 + 1] = c[1];
+        outSnapshot.positions[size_t(v) * 3 + 2] = c[2];
       }
     }
 
-    // normals -> tightly packed vec3 (float formats only; packed R32_UINT normals from
-    // vertex capture cannot be read as floats and are treated as absent)
+    // normals -> tightly packed vec3 (format-decoded so any game's normal format is preserved on
+    // Path A, matching the classic path; packed octahedral R32_UINT normals remain unsupported)
     if (normalBuffer.defined()) {
       const VkFormat normalFormat = normalBuffer.vertexFormat();
-      if (normalFormat == VK_FORMAT_R32G32B32_SFLOAT || normalFormat == VK_FORMAT_R32G32B32A32_SFLOAT) {
+      const size_t normalElementBytes = clusterFormatElementBytes(normalFormat);
+      if (normalElementBytes != 0) {
         const uint8_t* normalPtr =
           (const uint8_t*) normalBuffer.mapPtr((size_t) normalBuffer.offsetFromSlice());
         const size_t strideBytes = normalBuffer.stride();
 
         // optional attribute: on a short buffer just cluster without normals
         if (normalPtr != nullptr
-            && size_t(normalBuffer.offsetFromSlice()) + strideBytes * (vertexCount - 1) + 3 * sizeof(float) <= normalBuffer.length()) {
+            && size_t(normalBuffer.offsetFromSlice()) + strideBytes * (vertexCount - 1) + normalElementBytes <= normalBuffer.length()) {
           outSnapshot.normals.resize(size_t(vertexCount) * 3);
           for (uint32_t v = 0; v < vertexCount; v++) {
-            const float* src = (const float*) (normalPtr + strideBytes * v);
-            outSnapshot.normals[size_t(v) * 3 + 0] = src[0];
-            outSnapshot.normals[size_t(v) * 3 + 1] = src[1];
-            outSnapshot.normals[size_t(v) * 3 + 2] = src[2];
+            float c[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+            clusterDecodeVertex(normalPtr + strideBytes * v, normalFormat, c);
+            outSnapshot.normals[size_t(v) * 3 + 0] = c[0];
+            outSnapshot.normals[size_t(v) * 3 + 1] = c[1];
+            outSnapshot.normals[size_t(v) * 3 + 2] = c[2];
           }
         }
       } else {
-        ONCE(Logger::info(str::format("[ClusterLOD] geometry 0x", std::hex, geometryHash, " has non-float normal format ", std::dec, normalFormat, ", clustering without normals")));
+        ONCE(Logger::info(str::format("[ClusterLOD] geometry 0x", std::hex, geometryHash, " has undecodable normal format ", std::dec, normalFormat, ", clustering without normals")));
       }
     }
 
-    // texcoords -> tightly packed vec2 (same float32-only rule as GeometryBufferData)
+    // texcoords -> tightly packed vec2 (format-decoded; the previous float32-only rule silently
+    // dropped half-float/unorm texcoords and left Path A clusters with no UVs -> broken textures)
     if (texcoordBuffer.defined()) {
       const VkFormat texcoordFormat = texcoordBuffer.vertexFormat();
-      if (texcoordFormat == VK_FORMAT_R32G32_SFLOAT || texcoordFormat == VK_FORMAT_R32G32B32_SFLOAT
-          || texcoordFormat == VK_FORMAT_R32G32B32A32_SFLOAT) {
+      const size_t texcoordElementBytes = clusterFormatElementBytes(texcoordFormat);
+      if (texcoordElementBytes != 0) {
         const uint8_t* texcoordPtr =
           (const uint8_t*) texcoordBuffer.mapPtr((size_t) texcoordBuffer.offsetFromSlice());
         const size_t strideBytes = texcoordBuffer.stride();
 
         // optional attribute: on a short buffer just cluster without texcoords
         if (texcoordPtr != nullptr
-            && size_t(texcoordBuffer.offsetFromSlice()) + strideBytes * (vertexCount - 1) + 2 * sizeof(float) <= texcoordBuffer.length()) {
+            && size_t(texcoordBuffer.offsetFromSlice()) + strideBytes * (vertexCount - 1) + texcoordElementBytes <= texcoordBuffer.length()) {
           outSnapshot.texcoords0.resize(size_t(vertexCount) * 2);
           for (uint32_t v = 0; v < vertexCount; v++) {
-            const float* src = (const float*) (texcoordPtr + strideBytes * v);
-            outSnapshot.texcoords0[size_t(v) * 2 + 0] = src[0];
-            outSnapshot.texcoords0[size_t(v) * 2 + 1] = src[1];
+            float c[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+            clusterDecodeVertex(texcoordPtr + strideBytes * v, texcoordFormat, c);
+            outSnapshot.texcoords0[size_t(v) * 2 + 0] = c[0];
+            outSnapshot.texcoords0[size_t(v) * 2 + 1] = c[1];
           }
         }
+      } else {
+        ONCE(Logger::info(str::format("[ClusterLOD] geometry 0x", std::hex, geometryHash, " has undecodable texcoord format ", std::dec, texcoordFormat, ", clustering without texcoords")));
       }
     }
 
     // material state baked into cluster state bits (shading stays Remix's)
     outSnapshot.twoSided = geometryData.cullMode == VK_CULL_MODE_NONE;
     outSnapshot.alphaMasked = drawCallState.getMaterialData().alphaTestEnabled;
+
+    // [SnapAttr] RAW one-shot dump: why does a Path A cluster end up with no texcoords?
+    // Prints the ACTUAL snapshot-input buffer state for the first draws so we can tell the
+    // three cases apart without guessing:
+    //   final=N>0            -> attribute decoded fine (fix working for this mesh)
+    //   defined=0            -> no CPU input buffer at all (VS-generated attr; lives only in the
+    //                           device-local capture slice -> unrecoverable CPU-side)
+    //   defined=1 map=null   -> input buffer is device-local (can't be read without a readback)
+    //   defined=1 elem=0     -> format the decoder still doesn't handle
+    //   defined=1 bounds=0   -> buffer shorter than count*stride implies (skipped)
+    // Capped so it can't spam. Raw values, no thresholds/classification.
+    {
+      static std::atomic<int> s_snapAttrDumps { 0 };
+      if (s_snapAttrDumps.fetch_add(1) < 64) {
+        auto bufState = [&](const RasterBuffer& b) {
+          const bool def = b.defined();
+          const VkFormat fmt = def ? b.vertexFormat() : VK_FORMAT_UNDEFINED;
+          const size_t elem = clusterFormatElementBytes(fmt);
+          const bool mapNull = def ? (b.mapPtr((size_t) b.offsetFromSlice()) == nullptr) : true;
+          const bool boundsOk = def && !mapNull && elem != 0
+            && size_t(b.offsetFromSlice()) + size_t(b.stride()) * (vertexCount - 1) + elem <= b.length();
+          return str::format("def=", def ? 1 : 0, " fmt=", uint32_t(fmt), " elem=", elem,
+                             " map=", mapNull ? "null" : "ok", " bounds=", boundsOk ? 1 : 0);
+        };
+        Logger::err(str::format(
+          "[SnapAttr] ", outSnapshot.name,
+          " preCap=", preCapture != nullptr ? 1 : 0,
+          " verts=", vertexCount,
+          " | TEX ", bufState(texcoordBuffer), " final=", outSnapshot.texcoords0.size() / 2,
+          " | NRM ", bufState(normalBuffer),   " final=", outSnapshot.normals.size() / 3,
+          " | POS fmt=", uint32_t(positionFormat)));
+      }
+    }
 
     return (topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST && usesIndices)
       ? SnapshotResult::Eligible

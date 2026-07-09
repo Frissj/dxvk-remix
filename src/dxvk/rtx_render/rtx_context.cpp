@@ -1385,6 +1385,13 @@ namespace dxvk {
       constants.clusterGeometriesTableAddressLo = uint32_t(clusterGeometriesTableAddress);
       constants.clusterGeometriesTableAddressHi = uint32_t(clusterGeometriesTableAddress >> 32);
 
+      // NV-DXVK: streaming-resident cluster address table for hit-side attribute fetch. Non-zero only
+      // while streaming; the hit shader uses it instead of the (streaming-null) preloadedClusters.
+      const uint64_t clusterResidentClustersAddress =
+        clusterLodManager != nullptr ? clusterLodManager->getResidentClustersAddress() : 0;
+      constants.clusterResidentClustersAddressLo = uint32_t(clusterResidentClustersAddress);
+      constants.clusterResidentClustersAddressHi = uint32_t(clusterResidentClustersAddress >> 32);
+
       // P4b Path B: animated cluster table for the hit-side primitive remap
       const uint64_t animatedClusterTableAddress =
         clusterLodManager != nullptr ? clusterLodManager->getAnimatedClusterTableAddress() : 0;
