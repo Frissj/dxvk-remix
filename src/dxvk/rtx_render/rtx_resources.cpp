@@ -1175,7 +1175,10 @@ namespace dxvk {
 
     // GPU print buffer
     {
-      const uint32_t bufferLength = kMaxFramesInFlight;
+      // NV-DXVK: legacy single-slot ring (first GPU_PRINT_RING_SLOTS) + a per-frame-in-flight
+      // [PathAProbe] append region of PATHA_PROBE_CAP hash-indexed slots each. See gpu_printing.h.
+      static_assert(GPU_PRINT_RING_SLOTS == kMaxFramesInFlight, "GPU_PRINT_RING_SLOTS must equal kMaxFramesInFlight");
+      const uint32_t bufferLength = GPU_PRINT_RING_SLOTS * (1u + PATHA_PROBE_CAP);
 
       DxvkBufferCreateInfo gpuPrintBufferInfo;
       gpuPrintBufferInfo.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;

@@ -308,6 +308,13 @@
 #define DEBUG_VIEW_CLUSTER_TEXTURE_GRADIENT 931
 #define DEBUG_VIEW_CLUSTER_MATERIAL_ANOMALY 932
 
+// NV-DXVK: Path A (resident cluster) UV / gradient views - visual counterpart to the [PathAProbe]
+// append buffer. Show every pixel at once (no sampling): whether Path A's UVs are continuous or
+// scrambled, and whether its texture gradient (mip pressure) explodes when the camera moves.
+#define DEBUG_VIEW_CLUSTER_PATHA_UV 933
+#define DEBUG_VIEW_CLUSTER_PATHA_UV_CHECKER 934
+#define DEBUG_VIEW_CLUSTER_PATHA_GRADIENT 935
+
 enum class CompositeDebugView : uint32_t {
   Disabled = 0,
   FinalRenderWithMaterialProperties,

@@ -807,6 +807,70 @@ void geometryResolverVertexOutputDebugView(
     }
 
     break;
+  case DEBUG_VIEW_CLUSTER_PATHA_UV:
+    // Final interpolated UVs on Path A (resident cluster) surfaces, R=frac(u) G=frac(v). Path B
+    // templates are shown dimmed for comparison on the same wall; classic = checkerboard. If Path A
+    // shows scrambled/uniform UVs where Path B is a smooth gradient, Path A's UV pipeline is broken.
+    if (surface.isClusterLod)
+    {
+      storeInDebugView(pixelCoordinate, vec3(fract(surfaceInteraction.textureCoordinates), 0.0f));
+    }
+    else if (surface.isClusterTemplate)
+    {
+      storeInDebugView(pixelCoordinate, vec3(fract(surfaceInteraction.textureCoordinates) * 0.35f, 0.0f));
+    }
+    else
+    {
+      const bool checker = (((pixelCoordinate.x >> 3) & 1) ^ ((pixelCoordinate.y >> 3) & 1)) != 0;
+      storeInDebugView(pixelCoordinate, vec3(checker ? 0.5 : 0.25));
+    }
+
+    break;
+  case DEBUG_VIEW_CLUSTER_PATHA_UV_CHECKER:
+    // Procedural checkerboard driven by the Path A UVs. Clean regular grid == UVs continuous/correct;
+    // warped/swirled/noisy squares == the UVs themselves are wrong (cluster texcoord decode or the
+    // texture transform). Fastest "is it the UVs or the texture?" split: clean grid here + wrong real
+    // texture == the texture, not the UVs.
+    if (surface.isClusterLod)
+    {
+      const vec2 uvC = surfaceInteraction.textureCoordinates * 16.0f;
+      const bool cc = ((int(floor(uvC.x)) + int(floor(uvC.y))) & 1) != 0;
+      storeInDebugView(pixelCoordinate, cc ? vec3(1.0, 0.6, 0.2) : vec3(0.1, 0.1, 0.15));
+    }
+    else if (surface.isClusterTemplate)
+    {
+      const vec2 uvC = surfaceInteraction.textureCoordinates * 16.0f;
+      const bool cc = ((int(floor(uvC.x)) + int(floor(uvC.y))) & 1) != 0;
+      storeInDebugView(pixelCoordinate, cc ? vec3(0.2, 0.5, 1.0) : vec3(0.05, 0.05, 0.1));
+    }
+    else
+    {
+      const bool checker = (((pixelCoordinate.x >> 3) & 1) ^ ((pixelCoordinate.y >> 3) & 1)) != 0;
+      storeInDebugView(pixelCoordinate, vec3(checker ? 0.5 : 0.25));
+    }
+
+    break;
+  case DEBUG_VIEW_CLUSTER_PATHA_GRADIENT:
+    // Grayscale texture-gradient magnitude (mip pressure) on Path A surfaces. Pan the camera and
+    // watch: if Path A brightens/explodes to white under motion while Path B (dim-tinted) stays
+    // stable, Path A's camera-derived gradient is the "only Path B survives camera motion" fault.
+    if (surface.isClusterLod)
+    {
+      const float g = max(length(surfaceInteraction.textureGradientX), length(surfaceInteraction.textureGradientY));
+      storeInDebugView(pixelCoordinate, vec3(saturate(g * 10.0f)));
+    }
+    else if (surface.isClusterTemplate)
+    {
+      const float g = max(length(surfaceInteraction.textureGradientX), length(surfaceInteraction.textureGradientY));
+      storeInDebugView(pixelCoordinate, vec3(0.0f, saturate(g * 10.0f) * 0.5f, 0.0f));
+    }
+    else
+    {
+      const bool checker = (((pixelCoordinate.x >> 3) & 1) ^ ((pixelCoordinate.y >> 3) & 1)) != 0;
+      storeInDebugView(pixelCoordinate, vec3(checker ? 0.5 : 0.25));
+    }
+
+    break;
   // NV-DXVK end
   case DEBUG_VIEW_CUSTOM_INDEX:
 

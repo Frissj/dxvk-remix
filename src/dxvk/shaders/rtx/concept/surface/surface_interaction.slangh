@@ -253,6 +253,33 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
   // -> original triangle, through the animated cluster table via ClusterID.
   const bool isTemplateHit = surface.isClusterTemplate && rayInteraction.clusterId != CLUSTER_ID_INVALID;
 
+  // NV-DXVK: [PathAProbe] CENSUS (revert). Fires for EVERY Path A (isClusterLod) primary hit,
+  // BEFORE any cluster fetch, so it captures the hits the rich probe below (gated on a valid
+  // clusterId) structurally cannot. This is what tells us whether Path A hits are even getting a
+  // ClusterID from the ray: if census samples >> rich samples, the ray is NOT returning ClusterID
+  // for resident CLAS hits and the whole cluster vertex/UV fetch is bypassed (-> classic fallback
+  // -> wrong UVs). Sentinel 0xC121; writtenData = [clusterId, isClusterHit, surfaceIndex,
+  // clusterGeometryId&0x3FFFF]; pad = [primitiveIndex, clusterId].
+#if defined(RAY_TRACING_PRIMARY_RAY)
+  if (surface.isClusterLod)
+  {
+    uint censusHash = surface.clusterGeometryId * 2654435761u
+                    + rayInteraction.primitiveIndex * 40503u
+                    + rayInteraction.surfaceIndex * 2246822519u;
+    censusHash ^= censusHash >> 15;
+    const uint censusBase = uint(GPU_PRINT_RING_SLOTS) + cb.gpuPrintElementIndex * uint(PATHA_PROBE_CAP);
+    const uint censusSlot = censusBase + (censusHash % uint(PATHA_PROBE_CAP));
+
+    GpuPrintBufferElement census;
+    census.writtenData = float4(float(rayInteraction.clusterId), isClusterHit ? 1.0f : 0.0f,
+                                float(rayInteraction.surfaceIndex), float(surface.clusterGeometryId & 0x3FFFFu));
+    census.threadIndex = u16vec2(0xFEEDu, uint16_t(kPathAProbeSentinel + 1u));  // 0xC121
+    census.frameIndex  = cb.frameIdx;
+    census.pad         = uint2(rayInteraction.primitiveIndex, rayInteraction.clusterId);
+    GpuPrintBuffer[censusSlot] = census;
+  }
+#endif
+
   ClusterGeometry clusterGeometry;
   uint3 clusterIndices = uint3(0, 0, 0);
 
@@ -264,6 +291,32 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
     clusterGeometry = clusterGeometryCreate(
       clusterGeometriesTableAddress, surface.clusterGeometryId & 0x3FFFF, rayInteraction.clusterId);
     clusterIndices = clusterGeometryGetTriangleIndices(clusterGeometry, rayInteraction.primitiveIndex);
+
+    // NV-DXVK: [PathAProbe] ATTR (revert). The census confirmed Path A hits get valid ClusterIDs yet
+    // the rich UV probe never fires -> the texcoord block is skipped -> clusterGeometry.hasTexcoords0
+    // is false. This dumps the RAW attributeBits of the resident cluster header so we can see WHY:
+    //   bit 4 (0x04) set  -> uncompressed TEX_0 present (hasTexcoords0 SHOULD be true; skip is elsewhere)
+    //   bit 32 (0x20) set -> COMPRESSED TEX_0: data is there but hasTexcoords0 checks bit 4 -> false (BUG)
+    //   neither           -> the cluster genuinely has no texcoords (built without them)
+    // Sentinel 0xC122; writtenData = [attributeBits, hasTexcoords0, hasNormals, vertexCount].
+#if defined(RAY_TRACING_PRIMARY_RAY)
+    {
+      uint attrHash = rayInteraction.clusterId * 374761393u + rayInteraction.surfaceIndex * 668265263u;
+      attrHash ^= attrHash >> 13;
+      const uint attrBase = uint(GPU_PRINT_RING_SLOTS) + cb.gpuPrintElementIndex * uint(PATHA_PROBE_CAP);
+      const uint attrSlot = attrBase + (attrHash % uint(PATHA_PROBE_CAP));
+
+      GpuPrintBufferElement attrRec;
+      attrRec.writtenData = float4(float(clusterGeometry.attributeBits),
+                                   clusterGeometry.hasTexcoords0 ? 1.0f : 0.0f,
+                                   clusterGeometry.hasNormals ? 1.0f : 0.0f,
+                                   float(clusterGeometry.vertexCount));
+      attrRec.threadIndex = u16vec2(0xFEEDu, uint16_t(kPathAProbeSentinel + 2u));  // 0xC122
+      attrRec.frameIndex  = cb.frameIdx;
+      attrRec.pad         = uint2(rayInteraction.clusterId, surface.clusterGeometryId & 0x3FFFFu);
+      GpuPrintBuffer[attrSlot] = attrRec;
+    }
+#endif
   }
   else if (isTemplateHit)
   {
@@ -732,7 +785,10 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
     // Capture the 3 per-vertex texcoord.x + idx[0] + clusterId for a template hit. Gated sparsely
     // (primitiveIndex low bits) to limit contention; last-writer-wins yields ~1 sample/frame.
     // Sentinel 0xC10E distinguishes it CPU-side (see rtx_context.cpp readback).
-    if (isTemplateHit && (rayInteraction.primitiveIndex & 0xFu) == 0u)
+    // NV-DXVK: DISABLED - Path B template hits (~1804 CLAS) were winning the single-slot GpuPrint
+    // ring every frame and starving the [PathAProbe] (~92 Path A CLAS). We are now debugging Path A,
+    // so this Path B probe is gated off to hand the ring to [PathAProbe]. Re-enable to probe Path B.
+    if (false && isTemplateHit && (rayInteraction.primitiveIndex & 0xFu) == 0u)
     {
       GpuPrintBufferElement tcDbg;
       tcDbg.writtenData = float4(texcoords[0].x, texcoords[1].x, texcoords[2].x, float(rayInteraction.surfaceIndex));
@@ -836,6 +892,49 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
     {
       surfaceInteraction.textureGradientX = (texcoords[1] - texcoords[0]) / 3.0f;
       surfaceInteraction.textureGradientY = (texcoords[2] - texcoords[0]) / 3.0f;
+    }
+
+    // NV-DXVK: [PathAProbe] DIAGNOSTIC (revert). Path A (resident cluster) hits render wrong UVs/
+    // textures, and only Path B survives camera motion. Instead of the old single-slot GPU-print ring
+    // (which Path B starved), each Path A hit SCATTERS one record into a large per-frame append region
+    // by a geometry hash - thousands of samples/frame, no atomics, no starvation. The CPU aggregates
+    // the whole region (rtx_context.cpp) into collapse/gradient/attribute stats. One record carries:
+    //   writtenData = [finalUV.x, finalUV.y, gradientMagnitude, uvTriangleSpread]
+    //     uvTriangleSpread ~0 == texcoords collapsed (flat -> untextured/vertex-colour look)
+    //   pad[0] = surfaceIndex, with flags in the top bits: bit31 = hasTexcoords0, bit30 = clusterValid
+    //   pad[1] = clusterId
+    // Compare a still capture vs a panning capture: gradientMagnitude exploding under motion == the
+    // camera-motion fault; collapsed/garbage UVs at rest == a cluster texcoord decode fault.
+    if (isClusterHit)
+    {
+      const vec2 pathAGradX = surfaceInteraction.textureGradientX;
+      const vec2 pathAGradY = surfaceInteraction.textureGradientY;
+      const float pathAGradMag = max(length(pathAGradX), length(pathAGradY));
+      const float pathAUvSpread = max(length(texcoords[1] - texcoords[0]),
+                                  max(length(texcoords[2] - texcoords[0]),
+                                      length(texcoords[2] - texcoords[1])));
+
+      // geometry-spread hash so distinct hits land in distinct slots (collisions just overwrite,
+      // which is harmless - we only want a broad sample of Path A pixels)
+      uint pathAHash = rayInteraction.clusterId * 2654435761u
+                     + rayInteraction.primitiveIndex * 40503u
+                     + rayInteraction.surfaceIndex * 2246822519u;
+      pathAHash ^= pathAHash >> 15;
+
+      const uint pathABase = uint(GPU_PRINT_RING_SLOTS) + cb.gpuPrintElementIndex * uint(PATHA_PROBE_CAP);
+      const uint pathASlot = pathABase + (pathAHash % uint(PATHA_PROBE_CAP));
+
+      const uint pathAFlags = (clusterGeometry.hasTexcoords0 ? 0x80000000u : 0u)
+                            | (clusterGeometry.isValid ? 0x40000000u : 0u);
+
+      GpuPrintBufferElement pathA;
+      pathA.writtenData = float4(surfaceInteraction.textureCoordinates.x, surfaceInteraction.textureCoordinates.y,
+                                 pathAGradMag, pathAUvSpread);
+      pathA.threadIndex = u16vec2(0xFEEDu, uint16_t(kPathAProbeSentinel));
+      pathA.frameIndex  = cb.frameIdx;
+      pathA.pad         = uint2((rayInteraction.surfaceIndex & 0x00FFFFFFu) | pathAFlags, rayInteraction.clusterId);
+
+      GpuPrintBuffer[pathASlot] = pathA;
     }
   }
   else

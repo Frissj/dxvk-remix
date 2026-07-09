@@ -23,6 +23,16 @@
 
 static const int16_t kInvalidThreadIndex = 32767; // ~ int16_t max
 
+// NV-DXVK: [PathAProbe] append region. The legacy single-slot GPU-print ring occupies the first
+// GPU_PRINT_RING_SLOTS elements (== kMaxFramesInFlight). After it, each frame-in-flight owns a
+// region of PATHA_PROBE_CAP hash-indexed slots that Path A probes scatter into (different hits ->
+// different slots by a geometry hash, so no single-slot starvation and no atomics needed). Total
+// buffer length = GPU_PRINT_RING_SLOTS * (1 + PATHA_PROBE_CAP). The CPU scans the oldest ring's
+// region each frame and aggregates. Sentinel threadIndex.y == kPathAProbeSentinel marks a record.
+#define GPU_PRINT_RING_SLOTS 4        // MUST equal kMaxFramesInFlight (static_assert in rtx_resources.cpp)
+#define PATHA_PROBE_CAP 8192
+#define kPathAProbeSentinel 0xC120u
+
 // Note: ensure alignment for C++ and Slang to match
 struct GpuPrintBufferElement
 {  

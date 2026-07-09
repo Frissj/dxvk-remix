@@ -2201,6 +2201,85 @@ namespace dxvk {
       }
     }
 
+    // NV-DXVK: [PathAProbe] aggregate scan of the Path A append region. Path A (resident cluster)
+    // hits scatter one record each into a large per-frame-in-flight region (surface_interaction.slangh)
+    // by a geometry hash - no single-slot starvation. Scan the OLDEST ring (guaranteed GPU-complete),
+    // aggregate collapse/gradient/attribute stats over all samples, log a compact summary, then
+    // invalidate the slots so the next pass only sees freshly-written records. Remove with the probe.
+    {
+      const uint32_t ring = (frameIdx + 1) % kMaxFramesInFlight;
+      const uint32_t regionBase = GPU_PRINT_RING_SLOTS + ring * PATHA_PROBE_CAP;
+      const VkDeviceSize regionOffset = VkDeviceSize(regionBase) * sizeof(GpuPrintBufferElement);
+      GpuPrintBufferElement* region =
+        reinterpret_cast<GpuPrintBufferElement*>(rtOutput.m_gpuPrintBuffer->mapPtr(regionOffset));
+
+      if (region) {
+        // Rich records (0xC120, valid-clusterId hits): UV/gradient/collapse stats.
+        uint32_t samples = 0, collapsed = 0, noTexAttr = 0, invalidCluster = 0;
+        float gradMin = 1e30f, gradMax = 0.0f, gradSum = 0.0f;
+        float uvxMin = 1e30f, uvxMax = -1e30f, uvyMin = 1e30f, uvyMax = -1e30f;
+        uint32_t exU0 = 0, exU1 = 0; float exGrad0 = 0.0f, exSpread0 = 0.0f;
+        // Census records (0xC121, EVERY Path A hit): how many got a ClusterID from the ray.
+        uint32_t census = 0, censusWithClusterId = 0, exCensusClusterId = 0, exCensusSurfIdx = 0;
+        // Attr records (0xC122, isClusterHit): resident-cluster attributeBits breakdown.
+        uint32_t attr = 0, attrTex0Bit = 0, attrCompressedTex0Bit = 0, attrHasTexcoords0 = 0, exAttrBits = 0;
+
+        for (uint32_t i = 0; i < PATHA_PROBE_CAP; ++i) {
+          GpuPrintBufferElement& e = region[i];
+          if (e.threadIndex.x != 0xFEEDu) {
+            continue;
+          }
+          const Vector4& wd = reinterpret_cast<Vector4&>(e.writtenData);
+          const uint32_t* pd = reinterpret_cast<const uint32_t*>(&e.pad);
+
+          if (e.threadIndex.y == uint16_t(kPathAProbeSentinel)) {           // 0xC120 rich
+            const float gradMag = wd.z, uvSpread = wd.w;
+            if (samples == 0) { exU0 = pd[0]; exU1 = pd[1]; exGrad0 = gradMag; exSpread0 = uvSpread; }
+            samples++;
+            if (uvSpread < 1.0e-5f) collapsed++;
+            if ((pd[0] & 0x80000000u) == 0u) noTexAttr++;        // hasTexcoords0 clear
+            if ((pd[0] & 0x40000000u) == 0u) invalidCluster++;   // clusterValid clear
+            gradMin = std::min(gradMin, gradMag); gradMax = std::max(gradMax, gradMag); gradSum += gradMag;
+            uvxMin = std::min(uvxMin, wd.x); uvxMax = std::max(uvxMax, wd.x);
+            uvyMin = std::min(uvyMin, wd.y); uvyMax = std::max(uvyMax, wd.y);
+            e.invalidate();
+          } else if (e.threadIndex.y == uint16_t(kPathAProbeSentinel + 1u)) { // 0xC121 census
+            if (census == 0) { exCensusClusterId = uint32_t(wd.x); exCensusSurfIdx = uint32_t(wd.z); }
+            census++;
+            if (wd.y > 0.5f) censusWithClusterId++;              // isClusterHit == valid ClusterID
+            e.invalidate();
+          } else if (e.threadIndex.y == uint16_t(kPathAProbeSentinel + 2u)) { // 0xC122 attr
+            const uint32_t bits = uint32_t(wd.x);
+            if (attr == 0) exAttrBits = bits;
+            attr++;
+            if (bits & 0x04u) attrTex0Bit++;            // CLUSTER_ATTRIBUTE_VERTEX_TEX_0
+            if (bits & 0x20u) attrCompressedTex0Bit++;  // CLUSTER_ATTRIBUTE_COMPRESSED_VERTEX_TEX_0
+            if (wd.y > 0.5f) attrHasTexcoords0++;
+            e.invalidate();
+          }
+        }
+
+        // Throttle the log line so a steady stream stays readable (~2x/sec at 60fps).
+        static uint32_t s_lastPathALogFrame = 0;
+        if ((census > 0 || samples > 0 || attr > 0) && (frameIdx - s_lastPathALogFrame >= 30u || frameIdx < s_lastPathALogFrame)) {
+          s_lastPathALogFrame = frameIdx;
+          Logger::err(str::format(
+            "[PathAProbe] frame=", frameIdx,
+            " PathAhits=", census, " withClusterID=", censusWithClusterId,
+            " | attrSamples=", attr, " hasTexcoords0=", attrHasTexcoords0,
+            " TEX0bit(0x04)=", attrTex0Bit, " COMPRESSEDtex0bit(0x20)=", attrCompressedTex0Bit,
+            " exAttrBits=0x", std::hex, exAttrBits, std::dec,
+            (attr > 0 && attrTex0Bit == 0 && attrCompressedTex0Bit > 0
+               ? "  *** texcoords are COMPRESSED (bit 0x20) but hasTexcoords0 checks bit 0x04 -> UVs skipped (BUG) ***"
+               : (attr > 0 && attrTex0Bit == 0 && attrCompressedTex0Bit == 0
+                    ? "  *** cluster has NO texcoord attribute at all (built without texcoords) ***" : "")),
+            " | richSamples=", samples,
+            " collapsedUV=", collapsed, " grad[min/avg/max]=", gradMin, "/", (samples ? gradSum / float(samples) : 0.0f), "/", gradMax,
+            " exCensus(clusterId=", exCensusClusterId, " surfIdx=", exCensusSurfIdx, ")"));
+        }
+      }
+    }
+
     if (!debugView.isActive()) {
       return;
     }
