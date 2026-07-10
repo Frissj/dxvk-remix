@@ -60,6 +60,7 @@ layout(local_size_x = 64) in;
 #define PROMO_FLAG_RIGID   1u
 #define PROMO_FLAG_DEMOTED 4u
 #define PROMO_FLAG_SKIPPED 8u    // diagnostic: this slot took the re-solve skip
+#define PROMO_FLAG_SOLVED  16u   // this slot has been solved at least once (has a valid retained M)
 // promo state slot capacity (mirror of ClusterRenderSystem::kPromotionSlotCapacity)
 // - a defensive in-shader bound so a bad stateSlot can never scribble the promo
 // buffers (turns a would-be device-lost into a silently dropped entry)
@@ -498,12 +499,29 @@ void main()
 
   PromoStatus status = statuses.s[entry.stateSlot];
   const bool contiguous = (status.lastFrame + 1u == push.frameId);
+  const bool everSolved = (status.flags & PROMO_FLAG_SOLVED) != 0u;
 
-  // prevM = last frame's M when the probe ran last frame too; on gaps the
-  // motion is unknowable - report zero motion instead of garbage
+  // [ColdPromo] probe (diagnostic): a promoted (patchSlot-valid) slot that was NEVER
+  // solved has no previous transform, so prevM = curM below => one frame of ZERO motion.
+  // That is a genuine first appearance / disocclusion (no history to reproject - TAA
+  // rejects it anyway), which is acceptable. A slot solved before (contiguous OR gapped)
+  // now reuses its retained M and is no longer cold. Sticky record; after the fix this
+  // should fire only on true first appearances, not the churn/gap waves.
+  if(entry.patchSlot != 0xFFFFFFFFu && !everSolved)
+  {
+    status._pad1 = push.frameId;
+  }
+
+  // prevM for motion continuity. Reuse the slot's RETAINED M (mBase+0) whenever it has
+  // EVER been solved: the contiguous case gives last frame's M, and a GAPPED slot (a
+  // promoted instance that dropped a frame, or whose BlasEntry was rebuilt by a [BlasWave]
+  // and whose warm slot the CPU recovered by instance id) gives the pre-gap M - the right
+  // previous transform for a rigid instance, and far better than seeding prevM = curM
+  // (zero motion => one frame of the reconstruction wobble => the promotion smear). Only a
+  // slot NEVER solved (first appearance, no history) falls back to prevM = curM.
   for(uint k = 0; k < 12; k++)
   {
-    const float prev = contiguous ? matrices.m[mBase + k] : M[k];
+    const float prev = everSolved ? matrices.m[mBase + k] : M[k];
     matrices.m[mBase + 12 + k] = prev;
     matrices.m[mBase + k]      = M[k];
   }
@@ -513,7 +531,7 @@ void main()
   status.lastFrame   = push.frameId;
   // clear SKIPPED too - this frame did the full solve (diagnostic counter)
   status.flags       = (status.flags & ~(PROMO_FLAG_RIGID | PROMO_FLAG_DEMOTED | PROMO_FLAG_SKIPPED))
-                     | (rigid ? PROMO_FLAG_RIGID : PROMO_FLAG_DEMOTED);
+                     | (rigid ? PROMO_FLAG_RIGID : PROMO_FLAG_DEMOTED) | PROMO_FLAG_SOLVED;
   // [MotionProbe] RAW per-frame transform translation delta (world units) = exactly the
   // motion the render applies to this promoted instance via M/prevM. Nonzero on a
   // camera-still frame => the solve is manufacturing motion; matches parallax => source ok.

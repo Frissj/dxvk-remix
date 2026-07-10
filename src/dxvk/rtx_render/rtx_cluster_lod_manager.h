@@ -413,6 +413,21 @@ namespace dxvk {
                  "the sparse per-frame solve can miss a VS animating a small vertex subset, so every promoted\n"
                  "instance re-runs the every-vertex sweep on this interval (staggered by state slot). A failing\n"
                  "sweep demotes that instance to Path B. 0 disables the sweeps (not recommended).");
+      // Stable-identity cell size (plan §2 Option L). The promo state slot (GPU M/prevM
+      // continuity) is recovered per frame by quantizing the instance's reconstructed world
+      // centroid into a cell of this size, instead of the churning RtInstance id / BlasEntry
+      // pointer. A static prop lands in the same (geometryHash, cell) every frame -> it recovers
+      // its WARM slot instead of a cold one -> no one-frame zero-motion snap ([ColdPromo]).
+      // Constraint: >= the reconstruction wobble amplitude ([MotionProbe] motionDelta, ~0.30
+      // world units observed) but < half the min spacing between two instances of the same
+      // asset (else two distinct props share a cell/slot and swap motion). Size it from
+      // [MotionProbe] data (Phase 0). Captured-geometry-scoped only; does NOT touch lights or
+      // rtx.uniqueObjectDistance.
+      RTX_OPTION("rtx.clusterLod.promotion", float, identityCellSize, 1.0f,
+                 "World-space cell size (units) for stable promoted-instance identity (Option L). Quantizes the\n"
+                 "reconstructed world centroid to recover a warm GPU transform slot across BlasEntry/RtInstance\n"
+                 "churn. Set >= the wobble amplitude ([MotionProbe] motionDelta) and < half the min inter-instance\n"
+                 "spacing. Runtime-tunable: sweep it while watching [ColdPromo] collapse to near-zero.");
     };
   };
 
@@ -857,6 +872,14 @@ namespace dxvk {
       uint32_t blasFrameCreated = 0;
     };
     std::unordered_map<const BlasEntry*, PromoInstance> m_promoSlotByBlas;
+    // NV-DXVK: recover a promoted instance's state slot across BlasEntry churn. Streaming and
+    // [BlasWave] generation rebuilds destroy/recreate BlasEntry objects, orphaning the
+    // pointer-keyed slot above; a fresh slot has no GPU M/prevM history, so its first solve
+    // reports zero motion (one frame of the reconstruction wobble => promotion smear - proven
+    // by [ColdPromo] waves coinciding with [BufVa] DESTROY + [BlasWave]). Keyed by the STABLE
+    // RtInstance id so the rebuilt instance inherits its warm slot instead. Also caps the slot
+    // leak: the same instance stops consuming a new slot on every rebuild.
+    std::unordered_map<uint64_t, uint32_t> m_promoSlotByInstanceId;
     // per-frame kernel work items (built in dispatchBuild, consumed by
     // recordFrame the same call) + readback scratch
     std::vector<lodclusters_remix::PromotionEntry> m_framePromoEntries;

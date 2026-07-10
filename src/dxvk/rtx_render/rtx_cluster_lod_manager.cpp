@@ -642,6 +642,34 @@ namespace dxvk {
       return;
     }
 
+    // [ColdPromo] probe (diagnostic): confirm whether promoted instances ever solve
+    // NON-contiguously (cold B->A), seeding prevM = curM for one frame => a single frame
+    // of zero motion. coldFrame (PromoStatus._pad1) is the last frame a promoted slot
+    // solved cold; coldFrame == lastFrame means the MOST RECENT solve was cold (it just
+    // happened, within readback lag). Log each (slot, coldFrame) once. If this never
+    // fires, candidacy always warms the slot and the imperfection does not occur.
+    {
+      static std::unordered_map<uint32_t, uint32_t> s_lastLoggedColdFrame;
+      for (const auto& slotEntry : m_promoSlotByBlas) {
+        const lodclusters_remix::PromotionStateView& st = m_promoStates[slotEntry.second.stateSlot];
+        if (st.coldFrame == 0u || st.coldFrame != st.lastFrame) {
+          continue;  // never cold, or a later solve already warmed it
+        }
+        const uint32_t slot = slotEntry.second.stateSlot;
+        const auto logged = s_lastLoggedColdFrame.find(slot);
+        if (logged != s_lastLoggedColdFrame.end() && logged->second == st.coldFrame) {
+          continue;  // already reported this cold event
+        }
+        s_lastLoggedColdFrame[slot] = st.coldFrame;
+        Logger::info(str::format("[ColdPromo] slot ", slot, " geom 0x", std::hex,
+                                 slotEntry.second.geometryHash, std::dec,
+                                 " : COLD (non-contiguous) promoted solve at frame ", st.coldFrame,
+                                 " rigidStreak ", st.rigidStreak,
+                                 " -> prevM seeded = curM (one-frame ZERO motion); correlate [PathFlap] dir=B->A near frame ",
+                                 st.coldFrame));
+      }
+    }
+
     // [MotionProbe] The churn question: are promoted instances reporting ZERO motion
     // (static-skip, PROMO_FLAG_SKIPPED=8) or FULL-SOLVING a new M every frame (motion)?
     // A static scene where most promoted slots FULL-SOLVE = their capture is changing
@@ -1622,11 +1650,27 @@ namespace dxvk {
               // per-INSTANCE promotion state slot (plan R21: every captured
               // instance's buffer carries its own transform)
               auto slotIt = m_promoSlotByBlas.find(blasEntry);
-              if (slotIt == m_promoSlotByBlas.end()
-                  && m_promoNextStateSlot < lodclusters_remix::ClusterRenderSystem::kPromotionSlotCapacity) {
+              if (slotIt == m_promoSlotByBlas.end()) {
                 PromoInstance promoInstance;
-                promoInstance.stateSlot = m_promoNextStateSlot++;
-                slotIt = m_promoSlotByBlas.emplace(blasEntry, promoInstance).first;
+                // Recover this instance's EXISTING state slot across BlasEntry churn
+                // (streaming / [BlasWave] rebuilds recreate the BlasEntry, orphaning the
+                // pointer key). Keyed by the stable RtInstance id, so the rebuilt instance
+                // reuses its warm GPU M/prevM slot instead of a fresh cold one -> the solve
+                // stays continuous (PROMO_FLAG_SOLVED already set) and the motion vector
+                // never falls back to zero. First-ever promotion still allocates a new slot.
+                const uint64_t instanceId = (instance != nullptr) ? instance->getId() : 0u;
+                const auto idIt = (instance != nullptr)
+                  ? m_promoSlotByInstanceId.find(instanceId) : m_promoSlotByInstanceId.end();
+                if (idIt != m_promoSlotByInstanceId.end()) {
+                  promoInstance.stateSlot = idIt->second;
+                  slotIt = m_promoSlotByBlas.emplace(blasEntry, promoInstance).first;
+                } else if (m_promoNextStateSlot < lodclusters_remix::ClusterRenderSystem::kPromotionSlotCapacity) {
+                  promoInstance.stateSlot = m_promoNextStateSlot++;
+                  if (instance != nullptr) {
+                    m_promoSlotByInstanceId.emplace(instanceId, promoInstance.stateSlot);
+                  }
+                  slotIt = m_promoSlotByBlas.emplace(blasEntry, promoInstance).first;
+                }
               }
               // per-instance demotion: a demoted instance falls through to
               // Path B below while its siblings stay promoted; its slot keeps

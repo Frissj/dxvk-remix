@@ -1129,6 +1129,7 @@ bool ClusterRenderSystem::readPromotionStates(PromotionStateView* outStates)
     memcpy(&v.flags, s + 12, sizeof(uint32_t));
     memcpy(&v.lastFrame, s + 16, sizeof(uint32_t));
     memcpy(&v.motionDelta, s + 20, sizeof(float));  // [MotionProbe] PromoStatus._pad0
+    memcpy(&v.coldFrame, s + 24, sizeof(uint32_t));  // [ColdPromo] PromoStatus._pad1
   }
   return true;
 }

@@ -410,6 +410,7 @@ namespace lodclusters_remix {
     uint32_t flags = 0;               // bit0 rigid, bit2 demoted (last solve non-rigid)
     uint32_t lastFrame = 0;           // renderer frameIndex of the last solve
     float motionDelta = 0.0f;         // [MotionProbe] |M.t - prevM.t| this frame (world units)
+    uint32_t coldFrame = 0;           // [ColdPromo] last frame this promoted slot solved non-contiguously (prevM=curM)
   };
 
   // P3: semaphores the caller must attach to the queue submission that
