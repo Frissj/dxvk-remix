@@ -432,6 +432,21 @@ namespace dxvk {
                  "Frames to keep a promoted mesh's BlasEntry alive after it leaves view, so re-entry\n"
                  "reuses the same BlasEntry and stays warm (no cold re-promote snap). 0 = use the\n"
                  "global numFramesToKeepBLAS lifetime.");
+      RTX_OPTION("rtx.clusterLod.promotion", bool, resolveSkip, false,
+                 "Per-frame re-solve skip: when a promoted slot's cached transform from last frame\n"
+                 "still reproduces this frame's vertex-capture within residualEpsilon, reuse it and\n"
+                 "skip the full affine solve (a perf shortcut that assumed most promoted geometry\n"
+                 "sits still). DEFAULT OFF - THE motion-lag fix. The captured geometry is\n"
+                 "reconstructed CAMERA-RELATIVE (inv(D3DTS)), so under camera motion every capture\n"
+                 "drifts a little each frame; the skip's 'still fits' test is a rigidity test, not a\n"
+                 "stillness test, so a slowly-drifting object passes it, the kernel FREEZES its M and\n"
+                 "forces prevM = M (zero motion) - the promoted geometry then trails the camera and\n"
+                 "snaps when motion stops, with a dead motion vector (smear). Proven by the game log\n"
+                 "([PromoDump] SKIP/static slots 123/145 held ~0.9-2.6u behind their own drifting\n"
+                 "capture while SOLVING slots tracked to <0.3u). Off = every promoted slot full-solves\n"
+                 "each frame (a handful of 64-thread workgroups - negligible), placement tracks the\n"
+                 "capture and prevM = last frame's M gives the correct motion vector. Set True only to\n"
+                 "A/B the lag or measure the skip's perf saving.");
       RTX_OPTION("rtx.clusterLod.promotion", float, identityCellSize, 1.0f,
                  "World-space cell size (units) for stable promoted-instance identity (Option L). Quantizes the\n"
                  "reconstructed world centroid to recover a warm GPU transform slot across BlasEntry/RtInstance\n"

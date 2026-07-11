@@ -385,6 +385,10 @@ namespace lodclusters_remix {
     const struct PromotionEntry* promotionEntries = nullptr;
     uint32_t promotionEntryCount = 0;
     float promotionResidualEpsilon = 0.005f;
+    // false (default) = every promoted slot full-solves each frame; the per-frame
+    // re-solve skip (reuse last frame's cached M) freezes placement + zeroes the
+    // motion vector under camera motion for camera-relative captured geometry.
+    bool promotionAllowResolveSkip = false;
   };
 
   // P4c: one promotion work item (40 bytes, mirrored by promotion_solve.comp

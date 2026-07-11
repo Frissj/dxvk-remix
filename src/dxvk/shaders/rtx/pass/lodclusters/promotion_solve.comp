@@ -178,6 +178,7 @@ layout(push_constant, scalar) uniform PushData
   uint     riFlipWindingOffset;    // dword holding flipWinding|twoSided|multiMaterial|opaqueStatus bytes
   float    residualEpsilon;        // relative to probe radius
   uint     gateEntryIndex;         // MODE_GATE: which entry this dispatch runs
+  uint     allowResolveSkip;       // 0 = every promoted slot full-solves each frame (see below)
 }
 push;
 
@@ -295,7 +296,18 @@ void main()
   {
     s_skip = false;
     const PromoStatus stChk = statuses.s[entry.stateSlot];
-    const bool haveCachedM = stChk.lastFrame != 0u
+    // The skip reuses last frame's cached M when it still REPRODUCES this frame's
+    // capture within residualEpsilon. That is a rigidity test, not a stillness test:
+    // this game's promoted geometry is vertex-captured and reconstructed CAMERA-RELATIVE
+    // (inv(D3DTS)), so when the camera moves every capture drifts a little each frame.
+    // A drift under the epsilon band still passes the fit check, so the skip FREEZES M
+    // and forces prevM = M (zero motion) - the promoted object then trails the camera and
+    // its motion vector dies (smear), snapping back only when motion stops. push.allowResolveSkip
+    // gates it OFF by default so every promoted slot full-solves each frame (placement tracks
+    // the capture, prevM = last frame's M gives the correct motion vector). Re-enable only to
+    // A/B the lag or measure the skip's perf saving.
+    const bool haveCachedM = push.allowResolveSkip != 0u
+                          && stChk.lastFrame != 0u
                           && (stChk.lastFrame + 1u == push.frameId)
                           && (stChk.flags & PROMO_FLAG_RIGID) != 0u
                           && entry.patchSlot != 0xFFFFFFFFu;

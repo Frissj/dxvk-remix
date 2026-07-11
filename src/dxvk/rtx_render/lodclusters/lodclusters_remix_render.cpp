@@ -255,6 +255,7 @@ struct PromoPush
   uint32_t riFlipWindingOffset;
   float    residualEpsilon;
   uint32_t gateEntryIndex;
+  uint32_t allowResolveSkip;
 };
 
 bool ClusterRenderSystem::Impl::initPromotion()
@@ -442,6 +443,7 @@ void ClusterRenderSystem::Impl::recordPromotion(VkCommandBuffer cmd, const Frame
   push.riFlipWindingOffset  = uint32_t(offsetof(shaderio::RenderInstance, flipWinding));
   push.residualEpsilon      = frame.promotionResidualEpsilon;
   push.gateEntryIndex       = 0xFFFFFFFFu;
+  push.allowResolveSkip     = frame.promotionAllowResolveSkip ? 1u : 0u;
 
   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, promoPipeline);
   vkCmdPushConstants(cmd, promoPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PromoPush), &push);
