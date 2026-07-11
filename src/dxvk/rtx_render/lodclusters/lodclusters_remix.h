@@ -411,6 +411,10 @@ namespace lodclusters_remix {
     uint32_t lastFrame = 0;           // renderer frameIndex of the last solve
     float motionDelta = 0.0f;         // [MotionProbe] |M.t - prevM.t| this frame (world units)
     uint32_t coldFrame = 0;           // [ColdPromo] last frame this promoted slot solved non-contiguously (prevM=curM)
+    float curT[3] = {0.f, 0.f, 0.f};  // [PromoDump] solved curM translation column (world units)
+    float prevT[3] = {0.f, 0.f, 0.f}; // [PromoDump] solved prevM translation column (world units)
+    float placed[3] = {0.f, 0.f, 0.f};// [PromoGap] world position the object's centroid is drawn at (M*centroid)
+    float capture[3] = {0.f, 0.f, 0.f};// [PromoGap] mean of the actual capture samples (reliable "true position")
   };
 
   // P3: semaphores the caller must attach to the queue submission that

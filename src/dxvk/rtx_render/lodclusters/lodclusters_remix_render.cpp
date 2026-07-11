@@ -159,11 +159,12 @@ struct ClusterRenderSystem::Impl
   // ---- P4c rigid-capture promotion (plan 7.7 spec) ----
   // System scope (survives generation swaps). SoA state: matrices hold M +
   // prevM (96 B/slot, prevM read by the hit side for motion vectors), status
-  // holds the 32 B/slot compact state the CPU reads back. Entries ride a
+  // holds the 80 B/slot compact state the CPU reads back. Entries ride a
   // host-visible BDA ring; the status array is copied into a host readback
-  // ring each frame promotion work ran.
+  // ring each frame promotion work ran. MUST match struct PromoStatus in
+  // promotion_solve.comp (80 B: 8x4 base + curT[3] + prevT[3] + placed[3] + cap[3]).
   static constexpr uint32_t kPromoMatricesStride = 96;
-  static constexpr uint32_t kPromoStatusStride   = 32;
+  static constexpr uint32_t kPromoStatusStride   = 80;
   static constexpr uint32_t kPromoEntryStride    = sizeof(PromotionEntry);
 
   shaderc::SpvCompilationResult promoShader;
@@ -1130,6 +1131,11 @@ bool ClusterRenderSystem::readPromotionStates(PromotionStateView* outStates)
     memcpy(&v.lastFrame, s + 16, sizeof(uint32_t));
     memcpy(&v.motionDelta, s + 20, sizeof(float));  // [MotionProbe] PromoStatus._pad0
     memcpy(&v.coldFrame, s + 24, sizeof(uint32_t));  // [ColdPromo] PromoStatus._pad1
+    // s + 28 = PromoStatus._pad2 (unused). [PromoDump] raw translation columns at +32..+52:
+    memcpy(&v.curT[0], s + 32, sizeof(float) * 3);   // curTx, curTy, curTz
+    memcpy(&v.prevT[0], s + 44, sizeof(float) * 3);  // prevTx, prevTy, prevTz
+    memcpy(&v.placed[0], s + 56, sizeof(float) * 3); // [PromoGap] placedX/Y/Z
+    memcpy(&v.capture[0], s + 68, sizeof(float) * 3); // [PromoGap] capX/Y/Z (reliable reference)
   }
   return true;
 }

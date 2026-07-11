@@ -697,6 +697,150 @@ namespace dxvk {
       }
     }
 
+    // [StableId] (plan §2 Option L effectiveness): how the promo state slot was recovered this
+    // session. warm* = a warm GPU M/prevM slot was reused (no cold, no snap); coldAlloc = a fresh
+    // slot (first sight, or a recovery MISS that will show as a [ColdPromo] snap). The delta line
+    // is the NEW cold allocations since the last report - in a settled static scene it should fall
+    // to ~0 (only real first appearances). A persistently climbing delta with a still camera means
+    // identityCellSize is mis-sized (too small -> boundary churn; verify against [ColdPromo]).
+    {
+      const uint32_t fid = m_device->getCurrentFrameId();
+      if ((fid % 30u) == 0u) {
+        static uint32_t s_lastColdAlloc = 0;
+        const uint32_t coldDelta = m_stableIdColdAlloc - s_lastColdAlloc;
+        s_lastColdAlloc = m_stableIdColdAlloc;
+        const uint32_t warmTotal = m_stableIdWarmCell + m_stableIdWarmNeighbor + m_stableIdWarmId;
+        Logger::info(str::format("[StableId] frame ", fid,
+                                 " : warm ", warmTotal,
+                                 " (cell ", m_stableIdWarmCell,
+                                 " + neighbor ", m_stableIdWarmNeighbor,
+                                 " + id ", m_stableIdWarmId,
+                                 ") | coldAlloc ", m_stableIdColdAlloc,
+                                 " (+", coldDelta, " since last) | live slots ", m_promoNextStateSlot,
+                                 " cells ", uint32_t(m_promoSlotByCell.size())));
+      }
+    }
+
+    // [PromoStale] the GPU-side effect of a dropped solve: does each promoted slot's solve frame
+    // keep advancing in the readback? A slot whose lastFrame plateaus while still promoted has a
+    // FROZEN M/prevM -> stale placement (lag) + dead motion vector (smear). Complements the CPU
+    // cause probe [PromoNoSolve]. Robust to the readback ring lag (we track ADVANCEMENT, not the
+    // absolute gap). stallFrames = consecutive CPU frames its solve frame has not moved.
+    {
+      const uint32_t fid = m_device->getCurrentFrameId();
+      uint32_t nowStalled = 0, worstStall = 0, worstSlot = ~0u;
+      uint32_t contBreaks = 0, contBreaksVisible = 0; float worstContErr = 0.f; uint32_t worstContSlot = ~0u;
+      for (const auto& slotEntry : m_promoSlotByBlas) {
+        const uint32_t slot = slotEntry.second.stateSlot;
+        if (slot >= m_promoStates.size()) { continue; }
+        const lodclusters_remix::PromotionStateView& st = m_promoStates[slot];
+        const uint32_t lf = st.lastFrame;
+        const auto prev = m_dbgSlotLastSolveFrame.find(slot);
+        if (prev != m_dbgSlotLastSolveFrame.end() && prev->second == lf) {
+          const uint32_t s = ++m_dbgSlotStallFrames[slot];
+          if (s >= 3u) { nowStalled++; }        // >=3 CPU frames without a new solve = truly stalled
+          if (s > worstStall) { worstStall = s; worstSlot = slot; }
+        } else {
+          m_dbgSlotStallFrames[slot] = 0;
+        }
+        m_dbgSlotLastSolveFrame[slot] = lf;
+
+        // [PromoCont] prevM lineage: this readback's prevT should equal the PREVIOUS readback's
+        // curT (prevM == last frame's M). A nonzero break with motion present = the smear's MV bug
+        // (the motion vector reprojects from the wrong previous transform). Only meaningful when the
+        // slot advanced a solve this frame (else prevT/curT are last solve's, unchanged).
+        const Vector3 curT(st.curT[0], st.curT[1], st.curT[2]);
+        const Vector3 prevTv(st.prevT[0], st.prevT[1], st.prevT[2]);
+        const auto lastCur = m_dbgSlotPrevCurT.find(slot);
+        if (lastCur != m_dbgSlotPrevCurT.end()) {
+          const float contErr = length(prevTv - lastCur->second);
+          // ignore first-appearance (prevT==curT => zero motion seed) and pure-static (no motion)
+          if (contErr > 0.01f && st.motionDelta > 0.001f) {
+            contBreaks++;
+            if (m_dbgRenderedSlots.find(slot) != m_dbgRenderedSlots.end()) { contBreaksVisible++; }
+            if (contErr > worstContErr) { worstContErr = contErr; worstContSlot = slot; }
+          }
+        }
+        m_dbgSlotPrevCurT[slot] = curT;
+      }
+      if (nowStalled > 0u || contBreaks > 0u || (fid % 30u) == 0u) {
+        Logger::info(str::format("[PromoStale] frame ", fid,
+                                 " : promotedSlots ", uint32_t(m_promoSlotByBlas.size()),
+                                 " stalled(>=3f) ", nowStalled,
+                                 " worstStallF ", worstStall, " (slot ", int32_t(worstSlot), ")",
+                                 " | contBreaks ", contBreaks, " (VISIBLE ", contBreaksVisible, ")",
+                                 " worstContErr ", worstContErr, " (slot ", int32_t(worstContSlot), ")",
+                                 (nowStalled > 0u ? "  <<< frozen M" : ""),
+                                 (contBreaksVisible > 0u ? "  <<< VISIBLE prevM lineage break=smear" : "")));
+      }
+
+      // [PromoGap] THE gap probe: for every promoted slot, compare where the object is DRAWN
+      // (placed = M*centroid, from the readback) to where it SHOULD be (expected = live bbox
+      // centroid recorded at route time). A large gap = the object is rendered far from its true
+      // position - exactly the "two objects that should be adjacent are far apart" symptom. Logs
+      // the worst offenders every frame they exceed the threshold.
+      {
+        uint32_t bigGaps = 0, bigGapsVisible = 0; float worstGap = 0.f; uint32_t worstGapSlot = ~0u;
+        Vector3 worstPlaced(0.f), worstCapture(0.f);
+        for (const auto& slotEntry : m_promoSlotByBlas) {
+          const uint32_t slot = slotEntry.second.stateSlot;
+          if (slot >= m_promoStates.size()) { continue; }
+          const lodclusters_remix::PromotionStateView& st = m_promoStates[slot];
+          const Vector3 placed(st.placed[0], st.placed[1], st.placed[2]);
+          const Vector3 capture(st.capture[0], st.capture[1], st.capture[2]);
+          // capture==0 => slot never solved (no reference yet); skip.
+          if (capture.x == 0.f && capture.y == 0.f && capture.z == 0.f) { continue; }
+          // gap = does the solved transform place the object where its OWN capture is? This is
+          // independent of any CPU bbox - both come from the kernel this frame.
+          const float gap = length(placed - capture);
+          if (gap > 2.0f) {
+            bigGaps++;
+            if (m_dbgRenderedSlots.find(slot) != m_dbgRenderedSlots.end()) { bigGapsVisible++; }
+            if (gap > worstGap) { worstGap = gap; worstGapSlot = slot; worstPlaced = placed; worstCapture = capture; }
+          }
+        }
+        if (bigGaps > 0u) {
+          Logger::info(str::format("[PromoGap] frame ", fid, " : ", bigGaps, " (visible ", bigGapsVisible,
+                                   ") promoted objects placed >2u from their OWN capture.",
+                                   " worst slot ", int32_t(worstGapSlot), " gap ", worstGap, "u",
+                                   "  placed (", worstPlaced.x, ",", worstPlaced.y, ",", worstPlaced.z, ")",
+                                   " capture (", worstCapture.x, ",", worstCapture.y, ",", worstCapture.z, ")",
+                                   (bigGapsVisible > 0u ? "  <<< VISIBLE misplacement (M does not match capture)" : "")));
+        } else if ((fid % 30u) == 0u) {
+          Logger::info(str::format("[PromoGap] frame ", fid, " : all solved promoted objects placed at their capture (M is consistent; any on-screen gap is NOT the solve)"));
+        }
+      }
+
+      // [PromoDump] rich per-slot raw dump every 30 frames for the first promoted slots: mode,
+      // per-frame motion (motionDelta), fit residual, rigid streak, and apparent staleness gap.
+      if ((fid % 30u) == 0u) {
+        uint32_t shown = 0;
+        for (const auto& slotEntry : m_promoSlotByBlas) {
+          if (shown >= 16u) { break; }
+          const uint32_t slot = slotEntry.second.stateSlot;
+          if (slot >= m_promoStates.size()) { continue; }
+          const lodclusters_remix::PromotionStateView& st = m_promoStates[slot];
+          const char* mode = slotEntry.second.demoted ? "DEMOTED"
+                           : ((st.flags & 8u) != 0u ? "SKIP/static" : "SOLVING");
+          const uint32_t stall = m_dbgSlotStallFrames.count(slot) ? m_dbgSlotStallFrames[slot] : 0u;
+          Logger::info(str::format("[PromoDump] f", fid, " slot ", slot,
+                                   " geom 0x", std::hex, slotEntry.second.geometryHash, std::dec,
+                                   " ", mode,
+                                   " motionDelta ", st.motionDelta,
+                                   " residualRel ", st.residualRel,
+                                   " rigidStreak ", st.rigidStreak,
+                                   " lastFrame ", st.lastFrame, " (gap ", int32_t(fid - st.lastFrame), ")",
+                                   " stallF ", stall,
+                                   " coldFrame ", st.coldFrame,
+                                   " placed (", st.placed[0], ",", st.placed[1], ",", st.placed[2], ")",
+                                   " capture (", st.capture[0], ",", st.capture[1], ",", st.capture[2], ")",
+                                   " gap ", length(Vector3(st.placed[0], st.placed[1], st.placed[2])
+                                                 - Vector3(st.capture[0], st.capture[1], st.capture[2])), "u"));
+          shown++;
+        }
+      }
+    }
+
     const uint32_t rigidFrames = uint32_t(std::max(1, ClusterLodOptions::Promotion::rigidFrames()));
     const float epsilon = std::max(1e-5f, ClusterLodOptions::Promotion::residualEpsilon());
     const uint32_t gateLag = uint32_t(std::max(2, ClusterLodOptions::Promotion::gateLagFrames()));
@@ -793,6 +937,8 @@ namespace dxvk {
 
   void ClusterLodManager::buildPromotionEntries() {
     m_framePromoEntries.clear();
+    std::swap(m_dbgRenderedSlotsPrev, m_dbgRenderedSlots);  // [PromoRender] keep last frame's set
+    m_dbgRenderedSlots.clear();
 
     if (m_renderSystem == nullptr || !m_renderSystem->hasGeneration()
         || !ClusterLodOptions::Promotion::enable() || m_promoCandidates.empty()) {
@@ -868,6 +1014,13 @@ namespace dxvk {
     // Path A slots: per-INSTANCE solve+patch entries for promoted instances
     // (plan R21: each instance's capture carries its own transform, so each
     // gets its own state slot for M/prevM continuity and hit-side fetch)
+    // [PromoNoSolve] diagnostic (lag+smear hunt): every promoted slot rendered Path A this
+    // frame MUST get a solve+patch entry here, else its GPU worldMatrix + M/prevM freeze at
+    // last frame's values while the instance is still on screen -> stale placement (lag) and a
+    // dead/blown motion vector (smear). The code comment below documents exactly this drop-out.
+    // If missBlas/missCand are ever > 0, that IS the bug. promoRendered = promoted slots seen;
+    // solveEmitted = got a fresh solve; missNullBlas/missSlot/missCand = the three drop paths.
+    uint32_t dbgPromoRendered = 0, dbgSolveEmitted = 0, dbgMissNullBlas = 0, dbgMissSlot = 0, dbgMissCand = 0;
     uint32_t flatIndex = 0;
     for (const size_t tlasType : { size_t(Tlas::Opaque), size_t(Tlas::Unordered) }) {
       for (size_t i = 0; i < m_slots[tlasType].size(); i++, flatIndex++) {
@@ -875,8 +1028,10 @@ namespace dxvk {
         if ((slot.geometryId & kPromotedTag) == 0) {
           continue;
         }
+        dbgPromoRendered++;
         const BlasEntry* blasEntry = slot.instance->getBlas();
         if (blasEntry == nullptr) {
+          dbgMissNullBlas++;
           continue;
         }
         // Key the candidate lookup off the CACHED ingest-time hash on the promotion
@@ -888,11 +1043,13 @@ namespace dxvk {
         // routing and this per-frame solve MUST use the same stable key.
         const auto slotIt = m_promoSlotByBlas.find(blasEntry);
         if (slotIt == m_promoSlotByBlas.end()) {
+          dbgMissSlot++;
           continue;
         }
         const XXH64_hash_t hash = slotIt->second.geometryHash;
         const auto found = m_promoCandidates.find(hash);
         if (found == m_promoCandidates.end()) {
+          dbgMissCand++;
           continue;
         }
 
@@ -905,6 +1062,8 @@ namespace dxvk {
         promoEntry.stateSlot = (slot.geometryId >> kPromotedSlotShift) & 0x1FFFu;
         promoEntry.patchSlot = flatIndex;
         m_framePromoEntries.push_back(promoEntry);
+        dbgSolveEmitted++;
+        m_dbgRenderedSlots.insert(promoEntry.stateSlot);  // [PromoRender] visible Path A set
 
         // periodic full-mesh residual sweep (risk R20): the sparse solve can
         // miss a VS animating a small vertex subset, so every promoted
@@ -925,6 +1084,48 @@ namespace dxvk {
             instanceIt->second.sweepLagFrames = 0;
           }
         }
+      }
+    }
+
+    // [PromoNoSolve] per-frame verdict. dbgMiss* > 0 means promoted-and-on-screen instances did
+    // NOT get a fresh solve/patch -> their transform + M/prevM are frozen at stale values while
+    // still rendered = the lag (stale placement) + smear (stale/zero MV). Logged every frame it
+    // is nonzero, plus a heartbeat every 30 frames so we can see the clean baseline too.
+    {
+      const uint32_t fid = m_device->getCurrentFrameId();
+      const bool anyMiss = (dbgMissNullBlas | dbgMissSlot | dbgMissCand) != 0u;
+      if (anyMiss || (fid % 30u) == 0u) {
+        Logger::info(str::format("[PromoNoSolve] frame ", fid,
+                                 " : promotedRendered ", dbgPromoRendered,
+                                 " solveEmitted ", dbgSolveEmitted,
+                                 " | STALE missNullBlas ", dbgMissNullBlas,
+                                 " missSlot ", dbgMissSlot,
+                                 " missCand ", dbgMissCand,
+                                 (anyMiss ? "  <<< STALE-M (lag+smear source)" : "")));
+      }
+
+      // [PromoRender] rendered-set CHURN: how the VISIBLE Path A set changed vs last frame. dropped
+      // = rendered last frame, gone this frame (flipped to Path B or culled -> flicker). added =
+      // new this frame; of those, reCold = a slot that was rendered before, went away, and came
+      // back (its M/prevM is now stale/cold -> re-promotion SNAP + a prevM lineage break = smear).
+      // A large steady churn on geometry that stays on screen IS the lag+smear+jump, all one bug.
+      uint32_t dropped = 0, added = 0, reCold = 0;
+      for (uint32_t s : m_dbgRenderedSlotsPrev) {
+        if (m_dbgRenderedSlots.find(s) == m_dbgRenderedSlots.end()) { dropped++; }
+      }
+      for (uint32_t s : m_dbgRenderedSlots) {
+        if (m_dbgRenderedSlotsPrev.find(s) == m_dbgRenderedSlotsPrev.end()) {
+          added++;
+          // seen earlier this session but not last frame => came back after a gap => cold re-promo
+          if (m_dbgSlotLastSolveFrame.find(s) != m_dbgSlotLastSolveFrame.end()) { reCold++; }
+        }
+      }
+      if (dropped > 0u || added > 0u || (fid % 30u) == 0u) {
+        Logger::info(str::format("[PromoRender] frame ", fid,
+                                 " : renderedNow ", uint32_t(m_dbgRenderedSlots.size()),
+                                 " (was ", uint32_t(m_dbgRenderedSlotsPrev.size()), ")",
+                                 " dropped ", dropped, " added ", added, " reCold ", reCold,
+                                 ((dropped > 2u || added > 2u) ? "  <<< Path A<->B churn = flicker/snap/smear" : "")));
       }
     }
   }
@@ -1537,6 +1738,13 @@ namespace dxvk {
         || (m_templateSystemMT != nullptr && !m_animatedGeometryByKey.empty());
   }
 
+  // plan §2 Option L: fold (geometryHash, integer cell coord) into a stable 64-bit key. Pure
+  // integer mix (no float in the key) so a centroid anywhere inside a cell hashes identically.
+  XXH64_hash_t ClusterLodManager::makePromoCellKey(uint64_t geometryHash, int64_t cx, int64_t cy, int64_t cz) {
+    struct { uint64_t geom; int64_t x, y, z; } data { geometryHash, cx, cy, cz };
+    return XXH3_64bits(&data, sizeof(data));
+  }
+
   bool ClusterLodManager::isClusterInstance(const RtInstance* instance, uint32_t& outGeometryId) {
     if (!ClusterLodOptions::enable()) {
       return false;
@@ -1607,6 +1815,8 @@ namespace dxvk {
               && (!ClusterLodOptions::Render::routeTrivialToClassic()
                   || m_trivialGeometryIds.count(pinIt->second.residentGeometryId) == 0)) {
             outGeometryId = kPromotedTag | (pinIt->second.stateSlot << kPromotedSlotShift) | pinIt->second.residentGeometryId;
+            m_dbgSlotExpectedPos[pinIt->second.stateSlot] = blasEntry->input.getGeometryData().boundingBox
+              .getTransformedCentroid(blasEntry->input.getTransformData().objectToWorld);  // [PromoGap]
             recordTopoRoute(topologyKey, 1u, instance, pinIt->second.residentGeometryId, 2u);  // Path A (promoted, pinned)
             return true;
           }
@@ -1652,24 +1862,130 @@ namespace dxvk {
               auto slotIt = m_promoSlotByBlas.find(blasEntry);
               if (slotIt == m_promoSlotByBlas.end()) {
                 PromoInstance promoInstance;
-                // Recover this instance's EXISTING state slot across BlasEntry churn
-                // (streaming / [BlasWave] rebuilds recreate the BlasEntry, orphaning the
-                // pointer key). Keyed by the stable RtInstance id, so the rebuilt instance
-                // reuses its warm GPU M/prevM slot instead of a fresh cold one -> the solve
-                // stays continuous (PROMO_FLAG_SOLVED already set) and the motion vector
-                // never falls back to zero. First-ever promotion still allocates a new slot.
-                const uint64_t instanceId = (instance != nullptr) ? instance->getId() : 0u;
-                const auto idIt = (instance != nullptr)
-                  ? m_promoSlotByInstanceId.find(instanceId) : m_promoSlotByInstanceId.end();
-                if (idIt != m_promoSlotByInstanceId.end()) {
-                  promoInstance.stateSlot = idIt->second;
-                  slotIt = m_promoSlotByBlas.emplace(blasEntry, promoInstance).first;
-                } else if (m_promoNextStateSlot < lodclusters_remix::ClusterRenderSystem::kPromotionSlotCapacity) {
-                  promoInstance.stateSlot = m_promoNextStateSlot++;
-                  if (instance != nullptr) {
-                    m_promoSlotByInstanceId.emplace(instanceId, promoInstance.stateSlot);
+                // plan §2 Option L: recover this instance's EXISTING state slot by a STABLE
+                // QUANTIZED WORLD CELL, not the BlasEntry pointer (churns on streaming/[BlasWave]
+                // rebuilds) or the RtInstance id (churns under spatial re-matching). A static
+                // prop's reconstructed world centroid lands in the same (geometryHash, cell)
+                // every frame despite the ~0.30u wobble, so it reuses its WARM GPU M/prevM slot
+                // instead of a fresh cold one -> the solve stays continuous (PROMO_FLAG_SOLVED
+                // set) and the motion vector never falls back to zero ([ColdPromo]).
+                //
+                // worldCentroid is the SAME per-instance world signal the production spatial
+                // matcher keys on (DrawCallTracker::findOrCreateReplacementInstance: boundingBox
+                // .getTransformedCentroid(objectToWorld)); for captured geometry objectToWorld is
+                // identity and the bbox is built from the reconstructed positions, so distinct
+                // props of one asset sit in distinct cells.
+                // Key on the STABLE resident geometry id (found->second), NOT the raw asset
+                // geometryHash: this game's captured draws churn their asset hash frame-to-frame
+                // under camera motion, so folding the hash into the cell key made a static prop's
+                // key change every rebuild -> recovery missed -> cold alloc (the residual
+                // [ColdPromo] waves + warmNeighbor=0). residentGeometryId is the deduplicated
+                // per-ASSET id the pin path already trusts, so it's stable across hash churn while
+                // still distinguishing different assets that share a cell.
+                const uint64_t residentGeometryId = uint64_t(found->second);
+                // KILL SWITCH: identityCellSize <= 0 disables cell recovery entirely and falls
+                // back to the original id-tier + fresh-slot assignment. Use it to A/B whether the
+                // cell key is handing an instance the WRONG stateSlot: a wrong slot makes the GPU
+                // read M(+0) AND prevM(+48) from another instance's rows -> position jump + smear
+                // together. If jump/smear vanish at identityCellSize=0, the cell key is the cause.
+                const float cellSizeRaw = ClusterLodOptions::Promotion::identityCellSize();
+                const bool cellEnabled = cellSizeRaw > 0.f;
+                const float cell = std::max(1e-4f, cellSizeRaw);
+                const AxisAlignedBoundingBox& objBox = blasEntry->input.getGeometryData().boundingBox;
+                const Vector3 worldCentroid = objBox.getTransformedCentroid(
+                    blasEntry->input.getTransformData().objectToWorld);
+                // else centroid degenerates to origin -> all collide; disabled -> skip cell path entirely
+                const bool cellUsable = cellEnabled && objBox.isValid();
+                const int64_t cx = int64_t(std::floor(worldCentroid.x / cell));
+                const int64_t cy = int64_t(std::floor(worldCentroid.y / cell));
+                const int64_t cz = int64_t(std::floor(worldCentroid.z / cell));
+                const XXH64_hash_t cellKey = makePromoCellKey(residentGeometryId, cx, cy, cz);
+
+                // (1) exact cell hit for this asset -> recover its warm slot.
+                auto cellIt = cellUsable ? m_promoSlotByCell.find(cellKey) : m_promoSlotByCell.end();
+                if (cellIt != m_promoSlotByCell.end() && cellIt->second.residentGeometryId != residentGeometryId) {
+                  cellIt = m_promoSlotByCell.end();  // hash-collision on the folded key; treat as miss
+                }
+
+                // [StableId] which tier recovered this slot (for the periodic log below).
+                bool recoveredViaNeighbor = false;
+
+                // (2) boundary wobble: the prop drifted into an adjacent cell this frame. Scan the
+                // 26 neighbors for an UNCLAIMED (frameClaimed != currentFrame) same-asset slot whose
+                // stored centroid is still within one cell, and re-key it to the new cell.
+                if (cellIt == m_promoSlotByCell.end() && cellUsable) {
+                  for (int64_t dz = -1; dz <= 1 && cellIt == m_promoSlotByCell.end(); ++dz) {
+                    for (int64_t dy = -1; dy <= 1 && cellIt == m_promoSlotByCell.end(); ++dy) {
+                      for (int64_t dx = -1; dx <= 1; ++dx) {
+                        if (dx == 0 && dy == 0 && dz == 0) { continue; }
+                        const auto nIt = m_promoSlotByCell.find(makePromoCellKey(residentGeometryId, cx + dx, cy + dy, cz + dz));
+                        if (nIt != m_promoSlotByCell.end()
+                            && nIt->second.residentGeometryId == residentGeometryId
+                            && nIt->second.frameClaimed != currentFrame
+                            && lengthSqr(nIt->second.centroid - worldCentroid) <= cell * cell) {
+                          // move the entry to the new exact cell key so it tracks the drift.
+                          CellSlot moved = nIt->second;
+                          m_promoSlotByCell.erase(nIt);
+                          cellIt = m_promoSlotByCell.emplace(cellKey, moved).first;
+                          recoveredViaNeighbor = true;
+                          break;
+                        }
+                      }
+                    }
                   }
+                }
+
+                // COLLISION SAFETY (fixes the smear the first cell build added): if this cell's
+                // slot was already claimed by ANOTHER instance THIS frame, do NOT share it. Sharing
+                // aliases two instances onto one GPU M/prevM slot, so the solve for one drives the
+                // other's render transform -> wrong-slot placement + motion = smear. Fall through to
+                // a fresh slot instead: a one-frame cold re-promote is far cheaper than a persistent
+                // wrong-transform smear. Frequent hits here mean identityCellSize is too big for the
+                // prop spacing (lower it).
+                if (cellIt != m_promoSlotByCell.end() && cellIt->second.frameClaimed == currentFrame) {
+                  static uint32_t s_subWobbleLogs = 0;
+                  if (s_subWobbleLogs < 256) {
+                    s_subWobbleLogs++;
+                    Logger::info(str::format("[SubWobbleCluster] residentGeom ", residentGeometryId,
+                                             " cell (", cx, ",", cy, ",", cz, ") slot ", cellIt->second.stateSlot,
+                                             " already claimed frame ", currentFrame,
+                                             " -> allocating FRESH slot (no share) to avoid wrong-slot smear;",
+                                             " lower identityCellSize if these are distinct props"));
+                  }
+                  cellIt = m_promoSlotByCell.end();  // force the fresh-alloc path below
+                }
+
+                if (cellIt != m_promoSlotByCell.end()) {
+                  promoInstance.stateSlot = cellIt->second.stateSlot;
+                  cellIt->second.centroid = worldCentroid;
+                  cellIt->second.frameClaimed = currentFrame;
                   slotIt = m_promoSlotByBlas.emplace(blasEntry, promoInstance).first;
+                  (recoveredViaNeighbor ? m_stableIdWarmNeighbor : m_stableIdWarmCell)++;  // [StableId]
+                } else {
+                  // (3) dormant instance-id tier (kept per handoff; id churns so this rarely
+                  // hits), then a fresh slot. First-ever promotion of a prop lands here.
+                  const uint64_t instanceId = (instance != nullptr) ? instance->getId() : 0u;
+                  const auto idIt = (instance != nullptr)
+                    ? m_promoSlotByInstanceId.find(instanceId) : m_promoSlotByInstanceId.end();
+                  bool allocated = false;
+                  if (idIt != m_promoSlotByInstanceId.end()) {
+                    promoInstance.stateSlot = idIt->second;
+                    allocated = true;
+                    m_stableIdWarmId++;  // [StableId]
+                  } else if (m_promoNextStateSlot < lodclusters_remix::ClusterRenderSystem::kPromotionSlotCapacity) {
+                    promoInstance.stateSlot = m_promoNextStateSlot++;
+                    if (instance != nullptr) {
+                      m_promoSlotByInstanceId.emplace(instanceId, promoInstance.stateSlot);
+                    }
+                    allocated = true;
+                    m_stableIdColdAlloc++;  // [StableId] fresh slot -> potential [ColdPromo] snap
+                  }
+                  if (allocated) {
+                    if (cellUsable) {
+                      m_promoSlotByCell.emplace(cellKey, CellSlot{ promoInstance.stateSlot, residentGeometryId, worldCentroid, currentFrame });
+                    }
+                    slotIt = m_promoSlotByBlas.emplace(blasEntry, promoInstance).first;
+                  }
                 }
               }
               // per-instance demotion: a demoted instance falls through to
@@ -1682,6 +1998,8 @@ namespace dxvk {
                 slotIt->second.geometryHash = geometryHash;
                 slotIt->second.blasFrameCreated = blasEntry->frameCreated;
                 outGeometryId = kPromotedTag | (slotIt->second.stateSlot << kPromotedSlotShift) | found->second;
+                m_dbgSlotExpectedPos[slotIt->second.stateSlot] = blasEntry->input.getGeometryData().boundingBox
+                  .getTransformedCentroid(blasEntry->input.getTransformData().objectToWorld);  // [PromoGap] where Path B draws it
                 recordTopoRoute(topologyKey, 1u, instance, found->second, 2u);  // Path A (promoted)
                 return true;
               }

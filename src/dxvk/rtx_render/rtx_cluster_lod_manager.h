@@ -880,6 +880,50 @@ namespace dxvk {
     // RtInstance id so the rebuilt instance inherits its warm slot instead. Also caps the slot
     // leak: the same instance stops consuming a new slot on every rebuild.
     std::unordered_map<uint64_t, uint32_t> m_promoSlotByInstanceId;
+    // NV-DXVK (plan §2 Option L): the STABLE identity that actually kills the cold-slot snap.
+    // Keyed by hash(geometryHash, quantize(worldCentroid, identityCellSize)) - a static prop's
+    // reconstructed world centroid lands in the same cell every frame despite the wobble, so it
+    // recovers its warm M/prevM slot even when both the BlasEntry pointer AND the RtInstance id
+    // churn (the m_promoSlotByInstanceId tier above is dormant because the id churns too). The
+    // stored centroid + frameClaimed drive the 26-neighbor hysteresis that catches a prop
+    // wobbling across a cell boundary. geometryHash distinguishes different assets that share a
+    // cell. Captured-geometry-scoped, so lights / uniqueObjectDistance are untouched.
+    struct CellSlot {
+      uint32_t stateSlot = 0;
+      uint64_t residentGeometryId = 0;  // STABLE per-asset id (not the churning geometryHash)
+      Vector3 centroid = Vector3(0.f);
+      uint32_t frameClaimed = 0;
+    };
+    std::unordered_map<XXH64_hash_t, CellSlot> m_promoSlotByCell;
+    // [StableId] diagnostic (Option L effectiveness): cumulative slot-recovery outcomes. warmCell
+    // + warmNeighbor recovered a warm GPU M/prevM slot (good - no snap); coldAlloc took a fresh
+    // slot (a genuine first sight, OR the cell key failed to recover -> a [ColdPromo] snap). A
+    // healthy run: coldAlloc plateaus near the live-instance count while warm* keeps climbing.
+    uint32_t m_stableIdWarmCell = 0;      // exact-cell hit
+    uint32_t m_stableIdWarmNeighbor = 0;  // 26-neighbor hysteresis hit (boundary wobble)
+    uint32_t m_stableIdWarmId = 0;        // dormant instance-id tier hit (rare)
+    uint32_t m_stableIdColdAlloc = 0;     // fresh slot allocated (first sight or recovery miss)
+    // [PromoStale] diagnostic: per-slot last-seen solve frame (from the readback) + how many CPU
+    // frames its solve frame has NOT advanced while the slot is still promoted. A stalled slot
+    // means the GPU M/prevM froze -> stale placement (lag) + dead motion vector (smear).
+    std::unordered_map<uint32_t, uint32_t> m_dbgSlotLastSolveFrame;
+    std::unordered_map<uint32_t, uint32_t> m_dbgSlotStallFrames;
+    // [PromoCont] previous-frame curM translation per slot (CPU-tracked) to verify prevM lineage:
+    // this frame's prevT should equal last frame's curT. A break = the smear's motion-vector bug.
+    std::unordered_map<uint32_t, Vector3> m_dbgSlotPrevCurT;
+    // [PromoRender] the set of promo state slots actually RENDERED Path A (got a solve+patch) each
+    // frame, so diagnostics can isolate the VISIBLE instances from the ~90% non-rendered pool. A
+    // slot dropping out then re-appearing = Path A<->B flip = flicker/smear; a slot re-appearing
+    // after a gap re-promotes COLD = the snap.
+    std::unordered_set<uint32_t> m_dbgRenderedSlots;
+    std::unordered_set<uint32_t> m_dbgRenderedSlotsPrev;
+    // [PromoGap] per-slot EXPECTED world position (this frame's live bbox centroid, i.e. where
+    // Path B draws it), recorded at route time. Compared against the kernel's PLACED position
+    // (M*centroid, from the readback) to catch an object drawn far from where it should be.
+    std::unordered_map<uint32_t, Vector3> m_dbgSlotExpectedPos;
+    // Quantize a world centroid to an integer cell coord + fold it with the geometry hash into a
+    // stable 64-bit cell key. Static so the neighbor-cell hysteresis can reuse it.
+    static XXH64_hash_t makePromoCellKey(uint64_t geometryHash, int64_t cx, int64_t cy, int64_t cz);
     // per-frame kernel work items (built in dispatchBuild, consumed by
     // recordFrame the same call) + readback scratch
     std::vector<lodclusters_remix::PromotionEntry> m_framePromoEntries;
