@@ -332,11 +332,25 @@ namespace dxvk {
     // Only GC entries with no linked instances — instances still reference the BlasEntry
     // for TLAS build, and destroying it would cause a one-frame visibility gap.
     if (m_device->getCurrentFrameId() > RtxOptions::numFramesToKeepGeometryData()) {
-      const size_t oldestFrame = m_device->getCurrentFrameId() - RtxOptions::numFramesToKeepGeometryData();
+      const uint32_t currentFrameId = m_device->getCurrentFrameId();
+      const size_t oldestFrame = currentFrameId - RtxOptions::numFramesToKeepGeometryData();
+      // Churn reduction: promoted meshes get a longer keep-alive so their BlasEntry (and thus the
+      // warm promo slot pinned by its pointer) survives brief occlusion / camera cuts -> re-entry
+      // reuses the same BlasEntry and stays warm instead of cold re-promoting. Bounded, so
+      // truly-gone geometry still frees. Pointer-exact, so no aliasing (unlike Option L).
+      const uint32_t promotedKeep = (m_clusterLodManager != nullptr)
+        ? uint32_t(std::max(0, ClusterLodOptions::Promotion::promotedKeepFrames())) : 0u;
+      const size_t oldestFramePromoted = (currentFrameId > promotedKeep) ? (currentFrameId - promotedKeep) : 0u;
       auto& entries = m_drawCallCache.getEntries();
       for (auto iter = entries.begin(); iter != entries.end(); ) {
-        if (iter->second.frameLastTouched < oldestFrame &&
+        const bool promoted = promotedKeep > 0u && m_clusterLodManager != nullptr
+          && m_clusterLodManager->isBlasPromoted(&iter->second);
+        const size_t threshold = promoted ? oldestFramePromoted : oldestFrame;
+        if (iter->second.frameLastTouched < threshold &&
             iter->second.getLinkedInstances().empty()) {
+          if (promoted) {
+            m_clusterLodManager->onBlasEvicted(&iter->second);  // prune the slot so it doesn't leak past the window
+          }
           iter = entries.erase(iter);
         } else {
           ++iter;

@@ -423,6 +423,15 @@ namespace dxvk {
       // asset (else two distinct props share a cell/slot and swap motion). Size it from
       // [MotionProbe] data (Phase 0). Captured-geometry-scoped only; does NOT touch lights or
       // rtx.uniqueObjectDistance.
+      // Churn reduction (keeps promoted geometry warm across off-screen gaps). SceneManager GC
+      // keeps a promoted mesh's BlasEntry alive this many frames after it was last drawn (vs the
+      // global numFramesToKeepBLAS=1), so a mesh that leaves and re-enters view reuses its SAME
+      // BlasEntry -> its promo slot pin survives -> no cold re-promote snap. Bound it so truly-gone
+      // geometry still frees eventually. 0 disables (revert to the global GC lifetime).
+      RTX_OPTION("rtx.clusterLod.promotion", int, promotedKeepFrames, 300,
+                 "Frames to keep a promoted mesh's BlasEntry alive after it leaves view, so re-entry\n"
+                 "reuses the same BlasEntry and stays warm (no cold re-promote snap). 0 = use the\n"
+                 "global numFramesToKeepBLAS lifetime.");
       RTX_OPTION("rtx.clusterLod.promotion", float, identityCellSize, 1.0f,
                  "World-space cell size (units) for stable promoted-instance identity (Option L). Quantizes the\n"
                  "reconstructed world centroid to recover a warm GPU transform slot across BlasEntry/RtInstance\n"
@@ -479,6 +488,21 @@ namespace dxvk {
     // cluster templates) both route through here; outGeometryId carries a tag
     // bit distinguishing them (consumed by recordClusterInstance).
     bool isClusterInstance(const RtInstance* instance, uint32_t& outGeometryId);
+
+    // Churn reduction: a promoted instance stays WARM only while its BlasEntry lives (the promo
+    // slot is pinned by BlasEntry*). The default BlasEntry GC (numFramesToKeepBLAS=1) drops it one
+    // frame after it goes off-screen, so re-entry gets a fresh BlasEntry -> cold re-promote (the
+    // small snap jitter). isBlasPromoted lets SceneManager::garbageCollection keep promoted
+    // BlasEntries alive for a longer bounded window (Promotion::promotedKeepFrames) so the pointer
+    // pin survives camera cuts / brief occlusion -> warm re-entry, no cold, and NO aliasing (the
+    // pin is pointer-exact, unlike Option L's position recovery). onBlasEvicted prunes the slot
+    // when the entry is finally GC'd so nothing leaks past the window.
+    bool isBlasPromoted(const BlasEntry* blasEntry) const {
+      return m_promoSlotByBlas.find(blasEntry) != m_promoSlotByBlas.end();
+    }
+    void onBlasEvicted(const BlasEntry* blasEntry) {
+      m_promoSlotByBlas.erase(blasEntry);
+    }
 
     // mergeInstancesIntoBlas divert branch: records the instance into the given
     // TLAS type's cluster region (in arrival order) with its CPU-known
