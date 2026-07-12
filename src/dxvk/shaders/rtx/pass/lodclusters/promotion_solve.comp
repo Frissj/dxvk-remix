@@ -108,6 +108,7 @@ struct PromoEntry
   uint     mode;
   uint     vertexCount;  // gate dispatch sizing (mode 1; kernel bounds on probe)
   uint     pad0;
+  uint64_t prevCaptureVa;  // previous-frame capture; 0 = none. cold-promote prevM seed (see MODE_SOLVE)
 };
 
 layout(buffer_reference, buffer_reference_align = 8, scalar) buffer PromoEntries
@@ -130,9 +131,10 @@ struct PromoStatus
   uint  rigidStreak;
   uint  flags;
   uint  lastFrame;
-  float _pad0;   // [MotionProbe] per-frame transform translation delta (world units)
+  float _pad0;   // [MotionProbe] per-frame transform translation delta (world units) - CENTROID only
   uint  _pad1;
-  uint  _pad2;
+  uint  _pad2;   // [SmearProbe] floatBitsToUint(max over solve samples of |(M-prevM)*vertex|) - per-VERTEX
+                 // manufactured motion. Catches a rotation-only prevM lineage break (centroid ~still, extremities fling).
   // [PromoDump] raw solved-transform translation columns (world units) for lag/smear diagnosis:
   // curT = where Path A places this instance's origin this frame; prevT = last frame's (what the
   // motion vector reprojects from). CPU checks prevT_this == curT_last for prevM lineage.
@@ -146,6 +148,11 @@ struct PromoStatus
   // (where the geometry truly is in world). If placed != capture, the solved M does not put the
   // object where its own capture is - a genuine misplacement independent of any CPU bbox.
   float capX; float capY; float capZ;
+  // [ConditionProbe] isotropy of the SOLVE sample cloud = det(cov)/(trace/3)^3, in [0,1]. ~1 = samples
+  // fill 3D (rotation fully constrained by the fit). ~0 = planar/collinear/symmetric samples -> the
+  // affine solve's ROTATION is UNDERDETERMINED: it fits every sample yet the rotation DOF is free, so
+  // it lands on an arbitrary valid rotation that jumps frame-to-frame = the [SmearProbe] fling. -1 = skip.
+  float sampleIso;
 };
 
 layout(buffer_reference, buffer_reference_align = 4, scalar) buffer PromoStatuses
@@ -179,6 +186,7 @@ layout(push_constant, scalar) uniform PushData
   float    residualEpsilon;        // relative to probe radius
   uint     gateEntryIndex;         // MODE_GATE: which entry this dispatch runs
   uint     allowResolveSkip;       // 0 = every promoted slot full-solves each frame (see below)
+  uint     gapMaxFrames;           // max solve-frame gap for which the retained prevM is still trusted
 }
 push;
 
@@ -369,6 +377,8 @@ void main()
         st.lastFrame   = push.frameId;
         st.flags       = (st.flags & ~PROMO_FLAG_DEMOTED) | PROMO_FLAG_RIGID | PROMO_FLAG_SKIPPED;
         st._pad0       = 0.0;  // [MotionProbe] static-skip => prevM==M => zero motion by construction
+        st._pad2       = 0u;   // [SmearProbe] prevM==M => per-vertex motion is 0 by construction too
+        st.sampleIso   = -1.0; // [ConditionProbe] not computed on the static-skip path
         // [PromoDump] skip => curT == prevT == cached-M translation (decentered rows P at 3/7/11)
         st.curTx = P[3];  st.curTy = P[7];  st.curTz = P[11];
         st.prevTx = P[3]; st.prevTy = P[7]; st.prevTz = P[11];
@@ -554,11 +564,63 @@ void main()
   // promoted instance that dropped a frame, or whose BlasEntry was rebuilt by a [BlasWave]
   // and whose warm slot the CPU recovered by instance id) gives the pre-gap M - the right
   // previous transform for a rigid instance, and far better than seeding prevM = curM
-  // (zero motion => one frame of the reconstruction wobble => the promotion smear). Only a
-  // slot NEVER solved (first appearance, no history) falls back to prevM = curM.
+  // (zero motion => one frame of the reconstruction wobble => the promotion smear).
+  //
+  // COLD PROMOTION SEED: a slot NEVER solved (a Path B->A flip whose fresh per-instance slot
+  // has no GPU history) has no retained M. Seeding prevM = curM there is the [ColdPromo]
+  // zero-motion pop the denoiser reprojects wrong AT the promotion frame. When the instance's
+  // PREVIOUS-frame capture is available (entry.prevCaptureVa != 0 - it rendered Path B last
+  // frame, so historyBuffer[1] holds its previous reconstructed positions) seed prevM to
+  // reproduce last frame's world position instead: keep this frame's fitted A (rotation/scale)
+  // and set the translation so prevM maps the ref centroid onto the MEAN of the PREVIOUS
+  // capture. Motion is then (prevM - M)*obj = mean(prevCap) - mean(curCap) for every vertex =
+  // the object's true inter-frame drift (rigid, translation-dominant), continuous with the
+  // Path B motion vector it had last frame. Only a genuine first appearance (no prev capture)
+  // still falls back to prevM = curM, which is correct - TAA rejects a real disocclusion.
+  const bool coldSeed = (entry.patchSlot != 0xFFFFFFFFu) && !everSolved && (entry.prevCaptureVa != 0ul);
+  vec3 tPrevSeed = vec3(0.0);
+  if(coldSeed)
+  {
+    vec3 capPrevMean = vec3(0.0);
+    for(uint t = 0; t < probe.sampleCount; t++)
+    {
+      capPrevMean += loadCapture(entry.prevCaptureVa, entry.captureStrideBytes, probe.samples[t].index);
+    }
+    capPrevMean /= float(max(1u, probe.sampleCount));
+    // M is decentered (maps original ref -> world) so M * centroid == mean(curCapture);
+    // prevM shares A with M, translation = mean(prevCapture) - A * centroid.
+    tPrevSeed = capPrevMean - vec3(M[0]*c.x + M[1]*c.y + M[2]*c.z,
+                                   M[4]*c.x + M[5]*c.y + M[6]*c.z,
+                                   M[8]*c.x + M[9]*c.y + M[10]*c.z);
+  }
+  // GAP-STALE guard (the moving-cinematic smear fix). The retained M is only LAST frame's
+  // transform when the slot solved on the previous frame. A promoted slot that left Path A (went
+  // off-screen or flipped to Path B) and re-renders N frames later re-solves NON-contiguously, and
+  // its retained M is from N frames ago - reusing it as prevM makes the motion vector N frames of
+  // camera drift in ONE frame ([ChurnDiag] worstGap 29-77f, [SolveCadence] delta 1 => the shader
+  // sees these gaps). A reappearing/disoccluded object has no valid N-frames-ago on-screen position,
+  // so trust the retained M only for gaps <= gapMaxFrames (contiguous, or the original single
+  // dropped-frame case); beyond that fall back to zero motion, whose reprojection error is bounded
+  // by the object's own screen extent instead of the unbounded stale-M spike. gapMaxFrames huge =
+  // old behavior (for A/B).
+  const uint solveGap = push.frameId - status.lastFrame;   // 1 = solved last frame (contiguous)
+  const bool useRetained = everSolved && (solveGap <= push.gapMaxFrames);
   for(uint k = 0; k < 12; k++)
   {
-    const float prev = everSolved ? matrices.m[mBase + k] : M[k];
+    float prev;
+    if(useRetained)
+    {
+      prev = matrices.m[mBase + k];        // retained M is recent enough to be last frame's
+    }
+    else if(coldSeed)
+    {
+      // same A rows as M; only the translation column (k = 3,7,11) becomes tPrevSeed
+      prev = (k == 3) ? tPrevSeed.x : ((k == 7) ? tPrevSeed.y : ((k == 11) ? tPrevSeed.z : M[k]));
+    }
+    else
+    {
+      prev = M[k];                         // first appearance OR stale-gap reappearance -> zero motion
+    }
     matrices.m[mBase + 12 + k] = prev;
     matrices.m[mBase + k]      = M[k];
   }
@@ -591,6 +653,49 @@ void main()
     }
     capCen /= float(capN);
     status.capX = capCen.x; status.capY = capCen.y; status.capZ = capCen.z;
+  }
+  // [SmearProbe] per-VERTEX manufactured motion = max over the solve samples of |(M - prevM) * vertex|.
+  // motionDelta above is the CENTROID translation and can read ~0 while M and prevM differ in ROTATION,
+  // which leaves the centroid put but flings the mesh extremities - that per-vertex fling is exactly the
+  // motion vector the promoted hit hands DLSS, i.e. the smear. Uses the SAME live decentered M (local)
+  // and prevM (matrices.m[mBase+12+k], just written) the render's surface_interaction reads. Samples are
+  // CENTERED, M/prevM are decentered (map ORIGINAL input positions), so fold the centroid back in.
+  {
+    float maxVertMotion = 0.0;
+    for(uint t = 0; t < probe.sampleCount; t++)
+    {
+      const PromoSample smp = probe.samples[t];
+      const vec4 rp = vec4(smp.refX + c.x, smp.refY + c.y, smp.refZ + c.z, 1.0);
+      const vec3 wCur = vec3(dot(vec4(M[0], M[1], M[2], M[3]), rp),
+                             dot(vec4(M[4], M[5], M[6], M[7]), rp),
+                             dot(vec4(M[8], M[9], M[10], M[11]), rp));
+      const vec3 wPrev = vec3(dot(vec4(matrices.m[mBase + 12 + 0], matrices.m[mBase + 12 + 1], matrices.m[mBase + 12 + 2], matrices.m[mBase + 12 + 3]), rp),
+                             dot(vec4(matrices.m[mBase + 12 + 4], matrices.m[mBase + 12 + 5], matrices.m[mBase + 12 + 6], matrices.m[mBase + 12 + 7]), rp),
+                             dot(vec4(matrices.m[mBase + 12 + 8], matrices.m[mBase + 12 + 9], matrices.m[mBase + 12 + 10], matrices.m[mBase + 12 + 11]), rp));
+      maxVertMotion = max(maxVertMotion, length(wCur - wPrev));
+    }
+    status._pad2 = floatBitsToUint(maxVertMotion);
+  }
+  // [ConditionProbe] does the SOLVE sample cloud constrain the rotation? Covariance of the centered
+  // solve samples; det/(trace/3)^3 collapses to ~0 for planar/collinear/symmetric clouds (rotation
+  // free) and ~1 for a well-spread 3D cloud (rotation pinned). If the flinging slots read low iso,
+  // the smear is an underdetermined-rotation solve, not the plumbing.
+  {
+    float cxx = 0.0, cyy = 0.0, czz = 0.0, cxy = 0.0, cxz = 0.0, cyz = 0.0;
+    for(uint t = 0; t < probe.sampleCount; t++)
+    {
+      const PromoSample smp = probe.samples[t];
+      const vec3 p = vec3(smp.refX, smp.refY, smp.refZ);  // already centered on the centroid
+      cxx += p.x * p.x; cyy += p.y * p.y; czz += p.z * p.z;
+      cxy += p.x * p.y; cxz += p.x * p.z; cyz += p.y * p.z;
+    }
+    const float invN = 1.0 / float(max(1u, probe.sampleCount));
+    cxx *= invN; cyy *= invN; czz *= invN; cxy *= invN; cxz *= invN; cyz *= invN;
+    const float detC = cxx * (cyy * czz - cyz * cyz)
+                     - cxy * (cxy * czz - cyz * cxz)
+                     + cxz * (cxy * cyz - cyy * cxz);
+    const float tr3 = (cxx + cyy + czz) * (1.0 / 3.0);
+    status.sampleIso = clamp(detC / max(1e-12, tr3 * tr3 * tr3), 0.0, 1.0);
   }
   statuses.s[entry.stateSlot] = status;
 

@@ -164,7 +164,7 @@ struct ClusterRenderSystem::Impl
   // ring each frame promotion work ran. MUST match struct PromoStatus in
   // promotion_solve.comp (80 B: 8x4 base + curT[3] + prevT[3] + placed[3] + cap[3]).
   static constexpr uint32_t kPromoMatricesStride = 96;
-  static constexpr uint32_t kPromoStatusStride   = 80;
+  static constexpr uint32_t kPromoStatusStride   = 84;  // +4 for [ConditionProbe] sampleIso at +80
   static constexpr uint32_t kPromoEntryStride    = sizeof(PromotionEntry);
 
   shaderc::SpvCompilationResult promoShader;
@@ -256,6 +256,7 @@ struct PromoPush
   float    residualEpsilon;
   uint32_t gateEntryIndex;
   uint32_t allowResolveSkip;
+  uint32_t gapMaxFrames;
 };
 
 bool ClusterRenderSystem::Impl::initPromotion()
@@ -444,6 +445,7 @@ void ClusterRenderSystem::Impl::recordPromotion(VkCommandBuffer cmd, const Frame
   push.residualEpsilon      = frame.promotionResidualEpsilon;
   push.gateEntryIndex       = 0xFFFFFFFFu;
   push.allowResolveSkip     = frame.promotionAllowResolveSkip ? 1u : 0u;
+  push.gapMaxFrames         = frame.promotionGapMaxFrames;
 
   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, promoPipeline);
   vkCmdPushConstants(cmd, promoPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PromoPush), &push);
@@ -1133,11 +1135,13 @@ bool ClusterRenderSystem::readPromotionStates(PromotionStateView* outStates)
     memcpy(&v.lastFrame, s + 16, sizeof(uint32_t));
     memcpy(&v.motionDelta, s + 20, sizeof(float));  // [MotionProbe] PromoStatus._pad0
     memcpy(&v.coldFrame, s + 24, sizeof(uint32_t));  // [ColdPromo] PromoStatus._pad1
-    // s + 28 = PromoStatus._pad2 (unused). [PromoDump] raw translation columns at +32..+52:
+    memcpy(&v.maxVertMotion, s + 28, sizeof(float));  // [SmearProbe] PromoStatus._pad2 (float bits)
+    // [PromoDump] raw translation columns at +32..+52:
     memcpy(&v.curT[0], s + 32, sizeof(float) * 3);   // curTx, curTy, curTz
     memcpy(&v.prevT[0], s + 44, sizeof(float) * 3);  // prevTx, prevTy, prevTz
     memcpy(&v.placed[0], s + 56, sizeof(float) * 3); // [PromoGap] placedX/Y/Z
     memcpy(&v.capture[0], s + 68, sizeof(float) * 3); // [PromoGap] capX/Y/Z (reliable reference)
+    memcpy(&v.sampleIso, s + 80, sizeof(float));      // [ConditionProbe] solve-sample isotropy
   }
   return true;
 }

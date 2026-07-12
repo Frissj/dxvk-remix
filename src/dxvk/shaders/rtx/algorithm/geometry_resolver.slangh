@@ -518,6 +518,23 @@ void geometryResolverDLSSRROutputSurface(
   // Write out screen-space motion.
   PrimaryScreenSpaceMotionVectorDLSSRR[pixelCoordinate] = motionVectorPixel;
 
+#if GBUFFER_FEATURE_DEBUG_VIEW
+  // [SmearResidual] the uncancelled screen motion = the smear itself. motionVectorPixel above is camera
+  // parallax + world motion. For a world-static surface the parallax is CORRECT and cancels; the ONLY
+  // thing that should survive is real world motion. Reproject the SAME hit WITHOUT its motion under the
+  // previous camera (the static point's true previous screen position) and subtract from the reported
+  // previous position: what's left is the pixels DLSS drags the shading with no true motion behind it.
+  // 0 for correct static geometry (promoted props are world-static, so they must read 0); nonzero where
+  // the promoted transform manufactures motion = the smear, measured with the live cur/prev cameras.
+  if (cb.debugView == DEBUG_VIEW_PROMO_MV_RESIDUAL)
+  {
+    const vec4 staticPrevClip = mul(cb.camera.prevWorldToProjection, vec4(virtualHitPosition, 1.0f));
+    const vec2 staticPrevNDC = staticPrevClip.xy / staticPrevClip.w;
+    const vec2 residualPixel = (prevNDC.xy - staticPrevNDC) * vec2(0.5f, -0.5f) * cb.camera.resolution;
+    storeInDebugView(pixelCoordinate, length(residualPixel));
+  }
+#endif
+
   // Serialize out the Surface Material Interaction
   // Note: Always write to stochastic buffers in the primary surface case.
   polymorphicSurfaceMaterialInteractionWriteToGBufferDLSSRR(

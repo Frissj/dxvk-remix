@@ -665,8 +665,9 @@ namespace dxvk {
                                  slotEntry.second.geometryHash, std::dec,
                                  " : COLD (non-contiguous) promoted solve at frame ", st.coldFrame,
                                  " rigidStreak ", st.rigidStreak,
-                                 " -> prevM seeded = curM (one-frame ZERO motion); correlate [PathFlap] dir=B->A near frame ",
-                                 st.coldFrame));
+                                 " -> prevM seeded from PREVIOUS capture, motionDelta ", st.motionDelta,
+                                 " (0 => no prev capture = true first-appearance/disocclusion, zero motion is correct);"
+                                 " correlate [PathFlap] dir=B->A near frame ", st.coldFrame));
       }
     }
 
@@ -730,6 +731,11 @@ namespace dxvk {
       const uint32_t fid = m_device->getCurrentFrameId();
       uint32_t nowStalled = 0, worstStall = 0, worstSlot = ~0u;
       uint32_t contBreaks = 0, contBreaksVisible = 0; float worstContErr = 0.f; uint32_t worstContSlot = ~0u;
+      // [SmearProbe] the per-VERTEX manufactured motion (max |(M-prevM)*vertex|), tracked on-screen only.
+      // This is the actual motion vector fed to DLSS; a rotational prevM lineage break shows here while
+      // contErr/motionDelta (centroid) stay ~0.
+      float worstVertVisible = 0.f; uint32_t worstVertVisSlot = ~0u; float worstVertAny = 0.f; uint32_t worstVertAnySlot = ~0u;
+      float worstVertVisIso = -2.f;  // [ConditionProbe] sample isotropy of the worst on-screen flinging slot
       for (const auto& slotEntry : m_promoSlotByBlas) {
         const uint32_t slot = slotEntry.second.stateSlot;
         if (slot >= m_promoStates.size()) { continue; }
@@ -761,9 +767,14 @@ namespace dxvk {
             if (contErr > worstContErr) { worstContErr = contErr; worstContSlot = slot; }
           }
         }
+        // [SmearProbe] per-vertex fling from the live M/prevM (independent of the contErr proxy above).
+        if (st.maxVertMotion > worstVertAny) { worstVertAny = st.maxVertMotion; worstVertAnySlot = slot; }
+        if (m_dbgRenderedSlots.find(slot) != m_dbgRenderedSlots.end() && st.maxVertMotion > worstVertVisible) {
+          worstVertVisible = st.maxVertMotion; worstVertVisSlot = slot; worstVertVisIso = st.sampleIso;
+        }
         m_dbgSlotPrevCurT[slot] = curT;
       }
-      if (nowStalled > 0u || contBreaks > 0u || (fid % 30u) == 0u) {
+      if (nowStalled > 0u || contBreaks > 0u || worstVertVisible > 0.02f || (fid % 30u) == 0u) {
         Logger::info(str::format("[PromoStale] frame ", fid,
                                  " : promotedSlots ", uint32_t(m_promoSlotByBlas.size()),
                                  " stalled(>=3f) ", nowStalled,
@@ -772,6 +783,19 @@ namespace dxvk {
                                  " worstContErr ", worstContErr, " (slot ", int32_t(worstContSlot), ")",
                                  (nowStalled > 0u ? "  <<< frozen M" : ""),
                                  (contBreaksVisible > 0u ? "  <<< VISIBLE prevM lineage break=smear" : "")));
+        // [SmearProbe] the direct measurement: per-vertex manufactured motion (world units) on-screen vs
+        // any slot. Compare vertMotion(visible) against worstContErr/motionDelta: if vertMotion is LARGE
+        // while those are ~0, the smear is a ROTATION-only prevM break flinging the extremities.
+        Logger::info(str::format("[SmearProbe] frame ", fid,
+                                 " : vertMotion(VISIBLE) ", worstVertVisible, " (slot ", int32_t(worstVertVisSlot),
+                                 " iso ", worstVertVisIso, ")",
+                                 " | vertMotion(any) ", worstVertAny, " (slot ", int32_t(worstVertAnySlot), ")",
+                                 // [ConditionProbe] the decisive correlation: big fling + LOW iso (<~0.1) = the solve's
+                                 // rotation is underdetermined by planar/symmetric samples. big fling + HIGH iso = NOT
+                                 // conditioning (theory dead, look elsewhere).
+                                 (worstVertVisible > 0.05f && worstVertVisIso >= 0.f && worstVertVisIso < 0.1f
+                                    ? "  <<< SMEAR + DEGENERATE SAMPLES (underdetermined rotation)"
+                                    : (worstVertVisible > 0.05f ? "  <<< SMEAR but samples well-conditioned (NOT the solve)" : ""))));
       }
 
       // [PromoGap] THE gap probe: for every promoted slot, compare where the object is DRAWN
@@ -933,12 +957,63 @@ namespace dxvk {
         }
       }
     }
+
+    // [PromoSmear] RAW per-slot residual dump (diagnostic; probeGateEveryFrame only). For every promoted
+    // instance this frame, print the SPARSE solve residual (residualRel, 32 validation samples) beside the
+    // FULL-MESH gate residual (gateResidualRel, every vertex - fresh this frame because the probe forced the
+    // gate every frame above). The smear signature is residualRel <= eps AND gateResidualRel > eps: the
+    // sparse check called the instance rigid, but a vertex subset is deforming, so the single rigid M smears
+    // it on Path A. The placement gap |placed-capture| stays SMALL even when smearing (the rigid fit still
+    // centers the object) - large gate residual + small gap = pure deformation, not rigid misplacement.
+    if (ClusterLodOptions::Promotion::probeGateEveryFrame() && !m_promoSlotByBlas.empty()) {
+      struct Row { uint32_t slot; float sparse; float gate; float gap; bool demoted; };
+      std::vector<Row> rows;
+      rows.reserve(m_promoSlotByBlas.size());
+      uint32_t nPromoted = 0, nGateFresh = 0, nSmear = 0;
+      for (const auto& slotEntry : m_promoSlotByBlas) {
+        const uint32_t slot = slotEntry.second.stateSlot;
+        const lodclusters_remix::PromotionStateView& st = m_promoStates[slot];
+        const float dx = st.placed[0] - st.capture[0];
+        const float dy = st.placed[1] - st.capture[1];
+        const float dz = st.placed[2] - st.capture[2];
+        const float gap = std::sqrt(dx * dx + dy * dy + dz * dz);
+        nPromoted++;
+        if (st.gateResidualRel > 0.0f) {
+          nGateFresh++;
+        }
+        if (st.residualRel <= epsilon && st.gateResidualRel > epsilon) {
+          nSmear++;
+        }
+        rows.push_back({ slot, st.residualRel, st.gateResidualRel, gap, slotEntry.second.demoted });
+      }
+      // Log every frame that carries a smear signal (rare at streaming fps - each one matters), plus a
+      // sparse heartbeat so a clean stretch still shows the probe is live.
+      const uint32_t fid = m_device->getCurrentFrameId();
+      if (nSmear > 0 || (fid % 120u) == 0u) {
+        std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.gate > b.gate; });
+        Logger::info(str::format("[PromoSmear] frame ", fid, " eps ", epsilon,
+                                 " promoted ", nPromoted, " gateFresh ", nGateFresh,
+                                 " SMEAR(sparseOK,gateFail) ", nSmear));
+        const uint32_t topN = std::min<uint32_t>(8u, uint32_t(rows.size()));
+        for (uint32_t i = 0; i < topN; i++) {
+          const Row& r = rows[i];
+          Logger::info(str::format("[PromoSmear]   slot ", r.slot,
+                                   " sparse ", r.sparse, " gate ", r.gate,
+                                   " gate/eps ", (epsilon > 0.0f ? r.gate / epsilon : 0.0f),
+                                   " gap ", r.gap, (r.demoted ? " (demoted)" : ""),
+                                   ((r.sparse <= epsilon && r.gate > epsilon) ? "  <<< SMEAR" : "")));
+        }
+      }
+    }
   }
 
   void ClusterLodManager::buildPromotionEntries() {
     m_framePromoEntries.clear();
     std::swap(m_dbgRenderedSlotsPrev, m_dbgRenderedSlots);  // [PromoRender] keep last frame's set
     m_dbgRenderedSlots.clear();
+    // [ChurnDiag] per-frame render-gap / rebuild counters (accumulated in the Path A loop below,
+    // logged at the end of this call). m_churn is reset separately in beginInstanceRecording.
+    m_dbgSlotGapFresh = m_dbgSlotGapStale = m_dbgSlotGapWorst = m_dbgBlasRebuilds = 0;
 
     if (m_renderSystem == nullptr || !m_renderSystem->hasGeneration()
         || !ClusterLodOptions::Promotion::enable() || m_promoCandidates.empty()) {
@@ -967,6 +1042,30 @@ namespace dxvk {
           continue;
         }
         PromotionCandidate& candidate = found->second;
+
+        // WARMUP solve: a freshly-established promo slot renders Path B THIS frame (the establish
+        // path deferred its Path A route by one frame). Solve its slot UNPATCHED now, off the live
+        // capture, so NEXT frame it promotes to Path A with a warm prevM (= this solve's M) instead
+        // of the cold prevM = curM zero-motion smear. One entry per slot; only on the warmup frame.
+        {
+          const auto warmIt = m_promoSlotByBlas.find(blasEntry);
+          if (warmIt != m_promoSlotByBlas.end()
+              && warmIt->second.warmupPending
+              && warmIt->second.warmupFrame == m_device->getCurrentFrameId()
+              && candidate.probeVa != 0
+              && emittedInstanceSlots.insert(warmIt->second.stateSlot).second) {
+            const RaytraceBuffer& warmPos = blasEntry->modifiedGeometryData.positionBuffer;
+            if (warmPos.defined()) {
+              lodclusters_remix::PromotionEntry warmEntry;
+              warmEntry.probeVa = candidate.probeVa;
+              warmEntry.captureVa = warmPos.getDeviceAddress() + warmPos.offsetFromSlice();
+              warmEntry.captureStrideBytes = warmPos.stride();
+              warmEntry.stateSlot = warmIt->second.stateSlot;
+              warmEntry.patchSlot = 0xFFFFFFFFu;  // unpatched warmup (not rendered Path A this frame)
+              m_framePromoEntries.push_back(warmEntry);
+            }
+          }
+        }
 
         // DEMOTED promoted-instance rendering Path B: keep solving ITS OWN
         // slot so a rebuilt rigid streak re-promotes it (per-instance
@@ -1054,16 +1153,46 @@ namespace dxvk {
         }
 
         const RaytraceBuffer& positions = blasEntry->modifiedGeometryData.positionBuffer;
+        // Previous-frame capture (historyBuffer[1]) so a FIRST-frame promoted slot (B->A flip,
+        // no GPU history) can seed prevM from where the instance actually was last frame,
+        // instead of the zero-motion prevM = curM pop ([ColdPromo]). Undefined on genuine first
+        // appearance -> 0 -> shader falls back to zero motion (correct disocclusion).
+        const RaytraceBuffer& prevPositions = blasEntry->modifiedGeometryData.previousPositionBuffer;
 
         lodclusters_remix::PromotionEntry promoEntry;
         promoEntry.probeVa = found->second.probeVa;
         promoEntry.captureVa = positions.getDeviceAddress() + positions.offsetFromSlice();
         promoEntry.captureStrideBytes = positions.stride();
+        promoEntry.prevCaptureVa = prevPositions.defined()
+          ? (prevPositions.getDeviceAddress() + prevPositions.offsetFromSlice())
+          : 0ull;
         promoEntry.stateSlot = (slot.geometryId >> kPromotedSlotShift) & 0x1FFFu;
         promoEntry.patchSlot = flatIndex;
         m_framePromoEntries.push_back(promoEntry);
         dbgSolveEmitted++;
         m_dbgRenderedSlots.insert(promoEntry.stateSlot);  // [PromoRender] visible Path A set
+
+        // [ChurnDiag] this slot renders Path A this frame. Split it: contiguous (fine), FRESH (first
+        // ever render -> warmup, clean disocclusion) or GAPPED-everSolved (rendered before but not
+        // last frame -> its GPU prevM is the pre-gap M -> stale motion vector = SMEAR). Also detect
+        // a BlasEntry rebuilt under the slot (frameCreated changed = the streaming churn mechanism).
+        if (ClusterLodOptions::Promotion::churnDiag()) {
+          const uint32_t sslot = promoEntry.stateSlot;
+          const uint32_t fid = m_device->getCurrentFrameId();
+          const auto lr = m_dbgSlotLastRenderFrame.find(sslot);
+          if (lr == m_dbgSlotLastRenderFrame.end()) {
+            m_dbgSlotGapFresh++;                              // first ever render of this slot
+          } else if (lr->second + 1u != fid) {
+            m_dbgSlotGapStale++;                             // gapped re-render -> stale prevM smear
+            m_dbgSlotGapWorst = std::max(m_dbgSlotGapWorst, fid - lr->second);
+          }
+          m_dbgSlotLastRenderFrame[sslot] = fid;
+          const auto bf = m_dbgSlotBlasFrame.find(sslot);
+          if (bf != m_dbgSlotBlasFrame.end() && bf->second != blasEntry->frameCreated) {
+            m_dbgBlasRebuilds++;                             // BlasEntry rebuilt under this slot
+          }
+          m_dbgSlotBlasFrame[sslot] = blasEntry->frameCreated;
+        }
 
         // periodic full-mesh residual sweep (risk R20): the sparse solve can
         // miss a VS animating a small vertex subset, so every promoted
@@ -1071,7 +1200,18 @@ namespace dxvk {
         // solve entry above writes this frame (recordPromotion orders gates
         // after solves); the verdict demotes just this instance.
         const uint32_t sweepInterval = uint32_t(std::max(0, ClusterLodOptions::Promotion::fullSweepIntervalFrames()));
-        if (sweepInterval > 0 && found->second.probeVa != 0) {
+        // [PromoSmear] probe: force the full-mesh gate EVERY frame for EVERY promoted instance, so this
+        // frame's gateResidualRel is fresh (not the stale value from the last staggered sweep). Emitted
+        // WITHOUT setting sweepPending, so the demotion loop does not consume it - routing is unchanged
+        // and the smear stays reproducible while we measure it.
+        const bool probeEveryFrame = ClusterLodOptions::Promotion::probeGateEveryFrame();
+        if (probeEveryFrame && found->second.probeVa != 0 && found->second.vertexCount != 0) {
+          lodclusters_remix::PromotionEntry sweepEntry = promoEntry;
+          sweepEntry.patchSlot = 0xFFFFFFFFu;
+          sweepEntry.mode = 1;
+          sweepEntry.vertexCount = found->second.vertexCount;
+          m_framePromoEntries.push_back(sweepEntry);
+        } else if (sweepInterval > 0 && found->second.probeVa != 0) {
           const auto instanceIt = m_promoSlotByBlas.find(blasEntry);
           if (instanceIt != m_promoSlotByBlas.end() && !instanceIt->second.sweepPending
               && ((m_device->getCurrentFrameId() + instanceIt->second.stateSlot) % sweepInterval) == 0) {
@@ -1126,6 +1266,40 @@ namespace dxvk {
                                  " (was ", uint32_t(m_dbgRenderedSlotsPrev.size()), ")",
                                  " dropped ", dropped, " added ", added, " reCold ", reCold,
                                  ((dropped > 2u || added > 2u) ? "  <<< Path A<->B churn = flicker/snap/smear" : "")));
+      }
+
+      // [ChurnDiag] the answer to WHY promoted instances leave Path A during streaming, and which
+      // re-renders are the smear. Two blocks: (1) the routing census (m_churn) accumulated across
+      // this frame's isClusterInstance calls - one line per captured candidate's outcome/miss-reason;
+      // (2) the per-slot render-gap split - gapStale is the direct smear count (a slot re-rendered
+      // Path A after a gap carries a stale pre-gap prevM). blasRebuilds = BlasEntry recreated under
+      // a live slot (the suspected churn driver). Logged on any churn/smear activity + 30f heartbeat.
+      if (ClusterLodOptions::Promotion::churnDiag()) {
+        const uint32_t overflowDelta = m_frameOverflowCount - m_dbgChurnOverflowLast;
+        m_dbgChurnOverflowLast = m_frameOverflowCount;
+        const bool active = m_churn.capturedCandidates > 0u || m_dbgSlotGapStale > 0u
+                         || m_dbgBlasRebuilds > 0u || overflowDelta > 0u;
+        if (active && (dropped > 0u || added > 0u || m_dbgSlotGapStale > 0u
+                       || m_dbgBlasRebuilds > 0u || overflowDelta > 0u || (fid % 30u) == 0u)) {
+          Logger::info(str::format(
+            "[ChurnDiag] frame ", fid, " : candidates ", m_churn.capturedCandidates,
+            " | ROUTED pin ", m_churn.pinHit, " establish ", m_churn.establishPromote,
+            " warmupHold ", m_churn.warmupHold,
+            " | PINMISS noEntry ", m_churn.pinMissNoEntry, " rebuilt ", m_churn.pinMissRebuilt,
+            " notResident ", m_churn.pinMissNotResident, " demoted ", m_churn.pinMissDemoted,
+            " | PINBLOCK atomic ", m_churn.pinBlockedAtomic, " capacity ", m_churn.pinBlockedCapacity,
+            " trivial ", m_churn.pinBlockedTrivial,
+            " | ESTFAIL noCand ", m_churn.estNoCandidate, " notPromoted ", m_churn.estNotPromoted,
+            " noGeomId ", m_churn.estNoGeometryId, " capacity ", m_churn.estCapacity,
+            " noSlot ", m_churn.estNoSlot));
+          Logger::info(str::format(
+            "[ChurnDiag] frame ", fid, " : renderGap fresh ", m_dbgSlotGapFresh,
+            " gappedStale ", m_dbgSlotGapStale, " (SMEAR) worstGap ", m_dbgSlotGapWorst, "f",
+            " | blasRebuilds ", m_dbgBlasRebuilds, " | capacityOverflow(+) ", overflowDelta,
+            " usedSlots ", uint32_t(m_slots[Tlas::Opaque].size() + m_slots[Tlas::Unordered].size()),
+            "/", (m_renderSystem ? m_renderSystem->getMaxRenderInstances() : 0u),
+            ((m_dbgSlotGapStale > 0u) ? "  <<< gappedStale = the residual smear" : "")));
+        }
       }
     }
   }
@@ -1801,6 +1975,21 @@ namespace dxvk {
       if (!skinned && ClusterLodOptions::Promotion::enable()
           && m_renderSystem != nullptr && m_renderSystem->hasGeneration()) {
         auto pinIt = m_promoSlotByBlas.find(blasEntry);
+        // [ChurnDiag] classify the pin outcome (read-only; does not affect routing). captured &&
+        // !skinned here (skinned excluded by the enclosing branch); count every candidate once.
+        const bool churnDiag = ClusterLodOptions::Promotion::churnDiag() && captured;
+        if (churnDiag) {
+          m_churn.capturedCandidates++;
+          if (pinIt == m_promoSlotByBlas.end()) {
+            m_churn.pinMissNoEntry++;              // BlasEntry* new/rebuilt or first sight
+          } else if (pinIt->second.demoted) {
+            m_churn.pinMissDemoted++;
+          } else if (pinIt->second.residentGeometryId == ~0u) {
+            m_churn.pinMissNotResident++;          // still warming / not yet pinned
+          } else if (pinIt->second.blasFrameCreated != blasEntry->frameCreated) {
+            m_churn.pinMissRebuilt++;              // BlasEntry rebuilt under the slot (streaming)
+          }
+        }
         if (pinIt != m_promoSlotByBlas.end()
             && !pinIt->second.demoted
             && pinIt->second.residentGeometryId != ~0u
@@ -1811,9 +2000,16 @@ namespace dxvk {
           const bool atomicSuppress = ClusterLodOptions::Promotion::atomicDemotion()
             && pinCandidate != m_promoCandidates.end() && pinCandidate->second.anyInstanceDemoted;
           const uint32_t usedSlots = uint32_t(m_slots[Tlas::Opaque].size() + m_slots[Tlas::Unordered].size());
-          if (!atomicSuppress && usedSlots < m_renderSystem->getMaxRenderInstances()
-              && (!ClusterLodOptions::Render::routeTrivialToClassic()
-                  || m_trivialGeometryIds.count(pinIt->second.residentGeometryId) == 0)) {
+          const bool trivialBlocked = ClusterLodOptions::Render::routeTrivialToClassic()
+            && m_trivialGeometryIds.count(pinIt->second.residentGeometryId) != 0;
+          const bool capacityBlocked = usedSlots >= m_renderSystem->getMaxRenderInstances();
+          if (churnDiag) {
+            if (atomicSuppress) m_churn.pinBlockedAtomic++;
+            else if (capacityBlocked) m_churn.pinBlockedCapacity++;
+            else if (trivialBlocked) m_churn.pinBlockedTrivial++;
+            else m_churn.pinHit++;
+          }
+          if (!atomicSuppress && !capacityBlocked && !trivialBlocked) {
             outGeometryId = kPromotedTag | (pinIt->second.stateSlot << kPromotedSlotShift) | pinIt->second.residentGeometryId;
             m_dbgSlotExpectedPos[pinIt->second.stateSlot] = blasEntry->input.getGeometryData().boundingBox
               .getTransformedCentroid(blasEntry->input.getTransformData().objectToWorld);  // [PromoGap]
@@ -1848,14 +2044,22 @@ namespace dxvk {
                                      m_device->getCurrentFrameId()));
           }
         }
+        // [ChurnDiag] establish-eligibility census (reached only when the pin did not route Path A)
+        if (ClusterLodOptions::Promotion::churnDiag() && !atomicSuppress) {
+          if (candidate == m_promoCandidates.end()) { m_churn.estNoCandidate++; }
+          else if (candidate->second.phase != PromotionCandidate::Phase::Promoted) { m_churn.estNotPromoted++; }
+        }
         if (!atomicSuppress
             && candidate != m_promoCandidates.end()
             && candidate->second.phase == PromotionCandidate::Phase::Promoted) {
           const auto found = m_geometryIdByHash.find(geometryHash);
-          if (found != m_geometryIdByHash.end()
+          const bool geomIdOk = found != m_geometryIdByHash.end()
               && found->second <= kPromotedGeometryMask
-              && (!ClusterLodOptions::Render::routeTrivialToClassic() || m_trivialGeometryIds.count(found->second) == 0)) {
+              && (!ClusterLodOptions::Render::routeTrivialToClassic() || m_trivialGeometryIds.count(found->second) == 0);
+          if (ClusterLodOptions::Promotion::churnDiag() && !geomIdOk) { m_churn.estNoGeometryId++; }
+          if (geomIdOk) {
             const uint32_t usedSlots = uint32_t(m_slots[Tlas::Opaque].size() + m_slots[Tlas::Unordered].size());
+            if (ClusterLodOptions::Promotion::churnDiag() && usedSlots >= m_renderSystem->getMaxRenderInstances()) { m_churn.estCapacity++; }
             if (usedSlots < m_renderSystem->getMaxRenderInstances()) {
               // per-INSTANCE promotion state slot (plan R21: every captured
               // instance's buffer carries its own transform)
@@ -1979,12 +2183,22 @@ namespace dxvk {
                     }
                     allocated = true;
                     m_stableIdColdAlloc++;  // [StableId] fresh slot -> potential [ColdPromo] snap
+                    // WARMUP: a genuinely fresh slot has no GPU M history. Render Path B this frame
+                    // and solve the slot UNPATCHED (buildPromotionEntries) so it promotes to Path A
+                    // NEXT frame with a warm prevM - no cold zero-motion smear. Recovered (id/cell)
+                    // slots skip this: they already carry history. geometryHash lets the warmup
+                    // emission find the candidate probe while the instance is still on Path B.
+                    promoInstance.warmupPending = ClusterLodOptions::Promotion::warmup();
+                    promoInstance.warmupFrame = currentFrame;
+                    promoInstance.geometryHash = geometryHash;
                   }
                   if (allocated) {
                     if (cellUsable) {
                       m_promoSlotByCell.emplace(cellKey, CellSlot{ promoInstance.stateSlot, residentGeometryId, worldCentroid, currentFrame });
                     }
                     slotIt = m_promoSlotByBlas.emplace(blasEntry, promoInstance).first;
+                  } else if (ClusterLodOptions::Promotion::churnDiag()) {
+                    m_churn.estNoSlot++;  // promo-slot capacity exhausted -> Path B this frame
                   }
                 }
               }
@@ -1994,14 +2208,25 @@ namespace dxvk {
               if (slotIt != m_promoSlotByBlas.end() && !slotIt->second.demoted) {
                 // Cache the stable identity so the pinned fast-path above can route
                 // this instance every subsequent frame WITHOUT the churning-hash lookup.
-                slotIt->second.residentGeometryId = found->second;
                 slotIt->second.geometryHash = geometryHash;
                 slotIt->second.blasFrameCreated = blasEntry->frameCreated;
-                outGeometryId = kPromotedTag | (slotIt->second.stateSlot << kPromotedSlotShift) | found->second;
-                m_dbgSlotExpectedPos[slotIt->second.stateSlot] = blasEntry->input.getGeometryData().boundingBox
-                  .getTransformedCentroid(blasEntry->input.getTransformData().objectToWorld);  // [PromoGap] where Path B draws it
-                recordTopoRoute(topologyKey, 1u, instance, found->second, 2u);  // Path A (promoted)
-                return true;
+                // WARMUP hold: on the frame this slot was first established, keep the instance on
+                // Path B so buildPromotionEntries solves the slot UNPATCHED this frame. Promote to
+                // Path A only once we are PAST that warmup frame, when prevM is warm (= last frame's
+                // solved M) so the first Path A motion vector is correct instead of a cold zero.
+                if (slotIt->second.warmupPending && slotIt->second.warmupFrame == currentFrame) {
+                  // fall through to Path B routing below (the slot solves unpatched this frame)
+                  if (ClusterLodOptions::Promotion::churnDiag()) { m_churn.warmupHold++; }
+                } else {
+                  slotIt->second.warmupPending = false;  // warmed last frame -> promote now
+                  slotIt->second.residentGeometryId = found->second;
+                  outGeometryId = kPromotedTag | (slotIt->second.stateSlot << kPromotedSlotShift) | found->second;
+                  m_dbgSlotExpectedPos[slotIt->second.stateSlot] = blasEntry->input.getGeometryData().boundingBox
+                    .getTransformedCentroid(blasEntry->input.getTransformData().objectToWorld);  // [PromoGap] where Path B draws it
+                  recordTopoRoute(topologyKey, 1u, instance, found->second, 2u);  // Path A (promoted)
+                  if (ClusterLodOptions::Promotion::churnDiag()) { m_churn.establishPromote++; }
+                  return true;
+                }
               }
             }
           }
@@ -2198,6 +2423,7 @@ namespace dxvk {
     m_ghostRequests.clear();
     m_posBufPathThisFrame.clear();
     m_topoRouteThisFrame.clear();
+    m_churn.reset();  // [ChurnDiag] routing census accumulates across this frame's isClusterInstance calls
 
     // prune affiliation entries for instances that stopped being cluster-recorded
     // (destroyed or gone classic) so the map does not grow unboundedly
@@ -2481,6 +2707,38 @@ namespace dxvk {
       }
     }
 
+    // [SolveCadence] displayed-vs-artifact probe. This runs once per dispatchBuild (once per cluster
+    // render). getCurrentFrameId counts PRESENTS; the shader's contiguity uses the render system's
+    // frameIndex which only advances here. delta > 1 => that many PRESENTED frames elapsed with no
+    // promotion solve/render. Paired with the main-camera worldToView change over the gap: a gap
+    // WITH camera motion means the promoted geometry was absent while the view moved -> it reappears
+    // with a prevM stale by the whole gap = a REAL smear; a gap with a still camera is a hang (no
+    // smear), which would mean the earlier [ChurnDiag] gappedStale was a present-counter artifact.
+    if (ClusterLodOptions::Promotion::churnDiag()) {
+      const uint32_t fid = m_device->getCurrentFrameId();
+      const uint32_t delta = (m_dbgLastSolveFrame == 0u) ? 1u : (fid - m_dbgLastSolveFrame);
+      const RtCamera& cadenceCam = cameraManager.getMainCamera();
+      const Matrix4& w2v = cadenceCam.getWorldToViewf(false);
+      float camDeltaMax = 0.f;
+      if (m_dbgLastSolveFrame != 0u) {
+        for (int c = 0; c < 4; c++) {
+          for (int r = 0; r < 4; r++) {
+            camDeltaMax = std::max(camDeltaMax, std::abs(w2v[c][r] - m_dbgLastCamW2V[c][r]));
+          }
+        }
+      }
+      if (delta > 1u || (fid % 60u) == 0u) {
+        Logger::info(str::format(
+          "[SolveCadence] frame ", fid, " : delta ", delta,
+          " presents since last promotion-solve dispatch | camW2VdeltaMax ", camDeltaMax,
+          (delta > 1u && camDeltaMax > 0.01f
+             ? "  <<< SKIPPED displayed frames WHILE CAMERA MOVED -> reappearance smear is REAL"
+             : (delta > 1u ? "  <<< skipped frames but camera ~still -> hang/artifact, NOT a smear" : ""))));
+      }
+      m_dbgLastSolveFrame = fid;
+      m_dbgLastCamW2V = w2v;
+    }
+
     // P4c: this frame's promotion solve/gate/patch work items (needs the slot
     // lists, which are final here). Probing runs even when no Path A instance
     // rendered this frame - recordFrame handles the promotion-only case.
@@ -2595,6 +2853,7 @@ namespace dxvk {
     frameParams.promotionEntryCount = uint32_t(m_framePromoEntries.size());
     frameParams.promotionResidualEpsilon = std::max(1e-5f, ClusterLodOptions::Promotion::residualEpsilon());
     frameParams.promotionAllowResolveSkip = ClusterLodOptions::Promotion::resolveSkip();
+    frameParams.promotionGapMaxFrames = uint32_t(std::max(1, ClusterLodOptions::Promotion::gapMaxFrames()));
 
     // P4: HiZ occlusion feed. This runs from SceneManager::prepareSceneData,
     // BEFORE injectRTX re-points m_primaryDepth at this frame's target - so

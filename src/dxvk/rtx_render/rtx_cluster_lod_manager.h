@@ -413,6 +413,20 @@ namespace dxvk {
                  "the sparse per-frame solve can miss a VS animating a small vertex subset, so every promoted\n"
                  "instance re-runs the every-vertex sweep on this interval (staggered by state slot). A failing\n"
                  "sweep demotes that instance to Path B. 0 disables the sweeps (not recommended).");
+      // [PromoSmear] DIAGNOSTIC probe for the moving-cinematic RAW smear (per-instance, Path-A-only).
+      // Hypothesis: a promoted instance that is NON-RIGID this frame (a VS-animated prop) whose sparse
+      // 32-sample rigidity check happens to pass gets a least-squares rigid M patched; Path A then draws
+      // fitted = M*obj which disagrees with the true capture PER-VERTEX = a visible stretch/smear on that
+      // one instance. The full-vertex gate WOULD catch it, but it only runs every fullSweepIntervalFrames
+      // and demotes through the ~gateLag readback ring - tens of seconds at 1.6fps. When true this forces
+      // the full gate EVERY frame for EVERY promoted instance (so gateResidualRel is fresh this frame) and
+      // logs, per promoted slot, sparse residualRel vs full-mesh gateResidualRel and the placement gap.
+      // PURE MEASUREMENT: it does NOT set sweepPending, so routing/demotion is unchanged (the smear stays
+      // on screen while the log confirms which slots carry gate>>eps while residualRel<=eps). Off by default.
+      RTX_OPTION("rtx.clusterLod.promotion", bool, probeGateEveryFrame, false,
+                 "[PromoSmear] diagnostic: force the full-mesh residual gate every frame for every promoted\n"
+                 "instance and log sparse-vs-full residual per slot, to confirm the moving-cinematic smear is\n"
+                 "per-instance deformation the sparse solve misses. Measurement only (does not change routing).");
       // Stable-identity cell size (plan §2 Option L). The promo state slot (GPU M/prevM
       // continuity) is recovered per frame by quantizing the instance's reconstructed world
       // centroid into a cell of this size, instead of the churning RtInstance id / BlasEntry
@@ -432,6 +446,39 @@ namespace dxvk {
                  "Frames to keep a promoted mesh's BlasEntry alive after it leaves view, so re-entry\n"
                  "reuses the same BlasEntry and stays warm (no cold re-promote snap). 0 = use the\n"
                  "global numFramesToKeepBLAS lifetime.");
+      RTX_OPTION("rtx.clusterLod.promotion", int, gapMaxFrames, 1,
+                 "Max solve-frame gap for which a promoted slot's retained transform is still trusted\n"
+                 "as its PREVIOUS transform (motion vector). A promoted instance that leaves Path A\n"
+                 "(off-screen, or a Path A<->B flip) and re-renders N frames later re-solves with a\n"
+                 "retained M from N frames ago; reusing it as prevM turns the motion vector into N\n"
+                 "frames of camera drift in one frame - the smear that runs the whole moving cinematic\n"
+                 "([ChurnDiag] gappedStale, worstGap 29-157f). Beyond this many frames, prevM falls back\n"
+                 "to the current M (zero motion), correct for a reappearance/disocclusion and bounded\n"
+                 "instead of the stale-M spike.\n"
+                 "Default 1 = STRICT CONTIGUITY: prevM is trusted only when the slot actually solved the\n"
+                 "immediately preceding frame (solveGap == 1), so retained M IS last frame's M and the\n"
+                 "motion-vector lineage is exact. The old default 2 permitted the every-other-frame\n"
+                 "(solveGap == 2) case to reuse a 2-frame-stale M as 'last frame's', which the LEGO Batman\n"
+                 "cinematic proved is the residual raw smear: [PromoStale] logged VISIBLE prevM lineage\n"
+                 "breaks (contErr up to 2.4u) on stationary geometry, dragging the DLSS-reprojected shading\n"
+                 "across a correctly-placed surface (raw-visible because DLSS consumes the MV even with the\n"
+                 "denoiser off). Set very high (e.g. 100000) to A/B the old stale-M behavior.");
+      RTX_OPTION("rtx.clusterLod.promotion", bool, churnDiag, true,
+                 "[ChurnDiag] per-frame instrumentation of WHY promoted instances leave Path A during\n"
+                 "streaming (the churn behind the residual gapped-prevM smear). Logs a routing census\n"
+                 "(pin hit / rebuilt / capacity / establish-fail reasons), the per-slot render-gap split\n"
+                 "(fresh-warmup vs gapped-everSolved = stale-prevM smear risk), and BlasEntry-rebuild and\n"
+                 "capacity-overflow counts. Only logs on frames with promotion activity (skips menus/idle).\n"
+                 "Diagnostic - default on for this investigation; revert with the rest of the [Churn*] probes.");
+      RTX_OPTION("rtx.clusterLod.promotion", bool, warmup, true,
+                 "1-frame promotion warmup (default ON). A freshly promoted instance's state slot has\n"
+                 "no GPU transform history, so its first Path A solve seeds prevM = curM (zero motion) -\n"
+                 "a Path B->A flip then SMEARS for one frame (correct position, but the denoiser blends\n"
+                 "stale history onto a pixel it thinks did not move). Under streaming churn this fires on\n"
+                 "many instances per frame. With warmup on, a genuinely fresh slot stays on Path B for one\n"
+                 "more frame and is solved UNPATCHED, so it promotes the NEXT frame with a warm prevM =\n"
+                 "last frame's solved M -> correct motion vector, no smear. Recovered (warm) slots are\n"
+                 "unaffected. Set False to A/B the smear (off => [ColdPromo] events return with motionDelta 0).");
       RTX_OPTION("rtx.clusterLod.promotion", bool, resolveSkip, false,
                  "Per-frame re-solve skip: when a promoted slot's cached transform from last frame\n"
                  "still reproduces this frame's vertex-capture within residualEpsilon, reuse it and\n"
@@ -909,6 +956,17 @@ namespace dxvk {
       uint32_t residentGeometryId = ~0u;
       uint64_t geometryHash = 0;
       uint32_t blasFrameCreated = 0;
+      // NV-DXVK: 1-frame promotion WARMUP (kills the cold-promote motion-vector smear). A
+      // freshly allocated slot has no GPU M history, so its first patched solve seeds prevM = curM
+      // (zero motion) - a Path B->A flip then smears for one frame (the denoiser blends stale
+      // history onto a pixel it thinks did not move). Under streaming churn this fires on many
+      // instances per frame. Instead, on the establish frame the instance stays on Path B and its
+      // slot is solved UNPATCHED (buildPromotionEntries), so the NEXT frame it promotes to Path A
+      // with a warm prevM = last frame's solved M -> correct motion vector, no smear. Only genuinely
+      // fresh slots warm up; a recovered (id/cell) slot already has history. warmupFrame is the
+      // frame the warmup solve was emitted; the route promotes once currentFrame passes it.
+      bool warmupPending = false;
+      uint32_t warmupFrame = 0;
     };
     std::unordered_map<const BlasEntry*, PromoInstance> m_promoSlotByBlas;
     // NV-DXVK: recover a promoted instance's state slot across BlasEntry churn. Streaming and
@@ -1015,6 +1073,51 @@ namespace dxvk {
     uint32_t m_swapProbeRingHead = 0;
     uint32_t m_swapProbeSwapFrame = 0;   // frame the last full rebuild activated
     uint32_t m_swapProbeDumpAtFrame = 0; // dump the ring once currentFrame reaches this (0 = idle)
+
+    // ---- [ChurnDiag] streaming-churn instrumentation (Promotion::churnDiag) ----
+    // Per-frame routing-outcome census for captured promotion candidates: WHY an instance is or
+    // is not on Path A this frame. Reset in beginInstanceRecording, accumulated across the
+    // isClusterInstance calls of mergeInstancesIntoBlas, logged in buildPromotionEntries.
+    struct ChurnCensus {
+      uint32_t capturedCandidates = 0;   // captured, non-skinned, promotion-eligible instances seen
+      uint32_t pinHit = 0;               // routed Path A via the pinned fast-path
+      uint32_t establishPromote = 0;     // routed Path A via (re)establish
+      uint32_t warmupHold = 0;           // held on Path B one frame by the warmup (intentional)
+      uint32_t pinMissNoEntry = 0;       // no pin entry for this BlasEntry* (new/rebuilt pointer, or first sight)
+      uint32_t pinMissRebuilt = 0;       // pin entry present but blasFrameCreated changed (BlasEntry rebuilt in place)
+      uint32_t pinMissNotResident = 0;   // pin present, residentGeometryId == ~0 (still warming / not yet pinned)
+      uint32_t pinMissDemoted = 0;       // pin present but slot demoted (non-rigid solve)
+      uint32_t pinBlockedAtomic = 0;     // pin conditions met but atomicDemotion suppressed
+      uint32_t pinBlockedCapacity = 0;   // pin conditions met but render-instance capacity full
+      uint32_t pinBlockedTrivial = 0;    // pin conditions met but routeTrivialToClassic
+      uint32_t estNoCandidate = 0;       // no promotion candidate for the (churning) asset hash
+      uint32_t estNotPromoted = 0;       // candidate exists but not yet in Promoted phase
+      uint32_t estNoGeometryId = 0;      // m_geometryIdByHash miss (generation table churn)
+      uint32_t estCapacity = 0;          // establish blocked by render-instance capacity
+      uint32_t estNoSlot = 0;            // slot allocation failed (promo slot capacity)
+      void reset() { *this = ChurnCensus(); }
+    };
+    ChurnCensus m_churn;
+    // Per promoted stateSlot: the last frame it actually rendered Path A (got a solve+patch entry),
+    // so buildPromotionEntries can split this frame's rendered slots into contiguous / fresh (first
+    // ever render -> warmup, clean) / gapped-everSolved (re-render after a gap -> stale prevM = smear).
+    std::unordered_map<uint32_t, uint32_t> m_dbgSlotLastRenderFrame;
+    uint32_t m_dbgSlotGapFresh = 0;      // rendered this frame, never rendered before (fresh/warmup)
+    uint32_t m_dbgSlotGapStale = 0;      // rendered this frame, rendered before but with a gap (SMEAR)
+    uint32_t m_dbgSlotGapWorst = 0;      // largest such gap (frames) this frame
+    // Per promoted stateSlot: the instance's blasFrameCreated last time it rendered; a change means
+    // the BlasEntry was rebuilt under it (streaming / generation swap) - the prime churn suspect.
+    std::unordered_map<uint32_t, uint32_t> m_dbgSlotBlasFrame;
+    uint32_t m_dbgBlasRebuilds = 0;      // slots whose BlasEntry frameCreated changed this frame
+    uint32_t m_dbgChurnOverflowLast = 0; // m_frameOverflowCount at the previous [ChurnDiag] log
+    // [SolveCadence] the displayed-vs-artifact test. getCurrentFrameId is the PRESENT counter; the
+    // shader's contiguity check uses the render system's frameIndex which only advances when the
+    // cluster solve actually dispatches. So a present-gap here (delta > 1) means displayed frames
+    // advanced with NO promotion solve. Paired with the main-camera worldToView delta across the
+    // gap: gap + camera moved => the promoted geometry (absent those frames) reappears with a
+    // whole-gap-stale prevM = a REAL reappearance smear; gap + camera still => a hang, no smear.
+    uint32_t m_dbgLastSolveFrame = 0;    // getCurrentFrameId at the previous dispatchBuild
+    Matrix4 m_dbgLastCamW2V;             // main-camera worldToView at the previous dispatchBuild
 
     // periodic stats logging (rtx.clusterLod.logStatsIntervalFrames): last
     // frame a stats line was considered, and the counters it printed - a new

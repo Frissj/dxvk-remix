@@ -389,9 +389,14 @@ namespace lodclusters_remix {
     // re-solve skip (reuse last frame's cached M) freezes placement + zeroes the
     // motion vector under camera motion for camera-relative captured geometry.
     bool promotionAllowResolveSkip = false;
+    // Max solve-frame gap for which a promoted slot's retained M is still trusted as its
+    // previous transform. A slot re-rendering Path A after a longer gap (off-screen / Path A<->B
+    // flip) has an N-frames-stale retained M; beyond this many frames prevM falls back to curM
+    // (zero motion) instead of the stale-M motion-vector spike (the moving-cinematic smear).
+    uint32_t promotionGapMaxFrames = 2;
   };
 
-  // P4c: one promotion work item (40 bytes, mirrored by promotion_solve.comp
+  // P4c: one promotion work item (48 bytes, mirrored by promotion_solve.comp
   // with scalar layout - keep field order/size in exact sync).
   struct PromotionEntry {
     uint64_t probeVa = 0;             // probe blob (template-system owned)
@@ -402,8 +407,14 @@ namespace lodclusters_remix {
     uint32_t mode = 0;                // 0 = solve (+patch), 1 = full-mesh gate
     uint32_t vertexCount = 0;         // gate dispatch sizing (mode 1)
     uint32_t pad0 = 0;
+    // Previous-frame captured positions (modifiedGeometryData.previousPositionBuffer =
+    // historyBuffer[1], same stride as captureVa). 0 = unavailable. Used ONLY to seed a
+    // first-frame promoted slot's prevM (a B->A flip whose fresh slot has no history), so
+    // the motion vector is continuous instead of the one-frame prevM = curM (zero motion)
+    // pop the denoiser reprojects wrong. Warm slots ignore it (they retain last frame's M).
+    uint64_t prevCaptureVa = 0;
   };
-  static_assert(sizeof(PromotionEntry) == 40, "kernel mirrors this layout");
+  static_assert(sizeof(PromotionEntry) == 48, "kernel mirrors this layout");
 
   // P4c: compact per-slot state the manager reads back (3-frame lag);
   // converted from the kernel's 32-byte PromoStatus.
@@ -413,12 +424,17 @@ namespace lodclusters_remix {
     uint32_t rigidStreak = 0;
     uint32_t flags = 0;               // bit0 rigid, bit2 demoted (last solve non-rigid)
     uint32_t lastFrame = 0;           // renderer frameIndex of the last solve
-    float motionDelta = 0.0f;         // [MotionProbe] |M.t - prevM.t| this frame (world units)
+    float motionDelta = 0.0f;         // [MotionProbe] |M.t - prevM.t| this frame (world units) - CENTROID only
     uint32_t coldFrame = 0;           // [ColdPromo] last frame this promoted slot solved non-contiguously (prevM=curM)
+    float maxVertMotion = 0.0f;       // [SmearProbe] max over solve samples of |(M-prevM)*vertex| (world units) - the
+                                      // per-VERTEX manufactured motion. Rotation mismatch between M and prevM flings the
+                                      // extremities while motionDelta (centroid) stays ~0 = the MV smear no centroid probe sees.
     float curT[3] = {0.f, 0.f, 0.f};  // [PromoDump] solved curM translation column (world units)
     float prevT[3] = {0.f, 0.f, 0.f}; // [PromoDump] solved prevM translation column (world units)
     float placed[3] = {0.f, 0.f, 0.f};// [PromoGap] world position the object's centroid is drawn at (M*centroid)
     float capture[3] = {0.f, 0.f, 0.f};// [PromoGap] mean of the actual capture samples (reliable "true position")
+    float sampleIso = 0.0f;           // [ConditionProbe] solve-sample isotropy [0,1]; ~0 = planar/degenerate =
+                                      // rotation underdetermined; ~1 = well-constrained; -1 = skip path (not computed)
   };
 
   // P3: semaphores the caller must attach to the queue submission that

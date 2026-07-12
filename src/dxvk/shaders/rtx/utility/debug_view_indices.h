@@ -315,6 +315,14 @@
 #define DEBUG_VIEW_CLUSTER_PATHA_UV_CHECKER 934
 #define DEBUG_VIEW_CLUSTER_PATHA_GRADIENT 935
 
+// NV-DXVK: [SmearResidual] the uncancelled screen-space motion (in pixels) = the promoted-geometry
+// smear itself, measured at the hit with the LIVE cur/prev cameras (not the bugged CPU getMainCamera
+// getter). It reprojects the SAME hit WITHOUT its world motion under the previous camera (the static
+// point's true previous screen position) and subtracts that from the reported previous position. For
+// correct world-static geometry the camera parallax cancels and this is 0; where a promoted static
+// prop's transform manufactures motion, this lights up = the exact pixels DLSS drags the shading.
+#define DEBUG_VIEW_PROMO_MV_RESIDUAL 936
+
 enum class CompositeDebugView : uint32_t {
   Disabled = 0,
   FinalRenderWithMaterialProperties,
