@@ -736,6 +736,8 @@ namespace dxvk {
       // contErr/motionDelta (centroid) stay ~0.
       float worstVertVisible = 0.f; uint32_t worstVertVisSlot = ~0u; float worstVertAny = 0.f; uint32_t worstVertAnySlot = ~0u;
       float worstVertVisIso = -2.f;  // [ConditionProbe] sample isotropy of the worst on-screen flinging slot
+      // [SmearPix] worst on-screen smear IN PIXELS (written at the hit by the gbuffer pass - the smear itself)
+      float worstSmearPix = 0.f; uint32_t worstSmearSlot = ~0u; uint32_t smearingSlots = 0;
       for (const auto& slotEntry : m_promoSlotByBlas) {
         const uint32_t slot = slotEntry.second.stateSlot;
         if (slot >= m_promoStates.size()) { continue; }
@@ -772,9 +774,15 @@ namespace dxvk {
         if (m_dbgRenderedSlots.find(slot) != m_dbgRenderedSlots.end() && st.maxVertMotion > worstVertVisible) {
           worstVertVisible = st.maxVertMotion; worstVertVisSlot = slot; worstVertVisIso = st.sampleIso;
         }
+        // [SmearPix v2] WORLD-unit motion magnitude at the hit (|prevPosition-hitPosition| the MV is
+        // built from). Compare against the solve's own |curT-prevT|: matching (~0.1u) = hit reads what
+        // the solve wrote (probe artifact ruled out); large here while the solve says small = the hit
+        // consumed different memory (sync gap) or a different slot.
+        if (st.smearPix > 0.5f) { smearingSlots++; }  // > 0.5u phantom motion on "static" props
+        if (st.smearPix > worstSmearPix) { worstSmearPix = st.smearPix; worstSmearSlot = slot; }
         m_dbgSlotPrevCurT[slot] = curT;
       }
-      if (nowStalled > 0u || contBreaks > 0u || worstVertVisible > 0.02f || (fid % 30u) == 0u) {
+      if (nowStalled > 0u || contBreaks > 0u || worstVertVisible > 0.02f || worstSmearPix > 0.5f || (fid % 30u) == 0u) {
         Logger::info(str::format("[PromoStale] frame ", fid,
                                  " : promotedSlots ", uint32_t(m_promoSlotByBlas.size()),
                                  " stalled(>=3f) ", nowStalled,
@@ -796,6 +804,24 @@ namespace dxvk {
                                  (worstVertVisible > 0.05f && worstVertVisIso >= 0.f && worstVertVisIso < 0.1f
                                     ? "  <<< SMEAR + DEGENERATE SAMPLES (underdetermined rotation)"
                                     : (worstVertVisible > 0.05f ? "  <<< SMEAR but samples well-conditioned (NOT the solve)" : ""))));
+        // [SmearPix] the DIRECT measurement: pixels of uncancelled shading drag, from the gbuffer pass.
+        // The worst slot's SOLVE-side state is printed beside it to split the two remaining roots:
+        //   solved (lastFrame advancing, sane prevT) + garbage at hit  -> SYNC GAP (RT read not ordered
+        //                                                                against the solve's BDA writes)
+        //   never solved (lastFrame 0, flags 0)                        -> emitted entries dying in dispatch
+        std::string worstState = "(slot not in readback)";
+        if (worstSmearSlot != ~0u && worstSmearSlot < m_promoStates.size()) {
+          const lodclusters_remix::PromotionStateView& ws = m_promoStates[worstSmearSlot];
+          worstState = str::format("lastFrame ", ws.lastFrame, " flags ", ws.flags,
+                                   " everSolved ", (ws.flags & 16u) != 0 ? 1 : 0,
+                                   " prevT (", ws.prevT[0], ",", ws.prevT[1], ",", ws.prevT[2], ")",
+                                   " curT (", ws.curT[0], ",", ws.curT[1], ",", ws.curT[2], ")");
+        }
+        Logger::info(str::format("[SmearPix] frame ", fid,
+                                 " : worstMotionW ", worstSmearPix, "u (slot ", int32_t(worstSmearSlot), ")",
+                                 " slots>0.5u ", smearingSlots,
+                                 " | worstSlotSolveState: ", worstState,
+                                 (worstSmearPix > 0.5f ? "  <<< PHANTOM WORLD MOTION AT HIT" : "")));
       }
 
       // [PromoGap] THE gap probe: for every promoted slot, compare where the object is DRAWN
@@ -1120,6 +1146,13 @@ namespace dxvk {
     // If missBlas/missCand are ever > 0, that IS the bug. promoRendered = promoted slots seen;
     // solveEmitted = got a fresh solve; missNullBlas/missSlot/missCand = the three drop paths.
     uint32_t dbgPromoRendered = 0, dbgSolveEmitted = 0, dbgMissNullBlas = 0, dbgMissSlot = 0, dbgMissCand = 0;
+    // [ProbeZero] solve entries emitted with probeVa == 0: the kernel's defensive first line silently
+    // drops these (promotion_solve.comp: probeVa==0 -> return), so the slot renders Path A while its
+    // M/prevM NEVER update -> frozen placement (lag) + stale/zero prevM (the [SmearPix] px spikes).
+    // Counted as "emitted" by the accounting below, which is why [PromoNoSolve] always read clean.
+    // probeVa goes 0 permanently when the candidate's gate REJECTED (freePromotionProbe, terminal)
+    // while the pin path keeps routing its already-promoted instances to Path A.
+    uint32_t dbgProbeZero = 0; uint32_t dbgProbeZeroSlots[4] = { ~0u, ~0u, ~0u, ~0u };
     uint32_t flatIndex = 0;
     for (const size_t tlasType : { size_t(Tlas::Opaque), size_t(Tlas::Unordered) }) {
       for (size_t i = 0; i < m_slots[tlasType].size(); i++, flatIndex++) {
@@ -1168,6 +1201,11 @@ namespace dxvk {
           : 0ull;
         promoEntry.stateSlot = (slot.geometryId >> kPromotedSlotShift) & 0x1FFFu;
         promoEntry.patchSlot = flatIndex;
+        // [ProbeZero] the silent-death branch: emitted, but the kernel will drop it on arrival.
+        if (promoEntry.probeVa == 0) {
+          if (dbgProbeZero < 4) { dbgProbeZeroSlots[dbgProbeZero] = promoEntry.stateSlot; }
+          dbgProbeZero++;
+        }
         m_framePromoEntries.push_back(promoEntry);
         dbgSolveEmitted++;
         m_dbgRenderedSlots.insert(promoEntry.stateSlot);  // [PromoRender] visible Path A set
@@ -1233,7 +1271,7 @@ namespace dxvk {
     // is nonzero, plus a heartbeat every 30 frames so we can see the clean baseline too.
     {
       const uint32_t fid = m_device->getCurrentFrameId();
-      const bool anyMiss = (dbgMissNullBlas | dbgMissSlot | dbgMissCand) != 0u;
+      const bool anyMiss = (dbgMissNullBlas | dbgMissSlot | dbgMissCand | dbgProbeZero) != 0u;
       if (anyMiss || (fid % 30u) == 0u) {
         Logger::info(str::format("[PromoNoSolve] frame ", fid,
                                  " : promotedRendered ", dbgPromoRendered,
@@ -1241,7 +1279,14 @@ namespace dxvk {
                                  " | STALE missNullBlas ", dbgMissNullBlas,
                                  " missSlot ", dbgMissSlot,
                                  " missCand ", dbgMissCand,
-                                 (anyMiss ? "  <<< STALE-M (lag+smear source)" : "")));
+                                 " probeZero ", dbgProbeZero,
+                                 (dbgProbeZero != 0u
+                                    ? str::format(" (slots ", int32_t(dbgProbeZeroSlots[0]), " ", int32_t(dbgProbeZeroSlots[1]),
+                                                  " ", int32_t(dbgProbeZeroSlots[2]), " ", int32_t(dbgProbeZeroSlots[3]), ")")
+                                    : std::string()),
+                                 (dbgProbeZero != 0u
+                                    ? "  <<< SOLVE SILENTLY DROPPED (probeVa=0: kernel returns, M/prevM frozen = lag+smear)"
+                                    : (anyMiss ? "  <<< STALE-M (lag+smear source)" : ""))));
       }
 
       // [PromoRender] rendered-set CHURN: how the VISIBLE Path A set changed vs last frame. dropped
@@ -2854,6 +2899,8 @@ namespace dxvk {
     frameParams.promotionResidualEpsilon = std::max(1e-5f, ClusterLodOptions::Promotion::residualEpsilon());
     frameParams.promotionAllowResolveSkip = ClusterLodOptions::Promotion::resolveSkip();
     frameParams.promotionGapMaxFrames = uint32_t(std::max(1, ClusterLodOptions::Promotion::gapMaxFrames()));
+    frameParams.promotionRotStabilizeIso = std::max(0.0f, ClusterLodOptions::Promotion::rotStabilizeIso());
+    frameParams.promotionTeleportClampRadii = std::max(0.0f, ClusterLodOptions::Promotion::teleportClampRadii());
 
     // P4: HiZ occlusion feed. This runs from SceneManager::prepareSceneData,
     // BEFORE injectRTX re-points m_primaryDepth at this frame's target - so
@@ -3546,11 +3593,23 @@ namespace dxvk {
     return m_renderSystem->getResidentClustersAddress();
   }
 
+  // [UvXCheck] geometryId (active-generation table index) -> asset hash
+  uint64_t ClusterLodManager::getResidentGeometryHash(uint32_t geometryId) const {
+    return geometryId < m_residentGeometryHashes.size() ? m_residentGeometryHashes[geometryId] : 0;
+  }
+
   uint64_t ClusterLodManager::getPromotionStateAddress() const {
     if (m_renderSystem == nullptr || !ClusterLodOptions::Promotion::enable()) {
       return 0;
     }
     return m_renderSystem->getPromotionStateAddress();
+  }
+
+  uint64_t ClusterLodManager::getPromotionStatusAddress() const {
+    if (m_renderSystem == nullptr || !ClusterLodOptions::Promotion::enable()) {
+      return 0;
+    }
+    return m_renderSystem->getPromotionStatusAddress();
   }
 
   uint64_t ClusterLodManager::getAnimatedClusterTableAddress() const {

@@ -153,6 +153,12 @@ struct PromoStatus
   // affine solve's ROTATION is UNDERDETERMINED: it fits every sample yet the rotation DOF is free, so
   // it lands on an arbitrary valid rotation that jumps frame-to-frame = the [SmearProbe] fling. -1 = skip.
   float sampleIso;
+  // [SmearPix] written by the GBUFFER pass (surface_interaction promoted-hit block), NOT this kernel:
+  // float bits of the max on-screen UNCANCELLED screen-space motion residual (in pixels) any pixel of
+  // this slot's instance produced this frame - i.e. the smear itself, measured where it happens, with
+  // the live cur/prev cameras. This kernel must PRESERVE it (whole-struct writes carry it through);
+  // recordPromotion zeroes it after the readback copy each frame.
+  uint smearPixBits;
 };
 
 layout(buffer_reference, buffer_reference_align = 4, scalar) buffer PromoStatuses
@@ -187,6 +193,8 @@ layout(push_constant, scalar) uniform PushData
   uint     gateEntryIndex;         // MODE_GATE: which entry this dispatch runs
   uint     allowResolveSkip;       // 0 = every promoted slot full-solves each frame (see below)
   uint     gapMaxFrames;           // max solve-frame gap for which the retained prevM is still trusted
+  float    rotStabilizeIso;        // [RotStabilize] anchor rotation to prevM when sampleIso < this; 0 = off
+  float    teleportClampRadii;     // [TeleportClamp] zero the MV when per-frame motion > this x object radius; 0 = off
 }
 push;
 
@@ -548,6 +556,57 @@ void main()
   const bool contiguous = (status.lastFrame + 1u == push.frameId);
   const bool everSolved = (status.flags & PROMO_FLAG_SOLVED) != 0u;
 
+  // [ConditionProbe] isotropy of the solve sample cloud = det(cov)/(trace/3)^3 in [0,1]. ~1 = samples
+  // fill 3D (rotation constrained), ~0 = planar/collinear/symmetric (rotation UNDERDETERMINED). Computed
+  // here so [RotStabilize] below can use it; also read back for the [SmearProbe] correlation log.
+  float sampleIso;
+  {
+    float cxx = 0.0, cyy = 0.0, czz = 0.0, cxy = 0.0, cxz = 0.0, cyz = 0.0;
+    for(uint t = 0; t < probe.sampleCount; t++)
+    {
+      const PromoSample smp = probe.samples[t];
+      const vec3 p = vec3(smp.refX, smp.refY, smp.refZ);  // already centered on the centroid
+      cxx += p.x * p.x; cyy += p.y * p.y; czz += p.z * p.z;
+      cxy += p.x * p.y; cxz += p.x * p.z; cyz += p.y * p.z;
+    }
+    const float invN = 1.0 / float(max(1u, probe.sampleCount));
+    cxx *= invN; cyy *= invN; czz *= invN; cxy *= invN; cxz *= invN; cyz *= invN;
+    const float detC = cxx * (cyy * czz - cyz * cyz)
+                     - cxy * (cxy * czz - cyz * cxz)
+                     + cxz * (cxy * cyz - cyy * cxz);
+    const float tr3 = (cxx + cyy + czz) * (1.0 / 3.0);
+    sampleIso = clamp(detC / max(1e-12, tr3 * tr3 * tr3), 0.0, 1.0);
+  }
+
+  // [RotStabilize] THE underdetermined-rotation fix. When the sample cloud is degenerate (low iso) the
+  // solved rotation is free and jumps frame-to-frame, flinging the extremities = the raw smear. If iso is
+  // below the threshold AND this slot solved last frame (matrices.m[mBase+0..] still holds last frame's M,
+  // not yet overwritten), blend the solved LINEAR part toward last frame's, weighted by degeneracy (full
+  // anchor at iso 0, none at iso>=threshold), then RE-PIN the centroid so M*centroid (the well-determined
+  // placement) is unchanged. The rotation stops jumping; well-conditioned meshes (iso>=threshold) untouched.
+  if(push.rotStabilizeIso > 0.0 && everSolved && contiguous && sampleIso < push.rotStabilizeIso)
+  {
+    const float w = clamp((push.rotStabilizeIso - sampleIso) / push.rotStabilizeIso, 0.0, 1.0);
+    // solved linear part (row-major 3x3 within M)
+    const float A0 = M[0], A1 = M[1], A2 = M[2];
+    const float A4 = M[4], A5 = M[5], A6 = M[6];
+    const float A8 = M[8], A9 = M[9], A10 = M[10];
+    // last frame's linear part (retained M, still in place)
+    const float P0 = matrices.m[mBase + 0], P1 = matrices.m[mBase + 1], P2 = matrices.m[mBase + 2];
+    const float P4 = matrices.m[mBase + 4], P5 = matrices.m[mBase + 5], P6 = matrices.m[mBase + 6];
+    const float P8 = matrices.m[mBase + 8], P9 = matrices.m[mBase + 9], P10 = matrices.m[mBase + 10];
+    const float B0 = mix(A0, P0, w), B1 = mix(A1, P1, w), B2 = mix(A2, P2, w);
+    const float B4 = mix(A4, P4, w), B5 = mix(A5, P5, w), B6 = mix(A6, P6, w);
+    const float B8 = mix(A8, P8, w), B9 = mix(A9, P9, w), B10 = mix(A10, P10, w);
+    // re-pin the centroid: t += (A_solved - A_blended) * centroid so M*centroid is unchanged
+    M[3]  += (A0 - B0) * c.x + (A1 - B1) * c.y + (A2 - B2) * c.z;
+    M[7]  += (A4 - B4) * c.x + (A5 - B5) * c.y + (A6 - B6) * c.z;
+    M[11] += (A8 - B8) * c.x + (A9 - B9) * c.y + (A10 - B10) * c.z;
+    M[0] = B0; M[1] = B1; M[2] = B2;
+    M[4] = B4; M[5] = B5; M[6] = B6;
+    M[8] = B8; M[9] = B9; M[10] = B10;
+  }
+
   // [ColdPromo] probe (diagnostic): a promoted (patchSlot-valid) slot that was NEVER
   // solved has no previous transform, so prevM = curM below => one frame of ZERO motion.
   // That is a genuine first appearance / disocclusion (no history to reproject - TAA
@@ -675,28 +734,28 @@ void main()
       maxVertMotion = max(maxVertMotion, length(wCur - wPrev));
     }
     status._pad2 = floatBitsToUint(maxVertMotion);
-  }
-  // [ConditionProbe] does the SOLVE sample cloud constrain the rotation? Covariance of the centered
-  // solve samples; det/(trace/3)^3 collapses to ~0 for planar/collinear/symmetric clouds (rotation
-  // free) and ~1 for a well-spread 3D cloud (rotation pinned). If the flinging slots read low iso,
-  // the smear is an underdetermined-rotation solve, not the plumbing.
-  {
-    float cxx = 0.0, cyy = 0.0, czz = 0.0, cxy = 0.0, cxz = 0.0, cyz = 0.0;
-    for(uint t = 0; t < probe.sampleCount; t++)
+
+    // [TeleportClamp] THE smear fix (LEGO Batman cinemtic root cause, 2026-07-14). These games animate
+    // cinematic props in DISCRETE STEPS; at streaming framerates one step is 10-34 world units. The
+    // promoted MV honestly reports that jump and DLSS drags a full step of shading across the screen =
+    // the raw smear. (Path B looked clean only because its CPU prev==cur matrices report ZERO motion,
+    // so DLSS treats the step as a disocclusion and rejects history.) When the per-vertex per-frame
+    // motion exceeds the object's OWN radius x threshold - motion no temporal accumulator can reuse -
+    // report zero motion instead (prevM = M, proper disocclusion semantics). Scale-free (radius-
+    // relative), game-agnostic, placement (M) untouched: the object still renders at its exact new
+    // pose, only the useless teleport-scale motion vector is dropped.
+    if(push.teleportClampRadii > 0.0 && maxVertMotion > push.teleportClampRadii * max(probe.radius, 1e-6))
     {
-      const PromoSample smp = probe.samples[t];
-      const vec3 p = vec3(smp.refX, smp.refY, smp.refZ);  // already centered on the centroid
-      cxx += p.x * p.x; cyy += p.y * p.y; czz += p.z * p.z;
-      cxy += p.x * p.y; cxz += p.x * p.z; cyz += p.y * p.z;
+      for(uint k = 0; k < 12; k++)
+      {
+        matrices.m[mBase + 12 + k] = M[k];
+      }
+      status._pad0 = 0.0;
+      status.prevTx = status.curTx; status.prevTy = status.curTy; status.prevTz = status.curTz;
     }
-    const float invN = 1.0 / float(max(1u, probe.sampleCount));
-    cxx *= invN; cyy *= invN; czz *= invN; cxy *= invN; cxz *= invN; cyz *= invN;
-    const float detC = cxx * (cyy * czz - cyz * cyz)
-                     - cxy * (cxy * czz - cyz * cxz)
-                     + cxz * (cxy * cyz - cyy * cxz);
-    const float tr3 = (cxx + cyy + czz) * (1.0 / 3.0);
-    status.sampleIso = clamp(detC / max(1e-12, tr3 * tr3 * tr3), 0.0, 1.0);
   }
+  // [ConditionProbe] readback the isotropy computed above (drives [RotStabilize] + the [SmearProbe] log).
+  status.sampleIso = sampleIso;
   statuses.s[entry.stateSlot] = status;
 
   // ---- patch a promoted instance's slot: ALWAYS write when assigned - a

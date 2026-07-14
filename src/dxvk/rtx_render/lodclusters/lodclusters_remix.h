@@ -394,6 +394,13 @@ namespace lodclusters_remix {
     // flip) has an N-frames-stale retained M; beyond this many frames prevM falls back to curM
     // (zero motion) instead of the stale-M motion-vector spike (the moving-cinematic smear).
     uint32_t promotionGapMaxFrames = 2;
+    float promotionRotStabilizeIso = 0.15f;  // [RotStabilize] anchor the solved rotation to prevM when the
+                                             // sample-cloud isotropy is below this (degenerate/planar -> rotation
+                                             // underdetermined -> jumps -> smear). 0 disables.
+    float promotionTeleportClampRadii = 1.0f;  // [TeleportClamp] report ZERO motion (prevM = M, disocclusion
+                                               // semantics) when a promoted instance's per-frame per-vertex motion
+                                               // exceeds this multiple of its own radius - a discrete animation step
+                                               // no temporal accumulator can reuse (the cinematic smear). 0 disables.
   };
 
   // P4c: one promotion work item (48 bytes, mirrored by promotion_solve.comp
@@ -435,6 +442,9 @@ namespace lodclusters_remix {
     float capture[3] = {0.f, 0.f, 0.f};// [PromoGap] mean of the actual capture samples (reliable "true position")
     float sampleIso = 0.0f;           // [ConditionProbe] solve-sample isotropy [0,1]; ~0 = planar/degenerate =
                                       // rotation underdetermined; ~1 = well-constrained; -1 = skip path (not computed)
+    float smearPix = 0.0f;            // [SmearPix] THE SMEAR: worst uncancelled screen-space motion residual (pixels)
+                                      // any on-screen pixel of this slot produced, written at the hit by the gbuffer
+                                      // pass with the live cur/prev cameras. 0 = no smear on this slot this frame.
   };
 
   // P3: semaphores the caller must attach to the queue submission that
@@ -610,6 +620,10 @@ namespace lodclusters_remix {
     // device address of the promotion state array (128 B per slot), for the
     // hit side's prevM motion-vector fetch (raytrace_args)
     uint64_t getPromotionStateAddress() const;
+
+    // [SmearPix] device address of the promo STATUS buffer (kPromoStatusStride B/slot) so the
+    // promoted-hit block can write its on-screen smear residual back to its slot (raytrace_args)
+    uint64_t getPromotionStatusAddress() const;
 
     // Drains the newest complete host readback of the per-slot promotion
     // states (written by recordFrame with a ring of 4, read here with the

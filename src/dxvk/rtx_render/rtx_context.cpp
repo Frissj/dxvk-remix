@@ -19,6 +19,7 @@
 * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 * DEALINGS IN THE SOFTWARE.
 */
+#include <algorithm>
 #include <cstring>
 #include <cmath>
 #include <cassert>
@@ -33,6 +34,7 @@
 #include "rtx_bindless_resource_manager.h"
 #include "rtx_opacity_micromap_manager.h"
 #include "rtx_cluster_lod_manager.h"
+#include "rtx_cluster_lod_geometry_provider.h"  // [UvXCheck] uvxFind
 #include "rtx_asset_replacer.h"
 #include "rtx_terrain_baker.h"
 #include "rtx_texture_manager.h"
@@ -1403,6 +1405,12 @@ namespace dxvk {
         clusterLodManager != nullptr ? clusterLodManager->getPromotionStateAddress() : 0;
       constants.promotionStateAddressLo = uint32_t(promotionStateAddress);
       constants.promotionStateAddressHi = uint32_t(promotionStateAddress >> 32);
+
+      // [SmearPix] status buffer for the promoted-hit smear write-back
+      const uint64_t promotionStatusAddress =
+        clusterLodManager != nullptr ? clusterLodManager->getPromotionStatusAddress() : 0;
+      constants.promotionStatusAddressLo = uint32_t(promotionStatusAddress);
+      constants.promotionStatusAddressHi = uint32_t(promotionStatusAddress >> 32);
     }
     // NV-DXVK end
 
@@ -2230,6 +2238,22 @@ namespace dxvk {
         uint32_t census = 0, censusWithClusterId = 0, exCensusClusterId = 0, exCensusSurfIdx = 0;
         // Attr records (0xC122, isClusterHit): resident-cluster attributeBits breakdown.
         uint32_t attr = 0, attrTex0Bit = 0, attrCompressedTex0Bit = 0, attrHasTexcoords0 = 0, exAttrBits = 0;
+        // [UvXCheck] records (0xC123): hit-side (object-space pos, RAW cluster UV) of the hit
+        // triangle's vertex 0, compared below against the retained captured-input snapshot.
+        struct UvxRec {
+          float px, py, pz, u, v;
+          uint32_t geomId, lod, frame;
+          bool promoted;
+        };
+        std::vector<UvxRec> uvxRecs;
+        // [GradBlow] records (0xC124): incidence for hits whose texture gradient magnitude > 20.
+        // c = promoted-triangle incidence cosine; cClassic = same triangle under objectToWorld.
+        struct GradBlowRec {
+          float gradMag, c, cClassic, coneRadius, twoArea;
+          uint32_t geomId, lod, frame;
+          bool promoted;
+        };
+        std::vector<GradBlowRec> gbRecs;
 
         for (uint32_t i = 0; i < PATHA_PROBE_CAP; ++i) {
           GpuPrintBufferElement& e = region[i];
@@ -2263,13 +2287,166 @@ namespace dxvk {
             if (bits & 0x20u) attrCompressedTex0Bit++;  // CLUSTER_ATTRIBUTE_COMPRESSED_VERTEX_TEX_0
             if (wd.y > 0.5f) attrHasTexcoords0++;
             e.invalidate();
+          } else if (e.threadIndex.y == uint16_t(kPathAProbeSentinel + 3u)) { // 0xC123 [UvXCheck]
+            if (uvxRecs.size() < 64) {
+              UvxRec r;
+              r.px = wd.x; r.py = wd.y; r.pz = wd.z; r.u = wd.w;
+              std::memcpy(&r.v, &pd[0], sizeof(float));
+              r.geomId = pd[1] & 0x3FFFFu;
+              r.lod = (pd[1] >> 18) & 0xFFu;
+              r.promoted = (pd[1] & 0x80000000u) != 0u;
+              r.frame = e.frameIndex;
+              uvxRecs.push_back(r);
+            }
+            e.invalidate();
+          } else if (e.threadIndex.y == uint16_t(kPathAProbeSentinel + 4u)) { // 0xC124 [GradBlow]
+            if (gbRecs.size() < 64) {
+              GradBlowRec g;
+              g.gradMag = wd.x; g.c = wd.y; g.cClassic = wd.z; g.coneRadius = wd.w;
+              std::memcpy(&g.twoArea, &pd[1], sizeof(float));
+              g.geomId = pd[0] & 0x3FFFFu;
+              g.lod = (pd[0] >> 18) & 0xFFu;
+              g.promoted = (pd[0] & 0x80000000u) != 0u;
+              g.frame = e.frameIndex;
+              gbRecs.push_back(g);
+            }
+            e.invalidate();
+          }
+        }
+
+        // [GradBlow] flush: sort worst-gradient first, log the top few RAW so the mechanism
+        // is visible (numerator vs denominator), plus a one-line classification of the worst.
+        // Throttled (~1x/sec) so a streaming storm of blow-ups stays readable.
+        static uint32_t s_lastGradBlowFrame = 0;
+        if (!gbRecs.empty() && (frameIdx - s_lastGradBlowFrame >= 30u || frameIdx < s_lastGradBlowFrame)) {
+          s_lastGradBlowFrame = frameIdx;
+          std::sort(gbRecs.begin(), gbRecs.end(),
+                    [](const GradBlowRec& a, const GradBlowRec& b) { return a.gradMag > b.gradMag; });
+          const uint32_t shown = std::min<uint32_t>(gbRecs.size(), 5);
+          for (uint32_t k = 0; k < shown; k++) {
+            const GradBlowRec& g = gbRecs[k];
+            // predicted footprint scale if incidence is the whole story: coneR/|c|
+            const float predA = g.coneRadius / std::max(1e-6f, std::fabs(g.c));
+            Logger::err(str::format(
+              "[GradBlow] id=", g.geomId, " lod=", g.lod, " promo=", g.promoted ? 1 : 0,
+              " gradMag=", g.gradMag, " | c=", g.c, " cClassic=", g.cClassic,
+              " |c/cClassic|=", (std::fabs(g.cClassic) > 1e-9f ? std::fabs(g.c / g.cClassic) : 0.0f),
+              " coneR=", g.coneRadius, " coneR/|c|=", predA, " 2*area=", g.twoArea, " frame=", g.frame));
+          }
+          const GradBlowRec& w = gbRecs[0];
+          const float ratio = (std::fabs(w.cClassic) > 1e-9f) ? std::fabs(w.c / w.cClassic) : 0.0f;
+          Logger::err(str::format(
+            "[GradBlow] worst mechanism: ",
+            (std::fabs(w.c) < 0.05f
+               ? (ratio < 0.5f
+                    ? "PROMOTION TIPPED to grazing (|c| << |cClassic|) -> rigid-fit rotation error is the smear"
+                    : "GENUINELY grazing (c ~= cClassic, both small) -> Path A footprint not clamped like Path B")
+               : "NOT grazing (|c| healthy) -> blow-up is elsewhere; re-instrument"),
+            "  (c=", w.c, " cClassic=", w.cClassic, " coneR=", w.coneRadius, ")"));
+        }
+
+        // [UvXCheck] compare: nearest-position match into the retained captured-input snapshot,
+        // then UV delta. Promoted records first (those are the smearing meshes), max 16 compares
+        // a frame to bound the CPU cost; results accumulate across the log-throttle window.
+        static uint32_t s_uvxSampled = 0, s_uvxPromoted = 0, s_uvxCompared = 0, s_uvxNoRef = 0, s_uvxNoHash = 0;
+        static float s_uvxMaxPosErr = 0.0f, s_uvxMaxDuv = 0.0f;
+        static std::string s_uvxWorstLine;
+        static std::vector<std::string> s_uvxExamples;
+        {
+          std::stable_partition(uvxRecs.begin(), uvxRecs.end(), [](const UvxRec& r) { return r.promoted; });
+          uint32_t compares = 0;
+          for (const UvxRec& r : uvxRecs) {
+            s_uvxSampled++;
+            if (r.promoted) s_uvxPromoted++;
+            if (compares >= 16) continue;
+
+            const ClusterLodManager* clusterMgr = getSceneManager().getClusterLodManager();
+            const uint64_t geomHash = clusterMgr != nullptr ? clusterMgr->getResidentGeometryHash(r.geomId) : 0;
+            if (geomHash == 0) { s_uvxNoHash++; continue; }
+            const auto ref = ClusterLodGeometryProvider::uvxFind(geomHash);
+            if (ref == nullptr || ref->positions.size() < 3 || ref->texcoords0.size() < 2) { s_uvxNoRef++; continue; }
+            compares++;
+            s_uvxCompared++;
+
+            // Pass 1: nearest captured vertex by object-space position (for posErr).
+            const size_t vertCount = std::min(ref->positions.size() / 3, ref->texcoords0.size() / 2);
+            size_t best = 0; float bestD2 = 3.4e38f;
+            for (size_t v = 0; v < vertCount; v++) {
+              const float dx = ref->positions[v * 3 + 0] - r.px;
+              const float dy = ref->positions[v * 3 + 1] - r.py;
+              const float dz = ref->positions[v * 3 + 2] - r.pz;
+              const float d2 = dx * dx + dy * dy + dz * dz;
+              if (d2 < bestD2) { bestD2 = d2; best = v; }
+            }
+            const float posErr = std::sqrt(bestD2);
+            s_uvxMaxPosErr = std::max(s_uvxMaxPosErr, posErr);
+
+            // Pass 2: SEAM-SAFE UV comparison. A UV seam puts several captured vertices at the
+            // SAME position with DIFFERENT UVs, so a single nearest match falsely flags a correct
+            // cluster vertex against its seam-twin. Gather EVERY captured vertex co-located with the
+            // hit (within the same position tolerance the nearest match landed at) and take the
+            // MINIMUM UV delta: does the hit UV match ANY co-located captured vertex? If yes the
+            // cluster UV is faithful (just a seam-twin); only a hit matching NONE is real corruption.
+            // colocTol: a hair above the exact-match distance so all coincident verts are collected.
+            const float colocTol2 = std::max(bestD2 * 4.0f, 1e-8f);  // exact matches -> ~1e-8 floor
+            float capU = ref->texcoords0[best * 2 + 0];   // the nearest vertex's UV (for the log)
+            float capV = ref->texcoords0[best * 2 + 1];
+            float minDuv = 3.4e38f; float bestDu = 0.0f, bestDv = 0.0f; float bestCapU = capU, bestCapV = capV;
+            uint32_t colocated = 0;
+            for (size_t v = 0; v < vertCount; v++) {
+              const float dx = ref->positions[v * 3 + 0] - r.px;
+              const float dy = ref->positions[v * 3 + 1] - r.py;
+              const float dz = ref->positions[v * 3 + 2] - r.pz;
+              if (dx * dx + dy * dy + dz * dz > colocTol2) { continue; }
+              colocated++;
+              const float cu = ref->texcoords0[v * 2 + 0];
+              const float cv = ref->texcoords0[v * 2 + 1];
+              const float du = r.u - cu, dv = r.v - cv;
+              const float d = std::max(std::fabs(du), std::fabs(dv));
+              if (d < minDuv) { minDuv = d; bestDu = du; bestDv = dv; bestCapU = cu; bestCapV = cv; }
+            }
+            const float dUv = (colocated > 0) ? minDuv : 3.4e38f;
+            const float dU = bestDu, dV = bestDv;
+            capU = bestCapU; capV = bestCapV;
+
+            const std::string line = str::format(
+              "geom=0x", std::hex, geomHash, std::dec, " id=", r.geomId, " lod=", r.lod,
+              " promo=", r.promoted ? 1 : 0,
+              " pos=(", r.px, ",", r.py, ",", r.pz, ") posErr=", posErr, " coloc=", colocated,
+              " hitUV=(", r.u, ",", r.v, ") bestCapUV=(", capU, ",", capV, ")",
+              " minDUV=(", dU, ",", dV, ") refVerts=", vertCount, " frame=", r.frame);
+            if (dUv > s_uvxMaxDuv) { s_uvxMaxDuv = dUv; s_uvxWorstLine = line; }
+            if (s_uvxExamples.size() < 4) { s_uvxExamples.push_back(line); }
           }
         }
 
         // Throttle the log line so a steady stream stays readable (~2x/sec at 60fps).
         static uint32_t s_lastPathALogFrame = 0;
-        if ((census > 0 || samples > 0 || attr > 0) && (frameIdx - s_lastPathALogFrame >= 30u || frameIdx < s_lastPathALogFrame)) {
+        if ((census > 0 || samples > 0 || attr > 0 || s_uvxSampled > 0) && (frameIdx - s_lastPathALogFrame >= 30u || frameIdx < s_lastPathALogFrame)) {
           s_lastPathALogFrame = frameIdx;
+
+          // [UvXCheck] window flush: raw examples first, then the worst UV divergence, then totals.
+          if (s_uvxSampled > 0) {
+            for (const std::string& ex : s_uvxExamples) {
+              Logger::err(str::format("[UvXCheck] sample: ", ex));
+            }
+            if (!s_uvxWorstLine.empty()) {
+              Logger::err(str::format("[UvXCheck] worstDUV: ", s_uvxWorstLine));
+            }
+            Logger::err(str::format(
+              "[UvXCheck] window: sampled=", s_uvxSampled, " promoted=", s_uvxPromoted,
+              " compared=", s_uvxCompared, " noRef=", s_uvxNoRef, " noHash=", s_uvxNoHash,
+              " maxPosErr=", s_uvxMaxPosErr, " maxMinDUV=", s_uvxMaxDuv,
+              // seam-safe: maxMinDUV is the worst "hit UV matches NO co-located captured vertex".
+              // Only THEN is the cluster UV genuinely wrong (a seam-twin match would drive minDUV ~0).
+              (s_uvxCompared > 0 && s_uvxMaxDuv > 0.01f && s_uvxMaxPosErr < 0.01f
+                 ? "  *** hit UV matches NO co-located captured vertex -> cluster UV DATA genuinely wrong (build/streaming) ***"
+                 : "  *** all hit UVs match a co-located captured vertex -> cluster UV faithful; smear is DOWNSTREAM of the fetch ***")));
+            s_uvxSampled = s_uvxPromoted = s_uvxCompared = s_uvxNoRef = s_uvxNoHash = 0;
+            s_uvxMaxPosErr = s_uvxMaxDuv = 0.0f;
+            s_uvxWorstLine.clear();
+            s_uvxExamples.clear();
+          }
           Logger::err(str::format(
             "[PathAProbe] frame=", frameIdx,
             " PathAhits=", census, " withClusterID=", censusWithClusterId,

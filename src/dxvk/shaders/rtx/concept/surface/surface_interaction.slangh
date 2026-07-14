@@ -695,6 +695,34 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
       prevPosition = vec3(dot(promoPrevRow0, prevObjPos),
                           dot(promoPrevRow1, prevObjPos),
                           dot(promoPrevRow2, prevObjPos));
+
+      // [SmearPix] THE SMEAR, measured where it happens: the uncancelled screen-space motion residual
+      // this pixel hands DLSS. Reproject the SAME hit twice under the LIVE previous camera - once from
+      // the reported previous world position (prevPosition) and once as if the point were world-static
+      // (hitPosition). For correct world-static promoted geometry the two coincide (camera parallax
+      // cancels) and the residual is 0; anything nonzero is phantom shading drag in PIXELS = the smear.
+      // Written back (max, float-bits) to this slot's status at +84; recordPromotion zeroes it per frame.
+      const uint64_t promotionStatusAddress =
+        (uint64_t(cb.promotionStatusAddressHi) << 32) | uint64_t(cb.promotionStatusAddressLo);
+      if (promotionStatusAddress != 0)
+      {
+        // v2: WORLD-space motion magnitude, not pixels. The pixel metric divided by prevClip.w and
+        // exploded to 1e6+ px whenever prevPosition landed near the PREVIOUS camera's plane (w->0) -
+        // numerically meaningless even when the true error was ~0.1u (proven: slot 71 read 1e6px with
+        // a perfectly contiguous solve and exact prevT==curT_last lineage). |prevPosition-hitPosition|
+        // is bounded, divide-free, and directly comparable to the solve's own |curT-prevT|: if the hit
+        // reads the same matrices the solve wrote, these MATCH (~0.1u); if the hit reads garbage/stale
+        // memory, this is large where the readback says small - the sync gap, measured clean.
+        const float motionWorld = length(prevPosition - hitPosition);
+        Ptr<uint> smearSlot = Ptr<uint>(promotionStatusAddress
+                                        + uint64_t(promoStateSlotPlusOne - 1) * 88 + 84);
+        // read-compare-write max (racy across pixels of one slot; losing an occasional max is fine
+        // for a probe - any pixel of a smearing slot is enormous next to a clean slot's ~0)
+        if (floatBitsToUint(motionWorld) > *smearSlot)
+        {
+          *smearSlot = floatBitsToUint(motionWorld);
+        }
+      }
     }
     else
     {
@@ -720,6 +748,12 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
     // (potentially useful for say cubemap sampling, but Remix has little use to actually render cubemaps properly outside
     // of say sky capturing since ray traced reflections will replace most cubemap effects).
     vec2 texcoords[3];
+
+    // NV-DXVK: [UvXCheck] DIAGNOSTIC (remove with the smear probes). Vertex 0's RAW
+    // cluster-memory UV, captured BEFORE surface.textureTransform - the CPU compares
+    // it against the retained captured-input texcoords, which are equally untransformed.
+    vec2 uvxRawUv0 = vec2(0.0f, 0.0f);
+    bool uvxRawUv0Valid = false;
 
     for (uint i = 0; i < 3; i++)
     {
@@ -778,6 +812,13 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
         if (isClusterHit)
         {
           loadedTextureCoordinate = clusterGeometryGetTexcoord0(clusterGeometry, currentIndex);
+
+          // [UvXCheck] raw UV of the triangle's first vertex (pairs with positions[0])
+          if (i == 0)
+          {
+            uvxRawUv0 = loadedTextureCoordinate;
+            uvxRawUv0Valid = true;
+          }
         }
         else
         {
@@ -906,6 +947,58 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
         coneRadius, worldPositions, texcoords, surfaceInteraction.textureCoordinates,
         surfaceInteraction.textureGradientX, surfaceInteraction.textureGradientY);
 
+      // NV-DXVK: [GradBlow] DIAGNOSTIC (remove with the smear probes), sentinel 0xC124.
+      // [UvXCheck] proved the cluster UVs are faithful, yet [PathAProbe] shows the texture
+      // gradient MAGNITUDE spiking to 45-963 on a subset of Path A hits -> the anisotropic
+      // sampling footprint blows up = directional texture drag. The gradient scales as
+      // 1/worldTwoTriangleArea and with coneRadius, numerator = UV span. Dump those RAW inputs
+      // for the blown-up hits so the CPU can read numerator vs denominator:
+      //   tiny worldTwoTriangleArea + short edges -> collapsed/degenerate world triangle
+      //   tiny worldTwoTriangleArea + long edges  -> sliver triangle
+      //   huge coneRadius                         -> ray-cone/distance term
+      //   huge uvSpan                             -> tiled/wrapped UV over a small triangle
+      // writtenData = [worldTwoTriangleArea, coneRadius, gradMag, uvSpanMax]
+      // pad[0] = asuint(worldEdgeMax)
+      // pad[1] = geometryId[17:0] | lod[25:18] | promoted bit31   (only cluster hits emit)
+      if (isClusterHit)
+      {
+        const float gbGradMag = max(length(surfaceInteraction.textureGradientX),
+                                    length(surfaceInteraction.textureGradientY));
+        // gate: only the blown-up hits (matches the [PathAProbe] max spikes ~>20)
+        if (gbGradMag > 20.0f)
+        {
+          // [GradBlow] v2: the blow-up is coneRadius/|dot(normal,rayDir)| = grazing incidence.
+          // c = incidence cosine of the PROMOTED world triangle (what actually shaded).
+          // cClassic = incidence of the SAME object-space triangle under the surface's
+          // non-promoted objectToWorld - if |c| << |cClassic| the promotion transform tipped
+          // this triangle toward grazing (rigid-fit rotation error); if c ~= cClassic and both
+          // tiny, the geometry is genuinely edge-on and the fix is footprint clamping.
+          const float gbC = dot(triangleNormal, direction);
+          const vec3 gbCw0 = mul(surface.objectToWorld, vec4(positions[0], 1.0f));
+          const vec3 gbCw1 = mul(surface.objectToWorld, vec4(positions[1], 1.0f));
+          const vec3 gbCw2 = mul(surface.objectToWorld, vec4(positions[2], 1.0f));
+          const vec3 gbNClassic = safeNormalize(cross(gbCw1 - gbCw0, gbCw2 - gbCw0), vec3(0.0f, 0.0f, 1.0f));
+          const float gbCClassic = dot(gbNClassic, direction);
+
+          uint gbHash = rayInteraction.clusterId * 2246822519u
+                      + rayInteraction.primitiveIndex * 668265263u
+                      + rayInteraction.surfaceIndex * 40503u;
+          gbHash ^= gbHash >> 13;
+          const uint gbBase = uint(GPU_PRINT_RING_SLOTS) + cb.gpuPrintElementIndex * uint(PATHA_PROBE_CAP);
+          const uint gbSlot = gbBase + (gbHash % uint(PATHA_PROBE_CAP));
+
+          GpuPrintBufferElement gb;
+          gb.writtenData = float4(gbGradMag, gbC, gbCClassic, coneRadius);
+          gb.threadIndex = u16vec2(0xFEEDu, uint16_t(kPathAProbeSentinel + 4u));  // 0xC124
+          gb.frameIndex  = cb.frameIdx;
+          gb.pad         = uint2((surface.clusterGeometryId & 0x3FFFFu)
+                                 | ((uint(clusterGeometry.lodLevel) & 0xFFu) << 18)
+                                 | (promoStateSlotPlusOne != 0u ? 0x80000000u : 0u),
+                                 asuint(worldTwoTriangleArea));
+          GpuPrintBuffer[gbSlot] = gb;
+        }
+      }
+
       if (footprintMode == kFootprintFromRayOriginClamped)
       {
         vec2 dUV1 = texcoords[1] - texcoords[0];
@@ -964,6 +1057,38 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
       pathA.pad         = uint2((rayInteraction.surfaceIndex & 0x00FFFFFFu) | pathAFlags, rayInteraction.clusterId);
 
       GpuPrintBuffer[pathASlot] = pathA;
+
+      // NV-DXVK: [UvXCheck] DIAGNOSTIC (remove with the smear probes), sentinel 0xC123.
+      // One matched (object-space position, RAW cluster UV) pair per Path A hit: vertex 0
+      // of the hit triangle, straight from cluster memory. The CPU readback nearest-matches
+      // the position against the retained captured-input snapshot (the clusterization
+      // source) and compares UVs:
+      //   diverging UV at matching position -> cluster UV DATA is wrong (build or streaming)
+      //   matching UV                       -> corruption is downstream (sampler/material)
+      //   no position match                 -> hit vertex isn't a captured vertex (reported raw)
+      // writtenData = [pos0.x, pos0.y, pos0.z, rawUV0.x]
+      // pad[0] = asuint(rawUV0.y)
+      // pad[1] = geometryId[17:0] | lodLevel[25:18] | promoted bit31
+      if (uvxRawUv0Valid)
+      {
+        // distinct salt from the 0xC120/0xC121 hashes so the record types don't
+        // systematically collide into the same region slots
+        uint uvxHash = rayInteraction.clusterId * 668265263u
+                     + rayInteraction.primitiveIndex * 2246822519u
+                     + rayInteraction.surfaceIndex * 3266489917u;
+        uvxHash ^= uvxHash >> 16;
+        const uint uvxSlot = pathABase + (uvxHash % uint(PATHA_PROBE_CAP));
+
+        GpuPrintBufferElement uvx;
+        uvx.writtenData = float4(positions[0].x, positions[0].y, positions[0].z, uvxRawUv0.x);
+        uvx.threadIndex = u16vec2(0xFEEDu, uint16_t(kPathAProbeSentinel + 3u));  // 0xC123
+        uvx.frameIndex  = cb.frameIdx;
+        uvx.pad         = uint2(asuint(uvxRawUv0.y),
+                                (surface.clusterGeometryId & 0x3FFFFu)
+                                | ((uint(clusterGeometry.lodLevel) & 0xFFu) << 18)
+                                | (promoStateSlotPlusOne != 0u ? 0x80000000u : 0u));
+        GpuPrintBuffer[uvxSlot] = uvx;
+      }
     }
   }
   else

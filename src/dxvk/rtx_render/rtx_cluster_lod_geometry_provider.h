@@ -135,6 +135,17 @@ namespace dxvk {
     // disk and is ready to join the next render generation.
     std::vector<ReadyGeometry> drainReadyGeometries();
 
+    // NV-DXVK: [UvXCheck] DIAGNOSTIC (remove with the smear probes). CPU-retained
+    // reference copy of a CAPTURED snapshot's per-vertex positions + texcoords - the
+    // exact clusterization input. The readback (rtx_context.cpp) nearest-matches a
+    // Path A hit's cluster-memory (position, UV) against this to decide whether the
+    // texture smear is corrupt cluster UV DATA (mismatch) or downstream (match).
+    struct UvxRefData {
+      std::vector<float> positions;   // tightly packed vec3, snapshot input space
+      std::vector<float> texcoords0;  // tightly packed vec2
+    };
+    static std::shared_ptr<const UvxRefData> uvxFind(uint64_t geometryHash);
+
     // P4b: topology-stable Path B identity - indices content hash + counts +
     // primitive topology. Unlike the asset hash it excludes positions, so it
     // survives skinning bind poses being identical across characters AND

@@ -451,6 +451,12 @@ struct RaytraceArgs {
   uint promotionStateAddressLo;
   uint promotionStateAddressHi;
 
+  // [SmearPix] device address of the promo STATUS buffer (88 B/slot; smearPixBits at +84) so the
+  // promoted-hit block can write the on-screen uncancelled screen-space motion residual (the smear,
+  // in pixels) back to its own slot at shading time. 0 = probe off.
+  uint promotionStatusAddressLo;
+  uint promotionStatusAddressHi;
+
   // NOTE: Add structs to the top section of RaytraceArgs, not the bottom.
   // NOTE: bool does not work in debug builds, use uint instead.
 };

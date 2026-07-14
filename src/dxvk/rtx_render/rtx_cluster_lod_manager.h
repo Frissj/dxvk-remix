@@ -423,6 +423,35 @@ namespace dxvk {
       // logs, per promoted slot, sparse residualRel vs full-mesh gateResidualRel and the placement gap.
       // PURE MEASUREMENT: it does NOT set sweepPending, so routing/demotion is unchanged (the smear stays
       // on screen while the log confirms which slots carry gate>>eps while residualRel<=eps). Off by default.
+      // [RotStabilize] THE rotation-underdetermination fix. A planar/collinear/symmetric promoted mesh
+      // gives the affine solve a sample cloud that does NOT constrain the rotation DOF: it fits every
+      // sample yet lands on an arbitrary valid rotation that JUMPS frame-to-frame, flinging the mesh
+      // extremities (the [SmearProbe] 34u spikes on iso~0 slots = the raw smear). When the solve-sample
+      // isotropy (det(cov)/(trace/3)^3, [ConditionProbe]) is below this threshold, blend the newly-solved
+      // linear part toward the previous frame's rotation, weighted by how degenerate it is (full anchor at
+      // iso 0, none at iso >= threshold), and re-pin the centroid so placement is unchanged. Well-conditioned
+      // meshes (iso above threshold) are untouched. 0 disables the fix entirely (A/B the raw smear).
+      RTX_OPTION("rtx.clusterLod.promotion", float, rotStabilizeIso, 0.0f,
+                 "[RotStabilize] anchor the solved rotation to the previous frame's when the solve-sample\n"
+                 "isotropy is below this. DEFAULT OFF (0): the LEGO Batman cinematic disproved the premise -\n"
+                 "the low-iso smearing meshes were GENUINELY rotating props, and anchoring lags their real\n"
+                 "spin (visible pose error). Keep 0 unless a static-scene underdetermined-rotation case is\n"
+                 "actually measured ([SmearProbe] fling with low iso on geometry PROVEN world-static).");
+      // [TeleportClamp] THE cinematic-smear fix (root cause proven 2026-07-14). The game animates
+      // cinematic props in DISCRETE STEPS; at streaming framerates (1.6fps) one step is 10-34 world
+      // units ([SmearPix]: motionW 24-34u paired with |curT-prevT|=0 the NEXT frame = jump then hold).
+      // The promoted MV honestly reports the jump and DLSS drags a full step of shading = the raw
+      // smear. Path B looked clean only because captured geometry's CPU prev==cur matrices report
+      // ZERO motion there, so DLSS treats the step as a disocclusion and rejects history. This clamp
+      // gives Path A the same (correct) disocclusion semantics WITHOUT leaving Path A: when the
+      // per-frame per-vertex motion exceeds the object's own radius x this factor, the solve writes
+      // prevM = M (zero MV). Placement is untouched - the object renders at its exact new pose.
+      // Radius-relative = scale-free and game-agnostic.
+      RTX_OPTION("rtx.clusterLod.promotion", float, teleportClampRadii, 1.0f,
+                 "[TeleportClamp] report zero motion (disocclusion) for a promoted instance whose per-frame\n"
+                 "motion exceeds this multiple of its own bounding radius - a discrete animation step no\n"
+                 "temporal accumulator can reuse (the stop-motion cinematic smear at low fps). 0 disables;\n"
+                 "lower = clamp smaller jumps (more history rejection), higher = tolerate faster motion.");
       RTX_OPTION("rtx.clusterLod.promotion", bool, probeGateEveryFrame, false,
                  "[PromoSmear] diagnostic: force the full-mesh residual gate every frame for every promoted\n"
                  "instance and log sparse-vs-full residual per slot, to confirm the moving-cinematic smear is\n"
@@ -622,6 +651,14 @@ namespace dxvk {
     // P4c: device address of the promotion matrices array (M/prevM per state
     // slot; 0 while inactive) - consumed by promoted surfaces via raytrace_args
     uint64_t getPromotionStateAddress() const;
+
+    // [SmearPix] device address of the promo status buffer (smear write-back; 0 while inactive)
+    uint64_t getPromotionStatusAddress() const;
+
+    // [UvXCheck] DIAGNOSTIC (remove with the smear probes): resolve a shader-side
+    // cluster geometry table index (surface.clusterGeometryId & 0x3FFFF) to the
+    // geometry's asset hash; 0 if out of range for the active generation
+    uint64_t getResidentGeometryHash(uint32_t geometryId) const;
 
     // P4b: device address of the global animated cluster table (0 if none);
     // consumed by the hit-side Path B primitive remap via raytrace_args

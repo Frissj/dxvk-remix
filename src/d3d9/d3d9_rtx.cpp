@@ -230,6 +230,46 @@ namespace dxvk {
 
     auto constants = m_vsVertexCaptureData->allocSlice();
 
+    // [CamSplit] the vertex-capture unprojection uses THIS DRAW's D3DTS_VIEW/PROJECTION, while the
+    // clip positions it inverts come from the game's own VS constants. If D3DTS changes MID-FRAME
+    // (cinematic camera updating between draw batches), captured draws on opposite sides of the
+    // change reconstruct into TWO different "worlds" ~a camera-delta apart - the promoted slots seen
+    // alternating placements 39u apart ([SmearPix] slots 768/772) and the selective raw smear/lag.
+    // Track D3DTS_VIEW across captured draws within one frame and log every mid-frame change.
+    {
+      static uint32_t s_capFrame = ~0u;
+      static Matrix4 s_lastView;
+      static bool s_haveView = false;
+      static uint32_t s_logsThisFrame = 0;
+      const uint32_t capFid = m_parent->GetDXVKDevice()->getCurrentFrameId();
+      const Matrix4& curView = m_activeDrawCallState.transformData.worldToView;
+      if (capFid != s_capFrame) {
+        s_capFrame = capFid;
+        s_haveView = false;
+        s_logsThisFrame = 0;
+      }
+      if (s_haveView && s_logsThisFrame < 8) {
+        float maxDiff = 0.f;
+        for (int c = 0; c < 4; c++) {
+          for (int r = 0; r < 4; r++) {
+            maxDiff = std::max(maxDiff, std::abs(curView[c][r] - s_lastView[c][r]));
+          }
+        }
+        if (maxDiff > 1e-4f) {
+          s_logsThisFrame++;
+          const Vector3 oldT(s_lastView[3][0], s_lastView[3][1], s_lastView[3][2]);
+          const Vector3 newT(curView[3][0], curView[3][1], curView[3][2]);
+          Logger::info(str::format("[CamSplit] frame ", capFid,
+                                   " D3DTS_VIEW CHANGED MID-FRAME between captured draws: maxDiff ", maxDiff,
+                                   " viewT (", oldT.x, ",", oldT.y, ",", oldT.z, ") -> (",
+                                   newT.x, ",", newT.y, ",", newT.z, ") vtx ", geoData.vertexCount,
+                                   "  <<< split-world reconstruction (selective smear/lag mechanism)"));
+        }
+      }
+      s_lastView = curView;
+      s_haveView = true;
+    }
+
     // Upload
     auto& data = *reinterpret_cast<D3D9RtxVertexCaptureData*>(constants.mapPtr);
     data.invProj = inverse(m_activeDrawCallState.transformData.viewToProjection);

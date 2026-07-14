@@ -164,7 +164,7 @@ struct ClusterRenderSystem::Impl
   // ring each frame promotion work ran. MUST match struct PromoStatus in
   // promotion_solve.comp (80 B: 8x4 base + curT[3] + prevT[3] + placed[3] + cap[3]).
   static constexpr uint32_t kPromoMatricesStride = 96;
-  static constexpr uint32_t kPromoStatusStride   = 84;  // +4 for [ConditionProbe] sampleIso at +80
+  static constexpr uint32_t kPromoStatusStride   = 88;  // +80 [ConditionProbe] sampleIso, +84 [SmearPix] smearPixBits
   static constexpr uint32_t kPromoEntryStride    = sizeof(PromotionEntry);
 
   shaderc::SpvCompilationResult promoShader;
@@ -257,6 +257,8 @@ struct PromoPush
   uint32_t gateEntryIndex;
   uint32_t allowResolveSkip;
   uint32_t gapMaxFrames;
+  float    rotStabilizeIso;  // [RotStabilize] iso threshold; solve rotation anchors to prevM below it. 0 = off.
+  float    teleportClampRadii;  // [TeleportClamp] zero the MV when per-frame motion > this x object radius. 0 = off.
 };
 
 bool ClusterRenderSystem::Impl::initPromotion()
@@ -446,6 +448,8 @@ void ClusterRenderSystem::Impl::recordPromotion(VkCommandBuffer cmd, const Frame
   push.gateEntryIndex       = 0xFFFFFFFFu;
   push.allowResolveSkip     = frame.promotionAllowResolveSkip ? 1u : 0u;
   push.gapMaxFrames         = frame.promotionGapMaxFrames;
+  push.rotStabilizeIso      = frame.promotionRotStabilizeIso;
+  push.teleportClampRadii   = frame.promotionTeleportClampRadii;
 
   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, promoPipeline);
   vkCmdPushConstants(cmd, promoPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PromoPush), &push);
@@ -472,11 +476,21 @@ void ClusterRenderSystem::Impl::recordPromotion(VkCommandBuffer cmd, const Frame
     }
   }
 
-  // patch writes -> downstream kernels + copy-out; status writes -> readback
+  // patch writes -> downstream kernels + copy-out; status writes -> readback.
+  // [SmearSync] the solve's BDA writes have two consumers dxvk CANNOT auto-barrier (no descriptor):
+  //   - the RT pipeline (traceRays) reading M/prevM from the matrices buffer at hit time
+  //     (surface_interaction promoted-hit fetch) - RAY_TRACING_SHADER stage, NOT compute;
+  //   - the TLAS build consuming the patched VkAccelerationStructureInstanceKHR array -
+  //     ACCELERATION_STRUCTURE_BUILD stage.
+  // The old COMPUTE|TRANSFER-only mask left both unordered: the GPU could overlap the RT pass /
+  // AS build with the solve, so hits read PRE-SOLVE matrices (zeros on a fresh slot -> the
+  // astronomical [SmearPix] MVs; last frame's M on a warm slot -> camera-speed-scaled drag).
   memBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
   memBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
   vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &memBarrier, 0,
+                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT
+                         | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR
+                         | VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, 0, 1, &memBarrier, 0,
                        nullptr, 0, nullptr);
 
   // status snapshot for the CPU (readPromotionStates drains with the ring lag)
@@ -484,6 +498,25 @@ void ClusterRenderSystem::Impl::recordPromotion(VkCommandBuffer cmd, const Frame
     VkBufferCopy region{0, 0, VkDeviceSize(promoUsedSlots) * kPromoStatusStride};
     vkCmdCopyBuffer(cmd, promoStatusBuffer.buffer, promoReadbackBuffers[slot].buffer, 1, &region);
     promoReadbackUsedSlots[slot] = promoUsedSlots;
+  }
+
+  // [SmearPix] zero every used slot's smearPixBits (+84) AFTER the copy-out, so the snapshot the CPU
+  // reads carries LAST frame's gbuffer-pass maxima and this frame's gbuffer accumulates fresh.
+  {
+    VkMemoryBarrier copyThenFill{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    copyThenFill.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    copyThenFill.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1,
+                         &copyThenFill, 0, nullptr, 0, nullptr);
+    for(uint32_t s = 0; s < promoUsedSlots; s++)
+    {
+      vkCmdFillBuffer(cmd, promoStatusBuffer.buffer, VkDeviceSize(s) * kPromoStatusStride + 84, 4, 0);
+    }
+    VkMemoryBarrier fillThenShader{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    fillThenShader.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    fillThenShader.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1,
+                         &fillThenShader, 0, nullptr, 0, nullptr);
   }
 
   promoFramesRecorded++;
@@ -1098,6 +1131,13 @@ uint64_t ClusterRenderSystem::getPromotionStateAddress() const
   return impl.promoReady ? impl.promoMatricesBuffer.address : 0;
 }
 
+uint64_t ClusterRenderSystem::getPromotionStatusAddress() const
+{
+  // [SmearPix] kPromoStatusStride B per slot; smearPixBits at +84 (gbuffer-pass write-back)
+  Impl& impl = *m_impl;
+  return impl.promoReady ? impl.promoStatusBuffer.address : 0;
+}
+
 bool ClusterRenderSystem::readPromotionStates(PromotionStateView* outStates)
 {
   Impl& impl = *m_impl;
@@ -1142,6 +1182,9 @@ bool ClusterRenderSystem::readPromotionStates(PromotionStateView* outStates)
     memcpy(&v.placed[0], s + 56, sizeof(float) * 3); // [PromoGap] placedX/Y/Z
     memcpy(&v.capture[0], s + 68, sizeof(float) * 3); // [PromoGap] capX/Y/Z (reliable reference)
     memcpy(&v.sampleIso, s + 80, sizeof(float));      // [ConditionProbe] solve-sample isotropy
+    uint32_t smearBits = 0;
+    memcpy(&smearBits, s + 84, sizeof(uint32_t));     // [SmearPix] float bits (shader-side ordered-uint max)
+    memcpy(&v.smearPix, &smearBits, sizeof(float));
   }
   return true;
 }

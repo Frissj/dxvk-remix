@@ -27,6 +27,7 @@
 #include <chrono>
 #include <cstring>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 
 #include "rtx_types.h"
@@ -52,7 +53,44 @@ namespace dxvk {
         std::chrono::steady_clock::now().time_since_epoch()).count());
     }
 
+    // NV-DXVK: [UvXCheck] DIAGNOSTIC registry (remove with the smear probes).
+    // geometryHash -> retained captured-snapshot reference data. Written on the
+    // CS-thread intake (first sight of a captured geometry), read by the
+    // rtx_context.cpp probe readback. shared_ptr values so a reader keeps its
+    // copy alive without holding the lock during the (slow) nearest search.
+    std::mutex s_uvxMutex;
+    std::unordered_map<uint64_t, std::shared_ptr<const ClusterLodGeometryProvider::UvxRefData>> s_uvxRegistry;
+    size_t s_uvxBytes = 0;
+    constexpr size_t kUvxByteCap = 256ull << 20;  // hard cap; beyond it new geometries just aren't retained
+
+    void uvxRetain(uint64_t geometryHash, const lodclusters_remix::GeometrySnapshot& snapshot) {
+      if (snapshot.texcoords0.empty() || snapshot.positions.empty()) {
+        return;  // nothing to compare against
+      }
+      const size_t bytes = (snapshot.positions.size() + snapshot.texcoords0.size()) * sizeof(float);
+      std::unique_lock<std::mutex> lock(s_uvxMutex);
+      if (s_uvxRegistry.find(geometryHash) != s_uvxRegistry.end()) {
+        return;
+      }
+      if (s_uvxBytes + bytes > kUvxByteCap) {
+        ONCE(Logger::warn(str::format("[UvXCheck] retention cap (", kUvxByteCap >> 20,
+                                      " MiB) reached - later captured geometries will report noRef")));
+        return;
+      }
+      auto ref = std::make_shared<ClusterLodGeometryProvider::UvxRefData>();
+      ref->positions = snapshot.positions;    // copies; the snapshot itself moves on to the worker queue
+      ref->texcoords0 = snapshot.texcoords0;
+      s_uvxRegistry.emplace(geometryHash, std::move(ref));
+      s_uvxBytes += bytes;
+    }
+
   }  // namespace
+
+  std::shared_ptr<const ClusterLodGeometryProvider::UvxRefData> ClusterLodGeometryProvider::uvxFind(uint64_t geometryHash) {
+    std::unique_lock<std::mutex> lock(s_uvxMutex);
+    const auto found = s_uvxRegistry.find(geometryHash);
+    return found != s_uvxRegistry.end() ? found->second : nullptr;
+  }
 
   // P4b topology identity (see the header comment). indexCount and topology are
   // included because non-indexed draws have no index content to hash - without
@@ -259,6 +297,13 @@ namespace dxvk {
     m_stats.pending++;
     m_stats.pendingBytes += snapshot.approximateSizeBytes();
     snapshot.queuedAtUs = nowUs();  // chrono: worker reports the queue wait
+
+    // [UvXCheck] retain the promotion candidates' (captured, content-stable)
+    // reference vertex data - these are exactly the Path A meshes that smear
+    if (snapshot.isCaptured) {
+      uvxRetain(geometryHash, snapshot);
+    }
+
     m_queue.push_back(std::move(snapshot));
 
     lock.unlock();
