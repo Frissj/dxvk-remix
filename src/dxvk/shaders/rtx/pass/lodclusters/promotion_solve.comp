@@ -28,20 +28,33 @@
   RTX Remix glue kernel (P4c, authored - not part of the NVIDIA samples).
 
   RIGID-CAPTURE PROMOTION (plan 7.7): treats the game's vertex shader as a
-  black box and recovers, per instance per frame, the affine map M that
-  carries the CPU input-space snapshot onto the GPU vertex-capture output.
-  Low residual => the mesh is (this frame) a rigid transform of its input
-  data => the input-space Path A LOD clusters render it correctly with
-  worldMatrix = M, which this kernel patches directly into the frame's
+  black box and recovers, per instance per frame, the SIMILARITY map M
+  (uniform scale x orthogonal + translation) that carries the CPU
+  input-space snapshot onto the GPU vertex-capture output. Low residual =>
+  the mesh is (this frame) a rigid transform of its input data => the
+  input-space Path A LOD clusters render it correctly with worldMatrix = M,
+  which this kernel patches directly into the frame's
   shaderio::RenderInstance / VkAccelerationStructureInstanceKHR arrays
   between their upload and the first consuming kernel.
 
-  The closed-form solve uses a CPU-precomputed centered Gram pseudoinverse
-  (see plan 7.7 spec): rows [A_r | t_r] = Ginv * b_r with
-  b_r = sum(refH * cap_r), refH = (refCentered, 1); decentered translation
-  t' = t - A*centroid. Residual is checked on a disjoint validation sample
-  set; MODE_GATE additionally sweeps EVERY vertex (a mostly-rigid mesh with
-  a VS-animated patch must not promote - risk R20).
+  [GrazeFix 2026-07-14] The solve is a constrained Umeyama similarity fit:
+  sample-subset means -> cross-covariance H -> rotation = polar rotation of
+  H (Mueller et al. 2016 iterative extraction; improper branch via -H for
+  mirrored instances) -> uniform scale tr(R^T H)/refVar -> translation.
+  It REPLACED the original unconstrained affine Gram-pseudoinverse solve:
+  on degenerate sample clouds (planar/collinear props, sampleIso ~0) the
+  affine fit filled its unconstrained DOF with SHEAR - positions exact,
+  silhouette right, but geometric normals tilted up to ~90 deg (inverse-
+  transpose != A) -> grazing-incidence anisotropic-footprint blow-up
+  ([GradBlow] c ~1e-4 vs cClassic ~0.6) = the directional texture smear on
+  parts of animated props. A similarity transform cannot shear, so normals
+  are exact by construction; captures that genuinely demand shear now fail
+  the residual gate and demote to Path B (which renders them correctly).
+  The probe blob's gInv is legacy (unused; kept for blob ABI).
+
+  Residual is checked on a disjoint validation sample set; MODE_GATE
+  additionally sweeps EVERY vertex (a mostly-rigid mesh with a VS-animated
+  patch must not promote - risk R20).
 
   Descriptor-free: all inputs via push constants + buffer device addresses.
 */
@@ -92,7 +105,8 @@ layout(buffer_reference, buffer_reference_align = 4, scalar) buffer ProbeBlob
   uint  _pad0;
   vec3  centroidPos;
   float radius;           // residuals are relative to this
-  float gInv[16];         // row-major 4x4 Gram pseudoinverse (doubles on CPU)
+  float gInv[16];         // LEGACY: Gram pseudoinverse of the removed affine solve - unused
+                          // by the similarity fit, kept so the CPU blob layout is unchanged
   PromoSample samples[];  // [sampleCount] solve + [validationCount] validation
                           // + full ref positions appended as PromoSample
                           // {index = i} for the gate sweep
@@ -193,13 +207,13 @@ layout(push_constant, scalar) uniform PushData
   uint     gateEntryIndex;         // MODE_GATE: which entry this dispatch runs
   uint     allowResolveSkip;       // 0 = every promoted slot full-solves each frame (see below)
   uint     gapMaxFrames;           // max solve-frame gap for which the retained prevM is still trusted
-  float    rotStabilizeIso;        // [RotStabilize] anchor rotation to prevM when sampleIso < this; 0 = off
+  float    rotStabilizeIso;        // LEGACY - [RotStabilize] removed (the similarity fit's warm
+                                   // start supersedes it properly); field kept for push ABI
   float    teleportClampRadii;     // [TeleportClamp] zero the MV when per-frame motion > this x object radius; 0 = off
 }
 push;
 
 // ---- shared reduction storage ----
-shared float s_b[64][12];      // per-thread partial b vectors (3 rows x 4)
 shared float s_dev[64];        // validation deviations
 shared float s_M[12];          // solved rows [A|t'] (row-major 3x4)
 shared bool  s_rigid;
@@ -209,6 +223,57 @@ vec3 loadCapture(uint64_t captureVa, uint strideBytes, uint index)
 {
   RawFloats capture = RawFloats(captureVa + uint64_t(strideBytes) * uint64_t(index));
   return vec3(capture.f[0], capture.f[1], capture.f[2]);
+}
+
+// ---- [GrazeFix] quaternion helpers for the similarity fit (GLSL has no builtin quat) ----
+// quaternions are vec4(x, y, z, w)
+
+vec4 quatMul(vec4 a, vec4 b)
+{
+  return vec4(a.w * b.xyz + b.w * a.xyz + cross(a.xyz, b.xyz),
+              a.w * b.w - dot(a.xyz, b.xyz));
+}
+
+vec4 quatAxisAngle(vec3 unitAxis, float angle)
+{
+  return vec4(unitAxis * sin(0.5 * angle), cos(0.5 * angle));
+}
+
+// rotation matrix COLUMNS of the unit quaternion q
+void quatToCols(vec4 q, out vec3 c0, out vec3 c1, out vec3 c2)
+{
+  const float x = q.x, y = q.y, z = q.z, w = q.w;
+  c0 = vec3(1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y + w * z), 2.0 * (x * z - w * y));
+  c1 = vec3(2.0 * (x * y - w * z), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z + w * x));
+  c2 = vec3(2.0 * (x * z + w * y), 2.0 * (y * z - w * x), 1.0 - 2.0 * (x * x + y * y));
+}
+
+// unit quaternion from an orthonormal right-handed basis (Shepperd's max-pivot method)
+vec4 quatFromCols(vec3 c0, vec3 c1, vec3 c2)
+{
+  const float tr = c0.x + c1.y + c2.z;
+  vec4 q;
+  if(tr > 0.0)
+  {
+    const float s = sqrt(tr + 1.0) * 2.0;  // 4w
+    q = vec4((c1.z - c2.y) / s, (c2.x - c0.z) / s, (c0.y - c1.x) / s, 0.25 * s);
+  }
+  else if(c0.x > c1.y && c0.x > c2.z)
+  {
+    const float s = sqrt(1.0 + c0.x - c1.y - c2.z) * 2.0;  // 4x
+    q = vec4(0.25 * s, (c1.x + c0.y) / s, (c2.x + c0.z) / s, (c1.z - c2.y) / s);
+  }
+  else if(c1.y > c2.z)
+  {
+    const float s = sqrt(1.0 + c1.y - c0.x - c2.z) * 2.0;  // 4y
+    q = vec4((c1.x + c0.y) / s, 0.25 * s, (c2.y + c1.z) / s, (c2.x - c0.z) / s);
+  }
+  else
+  {
+    const float s = sqrt(1.0 + c2.z - c0.x - c1.y) * 2.0;  // 4z
+    q = vec4((c2.x + c0.z) / s, (c2.y + c1.z) / s, 0.25 * s, (c0.y - c1.x) / s);
+  }
+  return normalize(q);
 }
 
 void main()
@@ -454,55 +519,140 @@ void main()
     return;
   }
 
-  // ---- partial b vectors: b_r = sum(refH * cap_r) over the solve samples ----
-  for(uint k = 0; k < 12; k++)
-  {
-    s_b[threadId][k] = 0.0;
-  }
-
-  if(threadId < probe.sampleCount)
-  {
-    const PromoSample smp = probe.samples[threadId];
-    const vec4 refH = vec4(smp.refX, smp.refY, smp.refZ, 1.0);
-    const vec3 cap  = loadCapture(entry.captureVa, entry.captureStrideBytes, smp.index);
-
-    for(uint r = 0; r < 3; r++)
-    {
-      const float capR = cap[r];
-      s_b[threadId][r * 4 + 0] = refH.x * capR;
-      s_b[threadId][r * 4 + 1] = refH.y * capR;
-      s_b[threadId][r * 4 + 2] = refH.z * capR;
-      s_b[threadId][r * 4 + 3] = refH.w * capR;
-    }
-  }
-
-  barrier();
-
-  // ---- thread 0: reduce, solve rows via the precomputed pseudoinverse ----
+  // ---- [GrazeFix] thread 0: SIMILARITY fit A = s*Q (uniform scale x orthogonal),
+  //      exact Umeyama on the solve samples. Replaces the affine Gram-pseudoinverse
+  //      solve, whose unconstrained DOF filled degenerate (planar/collinear) sample
+  //      clouds with SHEAR: positions fit to ~1e-6 and the silhouette stayed right,
+  //      but the geometric normal (cross of A-transformed edges; inverse-transpose
+  //      != A under shear) tilted up to ~90 deg -> grazing-incidence footprint
+  //      blow-up in computeAnisotropicEllipseAxes = the directional texture smear.
+  //      A similarity map cannot shear, so normals are exact by construction; a
+  //      capture that genuinely demands shear/non-uniform scale now FAILS the
+  //      residual/gate checks below and demotes to Path B, which renders it
+  //      correctly - that is the rigid-promotion contract, not a regression.
   if(threadId == 0)
   {
-    float b[12];
-    for(uint k = 0; k < 12; k++)
+    const uint sampleN = probe.sampleCount;
+    const float invN = 1.0 / float(max(1u, sampleN));
+
+    // pass 1: sample-subset means. The refs are centered on the FULL-mesh centroid,
+    // so the subset mean is near - but not exactly - zero; exact Umeyama needs the
+    // subset means of both sides.
+    vec3 refMean = vec3(0.0);
+    vec3 capMean = vec3(0.0);
+    for(uint t = 0; t < sampleN; t++)
     {
-      float acc = 0.0;
-      for(uint t = 0; t < 64; t++)
-      {
-        acc += s_b[t][k];
-      }
-      b[k] = acc;
+      const PromoSample smp = probe.samples[t];
+      refMean += vec3(smp.refX, smp.refY, smp.refZ);
+      capMean += loadCapture(entry.captureVa, entry.captureStrideBytes, smp.index);
+    }
+    refMean *= invN;
+    capMean *= invN;
+
+    // pass 2: cross-covariance H (columns h_j = sum (cap - capMean) * refCentered_j)
+    // and the ref variance for the scale denominator (both un-normalized -
+    // consistent, N cancels)
+    vec3 h0 = vec3(0.0), h1 = vec3(0.0), h2 = vec3(0.0);
+    float refVar = 0.0;
+    for(uint t = 0; t < sampleN; t++)
+    {
+      const PromoSample smp = probe.samples[t];
+      const vec3 rc = vec3(smp.refX, smp.refY, smp.refZ) - refMean;
+      const vec3 cc = loadCapture(entry.captureVa, entry.captureStrideBytes, smp.index) - capMean;
+      h0 += cc * rc.x;
+      h1 += cc * rc.y;
+      h2 += cc * rc.z;
+      refVar += dot(rc, rc);
     }
 
-    // row r of [A|t]: (Ginv * b_r) - Ginv is row-major 4x4
-    for(uint r = 0; r < 3; r++)
+    // MIRRORED instances: when det(H) < 0 the optimal orthogonal fit is improper.
+    // Every improper orthogonal in 3D is -(proper rotation), and
+    // argmax_{det(Q)=-1} tr(Q^T H) = -(argmax_{det(R)=+1} tr(R^T (-H))), so fit the
+    // proper rotation to sgn*H and multiply by sgn. det(A) < 0 then drives the
+    // existing flipWinding / TLAS facing patch downstream exactly as before.
+    const float detH = dot(h0, cross(h1, h2));
+    const float sgnH = detH < 0.0 ? -1.0 : 1.0;
+    h0 *= sgnH;
+    h1 *= sgnH;
+    h2 *= sgnH;
+
+    // warm start: last solve's orthonormalized rotation (retained M linear part -
+    // read-only here; rows are rewritten only later this dispatch). On a
+    // rank-deficient H the extraction leaves the unconstrained rotation DOF AT THE
+    // SEED, so degenerate clouds keep last frame's roll instead of jumping
+    // frame-to-frame - this properly supersedes the removed [RotStabilize] blend.
+    // Identity on first solve or non-finite retained data.
+    vec4 q = vec4(0.0, 0.0, 0.0, 1.0);
     {
-      for(uint c = 0; c < 4; c++)
+      PromoMatrices matricesWarm = PromoMatrices(push.matricesVa);
+      const uint mBWarm = entry.stateSlot * 24;
+      if((statuses.s[entry.stateSlot].flags & PROMO_FLAG_SOLVED) != 0u)
       {
-        s_M[r * 4 + c] = probe.gInv[c * 4 + 0] * b[r * 4 + 0]
-                       + probe.gInv[c * 4 + 1] * b[r * 4 + 1]
-                       + probe.gInv[c * 4 + 2] * b[r * 4 + 2]
-                       + probe.gInv[c * 4 + 3] * b[r * 4 + 3];
+        vec3 a0 = vec3(matricesWarm.m[mBWarm + 0], matricesWarm.m[mBWarm + 4], matricesWarm.m[mBWarm + 8]);
+        vec3 a1 = vec3(matricesWarm.m[mBWarm + 1], matricesWarm.m[mBWarm + 5], matricesWarm.m[mBWarm + 9]);
+        vec3 a2 = vec3(matricesWarm.m[mBWarm + 2], matricesWarm.m[mBWarm + 6], matricesWarm.m[mBWarm + 10]);
+        // a mirrored retained fit is -(rotation) - flip to the proper branch for the seed
+        const float detA = dot(a0, cross(a1, a2));
+        if(detA < 0.0)
+        {
+          a0 = -a0; a1 = -a1; a2 = -a2;
+        }
+        // Gram-Schmidt; the third axis from the cross product forces right-handed
+        float l0 = length(a0);
+        if(!isnan(l0) && !isinf(l0) && l0 > 1e-12)
+        {
+          a0 /= l0;
+          a1 -= a0 * dot(a0, a1);
+          float l1 = length(a1);
+          if(!isnan(l1) && !isinf(l1) && l1 > 1e-12)
+          {
+            a1 /= l1;
+            a2 = cross(a0, a1);
+            q = quatFromCols(a0, a1, a2);
+          }
+        }
       }
     }
+
+    // iterative polar rotation extraction (Mueller, Bender, Chentanez, Macklin 2016,
+    // "A Robust Method to Extract the Rotational Part of Deformations"): converges to
+    // the polar rotation of H. Handles rank-2 H (planar clouds) exactly - the null
+    // direction is completed by orthogonality instead of least-squares shear. The step
+    // is scale-invariant in H (cross/dot ratio); angle clamped to pi for safety.
+    vec3 r0, r1, r2;
+    for(uint iter = 0u; iter < 32u; iter++)
+    {
+      quatToCols(q, r0, r1, r2);
+      const float denom = abs(dot(r0, h0) + dot(r1, h1) + dot(r2, h2)) + 1e-9;
+      const vec3 omega = (cross(r0, h0) + cross(r1, h1) + cross(r2, h2)) / denom;
+      const float w = length(omega);
+      if(w < 1e-7)
+      {
+        break;
+      }
+      q = normalize(quatMul(quatAxisAngle(omega / w, min(w, 3.14159265)), q));
+    }
+    quatToCols(q, r0, r1, r2);
+
+    // Umeyama uniform scale: s = tr(R^T Hp) / sum|refCentered|^2. Degenerate inputs
+    // (point-collapsed cloud, anti-aligned capture) fall back to s = 1 with the seed
+    // rotation - the validation residual below then decides rigidity honestly.
+    const float fitAlign = dot(r0, h0) + dot(r1, h1) + dot(r2, h2);
+    const float scaleUni = (refVar > 1e-12 && fitAlign > 0.0) ? (fitAlign / refVar) : 1.0;
+
+    // A = s * sgn * R (columns c0,c1,c2); centered-space translation
+    // t = capMean - A * refMean. The decenter step below folds the full-mesh
+    // centroid exactly as before (s_M contract unchanged: maps CENTERED refs).
+    const vec3 c0 = r0 * (scaleUni * sgnH);
+    const vec3 c1 = r1 * (scaleUni * sgnH);
+    const vec3 c2 = r2 * (scaleUni * sgnH);
+    const vec3 tFit = capMean - vec3(c0.x * refMean.x + c1.x * refMean.y + c2.x * refMean.z,
+                                     c0.y * refMean.x + c1.y * refMean.y + c2.y * refMean.z,
+                                     c0.z * refMean.x + c1.z * refMean.y + c2.z * refMean.z);
+
+    s_M[0] = c0.x; s_M[1] = c1.x; s_M[2]  = c2.x; s_M[3]  = tFit.x;
+    s_M[4] = c0.y; s_M[5] = c1.y; s_M[6]  = c2.y; s_M[7]  = tFit.y;
+    s_M[8] = c0.z; s_M[9] = c1.z; s_M[10] = c2.z; s_M[11] = tFit.z;
   }
 
   barrier();
@@ -557,8 +707,8 @@ void main()
   const bool everSolved = (status.flags & PROMO_FLAG_SOLVED) != 0u;
 
   // [ConditionProbe] isotropy of the solve sample cloud = det(cov)/(trace/3)^3 in [0,1]. ~1 = samples
-  // fill 3D (rotation constrained), ~0 = planar/collinear/symmetric (rotation UNDERDETERMINED). Computed
-  // here so [RotStabilize] below can use it; also read back for the [SmearProbe] correlation log.
+  // fill 3D (rotation constrained), ~0 = planar/collinear/symmetric (rotation underdetermined - now
+  // held at the warm-start seed instead of jumping). Read back for the [SmearProbe] correlation log.
   float sampleIso;
   {
     float cxx = 0.0, cyy = 0.0, czz = 0.0, cxy = 0.0, cxz = 0.0, cyz = 0.0;
@@ -578,34 +728,12 @@ void main()
     sampleIso = clamp(detC / max(1e-12, tr3 * tr3 * tr3), 0.0, 1.0);
   }
 
-  // [RotStabilize] THE underdetermined-rotation fix. When the sample cloud is degenerate (low iso) the
-  // solved rotation is free and jumps frame-to-frame, flinging the extremities = the raw smear. If iso is
-  // below the threshold AND this slot solved last frame (matrices.m[mBase+0..] still holds last frame's M,
-  // not yet overwritten), blend the solved LINEAR part toward last frame's, weighted by degeneracy (full
-  // anchor at iso 0, none at iso>=threshold), then RE-PIN the centroid so M*centroid (the well-determined
-  // placement) is unchanged. The rotation stops jumping; well-conditioned meshes (iso>=threshold) untouched.
-  if(push.rotStabilizeIso > 0.0 && everSolved && contiguous && sampleIso < push.rotStabilizeIso)
-  {
-    const float w = clamp((push.rotStabilizeIso - sampleIso) / push.rotStabilizeIso, 0.0, 1.0);
-    // solved linear part (row-major 3x3 within M)
-    const float A0 = M[0], A1 = M[1], A2 = M[2];
-    const float A4 = M[4], A5 = M[5], A6 = M[6];
-    const float A8 = M[8], A9 = M[9], A10 = M[10];
-    // last frame's linear part (retained M, still in place)
-    const float P0 = matrices.m[mBase + 0], P1 = matrices.m[mBase + 1], P2 = matrices.m[mBase + 2];
-    const float P4 = matrices.m[mBase + 4], P5 = matrices.m[mBase + 5], P6 = matrices.m[mBase + 6];
-    const float P8 = matrices.m[mBase + 8], P9 = matrices.m[mBase + 9], P10 = matrices.m[mBase + 10];
-    const float B0 = mix(A0, P0, w), B1 = mix(A1, P1, w), B2 = mix(A2, P2, w);
-    const float B4 = mix(A4, P4, w), B5 = mix(A5, P5, w), B6 = mix(A6, P6, w);
-    const float B8 = mix(A8, P8, w), B9 = mix(A9, P9, w), B10 = mix(A10, P10, w);
-    // re-pin the centroid: t += (A_solved - A_blended) * centroid so M*centroid is unchanged
-    M[3]  += (A0 - B0) * c.x + (A1 - B1) * c.y + (A2 - B2) * c.z;
-    M[7]  += (A4 - B4) * c.x + (A5 - B5) * c.y + (A6 - B6) * c.z;
-    M[11] += (A8 - B8) * c.x + (A9 - B9) * c.y + (A10 - B10) * c.z;
-    M[0] = B0; M[1] = B1; M[2] = B2;
-    M[4] = B4; M[5] = B5; M[6] = B6;
-    M[8] = B8; M[9] = B9; M[10] = B10;
-  }
+  // [RotStabilize] REMOVED ([GrazeFix]). The old affine solve's underdetermined rotation
+  // jumped frame-to-frame on degenerate clouds; the blend that anchored it lerped two
+  // matrices - which itself produces a NON-ORTHOGONAL (sheared) linear part, the exact
+  // defect behind the texture smear. The similarity fit's warm start (seed = last solve's
+  // rotation) keeps the unconstrained DOF at last frame's answer by construction, no
+  // blending needed. push.rotStabilizeIso is retained for push ABI only.
 
   // [ColdPromo] probe (diagnostic): a promoted (patchSlot-valid) slot that was NEVER
   // solved has no previous transform, so prevM = curM below => one frame of ZERO motion.
@@ -754,7 +882,7 @@ void main()
       status.prevTx = status.curTx; status.prevTy = status.curTy; status.prevTz = status.curTz;
     }
   }
-  // [ConditionProbe] readback the isotropy computed above (drives [RotStabilize] + the [SmearProbe] log).
+  // [ConditionProbe] readback the isotropy computed above (for the [SmearProbe] correlation log).
   status.sampleIso = sampleIso;
   statuses.s[entry.stateSlot] = status;
 

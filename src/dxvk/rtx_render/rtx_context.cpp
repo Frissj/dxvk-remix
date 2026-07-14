@@ -2246,12 +2246,13 @@ namespace dxvk {
           bool promoted;
         };
         std::vector<UvxRec> uvxRecs;
-        // [GradBlow] records (0xC124): incidence for hits whose texture gradient magnitude > 20.
-        // c = promoted-triangle incidence cosine; cClassic = same triangle under objectToWorld.
+        // [GradBlow] v3 records (0xC124): promoted hits whose texture gradient magnitude > 20.
+        // c = shaded-triangle incidence cosine; ortho = worst column-pair |cos| of the shading
+        // M linear part (similarity -> ~0); ratio = max/min column length (similarity -> ~1).
         struct GradBlowRec {
-          float gradMag, c, cClassic, coneRadius, twoArea;
+          float gradMag, c, ortho, ratio, twoArea;
           uint32_t geomId, lod, frame;
-          bool promoted;
+          bool primary;
         };
         std::vector<GradBlowRec> gbRecs;
 
@@ -2302,11 +2303,11 @@ namespace dxvk {
           } else if (e.threadIndex.y == uint16_t(kPathAProbeSentinel + 4u)) { // 0xC124 [GradBlow]
             if (gbRecs.size() < 64) {
               GradBlowRec g;
-              g.gradMag = wd.x; g.c = wd.y; g.cClassic = wd.z; g.coneRadius = wd.w;
+              g.gradMag = wd.x; g.c = wd.y; g.ortho = wd.z; g.ratio = wd.w;
               std::memcpy(&g.twoArea, &pd[1], sizeof(float));
               g.geomId = pd[0] & 0x3FFFFu;
               g.lod = (pd[0] >> 18) & 0xFFu;
-              g.promoted = (pd[0] & 0x80000000u) != 0u;
+              g.primary = (pd[0] & 0x04000000u) != 0u;
               g.frame = e.frameIndex;
               gbRecs.push_back(g);
             }
@@ -2322,27 +2323,32 @@ namespace dxvk {
           s_lastGradBlowFrame = frameIdx;
           std::sort(gbRecs.begin(), gbRecs.end(),
                     [](const GradBlowRec& a, const GradBlowRec& b) { return a.gradMag > b.gradMag; });
+          uint32_t primaryN = 0, sheared = 0;
+          for (const GradBlowRec& g : gbRecs) {
+            if (g.primary) primaryN++;
+            if (g.ortho > 0.02f || std::fabs(g.ratio - 1.0f) > 0.02f) sheared++;
+          }
           const uint32_t shown = std::min<uint32_t>(gbRecs.size(), 5);
           for (uint32_t k = 0; k < shown; k++) {
             const GradBlowRec& g = gbRecs[k];
-            // predicted footprint scale if incidence is the whole story: coneR/|c|
-            const float predA = g.coneRadius / std::max(1e-6f, std::fabs(g.c));
             Logger::err(str::format(
-              "[GradBlow] id=", g.geomId, " lod=", g.lod, " promo=", g.promoted ? 1 : 0,
-              " gradMag=", g.gradMag, " | c=", g.c, " cClassic=", g.cClassic,
-              " |c/cClassic|=", (std::fabs(g.cClassic) > 1e-9f ? std::fabs(g.c / g.cClassic) : 0.0f),
-              " coneR=", g.coneRadius, " coneR/|c|=", predA, " 2*area=", g.twoArea, " frame=", g.frame));
+              "[GradBlow] id=", g.geomId, " lod=", g.lod, " ray=", g.primary ? "PRIMARY" : "secondary",
+              " gradMag=", g.gradMag, " | c=", g.c,
+              " ortho=", g.ortho, " ratio=", g.ratio, " 2*area=", g.twoArea, " frame=", g.frame));
           }
           const GradBlowRec& w = gbRecs[0];
-          const float ratio = (std::fabs(w.cClassic) > 1e-9f) ? std::fabs(w.c / w.cClassic) : 0.0f;
+          const bool wSheared = w.ortho > 0.02f || std::fabs(w.ratio - 1.0f) > 0.02f;
           Logger::err(str::format(
-            "[GradBlow] worst mechanism: ",
-            (std::fabs(w.c) < 0.05f
-               ? (ratio < 0.5f
-                    ? "PROMOTION TIPPED to grazing (|c| << |cClassic|) -> rigid-fit rotation error is the smear"
-                    : "GENUINELY grazing (c ~= cClassic, both small) -> Path A footprint not clamped like Path B")
-               : "NOT grazing (|c| healthy) -> blow-up is elsewhere; re-instrument"),
-            "  (c=", w.c, " cClassic=", w.cClassic, " coneR=", w.coneRadius, ")"));
+            "[GradBlow] window: n=", uint32_t(gbRecs.size()), " primary=", primaryN,
+            " shearedM=", sheared, " | worst: ",
+            (wSheared
+               ? "shading M is NOT a similarity (ortho/ratio off) -> the similarity solve's output is NOT what shaded this hit (stale binary or a different writer patched this slot)"
+               : (std::fabs(w.c) < 0.05f
+                    ? (w.primary
+                         ? "ORTHOGONAL shading M yet a PRIMARY-visible region reads edge-on (c~0) -> shading rows disagree with the TLAS transform the ray intersected (slot/frame mismatch)"
+                         : "orthogonal M, grazing SECONDARY hit -> legitimate reflection-skim footprint, likely NOT the smear")
+                    : "orthogonal M, |c| healthy -> blow-up not incidence-driven here; re-instrument")),
+            "  (c=", w.c, " ortho=", w.ortho, " ratio=", w.ratio, ")"));
         }
 
         // [UvXCheck] compare: nearest-position match into the retained captured-input snapshot,

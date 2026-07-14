@@ -453,6 +453,13 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
   vec3 promoNormalRow1 = vec3(0.0f);
   vec3 promoNormalRow2 = vec3(0.0f);
 
+  // [GradBlow v3] columns of the shading M's linear part, hoisted for the
+  // orthogonality probe below (is the transform that SHADES this hit actually
+  // a similarity, i.e. is the new promotion solve's output what we consume?)
+  vec3 uvxPromoCol0 = vec3(0.0f);
+  vec3 uvxPromoCol1 = vec3(0.0f);
+  vec3 uvxPromoCol2 = vec3(0.0f);
+
   if (isPromotedHit)
   {
     const uint64_t promotionStateAddress =
@@ -466,6 +473,10 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
     promoNormalRow0 = cross(promoCurRow1.xyz, promoCurRow2.xyz);
     promoNormalRow1 = cross(promoCurRow2.xyz, promoCurRow0.xyz);
     promoNormalRow2 = cross(promoCurRow0.xyz, promoCurRow1.xyz);
+
+    uvxPromoCol0 = vec3(promoCurRow0.x, promoCurRow1.x, promoCurRow2.x);
+    uvxPromoCol1 = vec3(promoCurRow0.y, promoCurRow1.y, promoCurRow2.y);
+    uvxPromoCol2 = vec3(promoCurRow0.z, promoCurRow1.z, promoCurRow2.z);
 
     float4 promoRow0 = promoCurRow0;
     float4 promoRow1 = promoCurRow1;
@@ -960,25 +971,44 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
       // writtenData = [worldTwoTriangleArea, coneRadius, gradMag, uvSpanMax]
       // pad[0] = asuint(worldEdgeMax)
       // pad[1] = geometryId[17:0] | lod[25:18] | promoted bit31   (only cluster hits emit)
-      if (isClusterHit)
+      if (isPromotedHit)
       {
         const float gbGradMag = max(length(surfaceInteraction.textureGradientX),
                                     length(surfaceInteraction.textureGradientY));
         // gate: only the blown-up hits (matches the [PathAProbe] max spikes ~>20)
         if (gbGradMag > 20.0f)
         {
-          // [GradBlow] v2: the blow-up is coneRadius/|dot(normal,rayDir)| = grazing incidence.
-          // c = incidence cosine of the PROMOTED world triangle (what actually shaded).
-          // cClassic = incidence of the SAME object-space triangle under the surface's
-          // non-promoted objectToWorld - if |c| << |cClassic| the promotion transform tipped
-          // this triangle toward grazing (rigid-fit rotation error); if c ~= cClassic and both
-          // tiny, the geometry is genuinely edge-on and the fix is footprint clamping.
+          // [GradBlow] v3. v2's cClassic reference was INVALID (surface.objectToWorld is
+          // garbage for captured draws - the very reason promotion solves for M), so
+          // "promotion tipped vs classic" verdicts proved nothing. v3 measures what can
+          // actually discriminate:
+          //   ortho  = worst |cos| between column pairs of the SHADING M's linear part.
+          //            ~0  -> a similarity transform shades this hit (the new solve's output)
+          //            >>0 -> sheared M is still being consumed (fix not in effect here)
+          //   ratio  = max/min column length (non-uniform scale indicator, similarity -> ~1)
+          //   c      = incidence cosine of the shaded world triangle vs the ray
+          //   primary bit: an EDGE-ON triangle has ~zero projected area, so a REGION of
+          //   primary-visible pixels with orthogonal M and c~0 is geometrically impossible
+          //   for a self-consistent instance -> the shading rows disagree with the TLAS
+          //   transform the ray actually intersected. Secondary/reflection rays skimming a
+          //   surface are LEGITIMATE grazing hits - v2 never distinguished them.
           const float gbC = dot(triangleNormal, direction);
-          const vec3 gbCw0 = mul(surface.objectToWorld, vec4(positions[0], 1.0f));
-          const vec3 gbCw1 = mul(surface.objectToWorld, vec4(positions[1], 1.0f));
-          const vec3 gbCw2 = mul(surface.objectToWorld, vec4(positions[2], 1.0f));
-          const vec3 gbNClassic = safeNormalize(cross(gbCw1 - gbCw0, gbCw2 - gbCw0), vec3(0.0f, 0.0f, 1.0f));
-          const float gbCClassic = dot(gbNClassic, direction);
+
+          const float gbL0 = length(uvxPromoCol0);
+          const float gbL1 = length(uvxPromoCol1);
+          const float gbL2 = length(uvxPromoCol2);
+          const float gbLMin = max(min(gbL0, min(gbL1, gbL2)), 1e-12f);
+          const float gbLMax = max(gbL0, max(gbL1, gbL2));
+          const float gbRatio = gbLMax / gbLMin;
+          const float gbOrtho = max(abs(dot(uvxPromoCol0, uvxPromoCol1)) / max(gbL0 * gbL1, 1e-12f),
+                              max(abs(dot(uvxPromoCol0, uvxPromoCol2)) / max(gbL0 * gbL2, 1e-12f),
+                                  abs(dot(uvxPromoCol1, uvxPromoCol2)) / max(gbL1 * gbL2, 1e-12f)));
+
+#if defined(RAY_TRACING_PRIMARY_RAY)
+          const uint gbPrimaryBit = 0x04000000u;  // bit 26
+#else
+          const uint gbPrimaryBit = 0u;
+#endif
 
           uint gbHash = rayInteraction.clusterId * 2246822519u
                       + rayInteraction.primitiveIndex * 668265263u
@@ -988,12 +1018,13 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
           const uint gbSlot = gbBase + (gbHash % uint(PATHA_PROBE_CAP));
 
           GpuPrintBufferElement gb;
-          gb.writtenData = float4(gbGradMag, gbC, gbCClassic, coneRadius);
+          gb.writtenData = float4(gbGradMag, gbC, gbOrtho, gbRatio);
           gb.threadIndex = u16vec2(0xFEEDu, uint16_t(kPathAProbeSentinel + 4u));  // 0xC124
           gb.frameIndex  = cb.frameIdx;
           gb.pad         = uint2((surface.clusterGeometryId & 0x3FFFFu)
                                  | ((uint(clusterGeometry.lodLevel) & 0xFFu) << 18)
-                                 | (promoStateSlotPlusOne != 0u ? 0x80000000u : 0u),
+                                 | gbPrimaryBit
+                                 | 0x80000000u,  // promoted by construction (isPromotedHit gate)
                                  asuint(worldTwoTriangleArea));
           GpuPrintBuffer[gbSlot] = gb;
         }
