@@ -273,6 +273,14 @@ def createSlangTask(inputFile, variantSpec):
 
         task.commands = [command1, command2]
 
+        # NV-DXVK: the .h is a real output of this task - it is what C++ #includes.
+        # It used to be absent from task.outputs, so a .h deleted while its .spv
+        # survived (interrupted build, partial wipe) left needsBuild() reporting
+        # "up to date" forever and every dependent TU failing with C1083. Listing
+        # it here lets needsBuild() rebuild the pair on its own, which is what
+        # makes the removed per-build :smart_shader_heal sweep safe to skip.
+        task.outputs.append(headerFile)
+
     return task
 
 # Read the shader variant specifications from the source code.

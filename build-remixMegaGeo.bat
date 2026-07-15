@@ -161,7 +161,19 @@ rem 800+" (~10min). Pass "full" to wipe .spv only; pass "clean" to wipe
 rem .spv AND DXVK pipeline caches.
 if /i "%1"=="full"  goto :do_shader_hash_check
 if /i "%1"=="clean" goto :do_shader_hash_check
-goto :smart_shader_heal
+rem NV-DXVK: :smart_shader_heal used to run on EVERY build. It did two jobs:
+rem   (1) orphan heal - rebuild any unit whose .h vanished while its .spv
+rem       survived. That bug is fixed at the source: compile_shaders.py now
+rem       lists the .h in the task's outputs, so its own needsBuild() detects a
+rem       missing .h and rebuilds the pair.
+rem   (2) transitive-include rebuild via a full-tree SHA256 every build. Also
+rem       redundant: compile_shaders.py parses each unit's .d depfile into its
+rem       inputs and rebuilds on any changed include on its own.
+rem Both are now dead weight (the SHA256 sweep alone cost several seconds/build),
+rem so the normal path skips straight to ninja. Pass "heal" to force the old
+rem sweep if you ever suspect the shader outputs are inconsistent.
+if /i "%1"=="heal"  goto :smart_shader_heal
+goto :shader_hash_done
 :do_shader_hash_check
 echo.
 echo Checking shader source hashes for changes...
