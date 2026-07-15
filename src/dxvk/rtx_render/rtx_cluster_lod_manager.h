@@ -294,10 +294,14 @@ namespace dxvk {
       RTX_OPTION("rtx.clusterLod.animated", float, templateBboxBloatPercentage, 0.5f,
                  "instantiationBoundingBoxLimit bloat as a fraction of the geometry's bind-pose bbox diagonal -\n"
                  "the animation may move vertices this far outside the reference bbox. Negative disables the limit.");
-      RTX_OPTION("rtx.clusterLod.animated", int, positionTruncateBits, 4,
+      RTX_OPTION("rtx.clusterLod.animated", int, positionTruncateBits, 0,
                  "Mantissa bits truncated from CLAS vertex positions (smaller CLAS, faster instantiation).\n"
-                 "Default 4 (F3, 2026-07-04): the animated sample calls truncation highly recommended.\n"
-                 "Set 0 to disable.");
+                 "MUST be 0 for deforming geometry: the template is built from the bind pose and then\n"
+                 "instantiated against live deformed positions, so truncation quantizes close vertices\n"
+                 "together and collapses triangles into flickering razor slivers (root cause of the Path B\n"
+                 "razor-triangle flicker; the F3 default of 4 introduced it, 2026-07-05). The animated\n"
+                 "sample recommends truncation only because it never deforms the reference pose. Raise\n"
+                 "above 0 only after verifying the specific content shows no razor slivers.");
       RTX_OPTION("rtx.clusterLod.animated", bool, templateBuildFastTrace, true,
                  "Builds cluster templates with PREFER_FAST_TRACE (sample default; templates build once).");
       RTX_OPTION("rtx.clusterLod.animated", bool, instantiateFastTrace, false,
