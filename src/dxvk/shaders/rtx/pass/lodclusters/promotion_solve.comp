@@ -175,11 +175,61 @@ shared bool  s_rigid;
 shared float s_diagRefVar;     // ref-sample spread of this solve (near 0 == coincident refs)
 shared uint  s_diagSampleN;    // probe.sampleCount actually used
 shared bool  s_diagDegen;      // fit rejected as degenerate / non-finite
+shared uint  s_diagReason;     // which pipeline stage rejected it (see degenReason enum)
 
 vec3 loadCapture(uint64_t captureVa, uint strideBytes, uint index)
 {
   RawFloats capture = RawFloats(captureVa + uint64_t(strideBytes) * uint64_t(index));
   return vec3(capture.f[0], capture.f[1], capture.f[2]);
+}
+
+// quaternion (x,y,z,w) product a*b
+vec4 quatMul(vec4 a, vec4 b)
+{
+  return vec4(
+    a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+    a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+    a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+    a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z);
+}
+
+// unit quaternion (x,y,z,w) -> column-major rotation matrix (proper, det = +1)
+mat3 quatToMat3(vec4 q)
+{
+  const float x = q.x, y = q.y, z = q.z, w = q.w;
+  return mat3(
+    1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y + z * w),       2.0 * (x * z - y * w),        // col 0
+    2.0 * (x * y - z * w),       1.0 - 2.0 * (x * x + z * z),  2.0 * (y * z + x * w),        // col 1
+    2.0 * (x * z + y * w),       2.0 * (y * z - x * w),        1.0 - 2.0 * (x * x + y * y)); // col 2
+}
+
+// Rank-robust rotation extraction (Müller et al., "A Robust Method to Extract
+// the Rotational Part of Deformations", 2016). Recovers the polar rotation of a
+// 3x3 matrix A by iterating a quaternion, converging to the SAME rotation as the
+// Higham polar iteration for a full-rank A, but - unlike Higham, which needs an
+// invertible A - it degrades gracefully for a RANK-2 (coplanar) A: it returns the
+// best-fit proper rotation (det = +1, so no reflection ambiguity) instead of
+// diverging. Columns of A are treated as vectors; scale-invariant (the omega
+// numerator and denominator both scale with A).
+mat3 extractRotationRobust(mat3 A)
+{
+  vec4 q = vec4(0.0, 0.0, 0.0, 1.0);  // identity
+  for(int iter = 0; iter < 24; iter++)
+  {
+    const mat3 R = quatToMat3(q);
+    const vec3 omega =
+      (cross(R[0], A[0]) + cross(R[1], A[1]) + cross(R[2], A[2]))
+      / (abs(dot(R[0], A[0]) + dot(R[1], A[1]) + dot(R[2], A[2])) + 1e-9);
+    const float w = length(omega);
+    if(w < 1e-9)
+    {
+      break;
+    }
+    const float halfAngle = 0.5 * w;
+    const vec4 dq = vec4((omega / w) * sin(halfAngle), cos(halfAngle));
+    q = normalize(quatMul(dq, q));
+  }
+  return quatToMat3(q);
 }
 
 void main()
@@ -352,47 +402,32 @@ void main()
     }
 
     // rotation = orthogonal polar factor of Mcov via the Higham iteration
-    // R_{k+1} = 0.5*(R_k + (R_k^-1)^T). Quadratic convergence; the det guard keeps a
-    // near-singular (degenerate sample set) Mcov from feeding NaN into inverse().
-    bool ok = abs(determinant(Mcov)) > 1e-20;
-    mat3 R = Mcov;
-    if(ok)
-    {
-      for(int it = 0; it < 12; it++)
-      {
-        R = 0.5 * (R + transpose(inverse(R)));
-      }
-      ok = !any(isnan(R[0])) && !any(isnan(R[1])) && !any(isnan(R[2]))
-        && !any(isinf(R[0])) && !any(isinf(R[1])) && !any(isinf(R[2]));
-
-      // The Higham iteration only yields an ORTHONORMAL R when Mcov is well
-      // conditioned. A near-singular cross-covariance (few / coplanar samples -
-      // the sampleN 4 slots) passes the loose 1e-20 det guard yet makes
-      // inverse(R) diverge to a HUGE-but-finite R (~1e30). abs(s)<1e6 below only
-      // bounds the SCALE, not the rotation, so A = s*R then slips through fitOk
-      // finite -> the ||A^T A - I|| monitor squares dot(aCol,aCol)~(1e30)^2 and
-      // OVERFLOWS float to +inf (the 'maxAffineNonRigid inf' in the log; the slot
-      // is not counted degenerate because fitOk stayed true). A true rotation has
-      // unit-norm columns; reject when R is not orthonormal so the fit is scored
-      // degenerate (s_M -> 0 -> a bounded sqrt(3)) instead.
-      if(ok)
-      {
-        const float rn0 = dot(R[0], R[0]);
-        const float rn1 = dot(R[1], R[1]);
-        const float rn2 = dot(R[2], R[2]);
-        ok = rn0 > 0.5 && rn0 < 2.0
-          && rn1 > 0.5 && rn1 < 2.0
-          && rn2 > 0.5 && rn2 < 2.0;
-      }
-    }
+    // The rotation is recovered with the rank-robust quaternion extractor
+    // (extractRotationRobust) instead of the Higham polar iteration. Higham needs
+    // an INVERTIBLE Mcov, so every coplanar mesh - floors, walls, decals, flat
+    // props: 100% of the non-promoting 'rankDef' slots in the log - diverged and
+    // was wrongly rejected. The quaternion method returns the best-fit PROPER
+    // rotation (det = +1) for a rank-2 Mcov too, and the same rotation as Higham
+    // for full-rank input (no regression for the meshes already promoting). The
+    // full-mesh residual gate downstream is the real arbiter of rigid-vs-deform.
+    //
+    // Mcov is normalized to unit Frobenius norm first purely so the extractor's
+    // 1e-9 epsilon is well-scaled for tiny (small-prop) covariances; the recovered
+    // rotation is scale-invariant either way.
+    const float mcovNorm = sqrt(dot(Mcov[0], Mcov[0]) + dot(Mcov[1], Mcov[1]) + dot(Mcov[2], Mcov[2]));
+    const mat3  Mn = mcovNorm > 1e-20 ? (Mcov * (1.0 / mcovNorm)) : mat3(0.0);
+    const bool  mcovOk = mcovNorm > 1e-20;
+    const mat3  R = mcovOk ? extractRotationRobust(Mn) : mat3(1.0);
+    // A quaternion-built R is orthonormal by construction; this only catches a
+    // NaN/Inf that slipped through (e.g. from a non-finite Mcov entry).
+    const bool  orthoOk = mcovOk
+      && !any(isnan(R[0])) && !any(isnan(R[1])) && !any(isnan(R[2]))
+      && !any(isinf(R[0])) && !any(isinf(R[1])) && !any(isinf(R[2]));
 
     // uniform scale minimizing |s*R*ref - cap|^2 for the fixed R:
     //   s = trace(R^T Mcov) / sum|ref - refBar|^2
-    // refVar is the ref-sample spread. A near-coincident sample set (tiny refVar -
-    // e.g. a freshly appended geometry) makes s explode: the earlier 1e-9 clamp let
-    // that through as a huge scale -> s_M = inf -> patched an exploded transform into
-    // the TLAS -> device-lost (observed: maxAffineNonRigid 'inf' the frame before the
-    // fence crash). Treat tiny refVar / huge or non-finite s|A|t as degenerate.
+    // refVar is the ref-sample spread. A near-coincident sample set (tiny refVar)
+    // makes s explode; a huge / non-finite s|A|t is treated as degenerate.
     const float refVar = b[15] - n * dot(refBar, refBar);
     const float trRtM  = dot(R[0], Mcov[0]) + dot(R[1], Mcov[1]) + dot(R[2], Mcov[2]);
     const float s      = refVar > 1e-8 ? trRtM / refVar : 0.0;
@@ -400,17 +435,34 @@ void main()
     const mat3 A = s * R;
     const vec3 t = capBar - A * refBar;
 
-    const bool fitOk = ok
-      && refVar > 1e-8 && abs(s) < 1.0e6
-      && !any(isnan(A[0])) && !any(isnan(A[1])) && !any(isnan(A[2]))
+    const bool refVarOk = refVar > 1e-8;
+    const bool scaleOk  = abs(s) < 1.0e6;
+    const bool finiteOk =
+         !any(isnan(A[0])) && !any(isnan(A[1])) && !any(isnan(A[2]))
       && !any(isinf(A[0])) && !any(isinf(A[1])) && !any(isinf(A[2]))
       && !any(isnan(t)) && !any(isinf(t));
+
+    const bool fitOk = orthoOk && refVarOk && scaleOk && finiteOk;
+
+    // reason enum for the CPU histogram (why a fit was rejected). Ordered by the
+    // pipeline stage that failed FIRST: 0=ok, 1=coincident samples (no
+    // covariance), 2=(unused - rank no longer rejects), 3=rotation non-finite,
+    // 4=ref spread ~0, 5=scale overflow, 6=non-finite A/t. Coplanar meshes now
+    // pass the solve and are arbitrated by the residual gate (gate REJECTED),
+    // not counted here.
+    uint degenReason = 0u;
+    if(!mcovOk)         degenReason = 1u;
+    else if(!orthoOk)   degenReason = 3u;
+    else if(!refVarOk)  degenReason = 4u;
+    else if(!scaleOk)   degenReason = 5u;
+    else if(!finiteOk)  degenReason = 6u;
 
     // capture the inputs that decide degeneracy so the CPU can name WHY (a fresh
     // geometry solved before its probe is populated? coincident ref samples?).
     s_diagRefVar  = refVar;
     s_diagSampleN = probe.sampleCount;
     s_diagDegen   = !fitOk;
+    s_diagReason  = degenReason;
 
     if(fitOk)
     {
@@ -521,11 +573,13 @@ void main()
                      | (rigid ? PROMO_FLAG_RIGID : PROMO_FLAG_DEMOTED);
   status.diagShearBits = floatBitsToUint(affineNonRigid);  // non-negative -> ordered
   // degeneracy forensics: diagAux = refVar (float bits); diagGuard keeps the probeVa
-  // bit0, adds bit1 = degenerate fit, and packs sampleCount into bits [8:16].
+  // bit0, adds bit1 = degenerate fit, packs sampleCount into bits [8:16], and the
+  // reject-reason enum (0..6) into bits [16:24].
   status.diagAux   = floatBitsToUint(s_diagRefVar);
   status.diagGuard = (status.diagGuard & 0x1u)
                    | (s_diagDegen ? 0x2u : 0x0u)
-                   | (min(s_diagSampleN, 255u) << 8);
+                   | (min(s_diagSampleN, 255u) << 8)
+                   | ((s_diagReason & 0xFFu) << 16);
   statuses.s[entry.stateSlot] = status;
 
   // ---- patch a promoted instance's slot: ALWAYS write when assigned - a

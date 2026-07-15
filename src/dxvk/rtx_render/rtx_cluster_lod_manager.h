@@ -617,6 +617,11 @@ namespace dxvk {
     uint64_t m_diagWorstGeom = 0;          // geometry hash of the worst slot
     float m_diagWorstRefVar = 0.0f;        // its ref-sample spread (~0 == coincident refs)
     uint32_t m_diagWorstSampleN = 0;       // its probe.sampleCount
+    // reject-reason histogram over degenerate slots (index = degenReason enum in
+    // promotion_solve.comp: 1=coincident 2=rank-deficient 3=non-orthogonal
+    // 4=refVar~0 5=scale-overflow 6=non-finite; [0] unused). Names which stage is
+    // actually costing promotions instead of guessing from the single worst slot.
+    uint32_t m_diagReasonHist[7] = {};
 
     // worker thread (P4c): probe precompute (samples + Gram pseudoinverse in
     // doubles) + upload through the template system's callback-locked path

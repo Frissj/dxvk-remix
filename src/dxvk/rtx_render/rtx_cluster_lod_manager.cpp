@@ -651,6 +651,7 @@ namespace dxvk {
     m_diagWorstGeom = 0;
     m_diagWorstRefVar = 0.0f;
     m_diagWorstSampleN = 0;
+    for (uint32_t& c : m_diagReasonHist) { c = 0; }
     float worstRefVarSeen = std::numeric_limits<float>::max();
 
     for (auto& entry : m_promoCandidates) {
@@ -666,6 +667,8 @@ namespace dxvk {
         // = sampleCount used. refVar ~ 0 with sampleCount full == coincident refs;
         // sampleCount ~ 0 == probe not populated (solved before ready).
         m_diagDegenSlots++;
+        const uint32_t reason = (state.diagGuard >> 16) & 0xFFu;
+        if (reason < 7u) { m_diagReasonHist[reason]++; }
         float rv = 0.0f;
         std::memcpy(&rv, &state.diagAux, sizeof(float));
         if (rv < worstRefVarSeen) {
@@ -1378,6 +1381,12 @@ namespace dxvk {
                                  " (worst geom 0x", std::hex, m_diagWorstGeom, std::dec,
                                  " refVar ", m_diagWorstRefVar,
                                  " sampleN ", m_diagWorstSampleN, ")",
+                                 ", reasons[coincid ", m_diagReasonHist[1],
+                                 " rankDef ", m_diagReasonHist[2],
+                                 " nonOrtho ", m_diagReasonHist[3],
+                                 " refVar0 ", m_diagReasonHist[4],
+                                 " scaleOvf ", m_diagReasonHist[5],
+                                 " nonFin ", m_diagReasonHist[6], "]",
                                  ", statesValid ", (m_promoStatesValid ? 1 : 0)));
       }
     }
