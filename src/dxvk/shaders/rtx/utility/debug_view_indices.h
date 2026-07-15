@@ -323,6 +323,31 @@
 // prop's transform manufactures motion, this lights up = the exact pixels DLSS drags the shading.
 #define DEBUG_VIEW_PROMO_MV_RESIDUAL 936
 
+// NV-DXVK: [GeomAudit] path-class audit vs the diffuse smear. Albedo and shading-normal views read
+// CLEAN yet DIFFUSE lighting smears. Rather than guess a geometry metric (the first version used
+// shading-vs-geometric normal divergence, which is bright on ALL curved surfaces -> false
+// positives), this CLASSIFIES every pixel by its geometry path/state so the smear's colour names
+// exactly what it is - a split CLUSTER_PATH_CLASS (927) can't make (promoted vs non-promoted Path A):
+//   RED     = promoted Path A (rigid-capture M)
+//   YELLOW  = Path A resident cluster LOD, NOT promoted (CPU-transformed cluster)
+//   GREEN   = Path B cluster template
+//   BLUE    = a cluster hit whose geometric triangle faces away from the ray (winding/normal flip)
+//   checker = classic (non-cluster)
+// Flip against DEBUG_VIEW_NOISY_PRIMARY_DIRECT/INDIRECT_DIFFUSE_RADIANCE and read the smear's colour.
+// Backed by the [GeomAudit] log (path-class distribution + per-class geometry).
+#define DEBUG_VIEW_PROMO_GEOM_AUDIT 937
+
+// NV-DXVK: [PathBMotion] Path B (cluster-template) motion-vector audit. The smear is on Path B
+// diffuse and motion vectors were only ever ruled out for Path A - never Path B. Path B takes the
+// classic prev-position path (surface_interaction ~733); a vertex-CAPTURED mesh whose vertices move
+// each frame but whose object-to-world matrices are static reports ~ZERO motion, so temporal GI
+// history sticks to the old screen position = directional diffuse drag. This view isolates Path B:
+//   grayscale = world motion magnitude |surfaceInteraction.motion|  (BLACK on a moving prop = the bug)
+//   RED       = no real previous positions (previousPositionBufferIndex INVALID -> MV can't represent
+//               captured vertex motion; falls back to the static-matrix delta)
+//   Path A / classic dimmed. Flip against the diffuse smear + the [PathBMotion] log.
+#define DEBUG_VIEW_PATHB_MOTION 938
+
 enum class CompositeDebugView : uint32_t {
   Disabled = 0,
   FinalRenderWithMaterialProperties,

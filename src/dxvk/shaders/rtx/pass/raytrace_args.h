@@ -457,6 +457,11 @@ struct RaytraceArgs {
   uint promotionStatusAddressLo;
   uint promotionStatusAddressHi;
 
+  // [PathBMotion] pixel threshold: zero a Path B (cluster template) hit's motion vector when its
+  // on-screen motion beyond camera parallax exceeds this many pixels (teleport-scale motion no
+  // temporal accumulator can reuse -> the captured-prop diffuse smear). 0 = disabled.
+  float pathBTeleportClampPixels;
+
   // NOTE: Add structs to the top section of RaytraceArgs, not the bottom.
   // NOTE: bool does not work in debug builds, use uint instead.
 };

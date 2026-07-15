@@ -656,6 +656,71 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
     surfaceInteraction.geometryNormal = geometryNormal;
   }
 
+  // NV-DXVK: [GeomAudit] EXPANDED DIAGNOSTIC (remove with the smear probes). The first pass keyed
+  // only on promoted hits and used shading-vs-geometric normal divergence (R), which is bright on
+  // ANY curved surface (interpolated normal != flat triangle normal by design) -> "lots of areas,
+  // not the problem" false positives. This version drops that and instead CLASSIFIES the geometry
+  // path/state of EVERY pixel, so the smear region's colour names exactly what it is - which the
+  // existing CLUSTER_PATH_CLASS (927) can't, because it never splits promoted from non-promoted
+  // Path A. Read the smear's colour off this view:
+  //   RED       = promoted Path A (rigid-capture M) - what all prior work assumed
+  //   YELLOW    = Path A resident cluster LOD, NOT promoted (CPU-transformed cluster) - a DIFFERENT
+  //               path the smear work never touched
+  //   GREEN     = Path B cluster template (deforming/captured)
+  //   BLUE flash= any of the above whose GEOMETRIC triangle faces AWAY from the primary ray
+  //               (winding/normal genuinely flipped - a real defect, overlaid on the class hue)
+  //   checker   = classic (non-cluster) - if the smear is here, the "Path A only" premise is wrong
+#if defined(RAY_TRACING_PRIMARY_RAY)
+  {
+    const float gaEdgeMax = max(length(worldPositions[1] - worldPositions[0]),
+                            max(length(worldPositions[2] - worldPositions[0]),
+                                length(worldPositions[2] - worldPositions[1])));
+    const float gaSliver = worldTwoTriangleArea / max(gaEdgeMax * gaEdgeMax, 1e-12f);
+    const float gaBackFace = dot(triangleNormal, ray.direction);  // >0 = geom normal faces along ray
+    // class: 1 promoted, 2 clusterLOD-not-promoted, 3 template(Path B), 0 classic
+    const uint gaClass = isPromotedHit ? 1u : (isClusterHit ? 2u : (isTemplateHit ? 3u : 0u));
+
+    if (cb.debugView == DEBUG_VIEW_PROMO_GEOM_AUDIT)
+    {
+      vec3 gaCol;
+      if (gaClass == 1u)      { gaCol = vec3(1.0f, 0.0f, 0.0f); }  // RED promoted
+      else if (gaClass == 2u) { gaCol = vec3(1.0f, 1.0f, 0.0f); }  // YELLOW cluster-LOD, not promoted
+      else if (gaClass == 3u) { gaCol = vec3(0.0f, 1.0f, 0.0f); }  // GREEN Path B template
+      else
+      {
+        const uint2 pc = getDispatchRaysIndex().xy;
+        const bool checker = (((pc.x >> 3) & 1) ^ ((pc.y >> 3) & 1)) != 0;
+        gaCol = vec3(checker ? 0.5f : 0.25f);
+      }
+      // real defect overlay: a cluster hit whose geometric triangle faces away from the ray
+      if (gaClass != 0u && gaBackFace > 0.0f) { gaCol = vec3(0.2f, 0.2f, 1.0f); }
+      storeInDebugView(getDispatchRaysIndex().xy, gaCol);
+    }
+
+    // [GeomAudit] log: sample EVERY cluster hit (promoted or not), capped by the scatter region, so
+    // the CPU reports the path-class distribution + geometry per class. Sentinel 0xC125.
+    if (gaClass != 0u)
+    {
+      uint gaHash = rayInteraction.clusterId * 40503u
+                  + rayInteraction.primitiveIndex * 2246822519u
+                  + rayInteraction.surfaceIndex * 668265263u;
+      gaHash ^= gaHash >> 15;
+      const uint gaBase = uint(GPU_PRINT_RING_SLOTS) + cb.gpuPrintElementIndex * uint(PATHA_PROBE_CAP);
+      const uint gaSlot = gaBase + (gaHash % uint(PATHA_PROBE_CAP));
+
+      GpuPrintBufferElement ga;
+      ga.writtenData = float4(worldTwoTriangleArea, gaSliver, gaBackFace, gaEdgeMax);
+      ga.threadIndex = u16vec2(0xFEEDu, uint16_t(kPathAProbeSentinel + 5u));  // 0xC125
+      ga.frameIndex  = cb.frameIdx;
+      ga.pad         = uint2((surface.clusterGeometryId & 0x3FFFFu)
+                             | ((uint(clusterGeometry.lodLevel) & 0xFFu) << 18)
+                             | (gaClass << 26),   // class in bits [27:26]
+                             asuint(gaEdgeMax));
+      GpuPrintBuffer[gaSlot] = ga;
+    }
+  }
+#endif
+
   // Compute motion
   // Note: Ignore the motion if the caller needs previous positions, we don't know it.
 
@@ -746,6 +811,80 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
   {
     surfaceInteraction.motion = vec3(0.0);
   }
+
+  // NV-DXVK: [PathBMotion] DIAGNOSTIC (remove with the smear probes). The smear is on Path B diffuse;
+  // motion vectors were only ever ruled out for Path A. Path B (isTemplateHit) takes the classic
+  // prev-position path above - if previousPositionBufferIndex is INVALID a CAPTURED mesh's real
+  // per-frame vertex motion is unrepresentable and motion collapses to the (often static) matrix
+  // delta -> temporal GI history drags = the diffuse smear. Audit Path B motion per pixel + log it.
+#if defined(RAY_TRACING_PRIMARY_RAY)
+  if (isTemplateHit)
+  {
+    const bool pbPrevReal = surface.previousPositionBufferIndex != BINDING_INDEX_INVALID;
+    const float pbMotion = length(surfaceInteraction.motion);
+
+    // [PathBMotion] RESIDUAL: is this motion PHANTOM (camera-relative reconstruction wobble the
+    // reprojection should cancel) or REAL object motion? Reproject the hit under the PREVIOUS
+    // camera two ways - as world-static (hitPosition) and from the reported previous world position
+    // (prevPos = hitPosition + motion). The screen gap between them is the OBJECT's apparent
+    // on-screen motion BEYOND camera parallax = the shading drag the temporal GI history follows.
+    // For a truly world-static prop this is ~0; the smearing "stationary canvas" props reading a
+    // large residual here = phantom drag. Comparing it to the pure camera-parallax magnitude tells
+    // us if the phantom scales with camera motion (reconstruction wobble, worst in storms).
+    const vec3 pbPrevPos = hitPosition + surfaceInteraction.motion;  // = prevPosition, no re-fetch
+    const vec4 pbCurClip        = mul(cb.camera.worldToProjectionJittered,     vec4(hitPosition, 1.0f));
+    const vec4 pbPrevStaticClip = mul(cb.camera.prevWorldToProjectionJittered, vec4(hitPosition, 1.0f));
+    const vec4 pbPrevMovedClip  = mul(cb.camera.prevWorldToProjectionJittered, vec4(pbPrevPos, 1.0f));
+    float pbResidualPx = -1.0f;  // -1 = w-guard tripped (near prev-camera plane, meaningless)
+    float pbCameraPx   = -1.0f;
+    if (pbCurClip.w > 1e-4f && pbPrevStaticClip.w > 1e-4f && pbPrevMovedClip.w > 1e-4f)
+    {
+      const vec2 halfRes = 0.5f * vec2(cb.camera.resolution);
+      const vec2 curNDC        = pbCurClip.xy        / pbCurClip.w;
+      const vec2 prevStaticNDC = pbPrevStaticClip.xy / pbPrevStaticClip.w;
+      const vec2 prevMovedNDC  = pbPrevMovedClip.xy  / pbPrevMovedClip.w;
+      pbResidualPx = length((prevStaticNDC - prevMovedNDC) * halfRes);  // object screen motion (drag)
+      pbCameraPx   = length((curNDC - prevStaticNDC) * halfRes);        // pure camera parallax
+    }
+
+    // [PathBMotion] TELEPORT CLAMP (mechanism test + candidate fix). Teleport-scale on-screen motion
+    // is un-reusable by the temporal (screen-space) diffuse accumulator; zeroing the MV forces proper
+    // disocclusion semantics (reject history) instead of dragging stale radiance = the smear. Path B
+    // analogue of the promoted path's teleportClampRadii. cb.pathBTeleportClampPixels = 0 disables;
+    // pbResidualPx = -1 (w-guard) never trips it. If setting this kills the smear, the mechanism is
+    // confirmed and this IS the (targeted) fix; if not, the MV-drag chain is wrong.
+    if (cb.pathBTeleportClampPixels > 0.0f && pbResidualPx > cb.pathBTeleportClampPixels)
+    {
+      surfaceInteraction.motion = vec3(0.0f);
+    }
+
+    if (cb.debugView == DEBUG_VIEW_PATHB_MOTION)
+    {
+      storeInDebugView(getDispatchRaysIndex().xy, pbPrevReal
+        ? vec3(saturate(pbMotion * 2.0f))            // grayscale = |motion|
+        : vec3(1.0f, 0.0f, 0.0f));                   // RED = no real prev positions
+    }
+
+    // [PathBMotion] log (sentinel 0xC126). writtenData = [|motion|, residualPx, cameraPx,
+    // prevReal|isStatic<<1]; pad = [posBufIdx, prevPosBufIdx].
+    {
+      uint pbHash = rayInteraction.clusterId * 668265263u
+                  + rayInteraction.primitiveIndex * 40503u
+                  + rayInteraction.surfaceIndex * 2246822519u;
+      pbHash ^= pbHash >> 13;
+      const uint pbBase = uint(GPU_PRINT_RING_SLOTS) + cb.gpuPrintElementIndex * uint(PATHA_PROBE_CAP);
+      const uint pbSlot = pbBase + (pbHash % uint(PATHA_PROBE_CAP));
+
+      GpuPrintBufferElement pb;
+      pb.writtenData = float4(pbMotion, pbResidualPx, pbCameraPx,
+                              (pbPrevReal ? 1.0f : 0.0f) + (surface.isStatic ? 2.0f : 0.0f));
+      pb.threadIndex = u16vec2(0xFEEDu, uint16_t(kPathAProbeSentinel + 6u));  // 0xC126
+      pb.frameIndex  = cb.frameIdx;
+      pb.pad         = uint2(surface.positionBufferIndex, surface.previousPositionBufferIndex);
+      GpuPrintBuffer[pbSlot] = pb;
+    }
+  }
+#endif
 
   // Compute texture coordinates
 

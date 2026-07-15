@@ -1411,6 +1411,9 @@ namespace dxvk {
         clusterLodManager != nullptr ? clusterLodManager->getPromotionStatusAddress() : 0;
       constants.promotionStatusAddressLo = uint32_t(promotionStatusAddress);
       constants.promotionStatusAddressHi = uint32_t(promotionStatusAddress >> 32);
+
+      // [PathBMotion] Path B teleport-clamp threshold (pixels); 0 = off
+      constants.pathBTeleportClampPixels = std::max(0.0f, ClusterLodOptions::Promotion::pathBTeleportClampPixels());
     }
     // NV-DXVK end
 
@@ -2255,6 +2258,22 @@ namespace dxvk {
           bool primary;
         };
         std::vector<GradBlowRec> gbRecs;
+        // [GeomAudit] v2 records (0xC125): EVERY cluster hit, tagged by path class (1 promoted,
+        // 2 clusterLOD-not-promoted, 3 Path B template) + its geometry. Reports the class
+        // distribution so the smear surface's path is named, not assumed.
+        struct GeomAuditRec {
+          float twoArea, sliver, backFace, edgeMax;
+          uint32_t geomId, lod, cls, frame;
+        };
+        std::vector<GeomAuditRec> gaRecs;
+        // [PathBMotion] records (0xC126): Path B (cluster template) hits - world motion magnitude,
+        // matrix-only motion component, whether real previous positions exist. A moving Path B prop
+        // reading motion~0 (esp. prevReal=0) is an MV that can't represent captured vertex motion.
+        struct PathBMotionRec {
+          float motion, residualPx, cameraPx; bool prevReal, isStatic;
+          uint32_t posBuf, prevPosBuf, frame;
+        };
+        std::vector<PathBMotionRec> pbRecs;
 
         for (uint32_t i = 0; i < PATHA_PROBE_CAP; ++i) {
           GpuPrintBufferElement& e = region[i];
@@ -2312,7 +2331,105 @@ namespace dxvk {
               gbRecs.push_back(g);
             }
             e.invalidate();
+          } else if (e.threadIndex.y == uint16_t(kPathAProbeSentinel + 5u)) { // 0xC125 [GeomAudit]
+            if (gaRecs.size() < 64) {
+              GeomAuditRec g;
+              g.twoArea = wd.x; g.sliver = wd.y; g.backFace = wd.z; g.edgeMax = wd.w;
+              g.geomId = pd[0] & 0x3FFFFu;
+              g.lod = (pd[0] >> 18) & 0xFFu;
+              g.cls = (pd[0] >> 26) & 0x3u;
+              g.frame = e.frameIndex;
+              gaRecs.push_back(g);
+            }
+            e.invalidate();
+          } else if (e.threadIndex.y == uint16_t(kPathAProbeSentinel + 6u)) { // 0xC126 [PathBMotion]
+            if (pbRecs.size() < 64) {
+              PathBMotionRec p;
+              p.motion = wd.x; p.residualPx = wd.y; p.cameraPx = wd.z;
+              const uint32_t flags = uint32_t(wd.w + 0.5f);
+              p.prevReal = (flags & 1u) != 0u; p.isStatic = (flags & 2u) != 0u;
+              p.posBuf = pd[0]; p.prevPosBuf = pd[1];
+              p.frame = e.frameIndex;
+              pbRecs.push_back(p);
+            }
+            e.invalidate();
           }
+        }
+
+        // [PathBMotion] flush: how many Path B hits report ~zero motion, and how many lack real
+        // previous positions - a moving prop with motion~0 is the MV that drags the diffuse history.
+        static uint32_t s_lastPbMotionFrame = 0;
+        if (!pbRecs.empty() && (frameIdx - s_lastPbMotionFrame >= 30u || frameIdx < s_lastPbMotionFrame)) {
+          s_lastPbMotionFrame = frameIdx;
+          // sort by the on-screen drag (residual) - that is the visible smear magnitude
+          std::sort(pbRecs.begin(), pbRecs.end(),
+                    [](const PathBMotionRec& a, const PathBMotionRec& b) { return a.residualPx > b.residualPx; });
+          uint32_t noPrev = 0, bigDrag = 0, valid = 0;
+          float resMax = 0.0f, camAtResMax = 0.0f, resSum = 0.0f, camSum = 0.0f;
+          for (const PathBMotionRec& p : pbRecs) {
+            if (!p.prevReal) noPrev++;
+            if (p.residualPx >= 0.0f) {  // -1 = w-guard tripped
+              valid++;
+              resSum += p.residualPx; camSum += p.cameraPx;
+              if (p.residualPx > 2.0f) bigDrag++;
+              if (p.residualPx > resMax) { resMax = p.residualPx; camAtResMax = p.cameraPx; }
+            }
+          }
+          const uint32_t shown = std::min<uint32_t>(pbRecs.size(), 5);
+          for (uint32_t k = 0; k < shown; k++) {
+            const PathBMotionRec& p = pbRecs[k];
+            Logger::err(str::format(
+              "[PathBMotion] |motion|=", p.motion, " residualPx=", p.residualPx, " cameraPx=", p.cameraPx,
+              " ratio=", (p.cameraPx > 1e-3f ? p.residualPx / p.cameraPx : -1.0f),
+              " prevReal=", p.prevReal ? 1 : 0, " isStatic=", p.isStatic ? 1 : 0,
+              " prevPosBuf=", p.prevPosBuf, " frame=", p.frame));
+          }
+          // residual = object screen motion beyond camera parallax. Large residual on a "stationary
+          // canvas" prop = phantom drag. If residual tracks cameraPx (ratio ~const, both grow in
+          // storms), it is camera-relative RECONSTRUCTION WOBBLE; if residual is large with small
+          // cameraPx, the object is genuinely moving (real MV, smear is elsewhere).
+          const float avgRes = valid ? resSum / float(valid) : 0.0f;
+          const float avgCam = valid ? camSum / float(valid) : 0.0f;
+          Logger::err(str::format(
+            "[PathBMotion] window: n=", uint32_t(pbRecs.size()), " valid=", valid,
+            " residualPx[max]=", resMax, " (cameraPx there=", camAtResMax, ")",
+            " avgResidual=", avgRes, " avgCamera=", avgCam, " bigDrag(>2px)=", bigDrag, " noPrev=", noPrev,
+            (resMax > 2.0f
+               ? (camAtResMax > 2.0f
+                    ? "  *** large drag AND large camera parallax -> PHANTOM reconstruction wobble scaling with camera motion (fix Path B prev lineage like the promoted path) ***"
+                    : "  *** large drag with SMALL camera motion -> object genuinely moving; MV is real, smear is downstream ***")
+               : "  *** drag ~0 -> Path B MV is fine this window; smear not here ***")));
+        }
+
+        // [GeomAudit] flush: report the path-class distribution of the cluster hits + geometry
+        // health per class, so the smear surface's path is named. Sort slivers first.
+        static uint32_t s_lastGeomAuditFrame = 0;
+        if (!gaRecs.empty() && (frameIdx - s_lastGeomAuditFrame >= 30u || frameIdx < s_lastGeomAuditFrame)) {
+          s_lastGeomAuditFrame = frameIdx;
+          std::sort(gaRecs.begin(), gaRecs.end(),
+                    [](const GeomAuditRec& a, const GeomAuditRec& b) { return a.sliver < b.sliver; });
+          uint32_t promoted = 0, clusterNP = 0, templ = 0, sliverN = 0, backN = 0;
+          for (const GeomAuditRec& g : gaRecs) {
+            if (g.cls == 1u) promoted++; else if (g.cls == 2u) clusterNP++; else if (g.cls == 3u) templ++;
+            if (g.sliver < 0.05f) sliverN++;
+            if (g.backFace > 0.0f) backN++;
+          }
+          auto clsName = [](uint32_t c) {
+            return c == 1u ? "PROMOTED" : (c == 2u ? "clusterLOD-notPromoted" : (c == 3u ? "PathB-template" : "classic"));
+          };
+          const uint32_t shown = std::min<uint32_t>(gaRecs.size(), 5);
+          for (uint32_t k = 0; k < shown; k++) {
+            const GeomAuditRec& g = gaRecs[k];
+            Logger::err(str::format(
+              "[GeomAudit] class=", clsName(g.cls), " id=", g.geomId, " lod=", g.lod,
+              " 2*area=", g.twoArea, " sliver=", g.sliver, " edgeMax=", g.edgeMax,
+              " backFace=", g.backFace, " frame=", g.frame));
+          }
+          Logger::err(str::format(
+            "[GeomAudit] window: n=", uint32_t(gaRecs.size()),
+            " | classes: promoted=", promoted, " clusterLOD-notPromoted=", clusterNP, " PathB=", templ,
+            " | sliver<0.05=", sliverN, " backFacing=", backN,
+            "  -> read the smear's COLOUR in the Promoted Geometry Audit view (RED promoted / YELLOW non-promoted clusterLOD / GREEN PathB / checker classic)"));
         }
 
         // [GradBlow] flush: sort worst-gradient first, log the top few RAW so the mechanism

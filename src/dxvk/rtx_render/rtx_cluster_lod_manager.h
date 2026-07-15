@@ -452,6 +452,20 @@ namespace dxvk {
                  "motion exceeds this multiple of its own bounding radius - a discrete animation step no\n"
                  "temporal accumulator can reuse (the stop-motion cinematic smear at low fps). 0 disables;\n"
                  "lower = clamp smaller jumps (more history rejection), higher = tolerate faster motion.");
+      // [PathBMotion] The Path B (cluster-template) analogue of teleportClampRadii. The captured
+      // cinematic props that smear are Path B, not promoted; at streaming-storm framerates their
+      // normal animation becomes a per-frame teleport (|motion| ~2.5u = hundreds of px, [PathBMotion]
+      // residualPx). Path B honestly reports that MV and the temporal diffuse accumulator drags a full
+      // step of stale radiance across the screen = the smear. Zero the Path B motion vector when its
+      // on-screen motion beyond camera parallax exceeds this many pixels (motion no screen-space
+      // accumulator can reuse), forcing proper disocclusion semantics instead of the drag. Pixel-based
+      // (not radius) because temporal reuse is screen-space. 0 disables (default while verifying).
+      RTX_OPTION("rtx.clusterLod.promotion", float, pathBTeleportClampPixels, 0.0f,
+                 "[PathBMotion] zero a Path B (cluster template) hit's motion vector when its on-screen\n"
+                 "motion beyond camera parallax exceeds this many pixels - a per-frame jump no temporal\n"
+                 "accumulator can reuse (the low-fps captured-prop diffuse smear). Forces disocclusion\n"
+                 "(reject history) instead of dragging stale radiance. 0 disables. Path B analogue of\n"
+                 "teleportClampRadii.");
       RTX_OPTION("rtx.clusterLod.promotion", bool, probeGateEveryFrame, false,
                  "[PromoSmear] diagnostic: force the full-mesh residual gate every frame for every promoted\n"
                  "instance and log sparse-vs-full residual per slot, to confirm the moving-cinematic smear is\n"

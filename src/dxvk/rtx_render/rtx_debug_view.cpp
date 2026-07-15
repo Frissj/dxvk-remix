@@ -107,6 +107,8 @@ namespace dxvk {
         {DEBUG_VIEW_VIRTUAL_MOTION_VECTOR, "Virtual Motion Vector"},
         {DEBUG_VIEW_SCREEN_SPACE_MOTION_VECTOR, "Screen-Space Motion Vector"},
         {DEBUG_VIEW_PROMO_MV_RESIDUAL, "Promoted MV Residual (smear px)"},
+        {DEBUG_VIEW_PROMO_GEOM_AUDIT, "Promoted Geometry Audit (path class)", "Classifies every pixel by its geometry path/state so the smear's colour names what it is (which Cluster Path Class 927 can't - it never splits promoted from non-promoted Path A). RED = promoted Path A (rigid-capture M), YELLOW = Path A resident cluster LOD NOT promoted, GREEN = Path B template, BLUE = a cluster hit whose geometric triangle faces away from the ray (winding/normal flip), checker = classic non-cluster. Flip against the diffuse radiance views and read the smear's colour. Backed by the [GeomAudit] log's class distribution."},
+        {DEBUG_VIEW_PATHB_MOTION, "Path B Motion Vector Audit", "Isolates Path B (cluster template) motion. Grayscale = world motion magnitude; a moving prop reading BLACK means its motion vector is ~zero while the geometry moved -> temporal GI history drags = the diffuse smear. RED = no real previous positions (previousPositionBufferIndex invalid), so a captured mesh's per-frame vertex motion can't be represented. Flip against the diffuse smear; backed by the [PathBMotion] log."},
         {DEBUG_VIEW_GEOMETRY_NORMAL, "Geometry Normal"},
         {DEBUG_VIEW_GEOMETRY_TANGENT, "Geometry Tangent"},
         {DEBUG_VIEW_GEOMETRY_BITANGENT, "Geometry Bitangent"},
