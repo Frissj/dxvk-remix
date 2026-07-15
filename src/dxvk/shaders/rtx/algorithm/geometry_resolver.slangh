@@ -751,6 +751,24 @@ void geometryResolverVertexOutputDebugView(
     }
 
     break;
+  case DEBUG_VIEW_CLUSTER_PATH_CLASS:
+    // CYAN = Path B cluster template (deforming/captured), MAGENTA = Path A resident cluster LOD.
+    // Tells you which cluster path a surface is actually on at the moment it flips.
+    if (surface.isClusterTemplate)
+    {
+      storeInDebugView(pixelCoordinate, vec3(0.0, 1.0, 1.0));
+    }
+    else if (surface.isClusterLod)
+    {
+      storeInDebugView(pixelCoordinate, vec3(1.0, 0.0, 1.0));
+    }
+    else
+    {
+      const bool checker = (((pixelCoordinate.x >> 3) & 1) ^ ((pixelCoordinate.y >> 3) & 1)) != 0;
+      storeInDebugView(pixelCoordinate, vec3(checker ? 0.5 : 0.25));
+    }
+
+    break;
   // NV-DXVK end
   case DEBUG_VIEW_CUSTOM_INDEX:
 

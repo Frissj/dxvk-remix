@@ -72,6 +72,7 @@ namespace dxvk {
         {DEBUG_VIEW_CLUSTER_LOD_LEVEL, "Cluster LOD: LOD Level", "Green = highest detail (LOD 0) to red = lowest detail. Path B template surfaces always render source detail and show solid green. Classic surfaces show a checkerboard; MAGENTA = cluster surface without a ClusterID."},
         {DEBUG_VIEW_CLUSTER_LOD_TRIANGLE, "Cluster LOD: Triangle", "Hash-colors each cluster-local triangle. Classic surfaces show a checkerboard; MAGENTA = cluster surface without a ClusterID."},
         {DEBUG_VIEW_CLUSTER_LOD_BLAS, "Cluster LOD: BLAS", "Hash-colors by cluster geometry (per-frame cluster BLAS granularity); classic surfaces show a checkerboard."},
+        {DEBUG_VIEW_CLUSTER_PATH_CLASS, "Cluster: Path Class", "CYAN = Path B cluster template (deforming/captured geometry), MAGENTA = Path A resident cluster LOD, checkerboard = classic. Shows which cluster path a surface is actually taking at the moment it misbehaves."},
         // NV-DXVK end
         {DEBUG_VIEW_CUSTOM_INDEX, "Custom Index"},
         {DEBUG_VIEW_BARYCENTRICS, "Barycentric Coordinates"},

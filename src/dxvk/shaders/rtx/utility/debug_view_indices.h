@@ -294,6 +294,8 @@
 #define DEBUG_VIEW_CLUSTER_LOD_LEVEL 922
 #define DEBUG_VIEW_CLUSTER_LOD_TRIANGLE 923
 #define DEBUG_VIEW_CLUSTER_LOD_BLAS 924
+// NV-DXVK: which cluster path a surface is actually taking (Path decision view).
+#define DEBUG_VIEW_CLUSTER_PATH_CLASS 927
 
 enum class CompositeDebugView : uint32_t {
   Disabled = 0,
