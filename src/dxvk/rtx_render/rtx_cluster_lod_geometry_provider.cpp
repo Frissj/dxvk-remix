@@ -182,7 +182,14 @@ namespace dxvk {
     const bool eligible = snapshotResult == SnapshotResult::Eligible
                        || snapshotResult == SnapshotResult::EligibleConverted;
     snapshot.isDeforming = skinned;
-    snapshot.isMutating = deforming && !skinned;
+    // 4a fix: isMutating means GENUINE CPU vertex-rewrite only, NOT capture. The
+    // old `deforming && !skinned` folded captured draws in (deforming includes
+    // captured), so every captured mesh became isMutating=true and isCaptured
+    // below was mathematically unreachable -> 0 promotion candidates. A captured
+    // mesh is content-stable (its "rewrite" is the GPU capture, not a CPU edit),
+    // so it is a promotion candidate, not churn - separate the two here.
+    const bool cpuMutating = vertexDataUpdated && !captured;
+    snapshot.isMutating = cpuMutating && !skinned;
     // promotion candidates: captured AND content-stable. Mutating meshes stay
     // pure Path B - they can never promote (frozen snapshot vs live rewrites)
     // and their stable asset-rule hash + churning content hashes made every
@@ -664,7 +671,13 @@ namespace dxvk {
       // a session, discovery outpaces processing (raise processing.threadsPct)
       const double queuedMs = snapshot.queuedAtUs != 0 ? double(nowUs() - snapshot.queuedAtUs) * 1e-3 : 0.0;
 
-      if (snapshot.isDeforming || snapshot.isMutating) {
+      // 4a: isCaptured included. Captured meshes MUST register Path B every
+      // session (unconditionally here, unlike the cache-gated interim path
+      // below) - they render via cluster templates until promotion recovers
+      // their transform and flips them to Path A. Without this they fall to the
+      // static path and, on a cache hit, render as an UNTRANSFORMED Path A
+      // render (see the routing comment at the top of onDrawCallGeometry).
+      if (snapshot.isDeforming || snapshot.isMutating || snapshot.isCaptured) {
         // P4b Path B: cluster templates (vk_animated_clusters). The manager's
         // handler runs the one-time registration on this worker thread: CPU
         // clusterization of the topology, then the GPU template build under

@@ -1091,6 +1091,11 @@ bool ClusterRenderSystem::readPromotionStates(PromotionStateView* outStates)
     memcpy(&v.rigidStreak, s + 8, sizeof(uint32_t));
     memcpy(&v.flags, s + 12, sizeof(uint32_t));
     memcpy(&v.lastFrame, s + 16, sizeof(uint32_t));
+    uint32_t shearBits = 0;
+    memcpy(&shearBits, s + 20, sizeof(uint32_t));
+    memcpy(&v.affineNonRigid, &shearBits, sizeof(float));  // ordered-uint == float bits for non-negatives
+    memcpy(&v.diagGuard, s + 24, sizeof(uint32_t));
+    memcpy(&v.diagAux, s + 28, sizeof(uint32_t));
   }
   return true;
 }

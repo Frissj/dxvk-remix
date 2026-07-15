@@ -380,8 +380,12 @@ namespace dxvk {
       return false;
     }
 
-    // P4c: interim templates for static geometry have their own opt-out
-    if (!snapshot.isDeforming && !snapshot.isMutating && !ClusterLodOptions::Animated::interimTemplates()) {
+    // P4c: interim templates for static geometry have their own opt-out.
+    // 4a: captured meshes are exempt - they MUST build templates (Path B is the
+    // only correct render for them until promotion recovers their transform), so
+    // only pure-static non-captured geometry honors the interimTemplates opt-out.
+    if (!snapshot.isDeforming && !snapshot.isMutating && !snapshot.isCaptured
+        && !ClusterLodOptions::Animated::interimTemplates()) {
       return false;
     }
 
@@ -640,9 +644,19 @@ namespace dxvk {
     const float epsilon = std::max(1e-5f, ClusterLodOptions::Promotion::residualEpsilon());
     const uint32_t gateLag = uint32_t(std::max(2, ClusterLodOptions::Promotion::gateLagFrames()));
 
+    // fresh per-pass snapshot of the solve diagnostics (the GPU pads are sticky,
+    // so probeZero/oob are cumulative-ever; affineNonRigid is the latest solve)
+    m_diagMaxAffineNonRigid = 0.0f;
+    m_diagProbeZeroSlots = 0;
+    m_diagStateSlotOob = m_promoStates.empty() ? 0u : m_promoStates[0].diagAux;
+
     for (auto& entry : m_promoCandidates) {
       PromotionCandidate& candidate = entry.second;
       const lodclusters_remix::PromotionStateView& state = m_promoStates[candidate.stateSlot];
+      m_diagMaxAffineNonRigid = std::max(m_diagMaxAffineNonRigid, state.affineNonRigid);
+      if ((state.diagGuard & 1u) != 0u) {
+        m_diagProbeZeroSlots++;
+      }
 
       switch (candidate.phase) {
       case PromotionCandidate::Phase::Probing:
@@ -1328,6 +1342,25 @@ namespace dxvk {
 
     const uint32_t currentFrame = m_device->getCurrentFrameId();
 
+    // promoDiag: emit EVERY SECOND, ALWAYS (wall-clock, not frame-throttled and
+    // not gated on dispatch/candidates) so the data lands in the log before any
+    // crash. Aggregates are the latest from updatePromotionStates.
+    //   probeZeroGuard    = candidates that hit the probeVa==0 guard (the 4b half
+    //                       expected load-bearing; nonzero => it IS the real fix)
+    //   stateSlotOob      = the other guard half (expected 0 by CPU construction)
+    //   maxAffineNonRigid = worst ||A^T A - I||_F; persistently high on a mesh
+    //                       that should be rigid => the Umeyama upgrade is needed
+    {
+      const auto nowTp = std::chrono::steady_clock::now();
+      if (nowTp - m_lastPromoDiagLog >= std::chrono::seconds(1)) {
+        m_lastPromoDiagLog = nowTp;
+        Logger::info(str::format("[ClusterLOD][promoDiag] probeZeroGuard ", m_diagProbeZeroSlots,
+                                 " slots, stateSlotOob ", m_diagStateSlotOob,
+                                 ", maxAffineNonRigid ", m_diagMaxAffineNonRigid,
+                                 ", statesValid ", (m_promoStatesValid ? 1 : 0)));
+      }
+    }
+
     // Periodic stats so the log always carries the intake/skip counts - the
     // per-geometry skip messages are ONCE-per-reason and cannot show totals.
     // Only prints when the counters actually changed since the last line.
@@ -1450,9 +1483,40 @@ namespace dxvk {
                              && blasEntry->frameLastUpdated != blasEntry->frameCreated;
 
     if (skinned || captured || updatedInPlace) {
+      // ---- pinned Path A fast-path ----
+      // Once an instance has PROMOTED, it is identified by its stable BlasEntry*,
+      // NOT the asset hash. The draw-call cache keeps the same BlasEntry across
+      // camera moves, but this game's captured-draw asset hash is unstable
+      // frame-to-frame, so the m_geometryIdByHash lookup in the establish path
+      // below MISSES on every camera-move frame and dropped the mesh back to Path B
+      // (all-cyan in the Path Class view). Route straight off the cached
+      // residentGeometryId, deliberately IGNORING updatedInPlace: a changed asset
+      // hash on an already-rigid promoted instance is the transform moving, not
+      // deformation. Genuine deformation is still caught by the promotion solve
+      // (which sets slot.demoted), so the pin releases on real deform.
+      if (!skinned && ClusterLodOptions::Promotion::enable()
+          && m_renderSystem != nullptr && m_renderSystem->hasGeneration()) {
+        auto pinIt = m_promoSlotByBlas.find(blasEntry);
+        if (pinIt != m_promoSlotByBlas.end()
+            && !pinIt->second.demoted
+            && pinIt->second.residentGeometryId != ~0u
+            && pinIt->second.blasFrameCreated == blasEntry->frameCreated) {
+          const uint32_t usedSlots = uint32_t(m_slots[Tlas::Opaque].size() + m_slots[Tlas::Unordered].size());
+          if (usedSlots < m_renderSystem->getMaxRenderInstances()
+              && (!ClusterLodOptions::Render::routeTrivialToClassic()
+                  || m_trivialGeometryIds.count(pinIt->second.residentGeometryId) == 0)) {
+            outGeometryId = kPromotedTag | (pinIt->second.stateSlot << kPromotedSlotShift) | pinIt->second.residentGeometryId;
+            return true;
+          }
+        }
+      }
+
       // ---- P4c rigid-capture promotion (plan 7.7): PROMOTED captured
       // instances render Path A LOD clusters; the promotion kernel patches
       // their worldMatrix/TLAS transform from the per-frame solve ----
+      // (ESTABLISH path: still gated on !updatedInPlace + a live hash match so a
+      // mesh only enters Path A on a frame it has proven rigid; the pin above then
+      // holds it there across subsequent camera-driven hash churn.)
       if (captured && !skinned && !updatedInPlace
           && m_renderSystem != nullptr && m_renderSystem->hasGeneration()
           && ClusterLodOptions::Promotion::enable() && !m_promoCandidates.empty()) {
@@ -1479,6 +1543,11 @@ namespace dxvk {
               // Path B below while its siblings stay promoted; its slot keeps
               // solving (buildPromotionEntries) so it can re-promote
               if (slotIt != m_promoSlotByBlas.end() && !slotIt->second.demoted) {
+                // Cache the stable identity so the pinned fast-path above can route
+                // this instance every subsequent frame WITHOUT the churning-hash lookup.
+                slotIt->second.residentGeometryId = found->second;
+                slotIt->second.geometryHash = geometryHash;
+                slotIt->second.blasFrameCreated = blasEntry->frameCreated;
                 outGeometryId = kPromotedTag | (slotIt->second.stateSlot << kPromotedSlotShift) | found->second;
                 return true;
               }

@@ -409,6 +409,12 @@ namespace lodclusters_remix {
     uint32_t rigidStreak = 0;
     uint32_t flags = 0;               // bit0 rigid, bit2 demoted (last solve non-rigid)
     uint32_t lastFrame = 0;           // renderer frameIndex of the last solve
+    // diagnostics (kernel pads; see PromoStatus in promotion_solve.comp)
+    float affineNonRigid = 0.0f;      // ||A^T A - I||_F of the fitted affine A:
+                                      // shear+scale content (0 == pure rotation).
+                                      // High => the rigid Umeyama solve is warranted.
+    uint32_t diagGuard = 0;           // bit0: probeVa==0 guard fired for this slot
+    uint32_t diagAux = 0;             // slot 0: frame-global stateSlot-OOB count
   };
 
   // P3: semaphores the caller must attach to the queue submission that

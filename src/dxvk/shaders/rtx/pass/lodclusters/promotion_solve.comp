@@ -60,6 +60,10 @@ layout(local_size_x = 64) in;
 #define PROMO_FLAG_RIGID   1u
 #define PROMO_FLAG_DEMOTED 4u
 
+// mirror of ClusterRenderSystem::kPromotionSlotCapacity - defensive in-shader
+// bound so a bad stateSlot can never scribble the promo buffers (would device-lost)
+#define PROMO_SLOT_CAPACITY 8192u
+
 #define PROMO_SOLVE_SAMPLES      64
 #define PROMO_VALIDATION_SAMPLES 32
 
@@ -119,9 +123,13 @@ struct PromoStatus
   uint  rigidStreak;
   uint  flags;
   uint  lastFrame;
-  uint  _pad0;
-  uint  _pad1;
-  uint  _pad2;
+  // ---- diagnostics (were _pad0.._pad2; zero-filled at buffer init, sticky) ----
+  uint  diagShearBits;     // ordered-float ||A^T A - I||_F: affine-fit non-rigidity
+                           // (shear+scale the unconstrained affine solve invents).
+                           // Monitors whether the rigid Umeyama upgrade is needed.
+  uint  diagGuard;         // bit0: the probeVa==0 guard fired for this slot at least
+                           // once (freed/rejected probe -> null-deref averted)
+  uint  diagAux;           // slot 0 only: frame-global count of stateSlot-OOB entries
 };
 
 layout(buffer_reference, buffer_reference_align = 4, scalar) buffer PromoStatuses
@@ -188,8 +196,33 @@ void main()
     return;
   }
 
-  ProbeBlob     probe    = ProbeBlob(entry.probeVa);
   PromoStatuses statuses = PromoStatuses(push.statusVa);
+
+  // ---- 4b crash guard, SPLIT + INSTRUMENTED so a build can tell WHICH half is
+  //      actually load-bearing (the commit bundled several claimed fixes). Both
+  //      conditions are workgroup-uniform (stateSlot/probeVa are per-entry
+  //      uniform), so all 64 threads return together - no barrier reached below,
+  //      no divergence. ----
+  if(entry.stateSlot >= PROMO_SLOT_CAPACITY)
+  {
+    // OOB stateSlot: cannot touch statuses.s[stateSlot] (that write IS the fault
+    // the guard prevents). Park a frame-global count in slot 0's diag sink. The
+    // CPU bounds stateSlot by construction, so a NONZERO here means a real bug -
+    // i.e. this half of the guard was NOT the one that mattered unless it fires.
+    if(threadId == 0u) { atomicAdd(statuses.s[0].diagAux, 1u); }
+    return;
+  }
+  if(entry.probeVa == 0ul)
+  {
+    // freed/rejected probe: updatePromotionStates frees the blob and zeroes
+    // probeVa on a REJECTED candidate, so a still-dispatched entry lands here.
+    // ProbeBlob(0).sampleCount is a null read = device-lost. stateSlot is valid
+    // (checked above), so flag this slot. This is the half expected to fire.
+    if(threadId == 0u) { statuses.s[entry.stateSlot].diagGuard |= 1u; }
+    return;
+  }
+
+  ProbeBlob probe = ProbeBlob(entry.probeVa);
 
   // ======================================================================
   // MODE_GATE: full-mesh residual sweep with the already-solved M (grid of
@@ -351,11 +384,31 @@ void main()
     matrices.m[mBase + k]      = M[k];
   }
 
+  // ---- affine-upgrade monitor: how far the fitted 3x3 A is from a pure
+  //      rotation. The affine Gram-pseudoinverse solve is UNCONSTRAINED, so it
+  //      can absorb error into SHEAR/scale instead of reporting a bad fit. For a
+  //      rigid rotation A^T A = I; ||A^T A - I||_F is 0 then and grows with the
+  //      scale+shear the fit invents. A mesh that should be rigid but reads a
+  //      persistently high value here is exactly the case the rigid (Umeyama)
+  //      solve upgrade is meant to fix - this only measures the need, no upgrade. ----
+  const vec3 aCol0 = vec3(s_M[0], s_M[4], s_M[8]);   // columns of the row-major 3x3 A
+  const vec3 aCol1 = vec3(s_M[1], s_M[5], s_M[9]);
+  const vec3 aCol2 = vec3(s_M[2], s_M[6], s_M[10]);
+  const float gd0 = dot(aCol0, aCol0) - 1.0;         // diagonal of A^T A - I (scale)
+  const float gd1 = dot(aCol1, aCol1) - 1.0;
+  const float gd2 = dot(aCol2, aCol2) - 1.0;
+  const float go0 = dot(aCol0, aCol1);               // off-diagonal (pure shear)
+  const float go1 = dot(aCol0, aCol2);
+  const float go2 = dot(aCol1, aCol2);
+  const float affineNonRigid = sqrt(gd0*gd0 + gd1*gd1 + gd2*gd2
+                                    + 2.0 * (go0*go0 + go1*go1 + go2*go2));
+
   status.residualRel = residualRel;
   status.rigidStreak = rigid ? (contiguous ? status.rigidStreak + 1u : 1u) : 0u;
   status.lastFrame   = push.frameId;
   status.flags       = (status.flags & ~(PROMO_FLAG_RIGID | PROMO_FLAG_DEMOTED))
                      | (rigid ? PROMO_FLAG_RIGID : PROMO_FLAG_DEMOTED);
+  status.diagShearBits = floatBitsToUint(affineNonRigid);  // non-negative -> ordered
   statuses.s[entry.stateSlot] = status;
 
   // ---- patch a promoted instance's slot: ALWAYS write when assigned - a

@@ -22,6 +22,7 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -585,6 +586,19 @@ namespace dxvk {
       uint32_t sweepLagFrames = 0;
       bool sweepPending = false;
       bool demoted = false;
+      // NV-DXVK: pinned Path A residency. Once an instance PROMOTES, its identity
+      // is this stable BlasEntry* (the draw-call cache keeps the same BlasEntry
+      // across camera moves), NOT the asset hash. This game's captured draws
+      // produce an asset hash that is unstable frame-to-frame under camera motion,
+      // so re-deriving residency from it every frame is exactly what dropped
+      // promoted meshes back to Path B on any camera move. Cached at establish
+      // time so the per-frame route reads the id straight off the slot instead of
+      // an m_geometryIdByHash lookup by the churning hash. residentGeometryId == ~0u
+      // means "not yet pinned"; geometryHash is the ingest-time key; blasFrameCreated
+      // guards against BlasEntry* address reuse.
+      uint32_t residentGeometryId = ~0u;
+      uint64_t geometryHash = 0;
+      uint32_t blasFrameCreated = 0;
     };
     std::unordered_map<const BlasEntry*, PromoInstance> m_promoSlotByBlas;
     // per-frame kernel work items (built in dispatchBuild, consumed by
@@ -594,6 +608,11 @@ namespace dxvk {
     bool m_promoStatesValid = false;
     uint32_t m_statsPromoted = 0;
     uint32_t m_statsPromoRejected = 0;
+    // promotion-solve diagnostics, aggregated per updatePromotionStates pass and
+    // reported by logFrameTimes (gameplay-gated + throttled). See PromoStatus.
+    float m_diagMaxAffineNonRigid = 0.0f;  // worst affine shear/scale seen (0 == rigid)
+    uint32_t m_diagProbeZeroSlots = 0;     // candidates that hit the probeVa==0 guard
+    uint32_t m_diagStateSlotOob = 0;       // frame-global stateSlot-OOB count (slot 0)
 
     // worker thread (P4c): probe precompute (samples + Gram pseudoinverse in
     // doubles) + upload through the template system's callback-locked path
@@ -626,6 +645,8 @@ namespace dxvk {
     // line is only emitted when they changed
     uint32_t m_lastStatsLogFrame = 0;
     uint64_t m_lastLoggedStatsDigest = 0;
+    // promoDiag: wall-clock 1s throttle, emitted unconditionally every frame
+    std::chrono::steady_clock::time_point m_lastPromoDiagLog{};
 
     // ---- chrono: per-frame CPU section times, accumulated between periodic
     //      logs (avg = steady cost, max = the hitches an avg hides) ----
