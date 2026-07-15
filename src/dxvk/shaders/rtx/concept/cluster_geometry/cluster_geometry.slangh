@@ -142,6 +142,17 @@ ClusterGeometry clusterGeometryCreate(uint64_t geometriesTableAddress, uint geom
 
   const uint64_t clusterAddress = clusterGeometryLoadU64(preloadedClusters + uint64_t(clusterId) * 8);
 
+  // Stale / never-published cluster-table entry: a Path B ClusterID past the
+  // animated table's boundary that was never written, or an in-flight instance
+  // pointing at a freed pool after a cluster generation grow. Reading the header
+  // at address 0 is a Read VA=0 device-lost; return an invalid struct (clusterAddress
+  // stays 0 -> isValid false) so the getters below skip it and the caller renders a
+  // degenerate triangle instead of crashing.
+  if (clusterAddress == 0)
+  {
+    return clusterGeometry;
+  }
+
   // shaderio::Cluster header (16 bytes)
   const uint headerWord0 = clusterGeometryLoadU32(clusterAddress + 0);
   const uint headerWord1 = clusterGeometryLoadU32(clusterAddress + 4);
@@ -156,12 +167,26 @@ ClusterGeometry clusterGeometryCreate(uint64_t geometriesTableAddress, uint geom
   clusterGeometry.verticesOffset = clusterGeometryLoadU32(clusterAddress + 8);
   clusterGeometry.trianglesOffset = clusterGeometryLoadU32(clusterAddress + 12);
 
+  // A valid cluster's byte offsets are small (< one cluster's worth). A stale
+  // clusterAddress that happens to be mapped decodes to huge offsets that would OOB
+  // the getters below - reject it the same way (clusterAddress back to 0 -> invalid).
+  if (clusterGeometry.verticesOffset > 0x100000u || clusterGeometry.trianglesOffset > 0x100000u)
+  {
+    ClusterGeometry invalid;
+    return invalid;
+  }
+
   return clusterGeometry;
 }
 
 // Cluster-local uint8 triangle indices (Cluster_getTriangleIndices)
 uint3 clusterGeometryGetTriangleIndices(ClusterGeometry clusterGeometry, uint primitiveIndex)
 {
+  if (!clusterGeometry.isValid)
+  {
+    return uint3(0);  // invalid resolve (stale/unpublished cluster): degenerate triangle, not a VA=0 deref
+  }
+
   const uint64_t indicesAddress =
     clusterGeometry.clusterAddress + clusterGeometry.trianglesOffset + uint64_t(primitiveIndex) * 3;
 
@@ -175,6 +200,11 @@ uint3 clusterGeometryGetTriangleIndices(ClusterGeometry clusterGeometry, uint pr
 // vec3 object-space position (Cluster_getVertexPositions)
 vec3 clusterGeometryGetPosition(ClusterGeometry clusterGeometry, uint vertexIndex)
 {
+  if (!clusterGeometry.isValid)
+  {
+    return vec3(0.0);
+  }
+
   const uint64_t positionAddress =
     clusterGeometry.clusterAddress + clusterGeometry.verticesOffset + uint64_t(vertexIndex) * 12;
 
@@ -187,6 +217,11 @@ vec3 clusterGeometryGetPosition(ClusterGeometry clusterGeometry, uint vertexInde
 // packed normal(+tangent) attribute word (Cluster_getVertexNormals)
 uint clusterGeometryGetPackedNormal(ClusterGeometry clusterGeometry, uint vertexIndex)
 {
+  if (!clusterGeometry.isValid)
+  {
+    return 0u;
+  }
+
   const uint64_t normalsAddress = clusterGeometry.clusterAddress + clusterGeometry.verticesOffset
     + uint64_t(clusterGeometry.vertexCount) * 12 + uint64_t(vertexIndex) * 4;
 
@@ -197,6 +232,11 @@ uint clusterGeometryGetPackedNormal(ClusterGeometry clusterGeometry, uint vertex
 // present, the packed normal/tangent word; 8-byte aligned)
 vec2 clusterGeometryGetTexcoord0(ClusterGeometry clusterGeometry, uint vertexIndex)
 {
+  if (!clusterGeometry.isValid)
+  {
+    return vec2(0.0);
+  }
+
   const uint elementsPerVertex = clusterGeometry.hasNormals ? 4u : 3u;
 
   uint64_t texcoordsAddress = clusterGeometry.clusterAddress
@@ -229,6 +269,16 @@ uint3 clusterTemplateGetTriangleIndices(uint64_t tableAddress, uint clusterId, u
   }
 
   const uint64_t trianglesAddress = clusterGeometryLoadU64(tableAddress + uint64_t(clusterId) * 8);
+
+  // Null animated-table entry: a template baked a ClusterID whose global table slot
+  // was never published (observed for every clusterId >= 4096 - the second wave of
+  // registered geometries past the table's first-batch boundary). Reading indices at
+  // address 0 is a Read VA=0 device-lost; return a degenerate triangle instead.
+  if (trianglesAddress == 0)
+  {
+    return uint3(0, 0, 0);
+  }
+
   const uint64_t indicesAddress = trianglesAddress + uint64_t(primitiveIndex) * 12;
 
   return uint3(

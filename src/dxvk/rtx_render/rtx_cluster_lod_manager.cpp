@@ -644,11 +644,14 @@ namespace dxvk {
     const float epsilon = std::max(1e-5f, ClusterLodOptions::Promotion::residualEpsilon());
     const uint32_t gateLag = uint32_t(std::max(2, ClusterLodOptions::Promotion::gateLagFrames()));
 
-    // fresh per-pass snapshot of the solve diagnostics (the GPU pads are sticky,
-    // so probeZero/oob are cumulative-ever; affineNonRigid is the latest solve)
+    // fresh per-pass snapshot of the solve diagnostics
     m_diagMaxAffineNonRigid = 0.0f;
     m_diagProbeZeroSlots = 0;
-    m_diagStateSlotOob = m_promoStates.empty() ? 0u : m_promoStates[0].diagAux;
+    m_diagDegenSlots = 0;
+    m_diagWorstGeom = 0;
+    m_diagWorstRefVar = 0.0f;
+    m_diagWorstSampleN = 0;
+    float worstRefVarSeen = std::numeric_limits<float>::max();
 
     for (auto& entry : m_promoCandidates) {
       PromotionCandidate& candidate = entry.second;
@@ -656,6 +659,21 @@ namespace dxvk {
       m_diagMaxAffineNonRigid = std::max(m_diagMaxAffineNonRigid, state.affineNonRigid);
       if ((state.diagGuard & 1u) != 0u) {
         m_diagProbeZeroSlots++;
+      }
+      if ((state.diagGuard & 2u) != 0u) {
+        // a DEGENERATE fit (why it would have exploded). Name the worst one by the
+        // smallest ref-sample spread. diagAux = refVar (float bits); diagGuard[8:16]
+        // = sampleCount used. refVar ~ 0 with sampleCount full == coincident refs;
+        // sampleCount ~ 0 == probe not populated (solved before ready).
+        m_diagDegenSlots++;
+        float rv = 0.0f;
+        std::memcpy(&rv, &state.diagAux, sizeof(float));
+        if (rv < worstRefVarSeen) {
+          worstRefVarSeen = rv;
+          m_diagWorstGeom = entry.first;
+          m_diagWorstRefVar = rv;
+          m_diagWorstSampleN = (state.diagGuard >> 8) & 0xFFu;
+        }
       }
 
       switch (candidate.phase) {
@@ -1355,8 +1373,11 @@ namespace dxvk {
       if (nowTp - m_lastPromoDiagLog >= std::chrono::seconds(1)) {
         m_lastPromoDiagLog = nowTp;
         Logger::info(str::format("[ClusterLOD][promoDiag] probeZeroGuard ", m_diagProbeZeroSlots,
-                                 " slots, stateSlotOob ", m_diagStateSlotOob,
+                                 ", degenSlots ", m_diagDegenSlots,
                                  ", maxAffineNonRigid ", m_diagMaxAffineNonRigid,
+                                 " (worst geom 0x", std::hex, m_diagWorstGeom, std::dec,
+                                 " refVar ", m_diagWorstRefVar,
+                                 " sampleN ", m_diagWorstSampleN, ")",
                                  ", statesValid ", (m_promoStatesValid ? 1 : 0)));
       }
     }

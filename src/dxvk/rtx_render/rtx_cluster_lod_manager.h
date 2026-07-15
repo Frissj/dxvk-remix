@@ -612,7 +612,11 @@ namespace dxvk {
     // reported by logFrameTimes (gameplay-gated + throttled). See PromoStatus.
     float m_diagMaxAffineNonRigid = 0.0f;  // worst affine shear/scale seen (0 == rigid)
     uint32_t m_diagProbeZeroSlots = 0;     // candidates that hit the probeVa==0 guard
-    uint32_t m_diagStateSlotOob = 0;       // frame-global stateSlot-OOB count (slot 0)
+    uint32_t m_diagDegenSlots = 0;         // candidates whose fit was rejected degenerate
+    // forensics for the worst (max non-rigid) slot: names WHY it degenerates
+    uint64_t m_diagWorstGeom = 0;          // geometry hash of the worst slot
+    float m_diagWorstRefVar = 0.0f;        // its ref-sample spread (~0 == coincident refs)
+    uint32_t m_diagWorstSampleN = 0;       // its probe.sampleCount
 
     // worker thread (P4c): probe precompute (samples + Gram pseudoinverse in
     // doubles) + upload through the template system's callback-locked path

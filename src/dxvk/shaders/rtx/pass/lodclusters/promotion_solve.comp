@@ -166,10 +166,15 @@ layout(push_constant, scalar) uniform PushData
 push;
 
 // ---- shared reduction storage ----
-shared float s_b[64][12];      // per-thread partial b vectors (3 rows x 4)
+shared float s_b[64][16];      // per-thread partial sums: [0..11] cross-cov + Sum(cap),
+                               // [12..14] Sum(ref), [15] Sum(|ref|^2) - for the rigid fit
 shared float s_dev[64];        // validation deviations
 shared float s_M[12];          // solved rows [A|t'] (row-major 3x4)
 shared bool  s_rigid;
+// diagnostics to find WHY a fit degenerates (thread 0 writes, read in the tail):
+shared float s_diagRefVar;     // ref-sample spread of this solve (near 0 == coincident refs)
+shared uint  s_diagSampleN;    // probe.sampleCount actually used
+shared bool  s_diagDegen;      // fit rejected as degenerate / non-finite
 
 vec3 loadCapture(uint64_t captureVa, uint strideBytes, uint index)
 {
@@ -274,8 +279,11 @@ void main()
   // MODE_SOLVE: one 64-thread group per entry
   // ======================================================================
 
-  // ---- partial b vectors: b_r = sum(refH * cap_r) over the solve samples ----
-  for(uint k = 0; k < 12; k++)
+  // ---- partial sums over the solve samples (reduced by thread 0 into the rigid
+  //      similarity fit below). Per thread:
+  //        [r*4+c<3] = ref_c * cap_r  (cross-covariance Hyx), [r*4+3] = cap_r
+  //        [12..14]  = ref            (Sum(ref)),   [15] = |ref|^2 (Sum(|ref|^2))
+  for(uint k = 0; k < 16; k++)
   {
     s_b[threadId][k] = 0.0;
   }
@@ -283,7 +291,8 @@ void main()
   if(threadId < probe.sampleCount)
   {
     const PromoSample smp = probe.samples[threadId];
-    const vec4 refH = vec4(smp.refX, smp.refY, smp.refZ, 1.0);
+    const vec3 ref  = vec3(smp.refX, smp.refY, smp.refZ);
+    const vec4 refH = vec4(ref, 1.0);
     const vec3 cap  = loadCapture(entry.captureVa, entry.captureStrideBytes, smp.index);
 
     for(uint r = 0; r < 3; r++)
@@ -292,17 +301,21 @@ void main()
       s_b[threadId][r * 4 + 0] = refH.x * capR;
       s_b[threadId][r * 4 + 1] = refH.y * capR;
       s_b[threadId][r * 4 + 2] = refH.z * capR;
-      s_b[threadId][r * 4 + 3] = refH.w * capR;
+      s_b[threadId][r * 4 + 3] = refH.w * capR;   // == cap_r
     }
+    s_b[threadId][12] = ref.x;
+    s_b[threadId][13] = ref.y;
+    s_b[threadId][14] = ref.z;
+    s_b[threadId][15] = dot(ref, ref);
   }
 
   barrier();
 
-  // ---- thread 0: reduce, solve rows via the precomputed pseudoinverse ----
+  // ---- thread 0: reduce the partial sums, then solve a RIGID (similarity) map ----
   if(threadId == 0)
   {
-    float b[12];
-    for(uint k = 0; k < 12; k++)
+    float b[16];
+    for(uint k = 0; k < 16; k++)
     {
       float acc = 0.0;
       for(uint t = 0; t < 64; t++)
@@ -312,15 +325,113 @@ void main()
       b[k] = acc;
     }
 
-    // row r of [A|t]: (Ginv * b_r) - Ginv is row-major 4x4
-    for(uint r = 0; r < 3; r++)
+    // RIGID similarity fit (rotation + uniform scale + translation), NOT the old
+    // unconstrained affine Gram-pseudoinverse. The affine solve's free DOF absorbed
+    // fit error as SHEAR / anisotropic scale: it stayed sample-exact (tiny residual,
+    // so it PASSED the promotion gate) while the 3x3 blew up (||A^T A - I|| ~ 4.5e5
+    // observed the frame before a device-lost) and patched a degenerate transform
+    // into the TLAS. A similarity map cannot do that - shear raises the residual and
+    // is correctly rejected. probe.gInv is no longer used (legacy of the affine solve).
+    //
+    //   n samples, ref pre-centered by the full-mesh centroid on the CPU:
+    //     Hyx[r][c] = sum ref_c*cap_r (b[r*4+c], c<3);  sumCap=(b3,b7,b11)
+    //     sumRef = b[12..14];  sumRef2 = b[15]
+    const float n      = max(float(probe.sampleCount), 1.0);
+    const vec3  capBar = vec3(b[3], b[7], b[11]) / n;
+    const vec3  refBar = vec3(b[12], b[13], b[14]) / n;
+
+    // centered cross-covariance (GLSL mat3 is column-major: Mcov[col][row]):
+    //   Mcov[c][r] = Hyx[r][c] - n*capBar[r]*refBar[c]
+    mat3 Mcov;
+    for(uint c = 0; c < 3; c++)
     {
-      for(uint c = 0; c < 4; c++)
+      for(uint r = 0; r < 3; r++)
       {
-        s_M[r * 4 + c] = probe.gInv[c * 4 + 0] * b[r * 4 + 0]
-                       + probe.gInv[c * 4 + 1] * b[r * 4 + 1]
-                       + probe.gInv[c * 4 + 2] * b[r * 4 + 2]
-                       + probe.gInv[c * 4 + 3] * b[r * 4 + 3];
+        Mcov[c][r] = b[r * 4 + c] - n * capBar[r] * refBar[c];
+      }
+    }
+
+    // rotation = orthogonal polar factor of Mcov via the Higham iteration
+    // R_{k+1} = 0.5*(R_k + (R_k^-1)^T). Quadratic convergence; the det guard keeps a
+    // near-singular (degenerate sample set) Mcov from feeding NaN into inverse().
+    bool ok = abs(determinant(Mcov)) > 1e-20;
+    mat3 R = Mcov;
+    if(ok)
+    {
+      for(int it = 0; it < 12; it++)
+      {
+        R = 0.5 * (R + transpose(inverse(R)));
+      }
+      ok = !any(isnan(R[0])) && !any(isnan(R[1])) && !any(isnan(R[2]))
+        && !any(isinf(R[0])) && !any(isinf(R[1])) && !any(isinf(R[2]));
+
+      // The Higham iteration only yields an ORTHONORMAL R when Mcov is well
+      // conditioned. A near-singular cross-covariance (few / coplanar samples -
+      // the sampleN 4 slots) passes the loose 1e-20 det guard yet makes
+      // inverse(R) diverge to a HUGE-but-finite R (~1e30). abs(s)<1e6 below only
+      // bounds the SCALE, not the rotation, so A = s*R then slips through fitOk
+      // finite -> the ||A^T A - I|| monitor squares dot(aCol,aCol)~(1e30)^2 and
+      // OVERFLOWS float to +inf (the 'maxAffineNonRigid inf' in the log; the slot
+      // is not counted degenerate because fitOk stayed true). A true rotation has
+      // unit-norm columns; reject when R is not orthonormal so the fit is scored
+      // degenerate (s_M -> 0 -> a bounded sqrt(3)) instead.
+      if(ok)
+      {
+        const float rn0 = dot(R[0], R[0]);
+        const float rn1 = dot(R[1], R[1]);
+        const float rn2 = dot(R[2], R[2]);
+        ok = rn0 > 0.5 && rn0 < 2.0
+          && rn1 > 0.5 && rn1 < 2.0
+          && rn2 > 0.5 && rn2 < 2.0;
+      }
+    }
+
+    // uniform scale minimizing |s*R*ref - cap|^2 for the fixed R:
+    //   s = trace(R^T Mcov) / sum|ref - refBar|^2
+    // refVar is the ref-sample spread. A near-coincident sample set (tiny refVar -
+    // e.g. a freshly appended geometry) makes s explode: the earlier 1e-9 clamp let
+    // that through as a huge scale -> s_M = inf -> patched an exploded transform into
+    // the TLAS -> device-lost (observed: maxAffineNonRigid 'inf' the frame before the
+    // fence crash). Treat tiny refVar / huge or non-finite s|A|t as degenerate.
+    const float refVar = b[15] - n * dot(refBar, refBar);
+    const float trRtM  = dot(R[0], Mcov[0]) + dot(R[1], Mcov[1]) + dot(R[2], Mcov[2]);
+    const float s      = refVar > 1e-8 ? trRtM / refVar : 0.0;
+
+    const mat3 A = s * R;
+    const vec3 t = capBar - A * refBar;
+
+    const bool fitOk = ok
+      && refVar > 1e-8 && abs(s) < 1.0e6
+      && !any(isnan(A[0])) && !any(isnan(A[1])) && !any(isnan(A[2]))
+      && !any(isinf(A[0])) && !any(isinf(A[1])) && !any(isinf(A[2]))
+      && !any(isnan(t)) && !any(isinf(t));
+
+    // capture the inputs that decide degeneracy so the CPU can name WHY (a fresh
+    // geometry solved before its probe is populated? coincident ref samples?).
+    s_diagRefVar  = refVar;
+    s_diagSampleN = probe.sampleCount;
+    s_diagDegen   = !fitOk;
+
+    if(fitOk)
+    {
+      // A = s*R; t = capBar - A*refBar. Store row-major into s_M[r*4+c] (A[col][row]).
+      for(uint r = 0; r < 3; r++)
+      {
+        s_M[r * 4 + 0] = A[0][r];
+        s_M[r * 4 + 1] = A[1][r];
+        s_M[r * 4 + 2] = A[2][r];
+        s_M[r * 4 + 3] = t[r];
+      }
+    }
+    else
+    {
+      // degenerate / non-finite fit: emit a zero map so the validation residual
+      // below is huge -> rigid=false -> not promoted, last-good kept. NEVER patch a
+      // non-finite or exploded transform (that is the device-lost). This is also why
+      // maxAffineNonRigid reads a steady sqrt(3) ~ 1.73205 for rejected slots.
+      for(uint k = 0; k < 12; k++)
+      {
+        s_M[k] = 0.0;
       }
     }
   }
@@ -409,6 +520,12 @@ void main()
   status.flags       = (status.flags & ~(PROMO_FLAG_RIGID | PROMO_FLAG_DEMOTED))
                      | (rigid ? PROMO_FLAG_RIGID : PROMO_FLAG_DEMOTED);
   status.diagShearBits = floatBitsToUint(affineNonRigid);  // non-negative -> ordered
+  // degeneracy forensics: diagAux = refVar (float bits); diagGuard keeps the probeVa
+  // bit0, adds bit1 = degenerate fit, and packs sampleCount into bits [8:16].
+  status.diagAux   = floatBitsToUint(s_diagRefVar);
+  status.diagGuard = (status.diagGuard & 0x1u)
+                   | (s_diagDegen ? 0x2u : 0x0u)
+                   | (min(s_diagSampleN, 255u) << 8);
   statuses.s[entry.stateSlot] = status;
 
   // ---- patch a promoted instance's slot: ALWAYS write when assigned - a

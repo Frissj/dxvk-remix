@@ -242,6 +242,18 @@ struct ClusterTemplateSystem::Impl
   uint32_t              clusterTableCapacity = 0;  // records
   uint32_t              clusterTableCount    = 0;  // records used (worker-side)
   std::atomic<uint64_t> clusterTableAddress { 0 };
+  // buildGeometryTemplates runs on up to 4 provider worker threads; this guards
+  // the cluster-table reservation (globalClusterBase / clusterTableCount), the
+  // ensureClusterTableCapacity grow (buffer swap), AND the per-geometry publish,
+  // which were an unsynchronized read-modify-write -> overlapping/lost reservations
+  // and torn writes left some table slots unpublished (0), the root of the stale
+  // clusterId>=4096 resolves.
+  std::mutex            clusterTableMutex;
+  // [ClusterTableVerify] proof the mutex fixed the race: marks each published slot;
+  // a slot written twice == an overlapping reservation (the race). 0 == fixed.
+  std::vector<uint8_t>  tableCoverage;              // guarded by clusterTableMutex
+  uint64_t              tableOverlapCount = 0;      // guarded by clusterTableMutex
+  uint64_t              tablePublishedRecords = 0;  // guarded by clusterTableMutex
 
   //////////////////////////////////////////////////////////////////////////
   // pose sets (one per Remix BlasEntry)
@@ -888,13 +900,18 @@ bool ClusterTemplateSystem::buildGeometryTemplates(uint64_t token)
   data->opaque       = pending->opaque;
   data->clusters     = std::move(geometry.clusters);
 
-  // global cluster table range (REMIX: baked into template clusterIDs)
-  data->globalClusterBase = impl.clusterTableCount;
-  if(!impl.ensureClusterTableCapacity(impl.clusterTableCount + numClusters))
+  // global cluster table range (REMIX: baked into template clusterIDs). Reserve
+  // the range + grow the buffer atomically: 4 provider workers race here otherwise,
+  // producing overlapping bases and lost count updates (clusterTableMutex).
   {
-    return false;
+    std::lock_guard<std::mutex> lock(impl.clusterTableMutex);
+    data->globalClusterBase = impl.clusterTableCount;
+    if(!impl.ensureClusterTableCapacity(impl.clusterTableCount + numClusters))
+    {
+      return false;
+    }
+    impl.clusterTableCount += numClusters;
   }
-  impl.clusterTableCount += numClusters;
 
   // ---- resident cluster-ordered index topology + temporary reference
   //      positions (bind pose; template build only) ----
@@ -1289,8 +1306,31 @@ bool ClusterTemplateSystem::buildGeometryTemplates(uint64_t token)
     {
       records[c] = data->trianglesBuffer.address + uint64_t(data->clusters[c].firstTriangle) * sizeof(glm::uvec3);
     }
+    // publish under the same mutex: another worker's ensureClusterTableCapacity grow
+    // must not swap clusterTableBuffer out from under this upload (torn/lost write).
+    std::lock_guard<std::mutex> lock(impl.clusterTableMutex);
     impl.res.simpleUploadBuffer(impl.clusterTableBuffer, sizeof(uint64_t) * data->globalClusterBase,
                                 sizeof(uint64_t) * numClusters, records.data());
+
+    // [ClusterTableVerify] mark coverage; a double-mark is an overlapping reservation
+    // (the race this mutex fixes). Warn once per overlap; silence == fixed.
+    const uint32_t end = data->globalClusterBase + numClusters;
+    if(impl.tableCoverage.size() < end)
+    {
+      impl.tableCoverage.resize(end, 0u);
+    }
+    for(uint32_t c = 0; c < numClusters; c++)
+    {
+      if(impl.tableCoverage[data->globalClusterBase + c]++ != 0u)
+      {
+        impl.tableOverlapCount++;
+      }
+    }
+    impl.tablePublishedRecords += numClusters;
+    LOGI("[ClusterTableVerify] published [%u,%u) records=%llu overlaps=%llu count=%u\n",
+         data->globalClusterBase, end,
+         (unsigned long long)impl.tablePublishedRecords,
+         (unsigned long long)impl.tableOverlapCount, impl.clusterTableCount);
   }
 
   LOGI("ClusterTemplateSystem: %s: %u clusters, %u tris, %u verts%s\n", data->name.c_str(), numClusters,
