@@ -385,6 +385,9 @@ namespace lodclusters_remix {
     const struct PromotionEntry* promotionEntries = nullptr;
     uint32_t promotionEntryCount = 0;
     float promotionResidualEpsilon = 0.005f;
+    // DIAG (probe only): run the ref->capture correspondence offset scan in the
+    // solve kernel and report the best-matching offset in the reject log. No fix.
+    bool promotionCorrespondenceScan = false;
   };
 
   // P4c: one promotion work item (40 bytes, mirrored by promotion_solve.comp
@@ -397,7 +400,9 @@ namespace lodclusters_remix {
     uint32_t patchSlot = 0xFFFFFFFFu; // RenderInstance/TlasInstance index; ~0 = probe-only
     uint32_t mode = 0;                // 0 = solve (+patch), 1 = full-mesh gate
     uint32_t vertexCount = 0;         // gate dispatch sizing (mode 1)
-    uint32_t pad0 = 0;
+    uint32_t captureVertexCount = 0;  // DIAG: valid capture slots from captureVa (0 =
+                                      // unknown -> correspondence scan self-disables).
+                                      // Bounds the probe's offset-scan reads (no OOB).
   };
   static_assert(sizeof(PromotionEntry) == 40, "kernel mirrors this layout");
 
@@ -415,6 +420,8 @@ namespace lodclusters_remix {
                                       // High => the rigid Umeyama solve is warranted.
     uint32_t diagGuard = 0;           // bit0: probeVa==0 guard fired for this slot
     uint32_t diagAux = 0;             // slot 0: frame-global stateSlot-OOB count
+    uint32_t gateOverCount = 0;       // DIAG: full-mesh verts with residual > epsilon
+    uint32_t gateStaleFrames = 0;     // DIAG: gate frame - last-solve frame (M staleness)
   };
 
   // P3: semaphores the caller must attach to the queue submission that

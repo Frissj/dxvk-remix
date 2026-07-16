@@ -355,6 +355,14 @@ namespace dxvk {
                  "the sparse per-frame solve can miss a VS animating a small vertex subset, so every promoted\n"
                  "instance re-runs the every-vertex sweep on this interval (staggered by state slot). A failing\n"
                  "sweep demotes that instance to Path B. 0 disables the sweeps (not recommended).");
+      RTX_OPTION("rtx.clusterLod.promotion", bool, correspondenceScan, false,
+                 "DIAGNOSTIC PROBE (no fix, off by default). For every candidate, the solve kernel also runs a\n"
+                 "transform-invariant pairwise-distance scan over a fixed table of ref->capture vertex-index\n"
+                 "offsets and reports which offset best matches the reference point cloud. This reveals the\n"
+                 "ref/cap index skew that scrambles shared-vertex-buffer meshes (the sEff~1 + high-residual\n"
+                 "rejects, e.g. buildings) WITHOUT applying any correction. The verdict + offset are appended to\n"
+                 "the 'gate REJECTED' log line as scanOff=<n> scanV=<none|impr|COLLAPSE>. Costs a per-candidate\n"
+                 "scan while enabled; bounds-clamped so it can never read past the capture buffer.");
     };
   };
 
@@ -515,6 +523,8 @@ namespace dxvk {
       uint32_t poseSetId = ~0u;
       uint64_t positionsAddress = 0;
       uint32_t positionsStrideBytes = 0;
+      uint32_t positionsCount = 0;     // DIAG: valid capture slots from positionsAddress
+                                       // (bounds the correspondence scan; 0 = unknown)
       Rc<DxvkBuffer> positionsBuffer;  // lifetime tracking on the cmd list
     };
     std::vector<FramePose> m_framePoses;

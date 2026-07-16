@@ -101,7 +101,7 @@ struct PromoEntry
   uint     patchSlot;  // 0xFFFFFFFF = probe-only (no patch)
   uint     mode;
   uint     vertexCount;  // gate dispatch sizing (mode 1; kernel bounds on probe)
-  uint     pad0;
+  uint     captureVertexCount;  // DIAG: valid capture slots (bounds the offset scan)
 };
 
 layout(buffer_reference, buffer_reference_align = 8, scalar) buffer PromoEntries
@@ -130,6 +130,12 @@ struct PromoStatus
   uint  diagGuard;         // bit0: the probeVa==0 guard fired for this slot at least
                            // once (freed/rejected probe -> null-deref averted)
   uint  diagAux;           // slot 0 only: frame-global count of stateSlot-OOB entries
+  uint  gateOverCount;     // DIAG: MODE_GATE count of referenced verts with devRel >
+                           // epsilon. Distinguishes a few outlier verts (small) from a
+                           // globally-wrong fit / widespread deform (large). Reset per gate.
+  uint  gateStaleFrames;   // DIAG: MODE_GATE frameId - lastFrame(last solve). >0 means the
+                           // gate tests an M solved on an EARLIER frame than its capture -
+                           // wrong for the whole mesh if the capture space moved per frame.
 };
 
 layout(buffer_reference, buffer_reference_align = 4, scalar) buffer PromoStatuses
@@ -162,6 +168,7 @@ layout(push_constant, scalar) uniform PushData
   uint     riFlipWindingOffset;    // dword holding flipWinding|twoSided|multiMaterial|opaqueStatus bytes
   float    residualEpsilon;        // relative to probe radius
   uint     gateEntryIndex;         // MODE_GATE: which entry this dispatch runs
+  uint     promoScanEnable;        // DIAG: 1 = run the ref->cap correspondence offset scan
 }
 push;
 
@@ -176,6 +183,22 @@ shared float s_diagRefVar;     // ref-sample spread of this solve (near 0 == coi
 shared uint  s_diagSampleN;    // probe.sampleCount actually used
 shared bool  s_diagDegen;      // fit rejected as degenerate / non-finite
 shared uint  s_diagReason;     // which pipeline stage rejected it (see degenReason enum)
+shared float s_capSq[64];      // per-sample |cap|^2 (capture-spread diagnostic)
+shared float s_diagCapVar;     // capture-sample spread (ref-vs-cap correspondence probe)
+shared float s_diagMcovDet;    // DIAG: det(cross-covariance) sign = reflection detector
+shared float s_scanScore[64];  // DIAG: per-offset correspondence mismatch (one offset per thread)
+
+// DIAG correspondence scan: ref->capture vertex-index offset table, one entry per
+// thread. Index 0 is offset 0 (the correspondence the solve assumes); the rest are
+// +/- magnitudes, small-dense then exponential, to catch both a tiny skew and a
+// large shared-vertex-buffer base shift (e.g. a building's BaseVertexIndex). The CPU
+// side (rtx_cluster_lod_manager kScanOffsets) MUST mirror this table exactly.
+const int kScanOffsets[64] = int[](
+   0,
+   1,   -1,    2,   -2,    3,   -3,    4,   -4,    5,   -5,    6,   -6,    7,   -7,    8,   -8,
+  10,  -10,   12,  -12,   16,  -16,   20,  -20,   24,  -24,   32,  -32,   48,  -48,   64,  -64,
+  96,  -96,  128, -128,  192, -192,  256, -256,  384, -384,  512, -512,  768, -768, 1024,-1024,
+1536,-1536, 2048,-2048, 3072,-3072, 4096,-4096, 8192,-8192,16384,-16384,32768,-32768,65536);
 
 vec3 loadCapture(uint64_t captureVa, uint strideBytes, uint index)
 {
@@ -301,6 +324,13 @@ void main()
       return;
     }
 
+    // DIAG: how many frames stale the M under test is (single writer). lastFrame is the
+    // frameId of the solve that wrote this M; push.frameId is this gate's frame.
+    if(vertex == 0u)
+    {
+      statuses.s[entry.stateSlot].gateStaleFrames = push.frameId - statuses.s[entry.stateSlot].lastFrame;
+    }
+
     // full ref positions are stored CENTERED like the samples, index = vertex.
     // The matrices buffer holds the DECENTERED M (it maps ORIGINAL input-space
     // positions - see the decenter step in MODE_SOLVE), so the centroid must be
@@ -322,6 +352,11 @@ void main()
     const float devRel = length(fitted - cap) / max(probe.radius, 1e-6);
 
     atomicMax(statuses.s[entry.stateSlot].gateResidualBits, floatBitsToUint(devRel));
+    // DIAG: count verts that actually violate the residual gate (outliers vs global)
+    if(devRel > push.residualEpsilon)
+    {
+      atomicAdd(statuses.s[entry.stateSlot].gateOverCount, 1u);
+    }
     return;
   }
 
@@ -337,6 +372,7 @@ void main()
   {
     s_b[threadId][k] = 0.0;
   }
+  s_capSq[threadId] = 0.0;
 
   if(threadId < probe.sampleCount)
   {
@@ -344,6 +380,7 @@ void main()
     const vec3 ref  = vec3(smp.refX, smp.refY, smp.refZ);
     const vec4 refH = vec4(ref, 1.0);
     const vec3 cap  = loadCapture(entry.captureVa, entry.captureStrideBytes, smp.index);
+    s_capSq[threadId] = dot(cap, cap);
 
     for(uint r = 0; r < 3; r++)
     {
@@ -374,6 +411,11 @@ void main()
       }
       b[k] = acc;
     }
+    float sumCapSq = 0.0;
+    for(uint t = 0; t < 64; t++)
+    {
+      sumCapSq += s_capSq[t];
+    }
 
     // RIGID similarity fit (rotation + uniform scale + translation), NOT the old
     // unconstrained affine Gram-pseudoinverse. The affine solve's free DOF absorbed
@@ -388,6 +430,7 @@ void main()
     //     sumRef = b[12..14];  sumRef2 = b[15]
     const float n      = max(float(probe.sampleCount), 1.0);
     const vec3  capBar = vec3(b[3], b[7], b[11]) / n;
+    s_diagCapVar = sumCapSq - n * dot(capBar, capBar);  // capture-sample spread
     const vec3  refBar = vec3(b[12], b[13], b[14]) / n;
 
     // centered cross-covariance (GLSL mat3 is column-major: Mcov[col][row]):
@@ -400,6 +443,13 @@ void main()
         Mcov[c][r] = b[r * 4 + c] - n * capBar[r] * refBar[c];
       }
     }
+
+    // DIAG (probe only): reflection detector. In the Kabsch/Umeyama fit the sign of
+    // det(cross-covariance) is the handedness of the data's OPTIMAL alignment - < 0
+    // means the best ref->cap map is a REFLECTION (improper). extractRotationRobust
+    // below forces a PROPER rotation (det=+1), so a reflected capture cannot be fit
+    // and lands as a high residual even though it is a perfect isometry (scanScore~0).
+    s_diagMcovDet = determinant(Mcov);
 
     // rotation = orthogonal polar factor of Mcov via the Higham iteration
     // The rotation is recovered with the rank-robust quaternion extractor
@@ -506,10 +556,84 @@ void main()
 
   barrier();
 
+  // ---- DIAGNOSTIC: ref->capture correspondence offset scan (probe only, no fix) ----
+  // The validation residual above uses the ASSUMED pairing cap[smp.index] == ref[v].
+  // For meshes that draw a subset of a shared vertex buffer that pairing is skewed by
+  // a constant index shift, so the same point cloud fits with a huge residual. This
+  // scan measures a RIGID-INVARIANT quantity - the pairwise distances between solve
+  // samples - which is independent of the (unknown, possibly garbage) fitted M: at the
+  // TRUE offset the ref and capture pairwise distances agree, so the mismatch collapses.
+  // One offset per thread; every capture read is clamped to [0, captureVertexCount) and
+  // the whole offset is skipped if any sample lands out of range (no OOB, no device-lost).
+  s_scanScore[threadId] = 1.0e30;
+  if(push.promoScanEnable != 0u && entry.mode == PROMO_MODE_SOLVE && entry.captureVertexCount > 0u)
+  {
+    const int  off = kScanOffsets[threadId];
+    const uint nS  = min(probe.sampleCount, 24u);  // O(nS^2) pairwise; bound the work
+    float score = 0.0;
+    float denom = 0.0;
+    bool  oob   = false;
+    for(uint a = 0; a < nS && !oob; a++)
+    {
+      const PromoSample sa = probe.samples[a];
+      const int ia = int(sa.index) + off;
+      if(ia < 0 || ia >= int(entry.captureVertexCount)) { oob = true; break; }
+      const vec3 refA = vec3(sa.refX, sa.refY, sa.refZ);
+      const vec3 capA = loadCapture(entry.captureVa, entry.captureStrideBytes, uint(ia));
+      for(uint b = a + 1; b < nS; b++)
+      {
+        const PromoSample sb = probe.samples[b];
+        const int ib = int(sb.index) + off;
+        if(ib < 0 || ib >= int(entry.captureVertexCount)) { oob = true; break; }
+        const vec3 refB = vec3(sb.refX, sb.refY, sb.refZ);
+        const vec3 capB = loadCapture(entry.captureVa, entry.captureStrideBytes, uint(ib));
+        score += abs(length(refA - refB) - length(capA - capB));
+        denom += length(refA - refB);
+      }
+    }
+    s_scanScore[threadId] = (!oob && denom > 1e-6) ? (score / denom) : 1.0e30;
+  }
+
+  barrier();
+
   if(threadId != 0)
   {
     return;
   }
+
+  // reduce the scan: best (lowest) offset vs offset 0 (thread 0's entry). A collapsed
+  // score at a NONZERO offset is the shared-buffer index skew; packed into diagGuard
+  // spare bits [2:8]=table index, [24:26]=verdict for the CPU reject log.
+  uint  scanBestIdx   = 0u;
+  float scanBestScore = 1.0e30;
+  if(push.promoScanEnable != 0u)
+  {
+    for(uint t = 0; t < 64u; t++)
+    {
+      if(s_scanScore[t] < scanBestScore) { scanBestScore = s_scanScore[t]; scanBestIdx = t; }
+    }
+  }
+  const float scanZeroScore = s_scanScore[0];
+  uint scanVerdict = 0u;  // 0 = offset 0 is best / no signal
+  if(push.promoScanEnable != 0u && kScanOffsets[scanBestIdx] != 0 && scanBestScore < 1.0e29)
+  {
+    // COLLAPSE (2): a nonzero offset drives the mismatch near zero (a clean rigid
+    // pairing was found there). improved (1): clearly beats offset 0 but not clean.
+    scanVerdict = (scanBestScore < 0.02) ? 2u
+                : (scanBestScore < 0.5 * scanZeroScore ? 1u : 0u);
+  }
+  // absolute offset-0 pairwise mismatch, quantized to 6 bits (q/20 ~= score, range
+  // 0..3.1). 63 = the scan produced NO valid offset-0 pairs (captureVertexCount 0 or
+  // bounds skip) - i.e. the scan did NOT run, distinct from "ran and offset 0 is best".
+  uint scanScoreQ = 31u;  // 5-bit; 31 = scan did NOT run (no valid offset-0 pairs)
+  if(push.promoScanEnable != 0u && scanZeroScore < 1.0e29)
+  {
+    scanScoreQ = uint(clamp(scanZeroScore * 20.0, 0.0, 30.0) + 0.5);
+  }
+  // reflection flag: the fit's cross-covariance has negative determinant, so the
+  // data's best ref->cap alignment is improper (a reflection the proper-only solve
+  // cannot represent). Independent of the scan; always valid (thread 0 always fit).
+  const uint reflectedBit = (s_diagMcovDet < 0.0) ? 1u : 0u;
 
   float maxDev = 0.0;
   for(uint t = 0; t < PROMO_VALIDATION_SAMPLES; t++)
@@ -571,15 +695,19 @@ void main()
   status.lastFrame   = push.frameId;
   status.flags       = (status.flags & ~(PROMO_FLAG_RIGID | PROMO_FLAG_DEMOTED))
                      | (rigid ? PROMO_FLAG_RIGID : PROMO_FLAG_DEMOTED);
-  status.diagShearBits = floatBitsToUint(affineNonRigid);  // non-negative -> ordered
+  status.diagShearBits = floatBitsToUint(max(s_diagCapVar, 0.0));  // DIAG: capVar (was affineNonRigid)
   // degeneracy forensics: diagAux = refVar (float bits); diagGuard keeps the probeVa
   // bit0, adds bit1 = degenerate fit, packs sampleCount into bits [8:16], and the
   // reject-reason enum (0..6) into bits [16:24].
   status.diagAux   = floatBitsToUint(s_diagRefVar);
   status.diagGuard = (status.diagGuard & 0x1u)
                    | (s_diagDegen ? 0x2u : 0x0u)
+                   | ((scanBestIdx & 0x3Fu) << 2)   // DIAG: correspondence-scan table index [2:8]
                    | (min(s_diagSampleN, 255u) << 8)
-                   | ((s_diagReason & 0xFFu) << 16);
+                   | ((s_diagReason & 0xFFu) << 16)
+                   | ((scanVerdict & 0x3u) << 24)   // DIAG: scan verdict [24:26]
+                   | ((reflectedBit & 0x1u) << 26)  // DIAG: reflection flag (det(Mcov)<0) [26:27]
+                   | ((scanScoreQ & 0x1Fu) << 27);  // DIAG: offset-0 mismatch, quantized [27:32]
   statuses.s[entry.stateSlot] = status;
 
   // ---- patch a promoted instance's slot: ALWAYS write when assigned - a

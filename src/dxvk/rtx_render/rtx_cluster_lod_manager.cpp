@@ -634,6 +634,17 @@ namespace dxvk {
                              " of ", vertexCount, ", blob ", blob.size() / 1024, " KiB)"));
   }
 
+  // DIAG correspondence-scan offset table - MUST mirror kScanOffsets in
+  // promotion_solve.comp exactly (index -> ref->capture vertex-index offset). The
+  // shader reports the winning table index in diagGuard[2:8]; this maps it back.
+  static constexpr int kPromoScanOffsets[64] = {
+       0,
+       1,   -1,    2,   -2,    3,   -3,    4,   -4,    5,   -5,    6,   -6,    7,   -7,    8,   -8,
+      10,  -10,   12,  -12,   16,  -16,   20,  -20,   24,  -24,   32,  -32,   48,  -48,   64,  -64,
+      96,  -96,  128, -128,  192, -192,  256, -256,  384, -384,  512, -512,  768, -768, 1024,-1024,
+    1536,-1536, 2048,-2048, 3072,-3072, 4096,-4096, 8192,-8192,16384,-16384,32768,-32768,65536
+  };
+
   void ClusterLodManager::updatePromotionStates() {
     if (m_renderSystem == nullptr || !ClusterLodOptions::Promotion::enable()) {
       return;
@@ -724,9 +735,40 @@ namespace dxvk {
           } else if (state.gateResidualRel > epsilon) {
             candidate.phase = PromotionCandidate::Phase::Rejected;
             m_statsPromoRejected++;
+            // DIAG: capVar (state.affineNonRigid, repurposed) vs refVar (diagAux).
+            // sEff = sqrt(capVar/refVar). sEff~1 + high residual = ref/cap same
+            // spread but scrambled correspondence; sEff>>1 = capture in a bigger
+            // space (scale); residual>2 (impossible for a permutation) = the solve
+            // blew up on a degenerate/coplanar mesh.
+            const float capVar = state.affineNonRigid;
+            float refVarDbg = 0.0f;
+            std::memcpy(&refVarDbg, &state.diagAux, sizeof(float));
+            const float sEff = refVarDbg > 1e-12f ? std::sqrt(capVar / refVarDbg) : -1.0f;
+            // DIAG correspondence scan (probe only): diagGuard[2:8] = scan table index,
+            // [24:26] = verdict. Decoded to the actual ref->cap index offset that best
+            // matches the point cloud. scanV COLLAPSE at a nonzero scanOff == the
+            // shared-vertex-buffer index skew that scrambled this mesh.
+            const uint32_t scanIdx = (state.diagGuard >> 2) & 0x3Fu;
+            const uint32_t scanVerdict = (state.diagGuard >> 24) & 0x3u;
+            const uint32_t reflected = (state.diagGuard >> 26) & 0x1u;
+            const uint32_t scanScoreQ = (state.diagGuard >> 27) & 0x1Fu;
+            const int scanOff = kPromoScanOffsets[scanIdx];
+            const char* scanV = scanVerdict == 2u ? "COLLAPSE" : (scanVerdict == 1u ? "impr" : "none");
+            // scanScore = offset-0 pairwise mismatch (~0 => perfect correspondence, fit
+            // is the problem; large => genuinely non-rigid). 31 => scan did NOT run.
+            // refl = the fit's cross-covariance is improper (reflection the proper-only
+            // solve cannot represent): the prime suspect for scanScore~0 + high residual.
+            const std::string scanScore = scanScoreQ >= 31u ? std::string("n/a(off?)")
+                                                            : str::format(float(scanScoreQ) / 20.0f);
             Logger::info(str::format("[ClusterLOD] promotion: geometry 0x", std::hex, entry.first, std::dec,
-                                     " gate REJECTED - partial deformation (full-mesh residual ",
-                                     state.gateResidualRel, "), stays Path B"));
+                                     " gate REJECTED (full-mesh residual ", state.gateResidualRel,
+                                     ", verts ", candidate.vertexCount,
+                                     ", refVar ", refVarDbg, ", capVar ", capVar, ", sEff ", sEff,
+                                     ", scanOff ", scanOff, ", scanV ", scanV, ", scanScore ", scanScore,
+                                     ", refl ", reflected,
+                                     ", gateOver ", state.gateOverCount, "/", candidate.vertexCount,
+                                     ", gateStale ", state.gateStaleFrames,
+                                     "), stays Path B"));
             // rejection is terminal - nothing references the probe blob (incl.
             // its full-mesh ref positions) anymore; deferred-free it (former
             // V1 limitation: blobs lived until shutdown)
@@ -824,6 +866,7 @@ namespace dxvk {
             probeEntry.probeVa = candidate.probeVa;
             probeEntry.captureVa = m_framePoses[framePoseIndex].positionsAddress;
             probeEntry.captureStrideBytes = m_framePoses[framePoseIndex].positionsStrideBytes;
+            probeEntry.captureVertexCount = m_framePoses[framePoseIndex].positionsCount;
             probeEntry.stateSlot = instanceIt->second.stateSlot;
             probeEntry.patchSlot = 0xFFFFFFFFu;
             m_framePromoEntries.push_back(probeEntry);
@@ -843,6 +886,7 @@ namespace dxvk {
         promoEntry.probeVa = candidate.probeVa;
         promoEntry.captureVa = m_framePoses[framePoseIndex].positionsAddress;
         promoEntry.captureStrideBytes = m_framePoses[framePoseIndex].positionsStrideBytes;
+        promoEntry.captureVertexCount = m_framePoses[framePoseIndex].positionsCount;
         promoEntry.stateSlot = candidate.stateSlot;
         promoEntry.patchSlot = 0xFFFFFFFFu;
         if (candidate.phase == PromotionCandidate::Phase::GateScheduled) {
@@ -881,6 +925,8 @@ namespace dxvk {
         promoEntry.probeVa = found->second.probeVa;
         promoEntry.captureVa = positions.getDeviceAddress() + positions.offsetFromSlice();
         promoEntry.captureStrideBytes = positions.stride();
+        promoEntry.captureVertexCount = positions.stride() > 0 && positions.length() > positions.offsetFromSlice()
+          ? uint32_t((positions.length() - positions.offsetFromSlice()) / positions.stride()) : 0;
         promoEntry.stateSlot = (slot.geometryId >> kPromotedSlotShift) & 0x1FFFu;
         promoEntry.patchSlot = flatIndex;
         m_framePromoEntries.push_back(promoEntry);
@@ -1727,6 +1773,10 @@ namespace dxvk {
     framePose.poseSetId = pose.poseSetId;
     framePose.positionsAddress = positions.getDeviceAddress() + positions.offsetFromSlice();
     framePose.positionsStrideBytes = positions.stride();
+    // DIAG: conservative valid-slot count from the capture origin (bounds the
+    // correspondence scan's reads; underestimate is safe, it only skips offsets)
+    framePose.positionsCount = positions.stride() > 0 && positions.length() > positions.offsetFromSlice()
+      ? uint32_t((positions.length() - positions.offsetFromSlice()) / positions.stride()) : 0;
     framePose.positionsBuffer = positions.buffer();
 
     const uint32_t framePoseIndex = uint32_t(m_framePoses.size());
@@ -1933,6 +1983,7 @@ namespace dxvk {
     frameParams.promotionEntries = m_framePromoEntries.empty() ? nullptr : m_framePromoEntries.data();
     frameParams.promotionEntryCount = uint32_t(m_framePromoEntries.size());
     frameParams.promotionResidualEpsilon = std::max(1e-5f, ClusterLodOptions::Promotion::residualEpsilon());
+    frameParams.promotionCorrespondenceScan = ClusterLodOptions::Promotion::correspondenceScan();
 
     // P4: HiZ occlusion feed. This runs from SceneManager::prepareSceneData,
     // BEFORE injectRTX re-points m_primaryDepth at this frame's target - so

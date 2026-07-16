@@ -159,11 +159,11 @@ struct ClusterRenderSystem::Impl
   // ---- P4c rigid-capture promotion (plan 7.7 spec) ----
   // System scope (survives generation swaps). SoA state: matrices hold M +
   // prevM (96 B/slot, prevM read by the hit side for motion vectors), status
-  // holds the 32 B/slot compact state the CPU reads back. Entries ride a
+  // holds the 36 B/slot compact state the CPU reads back. Entries ride a
   // host-visible BDA ring; the status array is copied into a host readback
   // ring each frame promotion work ran.
   static constexpr uint32_t kPromoMatricesStride = 96;
-  static constexpr uint32_t kPromoStatusStride   = 32;
+  static constexpr uint32_t kPromoStatusStride   = 40;  // 8 base + gateOverCount + gateStaleFrames (DIAG)
   static constexpr uint32_t kPromoEntryStride    = sizeof(PromotionEntry);
 
   shaderc::SpvCompilationResult promoShader;
@@ -254,6 +254,7 @@ struct PromoPush
   uint32_t riFlipWindingOffset;
   float    residualEpsilon;
   uint32_t gateEntryIndex;
+  uint32_t promoScanEnable;          // DIAG: 1 = run the correspondence offset scan
 };
 
 bool ClusterRenderSystem::Impl::initPromotion()
@@ -394,8 +395,9 @@ void ClusterRenderSystem::Impl::recordPromotion(VkCommandBuffer cmd, const Frame
   {
     if(stagedEntries[i].mode == 1)
     {
-      vkCmdFillBuffer(cmd, promoStatusBuffer.buffer,
-                      VkDeviceSize(stagedEntries[i].stateSlot) * kPromoStatusStride + 4, 4, 0);
+      const VkDeviceSize base = VkDeviceSize(stagedEntries[i].stateSlot) * kPromoStatusStride;
+      vkCmdFillBuffer(cmd, promoStatusBuffer.buffer, base + 4,  4, 0);   // gateResidualBits
+      vkCmdFillBuffer(cmd, promoStatusBuffer.buffer, base + 32, 4, 0);   // gateOverCount (DIAG)
     }
   }
 
@@ -427,6 +429,7 @@ void ClusterRenderSystem::Impl::recordPromotion(VkCommandBuffer cmd, const Frame
   push.riFlipWindingOffset  = uint32_t(offsetof(shaderio::RenderInstance, flipWinding));
   push.residualEpsilon      = frame.promotionResidualEpsilon;
   push.gateEntryIndex       = 0xFFFFFFFFu;
+  push.promoScanEnable      = frame.promotionCorrespondenceScan ? 1u : 0u;
 
   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, promoPipeline);
   vkCmdPushConstants(cmd, promoPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PromoPush), &push);
@@ -1096,6 +1099,8 @@ bool ClusterRenderSystem::readPromotionStates(PromotionStateView* outStates)
     memcpy(&v.affineNonRigid, &shearBits, sizeof(float));  // ordered-uint == float bits for non-negatives
     memcpy(&v.diagGuard, s + 24, sizeof(uint32_t));
     memcpy(&v.diagAux, s + 28, sizeof(uint32_t));
+    memcpy(&v.gateOverCount, s + 32, sizeof(uint32_t));
+    memcpy(&v.gateStaleFrames, s + 36, sizeof(uint32_t));
   }
   return true;
 }
