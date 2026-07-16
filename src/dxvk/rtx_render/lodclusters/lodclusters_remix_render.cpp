@@ -163,7 +163,7 @@ struct ClusterRenderSystem::Impl
   // host-visible BDA ring; the status array is copied into a host readback
   // ring each frame promotion work ran.
   static constexpr uint32_t kPromoMatricesStride = 96;
-  static constexpr uint32_t kPromoStatusStride   = 40;  // 8 base + gateOverCount + gateStaleFrames (DIAG)
+  static constexpr uint32_t kPromoStatusStride   = 56;  // 8 base + gateOver/gateStale/temporalDeform + meanDev/dirCoh/normAlign (DIAG)
   static constexpr uint32_t kPromoEntryStride    = sizeof(PromotionEntry);
 
   shaderc::SpvCompilationResult promoShader;
@@ -171,6 +171,11 @@ struct ClusterRenderSystem::Impl
   VkPipeline       promoPipeline       = VK_NULL_HANDLE;
   nvvk::Buffer promoMatricesBuffer;
   nvvk::Buffer promoStatusBuffer;
+  nvvk::Buffer promoLastSampleBuffer;  // [slot][kPromoSolveSamples][3]: last frame's solve-sample
+                                       // capture, for the inter-frame deformation gate
+  static constexpr uint32_t kPromoSolveSamples = 64;  // mirrors PROMO_SOLVE_SAMPLES in the shader
+  nvvk::Buffer promoDumpReadback[kStagingSlots];      // DIAG: raw-dump ring (one slot's samples)
+  uint32_t promoDumpFramesRecorded = 0;
   nvvk::Buffer promoEntryBuffers[kStagingSlots];
   nvvk::Buffer promoReadbackBuffers[kStagingSlots];
   uint32_t promoUsedSlots = 0;                        // stateSlot high-water + 1
@@ -246,6 +251,7 @@ struct PromoPush
   uint64_t statusVa;
   uint64_t renderInstancesVa;
   uint64_t tlasInstancesVa;
+  uint64_t lastSampleVa;
   uint32_t entryCount;
   uint32_t frameId;
   uint32_t riStrideBytes;
@@ -255,6 +261,7 @@ struct PromoPush
   float    residualEpsilon;
   uint32_t gateEntryIndex;
   uint32_t promoScanEnable;          // DIAG: 1 = run the correspondence offset scan
+  float    temporalEpsilon;          // max inter-frame sample-distance drift for "rigid"
 };
 
 bool ClusterRenderSystem::Impl::initPromotion()
@@ -287,6 +294,17 @@ bool ClusterRenderSystem::Impl::initPromotion()
   NVVK_CHECK(res.createBuffer(promoStatusBuffer, size_t(kPromoStatusStride) * kPromotionSlotCapacity,
                               VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT
                                   | VK_BUFFER_USAGE_2_TRANSFER_DST_BIT | VK_BUFFER_USAGE_2_TRANSFER_SRC_BIT));
+  NVVK_CHECK(res.createBuffer(promoLastSampleBuffer,
+                              size_t(kPromoSolveSamples) * 3 * sizeof(float) * kPromotionSlotCapacity,
+                              VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT
+                                  | VK_BUFFER_USAGE_2_TRANSFER_DST_BIT | VK_BUFFER_USAGE_2_TRANSFER_SRC_BIT));
+  for(uint32_t i = 0; i < kStagingSlots; i++)
+  {
+    // DIAG raw-dump readback: one slot's 64 solve-sample capture positions
+    NVVK_CHECK(res.createBuffer(promoDumpReadback[i], size_t(kPromoSolveSamples) * 3 * sizeof(float),
+                                VK_BUFFER_USAGE_2_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                                VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT));
+  }
 
   for(uint32_t i = 0; i < kStagingSlots; i++)
   {
@@ -324,6 +342,17 @@ void ClusterRenderSystem::Impl::deinitPromotion()
   {
     res.m_allocator.destroyBuffer(promoStatusBuffer);
   }
+  if(promoLastSampleBuffer.buffer)
+  {
+    res.m_allocator.destroyBuffer(promoLastSampleBuffer);
+  }
+  for(uint32_t i = 0; i < kStagingSlots; i++)
+  {
+    if(promoDumpReadback[i].buffer)
+    {
+      res.m_allocator.destroyBuffer(promoDumpReadback[i]);
+    }
+  }
   for(uint32_t i = 0; i < kStagingSlots; i++)
   {
     if(promoEntryBuffers[i].buffer)
@@ -353,6 +382,7 @@ void ClusterRenderSystem::Impl::recordPromotion(VkCommandBuffer cmd, const Frame
   {
     vkCmdFillBuffer(cmd, promoMatricesBuffer.buffer, 0, VK_WHOLE_SIZE, 0);
     vkCmdFillBuffer(cmd, promoStatusBuffer.buffer, 0, VK_WHOLE_SIZE, 0);
+    vkCmdFillBuffer(cmd, promoLastSampleBuffer.buffer, 0, VK_WHOLE_SIZE, 0);
     promoStateCleared = true;
   }
 
@@ -430,6 +460,8 @@ void ClusterRenderSystem::Impl::recordPromotion(VkCommandBuffer cmd, const Frame
   push.residualEpsilon      = frame.promotionResidualEpsilon;
   push.gateEntryIndex       = 0xFFFFFFFFu;
   push.promoScanEnable      = frame.promotionCorrespondenceScan ? 1u : 0u;
+  push.lastSampleVa         = promoLastSampleBuffer.address;
+  push.temporalEpsilon      = frame.promotionTemporalEpsilon;
 
   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, promoPipeline);
   vkCmdPushConstants(cmd, promoPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PromoPush), &push);
@@ -468,6 +500,17 @@ void ClusterRenderSystem::Impl::recordPromotion(VkCommandBuffer cmd, const Frame
     VkBufferCopy region{0, 0, VkDeviceSize(promoUsedSlots) * kPromoStatusStride};
     vkCmdCopyBuffer(cmd, promoStatusBuffer.buffer, promoReadbackBuffers[slot].buffer, 1, &region);
     promoReadbackUsedSlots[slot] = promoUsedSlots;
+  }
+
+  // DIAG raw dump: the requested slot's solve-sample capture positions (the solve
+  // kernel stored them in the last-sample buffer this frame; barrier above covers it)
+  if(frame.promotionDumpStateSlot != ~0u && frame.promotionDumpStateSlot < kPromotionSlotCapacity
+     && promoDumpReadback[slot].buffer != VK_NULL_HANDLE)
+  {
+    const VkDeviceSize bytes = VkDeviceSize(kPromoSolveSamples) * 3 * sizeof(float);
+    VkBufferCopy region{VkDeviceSize(frame.promotionDumpStateSlot) * bytes, 0, bytes};
+    vkCmdCopyBuffer(cmd, promoLastSampleBuffer.buffer, promoDumpReadback[slot].buffer, 1, &region);
+    promoDumpFramesRecorded++;
   }
 
   promoFramesRecorded++;
@@ -1059,6 +1102,23 @@ uint64_t ClusterRenderSystem::getPromotionStateAddress() const
   return impl.promoReady ? impl.promoMatricesBuffer.address : 0;
 }
 
+bool ClusterRenderSystem::readPromotionSampleDump(float* outPositions192)
+{
+  Impl& impl = *m_impl;
+  if(!impl.promoReady || outPositions192 == nullptr || impl.promoDumpFramesRecorded < Impl::kStagingSlots)
+  {
+    return false;
+  }
+  const uint32_t slot = (impl.frameIndex + 1u) % Impl::kStagingSlots;
+  const void* src = impl.promoDumpReadback[slot].mapping;
+  if(src == nullptr)
+  {
+    return false;
+  }
+  memcpy(outPositions192, src, size_t(Impl::kPromoSolveSamples) * 3 * sizeof(float));
+  return true;
+}
+
 bool ClusterRenderSystem::readPromotionStates(PromotionStateView* outStates)
 {
   Impl& impl = *m_impl;
@@ -1101,6 +1161,12 @@ bool ClusterRenderSystem::readPromotionStates(PromotionStateView* outStates)
     memcpy(&v.diagAux, s + 28, sizeof(uint32_t));
     memcpy(&v.gateOverCount, s + 32, sizeof(uint32_t));
     memcpy(&v.gateStaleFrames, s + 36, sizeof(uint32_t));
+    uint32_t tdBits = 0;
+    memcpy(&tdBits, s + 40, sizeof(uint32_t));
+    memcpy(&v.temporalDeformRel, &tdBits, sizeof(float));  // ordered-uint == float bits for non-negatives
+    memcpy(&v.meanDevRel, s + 44, sizeof(float));
+    memcpy(&v.dirCoherence, s + 48, sizeof(float));
+    memcpy(&v.normAlign, s + 52, sizeof(float));
   }
   return true;
 }

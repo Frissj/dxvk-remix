@@ -1298,6 +1298,25 @@ namespace dxvk {
   
   SceneManager::ObjectCacheState SceneManager::onSceneObjectUpdated(Rc<DxvkContext> ctx, const DrawCallState& drawCallState, BlasEntry* pBlas) {
     if (pBlas->frameLastTouched == m_device->getCurrentFrameId()) {
+      // DIAG (MultiDraw): the same BlasEntry drawn AGAIN within one frame (multi-pass
+      // or multiple placements deduped to one hash). For vertex-CAPTURED geometry this
+      // makes the capture content ambiguous (which draw's VS output does the promotion
+      // solve read?) - candidate explanation for rigid buildings fitting with a steady
+      // 0.09-0.26 residual. Log once per geometry per 600 frames, captured draws only.
+      if (drawCallState.preCaptureVertexData != nullptr) {
+        static std::mutex s_mdMutex;
+        static std::unordered_map<XXH64_hash_t, uint32_t> s_mdLastLog;
+        const XXH64_hash_t gh = drawCallState.getGeometryData().getHashForRule(RtxOptions::geometryAssetHashRule());
+        const uint32_t frame = m_device->getCurrentFrameId();
+        std::lock_guard<std::mutex> mdLock(s_mdMutex);
+        uint32_t& last = s_mdLastLog[gh];
+        if (last == 0u || frame - last > 600u) {
+          last = frame;
+          Logger::info(str::format("[MultiDraw] captured geometry 0x", std::hex, gh, std::dec,
+                                   " drawn multiple times in frame ", frame,
+                                   " (capture content ambiguous for promotion solve)"));
+        }
+      }
       pBlas->cacheMaterial(drawCallState.getMaterialData());
       return SceneManager::ObjectCacheState::kUpdateInstance;
     }

@@ -585,14 +585,20 @@ namespace dxvk {
     // blob assembly: header + solve + validation (falls back to the solve set
     // when no disjoint candidates exist - the 64-vs-12-DOF overdetermination
     // still exposes non-affine output) + full centered ref positions (gate)
+    // + (DIAG) validation-sample REF NORMALS appended at the very end when the
+    // snapshot has them: the kernel measures how well the validation error
+    // vectors align with the normals (normal-push displacement discriminator).
     const uint32_t effectiveValidation = pickedValidation > 0 ? pickedValidation : pickedSolve;
+    const bool hasNormals = snapshot.normals.size() >= size_t(vertexCount) * 3;
     std::vector<uint8_t> blob(sizeof(ProbeHeader)
-                              + sizeof(ProbeSample) * (size_t(pickedSolve) + effectiveValidation + refCount));
+                              + sizeof(ProbeSample) * (size_t(pickedSolve) + effectiveValidation + refCount
+                                                       + (hasNormals ? effectiveValidation : 0)));
 
     ProbeHeader header = {};
     header.sampleCount = pickedSolve;
     header.validationCount = effectiveValidation;
     header.vertexCount = refCount;  // gate sweeps only referenced vertices
+    header.pad = hasNormals ? 1u : 0u;  // DIAG: 1 = validation normals appended
     header.centroid[0] = float(cx);
     header.centroid[1] = float(cy);
     header.centroid[2] = float(cz);
@@ -618,6 +624,43 @@ namespace dxvk {
     }
     for (uint32_t r = 0; r < refCount; r++) {
       writeSample(samples[size_t(pickedSolve) + effectiveValidation + r], referenced[r]);
+    }
+    if (hasNormals) {
+      // DIAG: ref normals of the validation samples, same order as the validation
+      // region (uncentered unit vectors; ProbeSample.index kept for sanity)
+      const float* normals = snapshot.normals.data();
+      for (uint32_t i = 0; i < effectiveValidation; i++) {
+        const uint32_t pickIndex = pickedValidation > 0 ? pickedSolve + i : i;
+        const uint32_t v = candidates[picked[pickIndex]];
+        ProbeSample& out = samples[size_t(pickedSolve) + effectiveValidation + refCount + i];
+        out.index = v;
+        out.x = normals[v * 3 + 0];
+        out.y = normals[v * 3 + 1];
+        out.z = normals[v * 3 + 2];
+      }
+    }
+
+    // DIAG raw dump: log the solve samples' REF positions once for the traced hash
+    // (absolute object space = centered + centroid; order matches the kernel's
+    // s_capNow / the [PromoDump] cap lines, so line i pairs with line i)
+    {
+      const std::string& dumpHashStr = ClusterLodOptions::Promotion::dumpGeometryHash();
+      if (!dumpHashStr.empty()) {
+        uint64_t dumpHash = 0;
+        try { dumpHash = std::stoull(dumpHashStr, nullptr, 16); } catch (...) { dumpHash = 0; }
+        if (dumpHash != 0 && dumpHash == snapshot.geometryHash) {
+          Logger::info(str::format("[PromoDump] ref geometry 0x", std::hex, snapshot.geometryHash, std::dec,
+                                   " solveSamples ", pickedSolve,
+                                   " centroid (", float(cx), ", ", float(cy), ", ", float(cz),
+                                   ") radius ", radius));
+          for (uint32_t i = 0; i < pickedSolve; i++) {
+            const uint32_t v = candidates[picked[i]];
+            Logger::info(str::format("[PromoDump] ref[", i, "] idx ", v,
+                                     " pos (", positions[v * 3 + 0], ", ", positions[v * 3 + 1],
+                                     ", ", positions[v * 3 + 2], ")"));
+          }
+        }
+      }
     }
 
     const uint64_t probeVa = m_templateSystem->uploadPromotionProbe(blob.data(), blob.size());
@@ -679,6 +722,26 @@ namespace dxvk {
       return;
     }
 
+    // DIAG raw dump: the traced geometry's solve-sample CAPTURE positions (ring-lagged;
+    // line i pairs with the [PromoDump] ref[i] line from the probe build). Throttled.
+    {
+      static uint32_t s_lastDumpFrame = 0;
+      const uint32_t frameNow = m_device->getCurrentFrameId();
+      if (!ClusterLodOptions::Promotion::dumpGeometryHash().empty()
+          && (s_lastDumpFrame == 0u || frameNow - s_lastDumpFrame > 300u)) {
+        float cap[64 * 3];
+        if (m_renderSystem->readPromotionSampleDump(cap)) {
+          s_lastDumpFrame = frameNow;
+          Logger::info(str::format("[PromoDump] cap geometry 0x", ClusterLodOptions::Promotion::dumpGeometryHash(),
+                                   " frame ", frameNow));
+          for (uint32_t i = 0; i < 64; i++) {
+            Logger::info(str::format("[PromoDump] cap[", i, "] pos (", cap[i * 3 + 0], ", ",
+                                     cap[i * 3 + 1], ", ", cap[i * 3 + 2], ")"));
+          }
+        }
+      }
+    }
+
     const uint32_t rigidFrames = uint32_t(std::max(1, ClusterLodOptions::Promotion::rigidFrames()));
     const float epsilon = std::max(1e-5f, ClusterLodOptions::Promotion::residualEpsilon());
     const uint32_t gateLag = uint32_t(std::max(2, ClusterLodOptions::Promotion::gateLagFrames()));
@@ -722,6 +785,35 @@ namespace dxvk {
       case PromotionCandidate::Phase::Probing:
         if (state.rigidStreak >= rigidFrames) {
           candidate.phase = PromotionCandidate::Phase::GateScheduled;
+        } else if (!candidate.loggedTemporalHold
+                   && (state.temporalDeformRel > ClusterLodOptions::Promotion::temporalEpsilon()
+                       || state.residualRel > epsilon)) {
+          // One-shot: WHY this candidate never builds a rigid streak, showing BOTH bars.
+          //  - sparseResidual = per-frame rigid-fit error. >> epsilon => the mesh does
+          //    not fit ANY rigid transform this frame => genuinely non-rigid geometry,
+          //    independent of the temporal gate (won't promote even with it disabled).
+          //  - tDeform = inter-frame distance drift. High with a LOW sparseResidual =
+          //    fits rigidly each frame but drifts across frames (the temporal signal).
+          // marginal (just over epsilon) => a tuning issue; large => real animation.
+          candidate.loggedTemporalHold = true;
+          // scan result too (needs rtx.clusterLod.promotion.correspondenceScan=True):
+          // scanOff!=0 / scanScore>0 => a ref->cap index skew is the non-rigidity (the
+          // old correspondence class, fixable); scanScore~0 with high sparseResidual =>
+          // the point cloud is genuinely a non-rigid deform, no offset can save it.
+          const uint32_t scanIdx = (state.diagGuard >> 2) & 0x3Fu;
+          const uint32_t scanScoreQ = (state.diagGuard >> 27) & 0x1Fu;
+          const uint32_t reflected = (state.diagGuard >> 26) & 0x1u;
+          const int scanOff = kPromoScanOffsets[scanIdx];
+          const std::string scanScore = scanScoreQ >= 31u ? std::string("n/a")
+                                                          : str::format(float(scanScoreQ) / 20.0f);
+          Logger::info(str::format("[ClusterLOD] promotion: geometry 0x", std::hex, entry.first, std::dec,
+                                   " stuck in Probing (sparseResidual ", state.residualRel,
+                                   " vs eps ", epsilon, ", meanDev ", state.meanDevRel,
+                                   ", dirCoh ", state.dirCoherence,
+                                   ", normAlign ", state.normAlign,
+                                   ", tDeform ", state.temporalDeformRel,
+                                   ", scanOff ", scanOff, ", scanScore ", scanScore, ", refl ", reflected,
+                                   ", verts ", candidate.vertexCount, ")"));
         }
         break;
 
@@ -768,6 +860,8 @@ namespace dxvk {
                                      ", refl ", reflected,
                                      ", gateOver ", state.gateOverCount, "/", candidate.vertexCount,
                                      ", gateStale ", state.gateStaleFrames,
+                                     ", tDeform ", state.temporalDeformRel,
+                                     ", meanDev ", state.meanDevRel, ", dirCoh ", state.dirCoherence,
                                      "), stays Path B"));
             // rejection is terminal - nothing references the probe blob (incl.
             // its full-mesh ref positions) anymore; deferred-free it (former
@@ -806,15 +900,24 @@ namespace dxvk {
         if (state.gateResidualRel > epsilon && !promoInstance.demoted) {
           promoInstance.demoted = true;
           Logger::info(str::format("[ClusterLOD] promotion: instance (slot ", promoInstance.stateSlot,
+                                   ", geom 0x", std::hex, promoInstance.geometryHash, std::dec,
                                    ") DEMOTED to Path B - full-mesh sweep residual ", state.gateResidualRel,
+                                   " gateOver ", state.gateOverCount,
                                    " (sparse-blind partial deformation, risk R20)"));
         }
       }
 
       if (!promoInstance.demoted && (state.flags & 4u) != 0) {
         promoInstance.demoted = true;
+        // DIAG: WHY it went non-rigid - the offending solve's residual + temporal drift.
+        // A static building spiking residual >> its steady value on isolated frames is
+        // a capture-data glitch (mid-upload read / wrong buffer), not motion; steady
+        // moderate residual is the calibration mystery; high tDeform is real deform.
         Logger::info(str::format("[ClusterLOD] promotion: instance (slot ", promoInstance.stateSlot,
-                                 ") DEMOTED to Path B (solve went non-rigid; last-good transform covered the lag)"));
+                                 ", geom 0x", std::hex, promoInstance.geometryHash, std::dec,
+                                 ") DEMOTED to Path B (solve non-rigid: residual ", state.residualRel,
+                                 ", tDeform ", state.temporalDeformRel,
+                                 ", solveFrame ", state.lastFrame, ")"));
       } else if (promoInstance.demoted && state.rigidStreak >= rigidFrames) {
         promoInstance.demoted = false;
         Logger::info(str::format("[ClusterLOD] promotion: instance (slot ", promoInstance.stateSlot,
@@ -889,13 +992,24 @@ namespace dxvk {
         promoEntry.captureVertexCount = m_framePoses[framePoseIndex].positionsCount;
         promoEntry.stateSlot = candidate.stateSlot;
         promoEntry.patchSlot = 0xFFFFFFFFu;
+        // Always emit the per-frame mode-0 solve so matrices.m[slot] holds an M
+        // solved for THIS frame's capture. The GateScheduled frame used to REPLACE
+        // the solve with the gate, so the full-mesh gate scored a 1-frame-STALE M
+        // against a capture whose (camera-relative) space had moved between frames:
+        // every vertex then failed the tiny residual epsilon and no genuinely rigid
+        // mesh could ever promote (diagnosed as gateStale 1 + gateOver N/N while the
+        // data was a clean isometry - scanScore 0, sEff 1, refl 0). recordPromotion
+        // runs all mode-0 solves, then a barrier, then the per-entry gates, so a
+        // companion gate emitted this same frame reads the fresh M.
+        m_framePromoEntries.push_back(promoEntry);
         if (candidate.phase == PromotionCandidate::Phase::GateScheduled) {
-          promoEntry.mode = 1;
-          promoEntry.vertexCount = candidate.vertexCount;
+          lodclusters_remix::PromotionEntry gateEntry = promoEntry;
+          gateEntry.mode = 1;
+          gateEntry.vertexCount = candidate.vertexCount;
+          m_framePromoEntries.push_back(gateEntry);
           candidate.phase = PromotionCandidate::Phase::GateRunning;
           candidate.gateFrames = 0;
         }
-        m_framePromoEntries.push_back(promoEntry);
       }
     }
 
@@ -1629,10 +1743,40 @@ namespace dxvk {
         if (candidate != m_promoCandidates.end()
             && candidate->second.phase == PromotionCandidate::Phase::Promoted) {
           const auto found = m_geometryIdByHash.find(geometryHash);
+          // DIAG (PathARoute): a geometry can PROMOTE (verdict) yet its instances still
+          // render Path B when a per-geometry condition here fails. The prime suspect is
+          // MISSING residency - m_geometryIdByHash miss = the Path A cluster/generation
+          // data for this geometry is not resident (not clusterized yet / evicted), so a
+          // "promoted but not on Path A" building has no route. Log the reason once/geom.
+          {
+            static std::mutex s_m;
+            static std::unordered_set<uint64_t> s_seen;
+            std::lock_guard<std::mutex> lk(s_m);
+            if (s_seen.insert(geometryHash).second) {
+              const bool resident = found != m_geometryIdByHash.end();
+              const bool trivialBlocked = resident && ClusterLodOptions::Render::routeTrivialToClassic()
+                                        && m_trivialGeometryIds.count(found->second) != 0;
+              const char* why = !resident ? "NOT RESIDENT (Path A cluster data missing/evicted)"
+                              : (found->second > kPromotedGeometryMask) ? "geomId exceeds promoted mask"
+                              : trivialBlocked ? "routed trivial->classic"
+                              : "routable (should reach Path A)";
+              Logger::info(str::format("[PathARoute] geometry 0x", std::hex, geometryHash, std::dec,
+                                       " PROMOTED but ", why, " (resident ", resident,
+                                       ", geomId ", (resident ? int64_t(found->second) : int64_t(-1)),
+                                       ", promotedMask ", kPromotedGeometryMask, ")"));
+            }
+          }
           if (found != m_geometryIdByHash.end()
               && found->second <= kPromotedGeometryMask
               && (!ClusterLodOptions::Render::routeTrivialToClassic() || m_trivialGeometryIds.count(found->second) == 0)) {
             const uint32_t usedSlots = uint32_t(m_slots[Tlas::Opaque].size() + m_slots[Tlas::Unordered].size());
+            if (usedSlots >= m_renderSystem->getMaxRenderInstances()) {
+              // DIAG (PathARoute): render-instance capacity is the drop (was silent)
+              ONCE(Logger::warn(str::format("[PathARoute] render-instance capacity ",
+                                            m_renderSystem->getMaxRenderInstances(),
+                                            " exhausted - promoted instances drop to Path B (first geometry 0x",
+                                            std::hex, geometryHash, std::dec, ")")));
+            }
             if (usedSlots < m_renderSystem->getMaxRenderInstances()) {
               // per-INSTANCE promotion state slot (plan R21: every captured
               // instance's buffer carries its own transform)
@@ -1654,6 +1798,27 @@ namespace dxvk {
                 slotIt->second.blasFrameCreated = blasEntry->frameCreated;
                 outGeometryId = kPromotedTag | (slotIt->second.stateSlot << kPromotedSlotShift) | found->second;
                 return true;
+              }
+              // DIAG (PathARoute): routable geometry whose INSTANCE still dropped here.
+              // The only two ways to reach this line: the per-instance slot is DEMOTED
+              // (solve flagged non-rigid for this instance's own capture) or the slot
+              // pool is exhausted. Names the last silent drop between "routable" and
+              // the screen. Throttled per geometry per 300 frames.
+              {
+                static std::mutex s_m2;
+                static std::unordered_map<uint64_t, uint32_t> s_lastLogFrame;
+                std::lock_guard<std::mutex> lk2(s_m2);
+                uint32_t& last = s_lastLogFrame[geometryHash];
+                if (currentFrame - last > 300u || last == 0u) {
+                  last = currentFrame;
+                  const char* why2 = (slotIt != m_promoSlotByBlas.end() && slotIt->second.demoted)
+                                   ? "instance DEMOTED (per-instance solve non-rigid)"
+                                   : "promo state slot pool exhausted";
+                  Logger::info(str::format("[PathARoute] geometry 0x", std::hex, geometryHash, std::dec,
+                                           " instance dropped to Path B: ", why2,
+                                           " (stateSlot ", (slotIt != m_promoSlotByBlas.end() ? int64_t(slotIt->second.stateSlot) : int64_t(-1)),
+                                           ")"));
+                }
               }
             }
           }
@@ -1983,7 +2148,21 @@ namespace dxvk {
     frameParams.promotionEntries = m_framePromoEntries.empty() ? nullptr : m_framePromoEntries.data();
     frameParams.promotionEntryCount = uint32_t(m_framePromoEntries.size());
     frameParams.promotionResidualEpsilon = std::max(1e-5f, ClusterLodOptions::Promotion::residualEpsilon());
+    frameParams.promotionTemporalEpsilon = std::max(0.0f, ClusterLodOptions::Promotion::temporalEpsilon());
     frameParams.promotionCorrespondenceScan = ClusterLodOptions::Promotion::correspondenceScan();
+    // DIAG raw dump: resolve the traced hash to its promo state slot (if a candidate)
+    frameParams.promotionDumpStateSlot = ~0u;
+    {
+      const std::string& dumpHashStr = ClusterLodOptions::Promotion::dumpGeometryHash();
+      if (!dumpHashStr.empty()) {
+        uint64_t dumpHash = 0;
+        try { dumpHash = std::stoull(dumpHashStr, nullptr, 16); } catch (...) { dumpHash = 0; }
+        const auto it = dumpHash != 0 ? m_promoCandidates.find(dumpHash) : m_promoCandidates.end();
+        if (it != m_promoCandidates.end()) {
+          frameParams.promotionDumpStateSlot = it->second.stateSlot;
+        }
+      }
+    }
 
     // P4: HiZ occlusion feed. This runs from SceneManager::prepareSceneData,
     // BEFORE injectRTX re-points m_primaryDepth at this frame's target - so

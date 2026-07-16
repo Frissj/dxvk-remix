@@ -385,9 +385,17 @@ namespace lodclusters_remix {
     const struct PromotionEntry* promotionEntries = nullptr;
     uint32_t promotionEntryCount = 0;
     float promotionResidualEpsilon = 0.005f;
+    // Max inter-frame solve-sample pairwise-distance drift for a frame to count as
+    // rigid. Rigid motion preserves distances, so this rejects VS-animated captures
+    // (characters) that momentarily fit a rigid M without punishing moving rigid bodies.
+    float promotionTemporalEpsilon = 0.01f;
     // DIAG (probe only): run the ref->capture correspondence offset scan in the
     // solve kernel and report the best-matching offset in the reject log. No fix.
     bool promotionCorrespondenceScan = false;
+    // DIAG (raw dump): state slot whose 64 solve-sample CAPTURE positions are copied
+    // to a host-readback ring each frame (pairs with the CPU-side ref-sample log).
+    // ~0u = disabled.
+    uint32_t promotionDumpStateSlot = ~0u;
   };
 
   // P4c: one promotion work item (40 bytes, mirrored by promotion_solve.comp
@@ -422,6 +430,10 @@ namespace lodclusters_remix {
     uint32_t diagAux = 0;             // slot 0: frame-global stateSlot-OOB count
     uint32_t gateOverCount = 0;       // DIAG: full-mesh verts with residual > epsilon
     uint32_t gateStaleFrames = 0;     // DIAG: gate frame - last-solve frame (M staleness)
+    float temporalDeformRel = 0.0f;   // inter-frame sample-distance drift (deformation gate)
+    float meanDevRel = 0.0f;          // DIAG: mean validation deviation (residualRel is max)
+    float dirCoherence = 0.0f;        // DIAG: error-direction coherence (1=systematic, 0=scatter)
+    float normAlign = -1.0f;          // DIAG: error-vs-normal alignment (1=normal-push, -1=n/a)
   };
 
   // P3: semaphores the caller must attach to the queue submission that
@@ -594,6 +606,11 @@ namespace lodclusters_remix {
     // frame lag baked in). Returns false while nothing has been read back
     // yet. outStates must hold kPromotionSlotCapacity entries.
     bool readPromotionStates(PromotionStateView* outStates);
+
+    // DIAG (raw dump): the dumped slot's 64 solve-sample capture positions
+    // (frame.promotionDumpStateSlot; same ring lag as readPromotionStates).
+    // out = 64 * 3 floats. False until the ring is primed or dump inactive.
+    bool readPromotionSampleDump(float* outPositions192);
 
     // delayed statistics (a few frames old); false while nothing rendered yet
     bool getFrameStats(FrameStats& outStats) const;

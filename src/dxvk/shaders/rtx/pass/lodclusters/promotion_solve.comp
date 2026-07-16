@@ -83,7 +83,8 @@ layout(buffer_reference, buffer_reference_align = 4, scalar) buffer ProbeBlob
   uint  sampleCount;      // <= PROMO_SOLVE_SAMPLES
   uint  validationCount;  // <= PROMO_VALIDATION_SAMPLES
   uint  vertexCount;      // full-mesh gate range
-  uint  _pad0;
+  uint  _pad0;            // DIAG: 1 = validation REF NORMALS appended after the full
+                          // ref positions (region [sampleCount+validationCount+vertexCount ..))
   vec3  centroidPos;
   float radius;           // residuals are relative to this
   float gInv[16];         // row-major 4x4 Gram pseudoinverse (doubles on CPU)
@@ -136,6 +137,17 @@ struct PromoStatus
   uint  gateStaleFrames;   // DIAG: MODE_GATE frameId - lastFrame(last solve). >0 means the
                            // gate tests an M solved on an EARLIER frame than its capture -
                            // wrong for the whole mesh if the capture space moved per frame.
+  uint  temporalDeformBits;// inter-frame sample-distance drift (ordered-float). ~0 for a
+                           // rigid mesh (still OR moving); spikes when the geometry itself
+                           // deforms - the signal that rejects VS-animated captures.
+  uint  meanDevBits;       // DIAG: MEAN validation deviation / radius (residualRel is MAX).
+                           // mean ~ max = uniform warp; mean << max = a few outlier verts.
+  uint  dirCohBits;        // DIAG: |sum(dev vectors)| / sum(|dev|) over validation samples.
+                           // ~1 = every error points the SAME direction (systematic space/
+                           // translation mismatch); ~0 = random scatter (noise/precision).
+  uint  normAlignBits;     // DIAG: mean |cos(error dir, fitted ref normal)|. ~1 = the VS
+                           // displaces along vertex NORMALS (shell/inflate); ~0.5 = un-
+                           // correlated (morph target/other); float -1 = normals absent.
 };
 
 layout(buffer_reference, buffer_reference_align = 4, scalar) buffer PromoStatuses
@@ -160,6 +172,7 @@ layout(push_constant, scalar) uniform PushData
   uint64_t statusVa;
   uint64_t renderInstancesVa;
   uint64_t tlasInstancesVa;
+  uint64_t lastSampleVa;           // [slot][PROMO_SOLVE_SAMPLES][3] last frame's sample capture
   uint     entryCount;
   uint     frameId;
   uint     riStrideBytes;          // sizeof(shaderio::RenderInstance)
@@ -169,6 +182,7 @@ layout(push_constant, scalar) uniform PushData
   float    residualEpsilon;        // relative to probe radius
   uint     gateEntryIndex;         // MODE_GATE: which entry this dispatch runs
   uint     promoScanEnable;        // DIAG: 1 = run the ref->cap correspondence offset scan
+  float    temporalEpsilon;        // max inter-frame sample-distance drift for "rigid"
 }
 push;
 
@@ -187,6 +201,10 @@ shared float s_capSq[64];      // per-sample |cap|^2 (capture-spread diagnostic)
 shared float s_diagCapVar;     // capture-sample spread (ref-vs-cap correspondence probe)
 shared float s_diagMcovDet;    // DIAG: det(cross-covariance) sign = reflection detector
 shared float s_scanScore[64];  // DIAG: per-offset correspondence mismatch (one offset per thread)
+shared vec3  s_capNow[64];     // this frame's solve-sample capture positions
+shared vec3  s_capPrev[64];    // last frame's, for the inter-frame deformation gate
+shared vec3  s_devVec[64];     // DIAG: validation deviation VECTORS (error-shape stats)
+shared float s_normAlign[64];  // DIAG: |dot(error dir, ref normal)| per validation sample
 
 // DIAG correspondence scan: ref->capture vertex-index offset table, one entry per
 // thread. Index 0 is offset 0 (the correspondence the solve assumes); the rest are
@@ -373,6 +391,8 @@ void main()
     s_b[threadId][k] = 0.0;
   }
   s_capSq[threadId] = 0.0;
+  s_capNow[threadId]  = vec3(0.0);
+  s_capPrev[threadId] = vec3(0.0);
 
   if(threadId < probe.sampleCount)
   {
@@ -381,6 +401,19 @@ void main()
     const vec4 refH = vec4(ref, 1.0);
     const vec3 cap  = loadCapture(entry.captureVa, entry.captureStrideBytes, smp.index);
     s_capSq[threadId] = dot(cap, cap);
+
+    // inter-frame deformation gate (only meaningful in MODE_SOLVE): stash this
+    // frame's sample capture and read back last frame's from the persistent per-slot
+    // buffer, then store this frame's for next time. Pairwise distances among these
+    // are compared by thread 0 below - rigid-motion invariant, so only true shape
+    // change (VS skinning/animation) moves them.
+    s_capNow[threadId] = cap;
+    RawFloats lastBuf = RawFloats(push.lastSampleVa);
+    const uint lbBase = (entry.stateSlot * PROMO_SOLVE_SAMPLES + threadId) * 3u;
+    s_capPrev[threadId] = vec3(lastBuf.f[lbBase + 0u], lastBuf.f[lbBase + 1u], lastBuf.f[lbBase + 2u]);
+    lastBuf.f[lbBase + 0u] = cap.x;
+    lastBuf.f[lbBase + 1u] = cap.y;
+    lastBuf.f[lbBase + 2u] = cap.z;
 
     for(uint r = 0; r < 3; r++)
     {
@@ -542,6 +575,8 @@ void main()
 
   // ---- validation residual on the disjoint sample set ----
   s_dev[threadId] = 0.0;
+  s_devVec[threadId] = vec3(0.0);
+  s_normAlign[threadId] = -1.0;  // -1 = no valid alignment sample
   if(threadId < probe.validationCount)
   {
     const PromoSample smp = probe.samples[probe.sampleCount + threadId];
@@ -551,7 +586,26 @@ void main()
     const vec3 fitted = vec3(dot(vec4(s_M[0], s_M[1], s_M[2], s_M[3]), refH),
                              dot(vec4(s_M[4], s_M[5], s_M[6], s_M[7]), refH),
                              dot(vec4(s_M[8], s_M[9], s_M[10], s_M[11]), refH));
+    s_devVec[threadId] = fitted - cap;
     s_dev[threadId] = length(fitted - cap);
+
+    // DIAG normal-push discriminator: |cos| between the error direction and the
+    // vertex's REF normal (rotated by the fitted rotation-ish A - for a similarity
+    // map A/|col| approximates the rotation; adequate for a yes/no alignment test).
+    if(probe._pad0 != 0u && s_dev[threadId] > 1e-6)
+    {
+      const PromoSample nrm = probe.samples[probe.sampleCount + probe.validationCount + probe.vertexCount + threadId];
+      const vec3 nRef = vec3(nrm.refX, nrm.refY, nrm.refZ);
+      // rotate the normal by the fitted linear part (columns of row-major A)
+      const vec3 nFit = vec3(dot(vec3(s_M[0], s_M[1], s_M[2]),  nRef),
+                             dot(vec3(s_M[4], s_M[5], s_M[6]),  nRef),
+                             dot(vec3(s_M[8], s_M[9], s_M[10]), nRef));
+      const float nLen = length(nFit);
+      if(nLen > 1e-6)
+      {
+        s_normAlign[threadId] = abs(dot(s_devVec[threadId] / s_dev[threadId], nFit / nLen));
+      }
+    }
   }
 
   barrier();
@@ -636,12 +690,62 @@ void main()
   const uint reflectedBit = (s_diagMcovDet < 0.0) ? 1u : 0u;
 
   float maxDev = 0.0;
+  float sumDev = 0.0;
+  vec3  sumDevVec = vec3(0.0);
+  float sumNormAlign = 0.0;
+  uint  numNormAlign = 0u;
   for(uint t = 0; t < PROMO_VALIDATION_SAMPLES; t++)
   {
     maxDev = max(maxDev, s_dev[t]);
+    sumDev += s_dev[t];
+    sumDevVec += s_devVec[t];
+    if(s_normAlign[t] >= 0.0)
+    {
+      sumNormAlign += s_normAlign[t];
+      numNormAlign++;
+    }
   }
+  // DIAG: mean |cos(error, normal)|. ~1 = displacement along vertex normals
+  // (shell/inflate VS); ~0.5 = uncorrelated (morph target / other); -1 = no data.
+  const float normAlign = numNormAlign > 0u ? (sumNormAlign / float(numNormAlign)) : -1.0;
   const float residualRel = maxDev / max(probe.radius, 1e-6);
-  const bool  rigid       = residualRel <= push.residualEpsilon;
+  // DIAG error-shape stats over the validation samples (see PromoStatus):
+  const float nVal        = max(float(probe.validationCount), 1.0);
+  const float meanDevRel  = (sumDev / nVal) / max(probe.radius, 1e-6);
+  const float dirCoherence = sumDev > 1e-9 ? length(sumDevVec) / sumDev : 0.0;
+
+  // ---- inter-frame deformation gate: compare this frame's solve-sample pairwise
+  // distances to last frame's stored ones. A rigid transform (camera OR object
+  // motion) preserves all pairwise distances, so this is ~0 for a genuinely rigid
+  // mesh and rises only when the GEOMETRY itself deforms (VS skinning/animation).
+  // This is what separates a moving-but-rigid building (promote) from a VS-animated
+  // character that happens to fit a rigid M this one frame (must stay Path B).
+  // Needs a contiguous previous frame; otherwise the stored samples are stale so we
+  // report 0 (no penalty) and let the next contiguous frame judge.
+  float temporalDeform = 0.0;
+  {
+    const uint prevFrame = statuses.s[entry.stateSlot].lastFrame;
+    if(prevFrame + 1u == push.frameId)
+    {
+      const uint nT = min(probe.sampleCount, 32u);
+      float acc = 0.0;
+      float den = 0.0;
+      for(uint a = 0; a < nT; a++)
+      {
+        for(uint b = a + 1u; b < nT; b++)
+        {
+          const float dNow  = length(s_capNow[a]  - s_capNow[b]);
+          const float dPrev = length(s_capPrev[a] - s_capPrev[b]);
+          acc += abs(dNow - dPrev);
+          den += dNow;
+        }
+      }
+      temporalDeform = (den > 1e-6) ? (acc / den) : 0.0;
+    }
+  }
+
+  const bool  rigid       = residualRel <= push.residualEpsilon
+                         && temporalDeform <= push.temporalEpsilon;
 
   // ---- decenter: the solve ran on (p - centroid); world translation is
   //      t' = t - A * centroid ----
@@ -708,6 +812,10 @@ void main()
                    | ((scanVerdict & 0x3u) << 24)   // DIAG: scan verdict [24:26]
                    | ((reflectedBit & 0x1u) << 26)  // DIAG: reflection flag (det(Mcov)<0) [26:27]
                    | ((scanScoreQ & 0x1Fu) << 27);  // DIAG: offset-0 mismatch, quantized [27:32]
+  status.temporalDeformBits = floatBitsToUint(max(temporalDeform, 0.0));
+  status.meanDevBits = floatBitsToUint(max(meanDevRel, 0.0));
+  status.dirCohBits  = floatBitsToUint(clamp(dirCoherence, 0.0, 1.0));
+  status.normAlignBits = floatBitsToUint(normAlign);
   statuses.s[entry.stateSlot] = status;
 
   // ---- patch a promoted instance's slot: ALWAYS write when assigned - a

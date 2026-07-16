@@ -29,6 +29,7 @@
 
 #include "rtx_types.h"
 #include "rtx_hashing.h"
+#include "rtx_options.h"
 #include "../util/log/log.h"
 #include "../util/util_string.h"
 #include "../util/util_env.h"
@@ -196,6 +197,35 @@ namespace dxvk {
     // session reprocess + overwrite the same .nvsngeo (see GeometrySnapshot)
     snapshot.isCaptured = captured && !skinned && !snapshot.isMutating;
     snapshot.topologyKey = topologyKey;
+
+    // DIAG (trace): log each geometry's DRAW-CALL hash (geometry ^ material - what the
+    // Remix object picker shows) beside its ClusterLOD classification, once per unique
+    // geometry. ClusterLOD keys everything by the geometry-ONLY hash, which never
+    // matches the picker, so this is the only way to locate a user-identified draw and
+    // see whether it is a promotion candidate, mutating, skinned, or not eligible.
+    {
+      static std::mutex s_traceMutex;
+      static std::unordered_set<uint64_t> s_traced;
+      std::lock_guard<std::mutex> traceLock(s_traceMutex);
+      if (s_traced.insert(geometryHash).second) {
+        const auto& rule = RtxOptions::geometryAssetHashRule();
+        // several hash variants so a picker/mod hash of ANY rule can be matched:
+        // draw = geometry^material, geom = geometry-only, each in asset + legacy form.
+        const XXH64_hash_t drawHash    = drawCallState.getHash(rule);
+        const XXH64_hash_t drawLegacy  = drawCallState.getHashLegacy(rule);
+        const XXH64_hash_t geomAsset   = geometryData.getHashForRule(rule);
+        const XXH64_hash_t geomLegacy  = geometryData.getHashForRuleLegacy(rule);
+        // material hash = the picker's "Material Hash" (cached; NO getImageHash() -
+        // that derefs the live mip view and races texture streaming on this thread).
+        const XXH64_hash_t matHash     = drawCallState.getMaterialData().getHash();
+        Logger::info(str::format("[PromoTrace] draw=0x", std::hex, drawHash,
+          " drawLegacy=0x", drawLegacy, " geom=0x", geomAsset, " geomLegacy=0x", geomLegacy,
+          " mat=0x", matHash, " clHash=0x", geometryHash, std::dec,
+          " skinned=", skinned, " captured=", captured, " vtxUpd=", vertexDataUpdated,
+          " mutating=", snapshot.isMutating, " promoCandidate=", snapshot.isCaptured,
+          " eligible=", eligible, " verts=", snapshot.vertexCount));
+      }
+    }
 
     std::unique_lock<std::mutex> lock(m_mutex);
 

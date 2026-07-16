@@ -355,6 +355,19 @@ namespace dxvk {
                  "the sparse per-frame solve can miss a VS animating a small vertex subset, so every promoted\n"
                  "instance re-runs the every-vertex sweep on this interval (staggered by state slot). A failing\n"
                  "sweep demotes that instance to Path B. 0 disables the sweeps (not recommended).");
+      RTX_OPTION("rtx.clusterLod.promotion", float, temporalEpsilon, 0.01f,
+                 "Maximum inter-frame drift of the solve samples' pairwise distances for a frame to count as\n"
+                 "rigid. A rigid transform (camera OR object motion) preserves pairwise distances, so this stays\n"
+                 "~0 for genuinely rigid geometry - moving or still - and spikes only when the mesh itself\n"
+                 "deforms. It is what rejects VS-animated captures (e.g. characters skinned in the vertex shader,\n"
+                 "which have numBones==0 and so are not caught as skinned) that momentarily fit a rigid transform\n"
+                 "on a single frame. Folded into the per-frame rigid verdict, so a candidate must be temporally\n"
+                 "rigid across its whole streak to promote, and a promoted instance demotes the moment it deforms.");
+      RTX_OPTION("rtx.clusterLod.promotion", std::string, dumpGeometryHash, "",
+                 "DIAGNOSTIC RAW DUMP (empty = off). Hex geometry hash (no 0x). At probe build the 64 solve\n"
+                 "samples' REF positions are logged ([PromoDump] ref); each frame the same samples' CAPTURE\n"
+                 "positions are read back and logged throttled ([PromoDump] cap). Diffing the two shows the\n"
+                 "actual per-vertex displacement field - raw data, no interpretation.");
       RTX_OPTION("rtx.clusterLod.promotion", bool, correspondenceScan, false,
                  "DIAGNOSTIC PROBE (no fix, off by default). For every candidate, the solve kernel also runs a\n"
                  "transform-invariant pairwise-distance scan over a fixed table of ref->capture vertex-index\n"
@@ -571,6 +584,7 @@ namespace dxvk {
       uint32_t stateSlot = 0;
       enum class Phase : uint32_t { Probing, GateScheduled, GateRunning, Promoted, Rejected } phase = Phase::Probing;
       uint32_t gateFrames = 0;
+      bool loggedTemporalHold = false;  // DIAG: one-shot "held by temporal gate" log
     };
     // main-thread after adoption in onFrameBegin
     std::unordered_map<uint64_t, PromotionCandidate> m_promoCandidates;
