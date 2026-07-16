@@ -58,6 +58,9 @@ layout(local_size_x = 64) in;
 #define PROMO_MODE_GATE  1
 
 #define PROMO_FLAG_RIGID   1u
+// last solve's raw verdict was non-rigid (persistence history for the demote/
+// streak-reset decision below - one isolated non-rigid frame must not act)
+#define PROMO_FLAG_NONRIGID_LAST 2u
 #define PROMO_FLAG_DEMOTED 4u
 
 // mirror of ClusterRenderSystem::kPromotionSlotCapacity - defensive in-shader
@@ -851,17 +854,22 @@ void main()
     }
   }
 
-  // Hysteresis: candidate probes (patchSlot == ~0) must pass the STRICT epsilon to
+  // Hysteresis: candidate probes (patchSlot == ~0) must pass the STRICT epsilons to
   // promote; an already-promoted instance (patchSlot valid) only demotes past
-  // eps * demoteHysteresis. A rigid mesh sitting exactly on the boundary (observed:
-  // residual 0.0052-0.0075 vs eps 0.005, tDeform ~1e-7) latches instead of flapping
-  // promote/demote every few frames. Demoted instances re-enter via probe-only
-  // entries, so RE-promotion is strict again.
-  const float epsEff = (entry.patchSlot != 0xFFFFFFFFu)
-                     ? push.residualEpsilon * max(push.demoteHysteresis, 1.0)
-                     : push.residualEpsilon;
+  // eps * demoteHysteresis. A rigid mesh sitting on the RESIDUAL boundary (observed:
+  // residual 0.0052-0.0075 vs eps 0.005, tDeform ~1e-7) latches instead of flapping.
+  // The TEMPORAL axis needs the same hysteresis: a genuinely rigid building whose
+  // inter-frame drift grazes temporalEpsilon (observed: 0x203c92 residual 1e-4,
+  // tDeform 0.011-0.016 vs tempEps 0.01, demoting/re-promoting every few frames)
+  // otherwise flaps on a hard cliff. Both boundaries widen by demoteHysteresis once
+  // promoted; demoted instances re-enter via probe-only entries so RE-promotion is
+  // strict on BOTH axes again (no promotion of a truly drifting mesh).
+  const float hyst   = max(push.demoteHysteresis, 1.0);
+  const bool  promotedInst = (entry.patchSlot != 0xFFFFFFFFu);
+  const float epsEff = promotedInst ? push.residualEpsilon * hyst : push.residualEpsilon;
+  const float tempEpsEff = promotedInst ? push.temporalEpsilon * hyst : push.temporalEpsilon;
   const bool  rigid       = residualRel <= epsEff
-                         && temporalDeform <= push.temporalEpsilon;
+                         && temporalDeform <= tempEpsEff;
 
   // ---- decenter: the solve ran on (p - centroid); world translation is
   //      t' = t - A * centroid ----
@@ -911,10 +919,29 @@ void main()
                                     + 2.0 * (go0*go0 + go1*go1 + go2*go2));
 
   status.residualRel = residualRel;
-  status.rigidStreak = rigid ? (contiguous ? status.rigidStreak + 1u : 1u) : 0u;
+  // ---- non-rigid PERSISTENCE (symmetric with the promote streak) ----
+  // The capture content behind a state slot is only as stable as the game's
+  // draw->BlasEntry binding: same-hash sibling draws (many placements of one
+  // LEGO piece at different anisotropic scales) can swap entries between
+  // frames. The swap frame fits its new content perfectly (residual ~1e-6)
+  // but the inter-frame distance drift spikes (observed: discrete repeating
+  // tDeform 0.047-0.68 on sibling slots in the same frames, single-draw per
+  // [MultiDraw]), which used to demote + streak-reset instantly -> continuous
+  // promote/demote flapping (212 demotes / 142 re-promotes in one session).
+  // An ISOLATED non-rigid solve (previous solve rigid) therefore HOLDS: no
+  // demote flag, streak kept (not incremented). Only 2+ CONSECUTIVE non-rigid
+  // solves act. Genuine VS animation drifts every frame -> acts one frame
+  // later; per-frame-oscillating multi-draw captures stay sustained-non-rigid
+  // -> correctly stay Path B; the full-mesh gate + periodic sweep (R20) still
+  // backstop anything that sneaks a streak through alternating verdicts.
+  const bool prevNonRigid = (status.flags & PROMO_FLAG_NONRIGID_LAST) != 0u;
+  const bool sustainedNonRigid = !rigid && prevNonRigid;
+  status.rigidStreak = rigid ? (contiguous ? status.rigidStreak + 1u : 1u)
+                             : (sustainedNonRigid ? 0u : status.rigidStreak);
   status.lastFrame   = push.frameId;
-  status.flags       = (status.flags & ~(PROMO_FLAG_RIGID | PROMO_FLAG_DEMOTED))
-                     | (rigid ? PROMO_FLAG_RIGID : PROMO_FLAG_DEMOTED);
+  status.flags       = (status.flags & ~(PROMO_FLAG_RIGID | PROMO_FLAG_NONRIGID_LAST | PROMO_FLAG_DEMOTED))
+                     | (rigid ? PROMO_FLAG_RIGID : PROMO_FLAG_NONRIGID_LAST)
+                     | (sustainedNonRigid ? PROMO_FLAG_DEMOTED : 0u);
   status.diagShearBits = floatBitsToUint(max(s_diagCapVar, 0.0));  // DIAG: capVar (was affineNonRigid)
   // degeneracy forensics: diagAux = refVar (float bits); diagGuard keeps the probeVa
   // bit0, adds bit1 = degenerate fit, packs sampleCount into bits [8:16], and the

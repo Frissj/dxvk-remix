@@ -384,6 +384,14 @@ namespace dxvk {
                  "samples' REF positions are logged ([PromoDump] ref); each frame the same samples' CAPTURE\n"
                  "positions are read back and logged throttled ([PromoDump] cap). Diffing the two shows the\n"
                  "actual per-vertex displacement field - raw data, no interpretation.");
+      RTX_OPTION("rtx.clusterLod.promotion", std::string, traceMaterialHash, "",
+                 "DIAGNOSTIC DRAW TRACE (empty = off). Hex MATERIAL hash (no 0x) as shown by the Remix picker.\n"
+                 "Every draw whose material matches is logged at three pipeline stages, throttled per geometry:\n"
+                 "[DrawTrace/scene] at SceneManager::processDrawCallState (BEFORE any cluster filtering - catches\n"
+                 "draws that are ignored/culled and never reach the cluster system at all), [DrawTrace/intake] at\n"
+                 "the cluster manager entry (empty-hash filtering), and [DrawTrace/provider] at the provider (the\n"
+                 "fast-path early-returns: already-known, mutating-skip, ineligible). Use it to see exactly how the\n"
+                 "game draws a user-identified surface - captured vs not, which sub-meshes reach the system.");
       RTX_OPTION("rtx.clusterLod.promotion", bool, correspondenceScan, false,
                  "DIAGNOSTIC PROBE (no fix, off by default). For every candidate, the solve kernel also runs a\n"
                  "transform-invariant pairwise-distance scan over a fixed table of ref->capture vertex-index\n"
@@ -615,15 +623,47 @@ namespace dxvk {
       // residual > eps while temporally static; resets when the mesh moves.
       uint32_t stuckFrames = 0;
       enum class RestState : uint32_t { None, Requested, Referenced } restState = RestState::None;
+      // ---- pinned temporal-probe instance ----
+      // The candidate's geometry-level solve compares this frame's capture samples
+      // to last frame's on the SAME state slot to measure temporalDeform. The
+      // capture buffer is per-INSTANCE (a specific placement's live positions), and
+      // the emit used to pick "first Path B slot in arrival order", which is NOT
+      // stable frame-to-frame when a geometry has many placed instances. Consecutive
+      // frames then sampled DIFFERENT placements, so tDeform spiked every frame and
+      // reset the rigid streak - a perfectly-rigid building (residual ~3e-6) sat in
+      // Probing for 20+ seconds instead of promoting in a frame or two. Pin the probe
+      // to one instance so tDeform reflects that instance's real motion (~0 for a
+      // static building). probeBlas == nullptr until first adoption; frameCreated
+      // guards BlasEntry* address reuse. Single-instance geometries pin trivially
+      // (the fix is a no-op there).
+      const BlasEntry* probeBlas = nullptr;
+      uint32_t probeBlasFrameCreated = 0;
+      // ---- STABLE topology identity (churning-hash immunity) ----
+      // This game's captured draws churn their geometry ASSET hash every frame (the
+      // capture buffer content feeds the hash), so the SAME pillar mesh appears under
+      // a dozen different hashes. The provider dedups by TOPOLOGY key, so only one
+      // hash per mesh becomes a candidate - but the per-frame draw carries a DIFFERENT
+      // (churned) hash, so a candidate keyed only by geometryHash almost never matches
+      // the live draw and is solved only on the rare frames its exact registered hash
+      // recurs (observed: pillar promoted after ~2 minutes instead of ~2 seconds).
+      // topologyKey is stable across the churn (indicesHash + counts), so the draw
+      // side resolves the candidate through m_promoCandidateByTopology every frame.
+      uint64_t topologyKey = 0;
     };
-    // main-thread after adoption in onFrameBegin
+    // main-thread after adoption in onFrameBegin. Keyed by the registered geometry
+    // hash (residency lookups use it); the draw side resolves through the topology
+    // index below because the live draw's hash churns.
     std::unordered_map<uint64_t, PromotionCandidate> m_promoCandidates;
+    // stable-topology -> candidate key (registered geometryHash). Lets a churned-hash
+    // draw find its candidate every frame instead of only when the hash recurs.
+    std::unordered_map<uint64_t, uint64_t> m_promoCandidateByTopology;
     // worker -> main handoff of uploaded probes
     struct PendingProbe {
       uint64_t geometryHash = 0;  // candidate key (ORIGINAL hash for rest probes)
       uint64_t probeVa = 0;
       uint32_t vertexCount = 0;
       uint64_t routeHash = 0;     // rest probes: space-tagged residency hash; else 0
+      uint64_t topologyKey = 0;   // stable identity for the churning-hash draw side
     };
     std::mutex m_promoPendingMutex;
     std::vector<PendingProbe> m_promoPendingProbes;
@@ -668,6 +708,23 @@ namespace dxvk {
       uint32_t sweepLagFrames = 0;
       bool sweepPending = false;
       bool demoted = false;
+      // ---- per-instance REST verdicts (rest-referenced candidates only) ----
+      // A rest-referenced candidate's instances promote INDIVIDUALLY: each
+      // instance's VS can build a genuinely different shape, so each solves
+      // ITS OWN capture buffer against the shared rest reference and passes
+      // its own gate before routing Path A. Solving against the shared probe
+      // IS the match test - an instance whose shape diverges from the shared
+      // rest reference never fits and terminates (Rejected) after the
+      // restCaptureStuckFrames patience, ending its per-frame solve cost.
+      // None = not a rest-verdict instance (normal geometry-level promotion).
+      enum class RestPhase : uint32_t { None, Probing, GateScheduled, GateRunning, Promoted, Rejected };
+      RestPhase restPhase = RestPhase::None;
+      uint32_t restGateFrames = 0;
+      uint32_t restStuckFrames = 0;
+      // last state.lastFrame the stuck detector consumed: the terminal verdict
+      // must count SOLVED frames only - an instance that leaves the scene stops
+      // solving, and ticking on its stale state would reject it in absentia
+      uint32_t restLastSolveFrame = 0;
       // NV-DXVK: pinned Path A residency. Once an instance PROMOTES, its identity
       // is this stable BlasEntry* (the draw-call cache keeps the same BlasEntry
       // across camera moves), NOT the asset hash. This game's captured draws
@@ -712,6 +769,10 @@ namespace dxvk {
     void updatePromotionStates();
     // dispatchBuild: emit this frame's solve/gate/patch entries
     void buildPromotionEntries();
+    // Resolve the m_promoCandidates key for a live draw's geometry. This game's
+    // captured asset hash churns every frame, so try the direct hash (stable-hash
+    // geometry) then fall back to the stable topology index. 0 = no candidate.
+    uint64_t resolvePromoCandidateKey(const RasterGeometry& geometryData) const;
     // SceneConfig cache digest the generation was built from; appends require
     // the current config to still resolve to it
     std::string m_generationConfigDigest;

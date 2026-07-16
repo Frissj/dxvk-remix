@@ -101,7 +101,24 @@ namespace dxvk {
     }
   }
 
-  void ClusterLodGeometryProvider::onDrawCallGeometry(const DrawCallState& drawCallState, uint64_t geometryHash, bool vertexDataUpdated) {
+  void ClusterLodGeometryProvider::onDrawCallGeometry(const DrawCallState& drawCallState, uint64_t geometryHash, bool vertexDataUpdated, bool traceThis) {
+    // DIAG (DrawTrace/provider): log this geometry's fate through the intake
+    // fast-path. Throttled per geometry hash. Only when the manager flagged the
+    // material match. Records which early-return (if any) drops it.
+    auto traceProvider = [&](const char* stage, const char* fate) {
+      if (!traceThis) {
+        return;
+      }
+      static std::mutex s_mx;
+      static std::unordered_map<uint64_t, uint32_t> s_last;
+      std::lock_guard<std::mutex> lk(s_mx);
+      uint32_t& last = s_last[geometryHash];
+      // count-based throttle (no frame id here): log first sight + every ~256 hits
+      if ((last++ % 256u) == 0u) {
+        Logger::info(str::format("[DrawTrace/provider] geom 0x", std::hex, geometryHash, std::dec,
+                                 " ", stage, ": ", fate));
+      }
+    };
     // chrono: record the CS-thread cost of this intake call on every exit path
     // (declared FIRST so it destructs LAST, after any scoped lock below has
     // released m_mutex - the destructor takes it again)
@@ -158,19 +175,25 @@ namespace dxvk {
 
       if (deforming) {
         if (m_knownTopologyKeys.find(topologyKey) != m_knownTopologyKeys.end()) {
+          traceProvider("fastpath", "already-known deforming topology (dedup return; already registered)");
           return;
         }
       } else {
         if (m_mutatingTopologyKeys.find(topologyKey) != m_mutatingTopologyKeys.end()) {
           // a known-mutating mesh on a frame without an update (or its very
           // first sighting order) - not a Path A candidate
+          traceProvider("fastpath", "topology seen mutating on another frame -> NOT a Path A candidate (return)");
           return;
         }
         if (m_knownHashes.find(geometryHash) != m_knownHashes.end()) {
+          traceProvider("fastpath", "already-known static hash (dedup return; already processed)");
           return;
         }
       }
     }
+    traceProvider("classify", str::format("skinned ", skinned, " captured ", captured,
+                                          " vtxUpd ", vertexDataUpdated, " deforming ", deforming,
+                                          " -> snapshotting").c_str());
 
     // Snapshot outside the lock: this copies the geometry's CPU staging data. This is
     // the only window where that data is guaranteed alive, so the copy must happen
@@ -232,6 +255,7 @@ namespace dxvk {
     if (deforming) {
       // re-check: another draw of the same topology may have won the race
       if (!m_knownTopologyKeys.insert(topologyKey).second) {
+        traceProvider("submit", "lost topology-key race (another draw registered it first; return)");
         return;
       }
       if (skinned || captured) {
@@ -241,12 +265,19 @@ namespace dxvk {
       }
     } else {
       if (!m_knownHashes.insert(geometryHash).second) {
+        traceProvider("submit", "lost static-hash race (return)");
         return;
       }
     }
 
     if (!eligible) {
       m_stats.ineligible++;
+      const char* why = snapshotResult == SnapshotResult::SkipTopology  ? "INELIGIBLE topology (unsupported primitive topology)"
+                      : snapshotResult == SnapshotResult::SkipTooSmall  ? "INELIGIBLE tooSmall (below min triangle/vertex count)"
+                      : snapshotResult == SnapshotResult::SkipFormat    ? "INELIGIBLE format (unsupported vertex/index format)"
+                      : snapshotResult == SnapshotResult::SkipNoCpuData ? "INELIGIBLE noCpuData (no host-visible geometry to snapshot)"
+                      : "INELIGIBLE (other)";
+      traceProvider("eligibility", why);
       switch (snapshotResult) {
         case SnapshotResult::SkipTopology:  m_stats.skippedTopology++; break;
         case SnapshotResult::SkipTooSmall:  m_stats.skippedTooSmall++; break;
@@ -256,6 +287,10 @@ namespace dxvk {
       }
       return;
     }
+    traceProvider("submit", captured ? "SUBMITTED as captured promotion candidate"
+                                     : (skinned ? "SUBMITTED as skinned Path B"
+                                                : (vertexDataUpdated ? "SUBMITTED as mutating Path B"
+                                                                     : "SUBMITTED as static Path A")));
 
     if (snapshotResult == SnapshotResult::EligibleConverted) {
       m_stats.convertedTopology++;

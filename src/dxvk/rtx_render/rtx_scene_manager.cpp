@@ -1404,6 +1404,41 @@ namespace dxvk {
   RtInstance* SceneManager::processDrawCallState(const Rc<DxvkContext>& ctx, const DrawCallState& drawCallState, const MaterialData& renderMaterialData, RtInstance* existingInstance, const RtxParticleSystemDesc* pParticleSystemDesc) {
     ScopedCpuProfileZone();
 
+    // DIAG (DrawTrace/scene): earliest per-draw point in Remix, BEFORE the ignored
+    // filter and all cluster routing. If a user-identified surface's sub-mesh never
+    // appears in the cluster logs, this shows whether it reached Remix at all, and
+    // whether it is drawn captured (vertex-shader capture) or as plain geometry -
+    // the deciding fact for why some sub-meshes never enter the promotion system.
+    // Gated by rtx.clusterLod.promotion.traceMaterialHash (hex material). Throttled.
+    if (ClusterLodOptions::enable()) {
+      const std::string& traceStr = ClusterLodOptions::Promotion::traceMaterialHash();
+      if (!traceStr.empty()) {
+        uint64_t traceMat = 0;
+        try { traceMat = std::stoull(traceStr, nullptr, 16); } catch (...) { traceMat = 0; }
+        if (traceMat != 0 && drawCallState.getMaterialData().getHash() == traceMat) {
+          const RasterGeometry& gd = drawCallState.getGeometryData();
+          const XXH64_hash_t geomHash = gd.getHashForRule(RtxOptions::geometryAssetHashRule());
+          const bool captured = drawCallState.preCaptureVertexData != nullptr;
+          const bool skinned = drawCallState.getSkinningState().numBones > 0 && gd.numBonesPerVertex > 0;
+          static std::mutex s_mx;
+          static std::unordered_map<uint64_t, uint32_t> s_last;
+          const uint32_t fr = m_device->getCurrentFrameId();
+          std::lock_guard<std::mutex> lk(s_mx);
+          uint32_t& last = s_last[geomHash];
+          if (last == 0u || fr - last > 300u) {
+            last = fr;
+            Logger::info(str::format("[DrawTrace/scene] geom 0x", std::hex, geomHash,
+                                     " mat 0x", traceMat, std::dec, " captured ", captured,
+                                     " skinned ", skinned, " verts ", gd.vertexCount,
+                                     " indices ", gd.indexCount,
+                                     " ignoredMaterial ", renderMaterialData.getIgnored(),
+                                     " existingInstance ", (existingInstance != nullptr),
+                                     " frame ", fr));
+          }
+        }
+      }
+    }
+
     if (renderMaterialData.getIgnored()) {
       return nullptr;
     }

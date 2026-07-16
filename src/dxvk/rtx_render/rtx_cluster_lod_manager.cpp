@@ -383,6 +383,15 @@ namespace dxvk {
     return hasExtension && hasFeature && hasSubgroup32 && hasShaderInt64 && hasMinmaxSampler && hasMaintenance5;
   }
 
+  // DIAG: parse rtx.clusterLod.promotion.traceMaterialHash once; 0 = off.
+  static uint64_t clusterLodTraceMaterialHash() {
+    const std::string& s = ClusterLodOptions::Promotion::traceMaterialHash();
+    if (s.empty()) {
+      return 0;
+    }
+    try { return std::stoull(s, nullptr, 16); } catch (...) { return 0; }
+  }
+
   void ClusterLodManager::onDrawCallGeometry(const DrawCallState& drawCallState, bool vertexDataUpdated) {
     // Whatever happens below, drop the pre-capture staging hold on the way out:
     // the snapshot (if one is taken) copies the data, and holding longer would
@@ -408,11 +417,38 @@ namespace dxvk {
     // variant AND make load-time keying (7.1a - no draw material exists yet)
     // impossible. Same rule, geometry hashes only.
     const XXH64_hash_t geometryHash = drawCallState.getGeometryData().getHashForRule(RtxOptions::geometryAssetHashRule());
+
+    // DIAG (DrawTrace/intake): this is the cluster manager's entry - a draw that
+    // reaches here passed SceneManager but may still be dropped by the empty-hash
+    // guard below (geometry with no hashable data never enters the cluster system).
+    const uint64_t traceMat = clusterLodTraceMaterialHash();
+    const bool traceThis = traceMat != 0 && drawCallState.getMaterialData().getHash() == traceMat;
+    if (traceThis) {
+      const RasterGeometry& gd = drawCallState.getGeometryData();
+      const bool captured = drawCallState.preCaptureVertexData != nullptr;
+      const bool skinned = drawCallState.getSkinningState().numBones > 0 && gd.numBonesPerVertex > 0;
+      static std::mutex s_mx;
+      static std::unordered_map<uint64_t, uint32_t> s_last;
+      const uint32_t fr = m_device->getCurrentFrameId();
+      std::lock_guard<std::mutex> lk(s_mx);
+      uint32_t& last = s_last[geometryHash];
+      if (last == 0u || fr - last > 300u) {
+        last = fr;
+        Logger::info(str::format("[DrawTrace/intake] geom 0x", std::hex, geometryHash,
+                                 " mat 0x", traceMat, std::dec, " captured ", captured,
+                                 " skinned ", skinned, " vtxUpd ", vertexDataUpdated,
+                                 " verts ", gd.vertexCount, " indices ", gd.indexCount,
+                                 " emptyHash ", (geometryHash == kEmptyHash),
+                                 " -> ", (geometryHash == kEmptyHash ? "DROPPED (no hash)" : "to provider"),
+                                 " frame ", fr));
+      }
+    }
+
     if (geometryHash == kEmptyHash) {
       return;
     }
 
-    m_provider->onDrawCallGeometry(drawCallState, geometryHash, vertexDataUpdated);
+    m_provider->onDrawCallGeometry(drawCallState, geometryHash, vertexDataUpdated, traceThis);
   }
 
   void ClusterLodManager::onReplacementGeometryLoaded(const RasterGeometry& geometryData) {
@@ -814,6 +850,7 @@ namespace dxvk {
       pending.probeVa = probeVa;
       pending.vertexCount = refCount;
       pending.routeHash = snapshot.isRestCapture ? snapshot.geometryHash : 0;
+      pending.topologyKey = snapshot.topologyKey;  // stable identity for the churning-hash draw side
       m_promoPendingProbes.push_back(pending);
     }
 
@@ -858,6 +895,20 @@ namespace dxvk {
             existing->second.stuckFrames = 0;
             existing->second.loggedTemporalHold = false;
             existing->second.restState = PromotionCandidate::RestState::Referenced;
+            // per-instance rest verdicts start fresh: instance state from the
+            // object-space probe era (pins, demotions, GPU streaks) is void -
+            // residency moved to the rest hash and the reference content changed
+            for (auto& slotEntry : m_promoSlotByBlas) {
+              if (slotEntry.second.geometryHash == pending.geometryHash) {
+                slotEntry.second.restPhase = PromoInstance::RestPhase::Probing;
+                slotEntry.second.restGateFrames = 0;
+                slotEntry.second.restStuckFrames = 0;
+                slotEntry.second.restLastSolveFrame = 0;
+                slotEntry.second.demoted = false;
+                slotEntry.second.sweepPending = false;
+                slotEntry.second.residentGeometryId = ~0u;
+              }
+            }
             Logger::info(str::format("[ClusterLOD] promotion: geometry 0x", std::hex, pending.geometryHash,
                                      " probe re-referenced to REST CAPTURE 0x", pending.routeHash, std::dec));
           }
@@ -876,7 +927,13 @@ namespace dxvk {
         candidate.vertexCount = pending.vertexCount;
         candidate.stateSlot = m_promoNextStateSlot++;
         candidate.routeHash = pending.routeHash;
+        candidate.topologyKey = pending.topologyKey;
         m_promoCandidates.emplace(pending.geometryHash, candidate);
+        // index by stable topology so a churned-hash draw resolves to this candidate
+        // every frame (this game's captured hashes churn per frame; see topologyKey).
+        if (pending.topologyKey != 0) {
+          m_promoCandidateByTopology[pending.topologyKey] = pending.geometryHash;
+        }
       }
       m_promoPendingProbes.clear();
     }
@@ -954,6 +1011,14 @@ namespace dxvk {
 
       switch (candidate.phase) {
       case PromotionCandidate::Phase::Probing:
+        // REST-referenced: per-instance verdicts (instance loop below) drive this
+        // candidate - its own state slot receives no solves anymore, so the state
+        // here is stale. The phase flips to Promoted when the first instance
+        // passes its gate (residency routing keys on the candidate phase).
+        if (candidate.routeHash != 0
+            && candidate.restState == PromotionCandidate::RestState::Referenced) {
+          break;
+        }
         if (state.rigidStreak >= rigidFrames) {
           candidate.phase = PromotionCandidate::Phase::GateScheduled;
         } else if (ClusterLodOptions::Promotion::restCaptureReference()
@@ -1093,6 +1158,79 @@ namespace dxvk {
       PromoInstance& promoInstance = slotEntry.second;
       const lodclusters_remix::PromotionStateView& state = m_promoStates[promoInstance.stateSlot];
 
+      // ---- per-instance REST verdicts (pre-promotion phases) ----
+      // Mirrors the candidate state machine, per instance: streak -> gate ->
+      // Promoted/Rejected. Pre-promotion phases skip the demote logic below
+      // (their solves legitimately read non-rigid while they probe). Rejection
+      // is terminal: a static instance that never fits the shared rest
+      // reference has a divergent VS-built shape - buildPromotionEntries stops
+      // emitting its solves, so it costs nothing steady-state.
+      if (promoInstance.restPhase != PromoInstance::RestPhase::None
+          && promoInstance.restPhase != PromoInstance::RestPhase::Promoted) {
+        switch (promoInstance.restPhase) {
+        case PromoInstance::RestPhase::Probing:
+          if (state.rigidStreak >= rigidFrames) {
+            promoInstance.restPhase = PromoInstance::RestPhase::GateScheduled;
+          } else if (state.lastFrame != 0u && state.lastFrame != promoInstance.restLastSolveFrame) {
+            // a fresh solve landed (stale passes change nothing - an absent
+            // instance must not be judged on its last state)
+            promoInstance.restLastSolveFrame = state.lastFrame;
+            if (state.residualRel > epsilon
+                && state.temporalDeformRel <= ClusterLodOptions::Promotion::temporalEpsilon()) {
+              // static but not matching the shared rest reference; same patience
+              // the rest trigger itself used before terminating
+              if (++promoInstance.restStuckFrames
+                  >= uint32_t(std::max(10, ClusterLodOptions::Promotion::restCaptureStuckFrames()))) {
+                promoInstance.restPhase = PromoInstance::RestPhase::Rejected;
+                Logger::info(str::format("[ClusterLOD] promotion: instance (slot ", promoInstance.stateSlot,
+                                         ", geom 0x", std::hex, promoInstance.geometryHash, std::dec,
+                                         ") REST verdict: static but does not match the shared rest reference (residual ",
+                                         state.residualRel, ") - stays Path B (terminal)"));
+              }
+            } else {
+              promoInstance.restStuckFrames = 0;
+            }
+          }
+          break;
+
+        case PromoInstance::RestPhase::GateRunning:
+          if (++promoInstance.restGateFrames >= gateLag) {
+            if (state.gateResidualRel > 0.0f && state.gateResidualRel <= epsilon) {
+              promoInstance.restPhase = PromoInstance::RestPhase::Promoted;
+              Logger::info(str::format("[ClusterLOD] promotion: instance (slot ", promoInstance.stateSlot,
+                                       ", geom 0x", std::hex, promoInstance.geometryHash, std::dec,
+                                       ") REST instance PROMOTED to Path A (full-mesh residual ",
+                                       state.gateResidualRel, ")"));
+              // first instance to pass promotes the candidate (routing gate)
+              const auto candIt = m_promoCandidates.find(promoInstance.geometryHash);
+              if (candIt != m_promoCandidates.end()
+                  && candIt->second.phase != PromotionCandidate::Phase::Promoted) {
+                candIt->second.phase = PromotionCandidate::Phase::Promoted;
+                m_statsPromoted++;
+                Logger::info(str::format("[ClusterLOD] promotion: geometry 0x", std::hex,
+                                         promoInstance.geometryHash, std::dec,
+                                         " PROMOTED to Path A via per-instance REST verdict"));
+              }
+            } else if (state.gateResidualRel > epsilon) {
+              promoInstance.restPhase = PromoInstance::RestPhase::Rejected;
+              Logger::info(str::format("[ClusterLOD] promotion: instance (slot ", promoInstance.stateSlot,
+                                       ", geom 0x", std::hex, promoInstance.geometryHash, std::dec,
+                                       ") REST gate REJECTED (full-mesh residual ", state.gateResidualRel,
+                                       ") - stays Path B (terminal)"));
+            } else {
+              // gate never accumulated (instance off-screen that frame) - retry
+              promoInstance.restPhase = PromoInstance::RestPhase::GateScheduled;
+              promoInstance.restGateFrames = 0;
+            }
+          }
+          break;
+
+        default:
+          break;  // GateScheduled waits on buildPromotionEntries; Rejected is terminal
+        }
+        continue;
+      }
+
       // periodic full-mesh sweep verdict (same lag handling as the gate). The sweep
       // judges an ALREADY-PROMOTED instance, so the demote hysteresis applies here
       // exactly like the per-frame solve verdict.
@@ -1128,6 +1266,21 @@ namespace dxvk {
     }
   }
 
+  uint64_t ClusterLodManager::resolvePromoCandidateKey(const RasterGeometry& geometryData) const {
+    // direct hit: stable-hash geometry, or the exact frame the churned hash recurs
+    const XXH64_hash_t hash = geometryData.getHashForRule(RtxOptions::geometryAssetHashRule());
+    if (m_promoCandidates.count(hash) != 0) {
+      return hash;
+    }
+    // churned hash: resolve through the stable topology index
+    const uint64_t topo = ClusterLodGeometryProvider::makeTopologyKey(geometryData);
+    const auto it = m_promoCandidateByTopology.find(topo);
+    if (it != m_promoCandidateByTopology.end() && m_promoCandidates.count(it->second) != 0) {
+      return it->second;
+    }
+    return 0;
+  }
+
   void ClusterLodManager::buildPromotionEntries() {
     m_framePromoEntries.clear();
 
@@ -1141,6 +1294,54 @@ namespace dxvk {
     // every instance solves the same way for the verdict's purposes)
     std::unordered_set<uint64_t> emitted;
     std::unordered_set<uint32_t> emittedInstanceSlots;
+
+    // ---- PIN the geometry-level temporal probe to one stable instance ----
+    // (see PromotionCandidate::probeBlas). Pre-pass: for each plain (non-rest)
+    // candidate still proving rigidity, choose the frame pose of the instance it
+    // used last frame if that instance is present this frame; otherwise adopt the
+    // first available. Without this the emit's "first slot in arrival order" swaps
+    // instances between frames and the temporalDeform gate never lets a rigid mesh
+    // build a streak (20+ s promotion latency observed on perfectly-rigid meshes).
+    std::unordered_map<uint64_t, uint32_t> probePoseByHash;
+    std::unordered_map<uint64_t, const BlasEntry*> probeBlasByHash;
+    std::unordered_set<uint64_t> probePinLocked;
+    for (const size_t tlasType : { size_t(Tlas::Opaque), size_t(Tlas::Unordered) }) {
+      for (const ClusterSlot& slot : m_slotsB[tlasType]) {
+        const uint32_t fpi = slot.geometryId & ~kPathBTag;
+        if (fpi >= m_framePoses.size()) {
+          continue;
+        }
+        const BlasEntry* be = slot.instance->getBlas();
+        if (be == nullptr) {
+          continue;
+        }
+        const uint64_t hash = resolvePromoCandidateKey(be->input.getGeometryData());
+        const auto cit = m_promoCandidates.find(hash);
+        if (cit == m_promoCandidates.end()) {
+          continue;
+        }
+        const PromotionCandidate& cand = cit->second;
+        // rest-referenced candidates solve per-instance (handled below), not through
+        // the shared geometry-level probe; promoted/rejected need no probe pin
+        if (cand.routeHash != 0 && cand.restState == PromotionCandidate::RestState::Referenced) {
+          continue;
+        }
+        if (cand.phase != PromotionCandidate::Phase::Probing
+            && cand.phase != PromotionCandidate::Phase::GateScheduled
+            && cand.phase != PromotionCandidate::Phase::GateRunning) {
+          continue;
+        }
+        if (cand.probeBlas == be && cand.probeBlasFrameCreated == be->frameCreated) {
+          // the pinned instance is present this frame - lock it (wins over any provisional)
+          probePoseByHash[hash] = fpi;
+          probeBlasByHash[hash] = be;
+          probePinLocked.insert(hash);
+        } else if (probePinLocked.count(hash) == 0 && probeBlasByHash.count(hash) == 0) {
+          probePoseByHash[hash] = fpi;   // provisional fallback (pinned instance absent)
+          probeBlasByHash[hash] = be;
+        }
+      }
+    }
     for (const size_t tlasType : { size_t(Tlas::Opaque), size_t(Tlas::Unordered) }) {
       for (size_t i = 0; i < m_slotsB[tlasType].size(); i++) {
         const ClusterSlot& slot = m_slotsB[tlasType][i];
@@ -1152,12 +1353,86 @@ namespace dxvk {
         if (blasEntry == nullptr) {
           continue;
         }
-        const XXH64_hash_t hash = blasEntry->input.getGeometryData().getHashForRule(RtxOptions::geometryAssetHashRule());
+        // stable candidate key (the draw's own hash churns per frame on this game's
+        // captured geometry; resolve through topology so the solve runs EVERY frame)
+        const uint64_t hash = resolvePromoCandidateKey(blasEntry->input.getGeometryData());
         const auto found = m_promoCandidates.find(hash);
         if (found == m_promoCandidates.end()) {
           continue;
         }
         PromotionCandidate& candidate = found->second;
+
+        // REST-referenced candidate: PER-INSTANCE solve/gate entries, deduped by
+        // BlasEntry state slot instead of by hash. Every instance's VS can build
+        // a different shape, so each solves ITS OWN capture buffer against the
+        // shared rest reference and promotes (or terminally fails) individually -
+        // a divergent sibling then never routes Path A instead of promoting
+        // wrongly and demote-flapping (0x84974cdd instance 1181, residual 0.223).
+        if (candidate.routeHash != 0
+            && candidate.restState == PromotionCandidate::RestState::Referenced
+            && candidate.probeVa != 0) {
+          auto instanceIt = m_promoSlotByBlas.find(blasEntry);
+          if (instanceIt == m_promoSlotByBlas.end()) {
+            if (m_promoNextStateSlot >= lodclusters_remix::ClusterRenderSystem::kPromotionSlotCapacity) {
+              ONCE(Logger::warn("[ClusterLOD] promotion state slots exhausted - rest instances stay Path B"));
+              continue;
+            }
+            PromoInstance promoInstance;
+            promoInstance.stateSlot = m_promoNextStateSlot++;
+            promoInstance.geometryHash = hash;
+            promoInstance.blasFrameCreated = blasEntry->frameCreated;
+            promoInstance.restPhase = PromoInstance::RestPhase::Probing;
+            instanceIt = m_promoSlotByBlas.emplace(blasEntry, promoInstance).first;
+          }
+          PromoInstance& promoInstance = instanceIt->second;
+          if (promoInstance.blasFrameCreated != blasEntry->frameCreated) {
+            // recycled BlasEntry address = fresh capture content on the same slot:
+            // restart this instance's rest probing
+            promoInstance.blasFrameCreated = blasEntry->frameCreated;
+            promoInstance.geometryHash = hash;
+            promoInstance.restPhase = PromoInstance::RestPhase::Probing;
+            promoInstance.restGateFrames = 0;
+            promoInstance.restStuckFrames = 0;
+            promoInstance.restLastSolveFrame = 0;
+            promoInstance.demoted = false;
+            promoInstance.sweepPending = false;
+            promoInstance.residentGeometryId = ~0u;
+          }
+          if (promoInstance.restPhase == PromoInstance::RestPhase::None) {
+            // instance predates the rest swap (pre-rest establish) - enter probing
+            promoInstance.restPhase = PromoInstance::RestPhase::Probing;
+            promoInstance.geometryHash = hash;
+            promoInstance.restStuckFrames = 0;
+          }
+          if (promoInstance.restPhase == PromoInstance::RestPhase::Rejected
+              || (promoInstance.restPhase == PromoInstance::RestPhase::Promoted && !promoInstance.demoted)) {
+            // terminal / routes Path A (a demoted rest instance falls through and
+            // keeps solving so a rebuilt rigid streak re-promotes it)
+            continue;
+          }
+          if (!emittedInstanceSlots.insert(promoInstance.stateSlot).second) {
+            continue;  // instances sharing a BlasEntry share capture content + slot
+          }
+          lodclusters_remix::PromotionEntry instEntry;
+          instEntry.probeVa = candidate.probeVa;
+          instEntry.captureVa = m_framePoses[framePoseIndex].positionsAddress;
+          instEntry.captureStrideBytes = m_framePoses[framePoseIndex].positionsStrideBytes;
+          instEntry.captureVertexCount = m_framePoses[framePoseIndex].positionsCount;
+          instEntry.stateSlot = promoInstance.stateSlot;
+          instEntry.patchSlot = 0xFFFFFFFFu;
+          m_framePromoEntries.push_back(instEntry);
+          if (promoInstance.restPhase == PromoInstance::RestPhase::GateScheduled) {
+            // same-frame gate pairing as the candidate flow (solves -> barrier ->
+            // gates in recordPromotion, so the gate reads this frame's fresh M)
+            lodclusters_remix::PromotionEntry gateEntry = instEntry;
+            gateEntry.mode = 1;
+            gateEntry.vertexCount = candidate.vertexCount;
+            m_framePromoEntries.push_back(gateEntry);
+            promoInstance.restPhase = PromoInstance::RestPhase::GateRunning;
+            promoInstance.restGateFrames = 0;
+          }
+          continue;
+        }
 
         // DEMOTED promoted-instance rendering Path B: keep solving ITS OWN
         // slot so a rebuilt rigid streak re-promotes it (per-instance
@@ -1187,6 +1462,38 @@ namespace dxvk {
           continue;
         }
 
+        // Use the PINNED instance's frame pose (chosen in the pre-pass) instead of
+        // this arrival-order slot, so the temporal gate compares like-for-like.
+        const uint32_t probePoseIndex = probePoseByHash.count(hash) ? probePoseByHash[hash] : framePoseIndex;
+        const BlasEntry* probeBe = probeBlasByHash.count(hash) ? probeBlasByHash[hash] : blasEntry;
+
+        // Pin change (the previous probe instance left the scene, or first adoption):
+        // the state slot's stored previous-frame samples belong to a DIFFERENT
+        // placement, so a temporalDeform computed against them is meaningless. Skip
+        // this frame's solve when switching between two real instances - the kernel
+        // then sees a frame gap (lastFrame not contiguous) next solve and reports
+        // tDeform 0, discarding the stale cross-instance sample. First adoption
+        // (old probeBlas == nullptr) has no prior samples to discard, so it proceeds.
+        const bool hadPrevPin = candidate.probeBlas != nullptr;
+        const bool pinChanged = candidate.probeBlas != probeBe
+                             || candidate.probeBlasFrameCreated != (probeBe ? probeBe->frameCreated : 0u);
+        candidate.probeBlas = probeBe;
+        candidate.probeBlasFrameCreated = probeBe ? probeBe->frameCreated : 0u;
+        if (pinChanged && hadPrevPin) {
+          static std::mutex s_pinMx;
+          static std::unordered_map<uint64_t, uint32_t> s_pinLastLog;
+          const uint32_t frameNow = m_device->getCurrentFrameId();
+          std::lock_guard<std::mutex> lk(s_pinMx);
+          uint32_t& last = s_pinLastLog[hash];
+          if (last == 0u || frameNow - last > 120u) {
+            last = frameNow;
+            Logger::info(str::format("[PromoPin] geometry 0x", std::hex, hash, std::dec,
+                                     " temporal-probe instance switched (pinned placement left view)"
+                                     " - resetting temporal history this frame"));
+          }
+          continue;  // skip solve -> temporal reset on the next contiguous frame
+        }
+
         // REST-CAPTURE staging: the frame pose IS the capture buffer, so stage the
         // one-time readback here (copy recorded in dispatchBuild where ctx lives).
         if (candidate.restState == PromotionCandidate::RestState::Requested) {
@@ -1198,7 +1505,7 @@ namespace dxvk {
               topoVertexCount = topoIt->second.vertexCount;
             }
           }
-          const FramePose& pose = m_framePoses[framePoseIndex];
+          const FramePose& pose = m_framePoses[probePoseIndex];
           if (topoVertexCount > 0 && pose.positionsCount >= topoVertexCount
               && pose.positionsStrideBytes >= 3 * sizeof(float)) {
             DxvkBufferCreateInfo stagingInfo;
@@ -1228,9 +1535,9 @@ namespace dxvk {
 
         lodclusters_remix::PromotionEntry promoEntry;
         promoEntry.probeVa = candidate.probeVa;
-        promoEntry.captureVa = m_framePoses[framePoseIndex].positionsAddress;
-        promoEntry.captureStrideBytes = m_framePoses[framePoseIndex].positionsStrideBytes;
-        promoEntry.captureVertexCount = m_framePoses[framePoseIndex].positionsCount;
+        promoEntry.captureVa = m_framePoses[probePoseIndex].positionsAddress;
+        promoEntry.captureStrideBytes = m_framePoses[probePoseIndex].positionsStrideBytes;
+        promoEntry.captureVertexCount = m_framePoses[probePoseIndex].positionsCount;
         promoEntry.stateSlot = candidate.stateSlot;
         promoEntry.patchSlot = 0xFFFFFFFFu;
         // Always emit the per-frame mode-0 solve so matrices.m[slot] holds an M
@@ -1268,7 +1575,7 @@ namespace dxvk {
         if (blasEntry == nullptr) {
           continue;
         }
-        const XXH64_hash_t hash = blasEntry->input.getGeometryData().getHashForRule(RtxOptions::geometryAssetHashRule());
+        const uint64_t hash = resolvePromoCandidateKey(blasEntry->input.getGeometryData());
         const auto found = m_promoCandidates.find(hash);
         if (found == m_promoCandidates.end()) {
           continue;
@@ -1304,6 +1611,80 @@ namespace dxvk {
             instanceIt->second.sweepPending = true;
             instanceIt->second.sweepLagFrames = 0;
           }
+        }
+      }
+    }
+
+    // ---- DIAG (PromoLimbo): a candidate that uploaded a probe and entered the
+    // state machine but gets NO solve entry this frame cannot advance - and a
+    // candidate at GateScheduled has no updatePromotionStates handler, so if its
+    // gate is never emitted (its geometry is not in the Path B slot list this
+    // frame) it stalls SILENTLY forever (no promote/reject/stuck log). This is the
+    // "static pillar that never reaches Path A" class. Report the stuck population
+    // and the discriminator: inPathB=0 means it is rendering classic/culled (never
+    // solved); inPathB=1 means it is on Path B but the emit skipped it. Throttled
+    // per geometry (600 frames). Off the hot path - only pre-promotion candidates.
+    {
+      std::unordered_set<uint64_t> pathBHashesThisFrame;
+      for (const size_t t : { size_t(Tlas::Opaque), size_t(Tlas::Unordered) }) {
+        for (const ClusterSlot& s : m_slotsB[t]) {
+          const BlasEntry* be = s.instance->getBlas();
+          if (be != nullptr) {
+            // resolve to the stable candidate key so the check matches m_promoCandidates
+            // (the raw draw hash churns per frame and would never match)
+            const uint64_t ck = resolvePromoCandidateKey(be->input.getGeometryData());
+            pathBHashesThisFrame.insert(ck != 0 ? ck
+              : be->input.getGeometryData().getHashForRule(RtxOptions::geometryAssetHashRule()));
+          }
+        }
+      }
+      static std::mutex s_limboMx;
+      static std::unordered_map<uint64_t, uint32_t> s_limboLog;
+      const uint32_t frameNow = m_device->getCurrentFrameId();
+      std::lock_guard<std::mutex> lk(s_limboMx);
+      for (const auto& e : m_promoCandidates) {
+        const PromotionCandidate& c = e.second;
+        if (c.phase == PromotionCandidate::Phase::Promoted
+            || c.phase == PromotionCandidate::Phase::Rejected
+            || c.routeHash != 0) {
+          continue;  // resolved, or rest-referenced (per-instance path)
+        }
+        if (emitted.count(e.first) != 0) {
+          continue;  // got a solve entry this frame (advancing normally)
+        }
+        uint32_t& last = s_limboLog[e.first];
+        if (last == 0u || frameNow - last > 600u) {
+          last = frameNow;
+          const bool inB = pathBHashesThisFrame.count(e.first) != 0;
+          const char* ph = c.phase == PromotionCandidate::Phase::Probing ? "Probing"
+                         : c.phase == PromotionCandidate::Phase::GateScheduled ? "GateScheduled"
+                         : "GateRunning";
+          // rigidStreak + lastSolveFrame from the state readback are the decisive
+          // discriminator: solveFrame==0 (or never advancing) => this candidate has
+          // NEVER been drawn Path B (off-screen; benign, resolves when drawn). A
+          // recent solveFrame with rigidStreak stuck at 0/1 while frameNow climbs =>
+          // it IS being drawn but on NON-CONTIGUOUS frames, so the kernel's
+          // contiguity check (lastFrame+1==frameId) keeps restarting the streak at 1
+          // and it can never reach the gate (the real "on-screen but never promotes"
+          // bug - intermittent/multi-pass draw).
+          uint32_t rigidStreak = 0, lastSolveFrame = 0;
+          if (m_promoStatesValid && c.stateSlot < m_promoStates.size()) {
+            rigidStreak = m_promoStates[c.stateSlot].rigidStreak;
+            lastSolveFrame = m_promoStates[c.stateSlot].lastFrame;
+          }
+          // residentPathA: this candidate's geometry is ALSO resident in the regular
+          // (non-promotion) Path A table. If a captured candidate is drawn without
+          // its capture flag on later frames it falls through to the ladder and
+          // renders regular Path A at its INPUT-space position (wrong transform),
+          // orphaning the promotion candidate here forever. residentPathA=1 +
+          // never-advancing solveFrame is that bug's signature.
+          const bool residentPathA = m_geometryIdByHash.count(e.first) != 0;
+          Logger::info(str::format("[PromoLimbo] geometry 0x", std::hex, e.first, std::dec,
+                                   " uploaded but NOT solved this frame (phase ", ph,
+                                   ", inPathB ", inB, ", residentPathA ", residentPathA,
+                                   ", rigidStreak ", rigidStreak,
+                                   ", lastSolveFrame ", lastSolveFrame, ", frameNow ", frameNow,
+                                   ", restState ", uint32_t(c.restState), ")"));
         }
       }
     }
@@ -1979,12 +2360,18 @@ namespace dxvk {
       if (captured && !skinned && !updatedInPlace
           && m_renderSystem != nullptr && m_renderSystem->hasGeneration()
           && ClusterLodOptions::Promotion::enable() && !m_promoCandidates.empty()) {
-        const XXH64_hash_t geometryHash = blasEntry->input.getGeometryData().getHashForRule(RtxOptions::geometryAssetHashRule());
+        // stable candidate key: the draw's own asset hash churns per frame on this
+        // game's captured geometry, so a direct-hash lookup here matched a Promoted
+        // candidate only on the rare frames the churn recurred - which is why a
+        // promoted pillar still took ~2 minutes to actually route Path A. Resolve
+        // through topology so EVERY frame's draw finds its promoted candidate.
+        const uint64_t geometryHash = resolvePromoCandidateKey(blasEntry->input.getGeometryData());
         const auto candidate = m_promoCandidates.find(geometryHash);
         if (candidate != m_promoCandidates.end()
             && candidate->second.phase == PromotionCandidate::Phase::Promoted) {
           // rest-referenced candidates render the clusters built from their CAPTURED
           // rest pose (space-tagged hash); everything else uses the object-space id
+          // (the stable candidate key, which m_geometryIdByHash is keyed by).
           const uint64_t residencyHash = candidate->second.routeHash != 0
                                        ? candidate->second.routeHash : geometryHash;
           const auto found = m_geometryIdByHash.find(residencyHash);
@@ -2031,11 +2418,34 @@ namespace dxvk {
                 PromoInstance promoInstance;
                 promoInstance.stateSlot = m_promoNextStateSlot++;
                 slotIt = m_promoSlotByBlas.emplace(blasEntry, promoInstance).first;
+              } else if (slotIt != m_promoSlotByBlas.end()
+                         && slotIt->second.blasFrameCreated != blasEntry->frameCreated) {
+                // recycled BlasEntry address: this map is never GC'd, so a freed
+                // entry's address coming back carries the OLD tenant's state
+                // (demoted flag, rest phase, pin) into a brand-new instance -
+                // reset everything but keep the slot (its stale GPU temporal
+                // sample is one isolated spike, which persistence now absorbs)
+                slotIt->second.blasFrameCreated = blasEntry->frameCreated;
+                slotIt->second.demoted = false;
+                slotIt->second.sweepPending = false;
+                slotIt->second.restPhase = PromoInstance::RestPhase::None;
+                slotIt->second.restGateFrames = 0;
+                slotIt->second.restStuckFrames = 0;
+                slotIt->second.restLastSolveFrame = 0;
+                slotIt->second.residentGeometryId = ~0u;
+                slotIt->second.geometryHash = 0;
               }
+              // rest-referenced candidates promote PER-INSTANCE: an instance
+              // routes Path A only after ITS OWN solve+gate against the shared
+              // rest reference passed - a divergent-shape sibling stays Path B
+              // instead of promoting wrongly and demote-flapping
+              const bool restGated = candidate->second.routeHash != 0
+                && (slotIt == m_promoSlotByBlas.end()
+                    || slotIt->second.restPhase != PromoInstance::RestPhase::Promoted);
               // per-instance demotion: a demoted instance falls through to
               // Path B below while its siblings stay promoted; its slot keeps
               // solving (buildPromotionEntries) so it can re-promote
-              if (slotIt != m_promoSlotByBlas.end() && !slotIt->second.demoted) {
+              if (slotIt != m_promoSlotByBlas.end() && !slotIt->second.demoted && !restGated) {
                 // Cache the stable identity so the pinned fast-path above can route
                 // this instance every subsequent frame WITHOUT the churning-hash lookup.
                 slotIt->second.residentGeometryId = found->second;
@@ -2058,6 +2468,8 @@ namespace dxvk {
                   last = currentFrame;
                   const char* why2 = (slotIt != m_promoSlotByBlas.end() && slotIt->second.demoted)
                                    ? "instance DEMOTED (per-instance solve non-rigid)"
+                                   : restGated
+                                   ? "REST instance verdict pending/failed (per-instance rest reference)"
                                    : "promo state slot pool exhausted";
                   Logger::info(str::format("[PathARoute] geometry 0x", std::hex, geometryHash, std::dec,
                                            " instance dropped to Path B: ", why2,
@@ -2070,7 +2482,38 @@ namespace dxvk {
         }
       }
 
-      return isClusterTemplateInstance(instance, blasEntry, outGeometryId);
+      const bool routedPathB = isClusterTemplateInstance(instance, blasEntry, outGeometryId);
+      // DIAG (PromoClassic): a CAPTURED promotion candidate that is NOT promoted
+      // and does NOT route Path B renders CLASSIC - so buildPromotionEntries never
+      // sees it in m_slotsB and its candidate solve never runs (silent limbo, the
+      // "static pillar never reaches Path A" class). Name the exact reason
+      // isClusterTemplateInstance declined. Throttled per geometry (600 frames).
+      if (!routedPathB && captured && !skinned
+          && ClusterLodOptions::Promotion::enable() && !m_promoCandidates.empty()) {
+        const uint64_t gh = resolvePromoCandidateKey(geometryData);
+        const auto candIt = m_promoCandidates.find(gh);
+        if (candIt != m_promoCandidates.end()
+            && candIt->second.phase != PromotionCandidate::Phase::Promoted
+            && candIt->second.phase != PromotionCandidate::Phase::Rejected) {
+          static std::mutex s_classicMx;
+          static std::unordered_map<uint64_t, uint32_t> s_classicLog;
+          std::lock_guard<std::mutex> lk(s_classicMx);
+          uint32_t& last = s_classicLog[gh];
+          if (last == 0u || currentFrame - last > 600u) {
+            last = currentFrame;
+            const bool templSys = m_templateSystemMT != nullptr;
+            const bool registered = templSys
+              && m_animatedGeometryByKey.count(ClusterLodGeometryProvider::makeTopologyKey(geometryData)) != 0;
+            const bool posDefined = blasEntry->modifiedGeometryData.positionBuffer.defined();
+            Logger::info(str::format("[PromoClassic] geometry 0x", std::hex, gh, std::dec,
+                                     " captured candidate renders CLASSIC (not Path B) - templateSys ", templSys,
+                                     ", registeredAnimated ", registered, ", positionsDefined ", posDefined,
+                                     ", animatedEnable ", ClusterLodOptions::Animated::enable(),
+                                     ", animMapSize ", m_animatedGeometryByKey.size(), ")"));
+          }
+        }
+      }
+      return routedPathB;
     }
 
     // ---- P4c ladder: Path A when resident, interim templates while it loads ----

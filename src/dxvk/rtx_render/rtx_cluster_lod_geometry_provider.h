@@ -72,7 +72,7 @@ namespace dxvk {
     // CS thread. Snapshots and enqueues the geometry on first sight of its hash
     // (Path A) or of its topology key (Path B: skinned draws, or an existing
     // BlasEntry whose vertex data updated in place - vertexDataUpdated).
-    void onDrawCallGeometry(const DrawCallState& drawCallState, uint64_t geometryHash, bool vertexDataUpdated);
+    void onDrawCallGeometry(const DrawCallState& drawCallState, uint64_t geometryHash, bool vertexDataUpdated, bool traceThis = false);
 
     // Loader threads (P4c, plan 7.1a): load-time intake for replacement
     // meshes. Snapshots directly from the replacement's buffers (static
