@@ -208,6 +208,65 @@ namespace dxvk {
       }
     }
 
+    // 3x3 symmetric eigendecomposition via cyclic Jacobi (doubles). Used by the
+    // promotion probe to build the SAMPLE-CENTERED ref Gram pseudoinverse and, for
+    // rank-2 (planar) meshes, the null-plane normal the kernel completes the affine
+    // solve with. eigVec is column-major: column i = eigenvector of eig[i].
+    void eigenSym3x3(const double g[9], double eig[3], double eigVec[9]) {
+      double a[9];
+      double v[9] = { 1,0,0, 0,1,0, 0,0,1 };
+      for (int i = 0; i < 9; i++) {
+        a[i] = g[i];
+      }
+      for (int sweep = 0; sweep < 32; sweep++) {
+        double off = 0.0;
+        for (int p = 0; p < 3; p++) {
+          for (int q = p + 1; q < 3; q++) {
+            off += a[p * 3 + q] * a[p * 3 + q];
+          }
+        }
+        if (off < 1e-28) {
+          break;
+        }
+        for (int p = 0; p < 3; p++) {
+          for (int q = p + 1; q < 3; q++) {
+            const double apq = a[p * 3 + q];
+            if (std::abs(apq) < 1e-32) {
+              continue;
+            }
+            const double theta = (a[q * 3 + q] - a[p * 3 + p]) / (2.0 * apq);
+            const double t = (theta >= 0.0 ? 1.0 : -1.0) / (std::abs(theta) + std::sqrt(theta * theta + 1.0));
+            const double c = 1.0 / std::sqrt(t * t + 1.0);
+            const double s = t * c;
+            for (int k = 0; k < 3; k++) {
+              const double akp = a[k * 3 + p];
+              const double akq = a[k * 3 + q];
+              a[k * 3 + p] = c * akp - s * akq;
+              a[k * 3 + q] = s * akp + c * akq;
+            }
+            for (int k = 0; k < 3; k++) {
+              const double apk = a[p * 3 + k];
+              const double aqk = a[q * 3 + k];
+              a[p * 3 + k] = c * apk - s * aqk;
+              a[q * 3 + k] = s * apk + c * aqk;
+            }
+            for (int k = 0; k < 3; k++) {
+              const double vkp = v[k * 3 + p];
+              const double vkq = v[k * 3 + q];
+              v[k * 3 + p] = c * vkp - s * vkq;
+              v[k * 3 + q] = s * vkp + c * vkq;
+            }
+          }
+        }
+      }
+      for (int i = 0; i < 3; i++) {
+        eig[i] = a[i * 3 + i];
+      }
+      for (int i = 0; i < 9; i++) {
+        eigVec[i] = v[i];
+      }
+    }
+
     lodclusters_remix::AnimatedConfig buildAnimatedConfig() {
       lodclusters_remix::AnimatedConfig config;
 
@@ -568,19 +627,84 @@ namespace dxvk {
     const uint32_t pickedSolve = std::min<uint32_t>(solveCount, uint32_t(picked.size()));
     uint32_t pickedValidation = uint32_t(picked.size()) - pickedSolve;
 
-    // Gram matrix over the solve samples (centered homogeneous, doubles)
-    double g[16] = {};
+    // SAMPLE-CENTERED 3x3 ref Gram inverse (doubles) for the kernel's affine solve:
+    //   A = Mcov * G3inv,  t = capBar - A*refBar   (translation decoupled)
+    // This replaces the old 4x4 centered-homogeneous pseudoinverse: evaluating
+    // gInv4x4 * b in the kernel multiplied huge inverse entries (~1/variance, 1e3+
+    // for small-radius meshes) by huge UNCENTERED capture sums - fp32 catastrophic
+    // cancellation that read a perfectly rigid 0.068-radius piece as residual 0.072
+    // ([PromoDump] verified: double-precision affine on the same samples = 2e-4).
+    // With both sides sample-centered every kernel intermediate is O(1)-sane.
+    double sm[3] = { 0.0, 0.0, 0.0 };  // solve-sample mean of the CENTERED positions
     for (uint32_t i = 0; i < pickedSolve; i++) {
       const uint32_t v = candidates[picked[i]];
-      const double h[4] = { positions[v * 3 + 0] - cx, positions[v * 3 + 1] - cy, positions[v * 3 + 2] - cz, 1.0 };
-      for (int r = 0; r < 4; r++) {
-        for (int c = 0; c < 4; c++) {
-          g[r * 4 + c] += h[r] * h[c];
+      sm[0] += positions[v * 3 + 0] - cx;
+      sm[1] += positions[v * 3 + 1] - cy;
+      sm[2] += positions[v * 3 + 2] - cz;
+    }
+    const double invN = pickedSolve > 0 ? 1.0 / double(pickedSolve) : 0.0;
+    sm[0] *= invN; sm[1] *= invN; sm[2] *= invN;
+
+    double g3[9] = {};
+    for (uint32_t i = 0; i < pickedSolve; i++) {
+      const uint32_t v = candidates[picked[i]];
+      const double h[3] = { positions[v * 3 + 0] - cx - sm[0],
+                            positions[v * 3 + 1] - cy - sm[1],
+                            positions[v * 3 + 2] - cz - sm[2] };
+      for (int r = 0; r < 3; r++) {
+        for (int c = 0; c < 3; c++) {
+          g3[r * 3 + c] += h[r] * h[c];
         }
       }
     }
-    double gInv[16];
-    pseudoInverse4x4(g, gInv);
+    // Eigendecomposed pseudoinverse + PLANE COMPLETION support:
+    //   gInv[0..8]  = row-major 3x3 Gram PSEUDOinverse (null eigenspace truncated)
+    //   gInv[9..11] = null-plane normal nHat (rank-2 only; kernel completes the
+    //                 affine solve's out-of-plane column with s*R*nHat)
+    //   gInv[12]    = 1.0 when rank-2 completion applies, else 0.0
+    // Rank <= 1 (collinear/point sample sets) stores all zeros -> the kernel's
+    // affine guards reject -> rigid fallback (unchanged behavior).
+    double gInv[16] = {};
+    {
+      double eig[3];
+      double eigVec[9];
+      eigenSym3x3(g3, eig, eigVec);
+      double maxEig = 0.0;
+      for (int i = 0; i < 3; i++) {
+        maxEig = std::max(maxEig, std::abs(eig[i]));
+      }
+      const double tol = maxEig * 1e-8;
+      int rank = 0;
+      int nullIdx = -1;
+      for (int i = 0; i < 3; i++) {
+        if (std::abs(eig[i]) > tol) {
+          rank++;
+        } else {
+          nullIdx = i;
+        }
+      }
+      if (rank >= 2 && maxEig > 0.0) {
+        // pseudoinverse = V * diag(1/eig | non-null) * V^T
+        for (int r = 0; r < 3; r++) {
+          for (int c = 0; c < 3; c++) {
+            double acc = 0.0;
+            for (int k = 0; k < 3; k++) {
+              if (std::abs(eig[k]) > tol) {
+                acc += eigVec[r * 3 + k] * eigVec[c * 3 + k] / eig[k];
+              }
+            }
+            gInv[r * 3 + c] = acc;
+          }
+        }
+        if (rank == 2 && nullIdx >= 0) {
+          gInv[9]  = eigVec[0 * 3 + nullIdx];
+          gInv[10] = eigVec[1 * 3 + nullIdx];
+          gInv[11] = eigVec[2 * 3 + nullIdx];
+          gInv[12] = 1.0;
+        }
+      }
+      // gInv[13..15] unused (kept zero; header layout unchanged)
+    }
 
     // blob assembly: header + solve + validation (falls back to the solve set
     // when no disjoint candidates exist - the 64-vs-12-DOF overdetermination
@@ -806,11 +930,20 @@ namespace dxvk {
           const int scanOff = kPromoScanOffsets[scanIdx];
           const std::string scanScore = scanScoreQ >= 31u ? std::string("n/a")
                                                           : str::format(float(scanScoreQ) / 20.0f);
+          // aff: which solve ran - "used" = affine accepted; otherwise the first
+          // guard that pushed it onto the rigid fallback (finite/norm/aniso/cond/var)
+          const uint32_t affFail = state.solveInfo & 0xFFu;
+          const char* affStr = (state.solveInfo & 0x100u) != 0u ? "used"
+                             : affFail == 1u ? "FAIL-finite"
+                             : affFail == 2u ? "FAIL-norm"
+                             : affFail == 3u ? "FAIL-aniso"
+                             : affFail == 4u ? "FAIL-cond"
+                             : affFail == 5u ? "FAIL-refVar" : "none";
           Logger::info(str::format("[ClusterLOD] promotion: geometry 0x", std::hex, entry.first, std::dec,
                                    " stuck in Probing (sparseResidual ", state.residualRel,
-                                   " vs eps ", epsilon, ", meanDev ", state.meanDevRel,
+                                   " vs eps ", epsilon, ", aff ", affStr,
+                                   ", meanDev ", state.meanDevRel,
                                    ", dirCoh ", state.dirCoherence,
-                                   ", normAlign ", state.normAlign,
                                    ", tDeform ", state.temporalDeformRel,
                                    ", scanOff ", scanOff, ", scanScore ", scanScore, ", refl ", reflected,
                                    ", verts ", candidate.vertexCount, ")"));
@@ -894,10 +1027,13 @@ namespace dxvk {
       PromoInstance& promoInstance = slotEntry.second;
       const lodclusters_remix::PromotionStateView& state = m_promoStates[promoInstance.stateSlot];
 
-      // periodic full-mesh sweep verdict (same lag handling as the gate)
+      // periodic full-mesh sweep verdict (same lag handling as the gate). The sweep
+      // judges an ALREADY-PROMOTED instance, so the demote hysteresis applies here
+      // exactly like the per-frame solve verdict.
+      const float sweepEpsilon = epsilon * std::max(1.0f, ClusterLodOptions::Promotion::demoteHysteresis());
       if (promoInstance.sweepPending && ++promoInstance.sweepLagFrames >= gateLag) {
         promoInstance.sweepPending = false;
-        if (state.gateResidualRel > epsilon && !promoInstance.demoted) {
+        if (state.gateResidualRel > sweepEpsilon && !promoInstance.demoted) {
           promoInstance.demoted = true;
           Logger::info(str::format("[ClusterLOD] promotion: instance (slot ", promoInstance.stateSlot,
                                    ", geom 0x", std::hex, promoInstance.geometryHash, std::dec,
@@ -2149,6 +2285,7 @@ namespace dxvk {
     frameParams.promotionEntryCount = uint32_t(m_framePromoEntries.size());
     frameParams.promotionResidualEpsilon = std::max(1e-5f, ClusterLodOptions::Promotion::residualEpsilon());
     frameParams.promotionTemporalEpsilon = std::max(0.0f, ClusterLodOptions::Promotion::temporalEpsilon());
+    frameParams.promotionDemoteHysteresis = std::max(1.0f, ClusterLodOptions::Promotion::demoteHysteresis());
     frameParams.promotionCorrespondenceScan = ClusterLodOptions::Promotion::correspondenceScan();
     // DIAG raw dump: resolve the traced hash to its promo state slot (if a candidate)
     frameParams.promotionDumpStateSlot = ~0u;

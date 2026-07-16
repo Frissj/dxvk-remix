@@ -363,6 +363,12 @@ namespace dxvk {
                  "which have numBones==0 and so are not caught as skinned) that momentarily fit a rigid transform\n"
                  "on a single frame. Folded into the per-frame rigid verdict, so a candidate must be temporally\n"
                  "rigid across its whole streak to promote, and a promoted instance demotes the moment it deforms.");
+      RTX_OPTION("rtx.clusterLod.promotion", float, demoteHysteresis, 2.0f,
+                 "Residual multiplier an ALREADY-PROMOTED instance is allowed before demoting to Path B\n"
+                 "(candidates still need the strict residualEpsilon to promote). A rigid mesh whose residual\n"
+                 "sits exactly on the epsilon boundary otherwise flaps promote/demote every few frames\n"
+                 "(observed: residual 0.005-0.008 vs eps 0.005 with zero temporal drift). Applies to the\n"
+                 "per-frame solve verdict and the periodic full-mesh sweep alike. 1.0 disables hysteresis.");
       RTX_OPTION("rtx.clusterLod.promotion", std::string, dumpGeometryHash, "",
                  "DIAGNOSTIC RAW DUMP (empty = off). Hex geometry hash (no 0x). At probe build the 64 solve\n"
                  "samples' REF positions are logged ([PromoDump] ref); each frame the same samples' CAPTURE\n"

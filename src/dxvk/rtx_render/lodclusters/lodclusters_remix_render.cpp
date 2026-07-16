@@ -163,7 +163,7 @@ struct ClusterRenderSystem::Impl
   // host-visible BDA ring; the status array is copied into a host readback
   // ring each frame promotion work ran.
   static constexpr uint32_t kPromoMatricesStride = 96;
-  static constexpr uint32_t kPromoStatusStride   = 56;  // 8 base + gateOver/gateStale/temporalDeform + meanDev/dirCoh/normAlign (DIAG)
+  static constexpr uint32_t kPromoStatusStride   = 60;  // 8 base + gateOver/gateStale/temporalDeform + meanDev/dirCoh/normAlign/solveInfo (DIAG)
   static constexpr uint32_t kPromoEntryStride    = sizeof(PromotionEntry);
 
   shaderc::SpvCompilationResult promoShader;
@@ -262,6 +262,7 @@ struct PromoPush
   uint32_t gateEntryIndex;
   uint32_t promoScanEnable;          // DIAG: 1 = run the correspondence offset scan
   float    temporalEpsilon;          // max inter-frame sample-distance drift for "rigid"
+  float    demoteHysteresis;         // promoted instances demote only past eps*this
 };
 
 bool ClusterRenderSystem::Impl::initPromotion()
@@ -462,6 +463,7 @@ void ClusterRenderSystem::Impl::recordPromotion(VkCommandBuffer cmd, const Frame
   push.promoScanEnable      = frame.promotionCorrespondenceScan ? 1u : 0u;
   push.lastSampleVa         = promoLastSampleBuffer.address;
   push.temporalEpsilon      = frame.promotionTemporalEpsilon;
+  push.demoteHysteresis     = frame.promotionDemoteHysteresis;
 
   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, promoPipeline);
   vkCmdPushConstants(cmd, promoPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PromoPush), &push);
@@ -1167,6 +1169,7 @@ bool ClusterRenderSystem::readPromotionStates(PromotionStateView* outStates)
     memcpy(&v.meanDevRel, s + 44, sizeof(float));
     memcpy(&v.dirCoherence, s + 48, sizeof(float));
     memcpy(&v.normAlign, s + 52, sizeof(float));
+    memcpy(&v.solveInfo, s + 56, sizeof(uint32_t));
   }
   return true;
 }

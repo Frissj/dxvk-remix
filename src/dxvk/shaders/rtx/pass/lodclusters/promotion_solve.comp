@@ -87,7 +87,11 @@ layout(buffer_reference, buffer_reference_align = 4, scalar) buffer ProbeBlob
                           // ref positions (region [sampleCount+validationCount+vertexCount ..))
   vec3  centroidPos;
   float radius;           // residuals are relative to this
-  float gInv[16];         // row-major 4x4 Gram pseudoinverse (doubles on CPU)
+  float gInv[16];         // [0..8]: row-major 3x3 SAMPLE-CENTERED ref Gram PSEUDOinverse
+                          // (doubles on CPU; all-zero = rank<=1 -> affine skipped).
+                          // [9..11]: null-plane normal nHat (rank-2 planar sets only);
+                          // [12]: 1.0 = rank-2 -> kernel completes A's out-of-plane
+                          // column with s*R*nHat. [13..15] unused.
   PromoSample samples[];  // [sampleCount] solve + [validationCount] validation
                           // + full ref positions appended as PromoSample
                           // {index = i} for the gate sweep
@@ -148,6 +152,9 @@ struct PromoStatus
   uint  normAlignBits;     // DIAG: mean |cos(error dir, fitted ref normal)|. ~1 = the VS
                            // displaces along vertex NORMALS (shell/inflate); ~0.5 = un-
                            // correlated (morph target/other); float -1 = normals absent.
+  uint  solveInfo;         // DIAG: which solve produced M. bit8 = affine used; low byte =
+                           // affine guard fail reason (0 used/none, 1 non-finite, 2 norm
+                           // window, 3 anisotropy cap, 4 condition/det, 5 refVar~0).
 };
 
 layout(buffer_reference, buffer_reference_align = 4, scalar) buffer PromoStatuses
@@ -183,6 +190,9 @@ layout(push_constant, scalar) uniform PushData
   uint     gateEntryIndex;         // MODE_GATE: which entry this dispatch runs
   uint     promoScanEnable;        // DIAG: 1 = run the ref->cap correspondence offset scan
   float    temporalEpsilon;        // max inter-frame sample-distance drift for "rigid"
+  float    demoteHysteresis;       // residual multiplier for ALREADY-PROMOTED instances:
+                                   // strict eps to enter, eps*this to stay (stops
+                                   // epsilon-boundary promote/demote flapping)
 }
 push;
 
@@ -205,6 +215,7 @@ shared vec3  s_capNow[64];     // this frame's solve-sample capture positions
 shared vec3  s_capPrev[64];    // last frame's, for the inter-frame deformation gate
 shared vec3  s_devVec[64];     // DIAG: validation deviation VECTORS (error-shape stats)
 shared float s_normAlign[64];  // DIAG: |dot(error dir, ref normal)| per validation sample
+shared uint  s_diagAffInfo;    // DIAG: affine-solve outcome (bit8 used; low byte guard fail)
 
 // DIAG correspondence scan: ref->capture vertex-index offset table, one entry per
 // thread. Index 0 is offset 0 (the correspondence the solve assumes); the rest are
@@ -450,13 +461,20 @@ void main()
       sumCapSq += s_capSq[t];
     }
 
-    // RIGID similarity fit (rotation + uniform scale + translation), NOT the old
-    // unconstrained affine Gram-pseudoinverse. The affine solve's free DOF absorbed
-    // fit error as SHEAR / anisotropic scale: it stayed sample-exact (tiny residual,
-    // so it PASSED the promotion gate) while the 3x3 blew up (||A^T A - I|| ~ 4.5e5
-    // observed the frame before a device-lost) and patched a degenerate transform
-    // into the TLAS. A similarity map cannot do that - shear raises the residual and
-    // is correctly rejected. probe.gInv is no longer used (legacy of the affine solve).
+    // Solve strategy (P4c anisotropic-instance fix): GUARDED AFFINE first, rigid
+    // similarity as the fallback. The game places captured meshes with NON-UNIFORM
+    // scale world matrices (measured 1.47x one-axis on building pieces via the
+    // [PromoDump] raw ref/cap dump: affine residual 1.3e-5 where the similarity fit
+    // read 0.09) - a similarity map cannot represent those, so they could never
+    // promote. The affine normal-equation solve (rows = gInv * b_r) represents them
+    // exactly. The HISTORICAL affine device-lost was not anisotropy: it was UNGUARDED
+    // null-space shear on rank-deficient (coplanar) sample sets - the pseudoinverse
+    // invents unbounded coefficients (||A^T A - I|| ~ 4.5e5 observed) that stay
+    // sample-exact. Legit game anisotropy is O(1); the explosion is O(1e5). The
+    // guards below (norm window, condition/det consistency, finiteness) separate the
+    // two with orders-of-magnitude margin; guard failure falls through to the rigid
+    // path, which is exactly today's behavior (coplanar meshes keep the quaternion
+    // route that works for them).
     //
     //   n samples, ref pre-centered by the full-mesh centroid on the CPU:
     //     Hyx[r][c] = sum ref_c*cap_r (b[r*4+c], c<3);  sumCap=(b3,b7,b11)
@@ -465,6 +483,7 @@ void main()
     const vec3  capBar = vec3(b[3], b[7], b[11]) / n;
     s_diagCapVar = sumCapSq - n * dot(capBar, capBar);  // capture-sample spread
     const vec3  refBar = vec3(b[12], b[13], b[14]) / n;
+    const float refVar = b[15] - n * dot(refBar, refBar);  // ref-sample spread
 
     // centered cross-covariance (GLSL mat3 is column-major: Mcov[col][row]):
     //   Mcov[c][r] = Hyx[r][c] - n*capBar[r]*refBar[c]
@@ -484,19 +503,15 @@ void main()
     // and lands as a high residual even though it is a perfect isometry (scanScore~0).
     s_diagMcovDet = determinant(Mcov);
 
-    // rotation = orthogonal polar factor of Mcov via the Higham iteration
-    // The rotation is recovered with the rank-robust quaternion extractor
-    // (extractRotationRobust) instead of the Higham polar iteration. Higham needs
-    // an INVERTIBLE Mcov, so every coplanar mesh - floors, walls, decals, flat
-    // props: 100% of the non-promoting 'rankDef' slots in the log - diverged and
-    // was wrongly rejected. The quaternion method returns the best-fit PROPER
-    // rotation (det = +1) for a rank-2 Mcov too, and the same rotation as Higham
-    // for full-rank input (no regression for the meshes already promoting). The
-    // full-mesh residual gate downstream is the real arbiter of rigid-vs-deform.
-    //
-    // Mcov is normalized to unit Frobenius norm first purely so the extractor's
-    // 1e-9 epsilon is well-scaled for tiny (small-prop) covariances; the recovered
-    // rotation is scale-invariant either way.
+    // ---- RIGID similarity precompute (used by the fallback below AND by the
+    // affine attempt's rank-2 plane completion). Rotation via the rank-robust
+    // quaternion extractor (extractRotationRobust) instead of the Higham polar
+    // iteration: Higham needs an INVERTIBLE Mcov, so every coplanar mesh - floors,
+    // walls, decals, flat props - diverged and was wrongly rejected. The quaternion
+    // method returns the best-fit PROPER rotation (det = +1) for a rank-2 Mcov too,
+    // and the same rotation as Higham for full-rank input. Mcov is normalized to
+    // unit Frobenius norm purely so the extractor's epsilon is well-scaled for tiny
+    // (small-prop) covariances; the recovered rotation is scale-invariant.
     const float mcovNorm = sqrt(dot(Mcov[0], Mcov[0]) + dot(Mcov[1], Mcov[1]) + dot(Mcov[2], Mcov[2]));
     const mat3  Mn = mcovNorm > 1e-20 ? (Mcov * (1.0 / mcovNorm)) : mat3(0.0);
     const bool  mcovOk = mcovNorm > 1e-20;
@@ -510,11 +525,102 @@ void main()
     // uniform scale minimizing |s*R*ref - cap|^2 for the fixed R:
     //   s = trace(R^T Mcov) / sum|ref - refBar|^2
     // refVar is the ref-sample spread. A near-coincident sample set (tiny refVar)
-    // makes s explode; a huge / non-finite s|A|t is treated as degenerate.
-    const float refVar = b[15] - n * dot(refBar, refBar);
+    // makes s explode; a huge / non-finite s|A|t is degenerate.
     const float trRtM  = dot(R[0], Mcov[0]) + dot(R[1], Mcov[1]) + dot(R[2], Mcov[2]);
     const float s      = refVar > 1e-8 ? trRtM / refVar : 0.0;
 
+    // ---- GUARDED AFFINE attempt: A = Mcov * G3inv, t = capBar - A*refBar.
+    // G3inv = SAMPLE-CENTERED 3x3 ref Gram inverse (CPU doubles, gInv[0..8] row-
+    // major). Both factors are sample-centered, so every intermediate is O(1)-sane;
+    // the old 4x4 homogeneous form multiplied ~1/variance inverse entries by huge
+    // UNCENTERED capture sums - fp32 cancellation that read a rigid 0.068-radius
+    // piece as residual 0.072 (verified vs double precision, [PromoDump]).
+    bool usedAffine = false;
+    {
+      vec3 affRow[3];  // row r of the 3x3 A
+      for(uint r = 0; r < 3; r++)
+      {
+        // math Mcov(r,k) = Mcov[k][r] (GLSL col-major); G3inv(k,c) = gInv[k*3+c]
+        for(uint c = 0; c < 3; c++)
+        {
+          affRow[r][c] = Mcov[0][r] * probe.gInv[0 * 3 + c]
+                       + Mcov[1][r] * probe.gInv[1 * 3 + c]
+                       + Mcov[2][r] * probe.gInv[2 * 3 + c];
+        }
+      }
+
+      // PLANE COMPLETION (rank-2 sample sets, gInv[12]=1): the pseudoinverse leaves
+      // the out-of-plane column of A zero (that direction is unobservable from a
+      // planar mesh), which would fail the det/norm guards and strand flat pieces
+      // with stretched or mirrored placements on Path B. Complete it from the rigid
+      // similarity solution: A += (s*R*nHat) * nHat^T. In-plane behavior (where all
+      // actual vertices live) keeps the exact least-squares fit; the invisible
+      // out-of-plane direction gets a sane, proper, uniformly-scaled mapping.
+      if(probe.gInv[12] != 0.0 && orthoOk && s != 0.0)
+      {
+        const vec3 nHat = vec3(probe.gInv[9], probe.gInv[10], probe.gInv[11]);
+        const vec3 comp = s * (R * nHat);
+        for(uint r = 0; r < 3; r++)
+        {
+          affRow[r] += comp[r] * nHat;
+        }
+      }
+
+      const vec3 affT = capBar - vec3(dot(affRow[0], refBar),
+                                      dot(affRow[1], refBar),
+                                      dot(affRow[2], refBar));
+
+      // columns of A (affRow are rows)
+      const vec3 col0 = vec3(affRow[0].x, affRow[1].x, affRow[2].x);
+      const vec3 col1 = vec3(affRow[0].y, affRow[1].y, affRow[2].y);
+      const vec3 col2 = vec3(affRow[0].z, affRow[1].z, affRow[2].z);
+      const float n0 = length(col0), n1 = length(col1), n2 = length(col2);
+      const float detAff = dot(col0, cross(col1, col2));
+      const float minN = min(n0, min(n1, n2));
+      const float maxN = max(n0, max(n1, n2));
+
+      const bool affFinite =
+           !any(isnan(affRow[0])) && !any(isnan(affRow[1])) && !any(isnan(affRow[2]))
+        && !any(isinf(affRow[0])) && !any(isinf(affRow[1])) && !any(isinf(affRow[2]))
+        && !any(isnan(affT)) && !any(isinf(affT)) && !isnan(detAff) && !isinf(detAff);
+      // norm window: real placements are O(1) scale; the degenerate explosion is
+      // O(1e5) and a collapsed column is ~0. Condition guard: near-parallel columns
+      // (pure shear blowup) have |det| << n0*n1*n2 even when norms look sane.
+      // Anisotropy cap: the widest legitimate stretch we accept.
+      const bool affNormOk  = minN > 1e-2 && maxN < 1e3;
+      const bool affAnisoOk = (maxN / max(minN, 1e-6)) <= 100.0;
+      const bool affCondOk  = abs(detAff) >= 1e-3 * n0 * n1 * n2;
+      const bool affVarOk   = refVar > 1e-8;
+      const bool affGuardsOk = affFinite && affNormOk && affAnisoOk && affCondOk && affVarOk;
+
+      // DIAG: name the first guard that blocked affine (0 = none/used)
+      uint affFail = 0u;
+      if(!affFinite)       affFail = 1u;
+      else if(!affNormOk)  affFail = 2u;
+      else if(!affAnisoOk) affFail = 3u;
+      else if(!affCondOk)  affFail = 4u;
+      else if(!affVarOk)   affFail = 5u;
+      s_diagAffInfo = affFail | (affGuardsOk ? 0x100u : 0u);
+
+      if(affGuardsOk)
+      {
+        for(uint r = 0; r < 3; r++)
+        {
+          s_M[r * 4 + 0] = affRow[r].x;
+          s_M[r * 4 + 1] = affRow[r].y;
+          s_M[r * 4 + 2] = affRow[r].z;
+          s_M[r * 4 + 3] = affT[r];
+        }
+        s_diagRefVar  = refVar;
+        s_diagSampleN = probe.sampleCount;
+        s_diagDegen   = false;
+        s_diagReason  = 0u;
+        usedAffine = true;
+      }
+    }
+
+    if(!usedAffine)
+    {
     const mat3 A = s * R;
     const vec3 t = capBar - A * refBar;
 
@@ -569,6 +675,7 @@ void main()
         s_M[k] = 0.0;
       }
     }
+    }  // if(!usedAffine) - rigid similarity fallback
   }
 
   barrier();
@@ -744,7 +851,16 @@ void main()
     }
   }
 
-  const bool  rigid       = residualRel <= push.residualEpsilon
+  // Hysteresis: candidate probes (patchSlot == ~0) must pass the STRICT epsilon to
+  // promote; an already-promoted instance (patchSlot valid) only demotes past
+  // eps * demoteHysteresis. A rigid mesh sitting exactly on the boundary (observed:
+  // residual 0.0052-0.0075 vs eps 0.005, tDeform ~1e-7) latches instead of flapping
+  // promote/demote every few frames. Demoted instances re-enter via probe-only
+  // entries, so RE-promotion is strict again.
+  const float epsEff = (entry.patchSlot != 0xFFFFFFFFu)
+                     ? push.residualEpsilon * max(push.demoteHysteresis, 1.0)
+                     : push.residualEpsilon;
+  const bool  rigid       = residualRel <= epsEff
                          && temporalDeform <= push.temporalEpsilon;
 
   // ---- decenter: the solve ran on (p - centroid); world translation is
@@ -816,6 +932,7 @@ void main()
   status.meanDevBits = floatBitsToUint(max(meanDevRel, 0.0));
   status.dirCohBits  = floatBitsToUint(clamp(dirCoherence, 0.0, 1.0));
   status.normAlignBits = floatBitsToUint(normAlign);
+  status.solveInfo = s_diagAffInfo;
   statuses.s[entry.stateSlot] = status;
 
   // ---- patch a promoted instance's slot: ALWAYS write when assigned - a

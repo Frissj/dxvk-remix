@@ -389,6 +389,9 @@ namespace lodclusters_remix {
     // rigid. Rigid motion preserves distances, so this rejects VS-animated captures
     // (characters) that momentarily fit a rigid M without punishing moving rigid bodies.
     float promotionTemporalEpsilon = 0.01f;
+    // Demote hysteresis: promoted instances demote only past residualEpsilon*this
+    // (candidates still need the strict epsilon to promote). Stops boundary flapping.
+    float promotionDemoteHysteresis = 2.0f;
     // DIAG (probe only): run the ref->capture correspondence offset scan in the
     // solve kernel and report the best-matching offset in the reject log. No fix.
     bool promotionCorrespondenceScan = false;
@@ -434,6 +437,7 @@ namespace lodclusters_remix {
     float meanDevRel = 0.0f;          // DIAG: mean validation deviation (residualRel is max)
     float dirCoherence = 0.0f;        // DIAG: error-direction coherence (1=systematic, 0=scatter)
     float normAlign = -1.0f;          // DIAG: error-vs-normal alignment (1=normal-push, -1=n/a)
+    uint32_t solveInfo = 0;           // DIAG: bit8 = affine used; low byte = affine guard fail
   };
 
   // P3: semaphores the caller must attach to the queue submission that
