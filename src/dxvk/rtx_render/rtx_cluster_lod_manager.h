@@ -657,6 +657,22 @@ namespace dxvk {
       enum class Phase : uint32_t { Probing, GateScheduled, GateRunning, Promoted, Rejected } phase = Phase::Probing;
       uint32_t gateFrames = 0;
       bool loggedTemporalHold = false;  // DIAG: one-shot "held by temporal gate" log
+
+      // [PromoLat] latency-breakdown instrumentation: decomposes first-sight ->
+      // Path A into "waiting to be solved" (instance not drawn) vs "drawn but
+      // grinding the gate". createdFrame/Time stamp candidate adoption;
+      // solveCount counts frames the GPU actually advanced this slot's solve
+      // (state.lastFrame stepped) - if solveCount << framesElapsed the instance
+      // simply was not on screen, which is inherent and not a pipeline fix.
+      // gateScheduledFrame marks the Probing->Gate handoff; streakResets counts
+      // how often a non-rigid spike knocked the rigid streak back to 0.
+      uint32_t createdFrame = 0;
+      std::chrono::steady_clock::time_point createdTime{};
+      uint32_t solveCount = 0;
+      uint32_t lastCountedSolveFrame = 0;  // last state.lastFrame we tallied
+      uint32_t gateScheduledFrame = 0;
+      uint32_t streakResets = 0;
+      uint32_t prevRigidStreak = 0;
       // ---- REST-CAPTURE reference (non-affine leftovers) ----
       // routeHash: residency hash instances route to when promoted (0 = the
       // candidate's own key). Set to the space-tagged rest hash once the probe

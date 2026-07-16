@@ -919,6 +919,8 @@ namespace dxvk {
         candidate.stateSlot = m_promoNextStateSlot++;
         candidate.routeHash = pending.routeHash;
         candidate.topologyKey = pending.topologyKey;
+        candidate.createdFrame = m_device->getCurrentFrameId();
+        candidate.createdTime = std::chrono::steady_clock::now();
         m_promoCandidates.emplace(pending.geometryHash, candidate);
         // index by stable topology so a churned-hash draw resolves to this candidate
         // every frame (this game's captured hashes churn per frame; see topologyKey).
@@ -979,6 +981,21 @@ namespace dxvk {
       PromotionCandidate& candidate = entry.second;
       const lodclusters_remix::PromotionStateView& state = m_promoStates[candidate.stateSlot];
       m_diagMaxAffineNonRigid = std::max(m_diagMaxAffineNonRigid, state.affineNonRigid);
+
+      // [PromoLat] tally an ACTUAL solve for this candidate: state.lastFrame is
+      // the frame the GPU last solved this slot, so it stepping forward means a
+      // solve ran (i.e. an instance was drawn and emitted a probe). A candidate
+      // whose lastFrame stops advancing is off-screen - the decisive signal for
+      // "waiting to be drawn" vs "drawn but grinding".
+      if (state.lastFrame != 0u && state.lastFrame != candidate.lastCountedSolveFrame) {
+        candidate.solveCount++;
+        candidate.lastCountedSolveFrame = state.lastFrame;
+        // rigid streak fell (a non-rigid spike reset the consecutive count)
+        if (state.rigidStreak < candidate.prevRigidStreak && candidate.prevRigidStreak > 0u) {
+          candidate.streakResets++;
+        }
+        candidate.prevRigidStreak = state.rigidStreak;
+      }
       if ((state.diagGuard & 1u) != 0u) {
         m_diagProbeZeroSlots++;
       }
@@ -1012,6 +1029,7 @@ namespace dxvk {
         }
         if (state.rigidStreak >= rigidFrames) {
           candidate.phase = PromotionCandidate::Phase::GateScheduled;
+          candidate.gateScheduledFrame = m_device->getCurrentFrameId();  // [PromoLat] Probing->Gate handoff
         } else if (ClusterLodOptions::Promotion::restCaptureReference()
                    && candidate.restState == PromotionCandidate::RestState::None
                    && state.residualRel > epsilon
@@ -1077,8 +1095,29 @@ namespace dxvk {
           if (state.gateResidualRel > 0.0f && state.gateResidualRel <= epsilon) {
             candidate.phase = PromotionCandidate::Phase::Promoted;
             m_statsPromoted++;
+            // [PromoLat] decompose the promotion latency. elapsedFrames = wall
+            // frames since adoption; solveCount = frames actually solved (drawn).
+            // coverage = solveCount/elapsedFrames: LOW => the mesh was off-screen
+            // most of the time (inherent, not a pipeline bug); HIGH but slow =>
+            // streak resets / gate round-trips are the cost. probingFrames vs
+            // gateFrames splits the two phases.
+            const uint32_t nowFrame = m_device->getCurrentFrameId();
+            const uint32_t elapsedFrames = nowFrame - candidate.createdFrame;
+            const uint32_t probingFrames = candidate.gateScheduledFrame != 0
+              ? candidate.gateScheduledFrame - candidate.createdFrame : elapsedFrames;
+            const double elapsedSec =
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - candidate.createdTime).count() / 1000.0;
+            const double coverage = elapsedFrames > 0 ? double(candidate.solveCount) / double(elapsedFrames) : 0.0;
             Logger::info(str::format("[ClusterLOD] promotion: geometry 0x", std::hex, entry.first, std::dec,
-                                     " PROMOTED to Path A (full-mesh residual ", state.gateResidualRel, ")"));
+                                     " PROMOTED to Path A (full-mesh residual ", state.gateResidualRel, ")",
+                                     " | [PromoLat] ", elapsedSec, "s over ", elapsedFrames, " frames",
+                                     " | solved ", candidate.solveCount, " (coverage ", coverage,
+                                     ") | probing ", probingFrames, " frames, gate ", candidate.gateFrames,
+                                     " frames | streakResets ", candidate.streakResets,
+                                     " | verdict=", coverage < 0.5 ? "OFF-SCREEN-BOUND(inherent)"
+                                       : candidate.streakResets > 3 ? "STREAK-THRASH(non-rigid spikes)"
+                                       : "solve-bound"));
           } else if (state.gateResidualRel > epsilon) {
             candidate.phase = PromotionCandidate::Phase::Rejected;
             m_statsPromoRejected++;
@@ -3250,9 +3289,16 @@ namespace dxvk {
       regions.push_back(region);
     }
 
-    m_device->vkd()->vkCmdCopyBuffer(cmd, sourceBuffer, instanceBufferSlice.handle, uint32_t(regions.size()), regions.data());
-
-    ctx->getCommandList()->trackResource<DxvkAccess::Write>(instanceBuffer);
+    // Vulkan requires regionCount > 0. Unlike the Path B copy (guarded by the
+    // countB==0 early-return), this Path A copy has no upstream guarantee that
+    // any cluster slots exist this frame - a frame with no Path-A opaque/
+    // unordered slots and no SSS duplicates yields an empty region list. Submit
+    // nothing rather than trip VUID-vkCmdCopyBuffer-regionCount-arraylength.
+    // No copy == no write, so the resource-tracking is scoped with it.
+    if (!regions.empty()) {
+      m_device->vkd()->vkCmdCopyBuffer(cmd, sourceBuffer, instanceBufferSlice.handle, uint32_t(regions.size()), regions.data());
+      ctx->getCommandList()->trackResource<DxvkAccess::Write>(instanceBuffer);
+    }
   }
 
   // P4b Path B: records the per-frame cluster-template build - CLAS
