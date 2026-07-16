@@ -457,19 +457,47 @@ namespace dxvk {
 
     const float* positions = snapshot.positions.data();
 
-    // centroid + bounding radius (residuals are relative to it)
+    // Only vertices actually REFERENCED by the index buffer get a vertex-shader
+    // capture write: the VS runs per index entry and writes capture slot
+    // gl_VertexIndex - baseVertex, so a vertex in [0,vertexCount) that no triangle
+    // references never receives a capture. Its slot holds stale VRAM (often another
+    // mesh's positions - same spread, so it looks fine to a coarse check but
+    // scrambles the per-vertex correspondence). Sampling/gating those garbage slots
+    // is what rejected genuinely-rigid meshes that draw a SUBSET of a shared vertex
+    // buffer (e.g. buildings): the fit ran against positions the capture never
+    // wrote. Restrict the whole probe to the referenced set so every sampled and
+    // gated vertex has a real capture behind it.
+    std::vector<uint32_t> referenced;
+    referenced.reserve(std::min<size_t>(snapshot.indices.size(), vertexCount));
+    {
+      std::vector<uint8_t> seen(vertexCount, 0);
+      for (const uint32_t idx : snapshot.indices) {
+        if (idx < vertexCount && !seen[idx]) {
+          seen[idx] = 1;
+          referenced.push_back(idx);
+        }
+      }
+    }
+    const uint32_t refCount = uint32_t(referenced.size());
+    if (refCount < 4) {
+      return;  // too few referenced vertices to fit a transform
+    }
+
+    // centroid + bounding radius over the REFERENCED vertices (residuals relative)
     double cx = 0.0, cy = 0.0, cz = 0.0;
-    for (uint32_t v = 0; v < vertexCount; v++) {
+    for (uint32_t r = 0; r < refCount; r++) {
+      const uint32_t v = referenced[r];
       cx += positions[v * 3 + 0];
       cy += positions[v * 3 + 1];
       cz += positions[v * 3 + 2];
     }
-    cx /= vertexCount;
-    cy /= vertexCount;
-    cz /= vertexCount;
+    cx /= refCount;
+    cy /= refCount;
+    cz /= refCount;
 
     double radiusSq = 0.0;
-    for (uint32_t v = 0; v < vertexCount; v++) {
+    for (uint32_t r = 0; r < refCount; r++) {
+      const uint32_t v = referenced[r];
       const double dx = positions[v * 3 + 0] - cx;
       const double dy = positions[v * 3 + 1] - cy;
       const double dz = positions[v * 3 + 2] - cz;
@@ -480,14 +508,14 @@ namespace dxvk {
       return;  // degenerate point cloud - unpromotable, stays Path B
     }
 
-    // farthest-point sampling over a strided candidate subset: 64 spread solve
-    // samples, then 32 validation samples continuing the same chain (spread
-    // AND disjoint from the solve set)
-    const uint32_t stride = std::max(1u, vertexCount / 4096u);
+    // farthest-point sampling over a strided subset of the REFERENCED vertices: 64
+    // spread solve samples, then 32 validation samples continuing the same chain
+    // (spread AND disjoint from the solve set)
+    const uint32_t stride = std::max(1u, refCount / 4096u);
     std::vector<uint32_t> candidates;
-    candidates.reserve(vertexCount / stride + 1);
-    for (uint32_t v = 0; v < vertexCount; v += stride) {
-      candidates.push_back(v);
+    candidates.reserve(refCount / stride + 1);
+    for (uint32_t r = 0; r < refCount; r += stride) {
+      candidates.push_back(referenced[r]);
     }
 
     const uint32_t solveCount = std::min<uint32_t>(64, uint32_t(candidates.size()));
@@ -559,12 +587,12 @@ namespace dxvk {
     // still exposes non-affine output) + full centered ref positions (gate)
     const uint32_t effectiveValidation = pickedValidation > 0 ? pickedValidation : pickedSolve;
     std::vector<uint8_t> blob(sizeof(ProbeHeader)
-                              + sizeof(ProbeSample) * (size_t(pickedSolve) + effectiveValidation + vertexCount));
+                              + sizeof(ProbeSample) * (size_t(pickedSolve) + effectiveValidation + refCount));
 
     ProbeHeader header = {};
     header.sampleCount = pickedSolve;
     header.validationCount = effectiveValidation;
-    header.vertexCount = vertexCount;
+    header.vertexCount = refCount;  // gate sweeps only referenced vertices
     header.centroid[0] = float(cx);
     header.centroid[1] = float(cy);
     header.centroid[2] = float(cz);
@@ -588,8 +616,8 @@ namespace dxvk {
       const uint32_t pickIndex = pickedValidation > 0 ? pickedSolve + i : i;
       writeSample(samples[pickedSolve + i], candidates[picked[pickIndex]]);
     }
-    for (uint32_t v = 0; v < vertexCount; v++) {
-      writeSample(samples[size_t(pickedSolve) + effectiveValidation + v], v);
+    for (uint32_t r = 0; r < refCount; r++) {
+      writeSample(samples[size_t(pickedSolve) + effectiveValidation + r], referenced[r]);
     }
 
     const uint64_t probeVa = m_templateSystem->uploadPromotionProbe(blob.data(), blob.size());
@@ -599,11 +627,11 @@ namespace dxvk {
 
     {
       std::lock_guard<std::mutex> lock(m_promoPendingMutex);
-      m_promoPendingProbes.push_back(PendingProbe { snapshot.geometryHash, probeVa, vertexCount });
+      m_promoPendingProbes.push_back(PendingProbe { snapshot.geometryHash, probeVa, refCount });
     }
 
-    Logger::info(str::format("[ClusterLOD] ", snapshot.name, ": promotion probe uploaded (verts ", vertexCount,
-                             ", blob ", blob.size() / 1024, " KiB)"));
+    Logger::info(str::format("[ClusterLOD] ", snapshot.name, ": promotion probe uploaded (referenced verts ", refCount,
+                             " of ", vertexCount, ", blob ", blob.size() / 1024, " KiB)"));
   }
 
   void ClusterLodManager::updatePromotionStates() {
