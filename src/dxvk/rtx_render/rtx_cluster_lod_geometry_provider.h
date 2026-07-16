@@ -82,6 +82,13 @@ namespace dxvk {
     // draw-time intake derives.
     void onReplacementGeometry(const RasterGeometry& geometryData, uint64_t geometryHash);
 
+    // Main thread (rest-capture promotion): enqueue a fully-built snapshot whose
+    // positions came from a GPU capture readback (snapshot.isRestCapture set).
+    // Runs the plain Path A route (clusterize + cache + residency) and then the
+    // promotion-probe handler, giving non-affine captured meshes a reference in
+    // their TRUE rendered space.
+    void enqueueRestSnapshot(lodclusters_remix::GeometrySnapshot&& snapshot);
+
     struct Stats {
       uint64_t submitted = 0;        // unique geometries snapshotted + queued
       uint64_t pending = 0;          // still in the queue

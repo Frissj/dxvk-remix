@@ -363,6 +363,16 @@ namespace dxvk {
                  "which have numBones==0 and so are not caught as skinned) that momentarily fit a rigid transform\n"
                  "on a single frame. Folded into the per-frame rigid verdict, so a candidate must be temporally\n"
                  "rigid across its whole streak to promote, and a promoted instance demotes the moment it deforms.");
+      RTX_OPTION("rtx.clusterLod.promotion", bool, restCaptureReference, true,
+                 "Rest-capture reference for NON-AFFINE captured meshes: a candidate that stays temporally\n"
+                 "static but never fits any single transform of its CPU input data (the VS assembles a\n"
+                 "genuinely different shape) gets its capture buffer read back ONCE, is re-clusterized from\n"
+                 "that true rendered shape under a space-tagged hash, and its promotion probe re-references\n"
+                 "the rest capture - the per-frame solve then fits identity(+motion) and the mesh promotes.\n"
+                 "Costs one small readback + one re-clusterization per such mesh per session.");
+      RTX_OPTION("rtx.clusterLod.promotion", int, restCaptureStuckFrames, 120,
+                 "Consecutive temporally-static frames a candidate must stay above residualEpsilon before the\n"
+                 "rest-capture path triggers (avoids re-referencing meshes that are merely briefly stuck).");
       RTX_OPTION("rtx.clusterLod.promotion", float, demoteHysteresis, 2.0f,
                  "Residual multiplier an ALREADY-PROMOTED instance is allowed before demoting to Path B\n"
                  "(candidates still need the strict residualEpsilon to promote). A rigid mesh whose residual\n"
@@ -455,6 +465,10 @@ namespace dxvk {
     // AccelManager's instance buffer regions.
     void dispatchBuild(Rc<DxvkContext> ctx, const CameraManager& cameraManager, AccelManager& accelManager);
 
+    // REST-CAPTURE readbacks (promotion, non-affine leftovers): records staged
+    // capture->host copies and drains retired ones into rest snapshots.
+    void processRestCaptureRequests(Rc<DxvkContext> ctx);
+
     // device address of the generation's shaderio::Geometry table (0 if none);
     // consumed by the path tracer's hit-side cluster fetch via raytrace_args
     uint64_t getGeometriesTableAddress() const;
@@ -544,6 +558,7 @@ namespace dxvk {
       uint32_t positionsStrideBytes = 0;
       uint32_t positionsCount = 0;     // DIAG: valid capture slots from positionsAddress
                                        // (bounds the correspondence scan; 0 = unknown)
+      VkDeviceSize positionsBufferOffset = 0;  // byte offset of positionsAddress in positionsBuffer
       Rc<DxvkBuffer> positionsBuffer;  // lifetime tracking on the cmd list
     };
     std::vector<FramePose> m_framePoses;
@@ -591,18 +606,55 @@ namespace dxvk {
       enum class Phase : uint32_t { Probing, GateScheduled, GateRunning, Promoted, Rejected } phase = Phase::Probing;
       uint32_t gateFrames = 0;
       bool loggedTemporalHold = false;  // DIAG: one-shot "held by temporal gate" log
+      // ---- REST-CAPTURE reference (non-affine leftovers) ----
+      // routeHash: residency hash instances route to when promoted (0 = the
+      // candidate's own key). Set to the space-tagged rest hash once the probe
+      // was rebuilt from the captured rest pose.
+      uint64_t routeHash = 0;
+      // static-stuck detector: consecutive updatePromotionStates passes with
+      // residual > eps while temporally static; resets when the mesh moves.
+      uint32_t stuckFrames = 0;
+      enum class RestState : uint32_t { None, Requested, Referenced } restState = RestState::None;
     };
     // main-thread after adoption in onFrameBegin
     std::unordered_map<uint64_t, PromotionCandidate> m_promoCandidates;
     // worker -> main handoff of uploaded probes
     struct PendingProbe {
-      uint64_t geometryHash = 0;
+      uint64_t geometryHash = 0;  // candidate key (ORIGINAL hash for rest probes)
       uint64_t probeVa = 0;
       uint32_t vertexCount = 0;
+      uint64_t routeHash = 0;     // rest probes: space-tagged residency hash; else 0
     };
     std::mutex m_promoPendingMutex;
     std::vector<PendingProbe> m_promoPendingProbes;
     uint32_t m_promoNextStateSlot = 0;
+
+    // ---- REST-CAPTURE reference machinery (non-affine leftovers) ----
+    // Topology retained at probe build so a rest snapshot can be assembled from a
+    // capture readback without touching (possibly dead) draw data. Small: indices
+    // of captured candidates only.
+    struct RetainedTopology {
+      std::vector<uint32_t> indices;
+      uint64_t indicesHash = 0;
+      uint64_t topologyKey = 0;
+      uint32_t vertexCount = 0;
+      std::string name;
+    };
+    std::mutex m_promoTopologyMutex;
+    std::unordered_map<uint64_t, RetainedTopology> m_promoTopologyByHash;
+    // In-flight capture readbacks: staged in buildPromotionEntries (frame-pose
+    // buffer at hand), copied in dispatchBuild (ctx at hand), drained after the
+    // frames-in-flight window into a rest snapshot for the provider.
+    struct RestCaptureRequest {
+      uint64_t geometryHash = 0;       // original candidate key
+      Rc<DxvkBuffer> source;           // capture buffer (lifetime held)
+      VkDeviceSize sourceOffset = 0;
+      uint32_t strideBytes = 0;
+      uint32_t vertexCount = 0;
+      Rc<DxvkBuffer> staging;          // host-visible readback target
+      uint32_t copyFrame = ~0u;        // frame the copy was recorded (~0 = not yet)
+    };
+    std::vector<RestCaptureRequest> m_restCaptureRequests;
     // per-INSTANCE state slots for PROMOTED instances (plan risk R21: M is per
     // instance - every captured instance's buffer carries its own transform -
     // so patch/prevM state must never alias across instances; the candidate's

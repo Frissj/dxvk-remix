@@ -310,6 +310,20 @@ namespace dxvk {
     m_condition.notify_one();
   }
 
+  void ClusterLodGeometryProvider::enqueueRestSnapshot(lodclusters_remix::GeometrySnapshot&& snapshot) {
+    std::unique_lock<std::mutex> lock(m_mutex);
+    if (m_stopping) {
+      return;
+    }
+    m_stats.submitted++;
+    m_stats.pending++;
+    m_stats.pendingBytes += snapshot.approximateSizeBytes();
+    snapshot.queuedAtUs = nowUs();
+    m_queue.push_back(std::move(snapshot));
+    lock.unlock();
+    m_condition.notify_one();
+  }
+
   ClusterLodGeometryProvider::Stats ClusterLodGeometryProvider::getStats() const {
     std::unique_lock<std::mutex> lock(m_mutex);
     return m_stats;
@@ -834,8 +848,10 @@ namespace dxvk {
 
       // P4c (plan 7.7): captured candidates get their promotion probe built +
       // uploaded here, on the worker, while the snapshot's CPU data is alive
-      // (upload rides the template system's queue - serialize with it)
-      if (snapshot.isCaptured && m_capturedProcessedHandler) {
+      // (upload rides the template system's queue - serialize with it).
+      // Rest-capture snapshots take the same handler: their probe references the
+      // TRUE rendered shape, so the solve becomes identity for non-affine meshes.
+      if ((snapshot.isCaptured || snapshot.isRestCapture) && m_capturedProcessedHandler) {
         std::lock_guard<std::mutex> templateLock(m_templateSerialMutex);
         m_capturedProcessedHandler(snapshot);
       }

@@ -792,9 +792,29 @@ namespace dxvk {
       return;
     }
 
+    // Retain the topology of captured candidates so a rest-capture snapshot can be
+    // assembled later from a GPU readback alone (draw data may be long dead then).
+    if (snapshot.isCaptured && !snapshot.isRestCapture
+        && ClusterLodOptions::Promotion::restCaptureReference()) {
+      std::lock_guard<std::mutex> topoLock(m_promoTopologyMutex);
+      RetainedTopology& topo = m_promoTopologyByHash[snapshot.geometryHash];
+      topo.indices = snapshot.indices;
+      topo.indicesHash = snapshot.indicesHash;
+      topo.topologyKey = snapshot.topologyKey;
+      topo.vertexCount = snapshot.vertexCount;
+      topo.name = snapshot.name;
+    }
+
     {
       std::lock_guard<std::mutex> lock(m_promoPendingMutex);
-      m_promoPendingProbes.push_back(PendingProbe { snapshot.geometryHash, probeVa, refCount });
+      // rest probes key the ORIGINAL candidate (promoKeyHash) and carry the
+      // space-tagged rest hash for residency routing
+      PendingProbe pending;
+      pending.geometryHash = snapshot.isRestCapture ? snapshot.promoKeyHash : snapshot.geometryHash;
+      pending.probeVa = probeVa;
+      pending.vertexCount = refCount;
+      pending.routeHash = snapshot.isRestCapture ? snapshot.geometryHash : 0;
+      m_promoPendingProbes.push_back(pending);
     }
 
     Logger::info(str::format("[ClusterLOD] ", snapshot.name, ": promotion probe uploaded (referenced verts ", refCount,
@@ -821,6 +841,32 @@ namespace dxvk {
     {
       std::lock_guard<std::mutex> lock(m_promoPendingMutex);
       for (const PendingProbe& pending : m_promoPendingProbes) {
+        // REST probe for an existing candidate: swap the reference in place - free
+        // the old (object-space) blob, adopt the rest probe, restart Probing, and
+        // route residency to the space-tagged rest hash. The state slot persists.
+        const auto existing = m_promoCandidates.find(pending.geometryHash);
+        if (existing != m_promoCandidates.end()) {
+          if (pending.routeHash != 0) {
+            if (m_templateSystemMT != nullptr && existing->second.probeVa != 0) {
+              m_templateSystemMT->freePromotionProbe(existing->second.probeVa);
+            }
+            existing->second.probeVa = pending.probeVa;
+            existing->second.vertexCount = pending.vertexCount;
+            existing->second.routeHash = pending.routeHash;
+            existing->second.phase = PromotionCandidate::Phase::Probing;
+            existing->second.gateFrames = 0;
+            existing->second.stuckFrames = 0;
+            existing->second.loggedTemporalHold = false;
+            existing->second.restState = PromotionCandidate::RestState::Referenced;
+            Logger::info(str::format("[ClusterLOD] promotion: geometry 0x", std::hex, pending.geometryHash,
+                                     " probe re-referenced to REST CAPTURE 0x", pending.routeHash, std::dec));
+          }
+          else if (m_templateSystemMT != nullptr && pending.probeVa != 0) {
+            // duplicate non-rest probe for a live candidate: free the fresh blob
+            m_templateSystemMT->freePromotionProbe(pending.probeVa);
+          }
+          continue;
+        }
         if (m_promoNextStateSlot >= lodclusters_remix::ClusterRenderSystem::kPromotionSlotCapacity) {
           ONCE(Logger::warn("[ClusterLOD] promotion state slots exhausted - further candidates stay Path B"));
           break;
@@ -829,6 +875,7 @@ namespace dxvk {
         candidate.probeVa = pending.probeVa;
         candidate.vertexCount = pending.vertexCount;
         candidate.stateSlot = m_promoNextStateSlot++;
+        candidate.routeHash = pending.routeHash;
         m_promoCandidates.emplace(pending.geometryHash, candidate);
       }
       m_promoPendingProbes.clear();
@@ -909,6 +956,25 @@ namespace dxvk {
       case PromotionCandidate::Phase::Probing:
         if (state.rigidStreak >= rigidFrames) {
           candidate.phase = PromotionCandidate::Phase::GateScheduled;
+        } else if (ClusterLodOptions::Promotion::restCaptureReference()
+                   && candidate.restState == PromotionCandidate::RestState::None
+                   && state.residualRel > epsilon
+                   && state.lastFrame != 0u) {
+          // REST-CAPTURE trigger: temporally static (not animating) yet never fits
+          // any single transform of the CPU snapshot -> the VS builds a genuinely
+          // different shape. Re-reference the probe (and Path A clusters) to the
+          // captured rest pose; the solve then fits identity(+motion) and promotes.
+          if (state.temporalDeformRel <= ClusterLodOptions::Promotion::temporalEpsilon()) {
+            candidate.stuckFrames++;
+            if (candidate.stuckFrames >= uint32_t(std::max(10, ClusterLodOptions::Promotion::restCaptureStuckFrames()))) {
+              candidate.restState = PromotionCandidate::RestState::Requested;
+              Logger::info(str::format("[ClusterLOD] promotion: geometry 0x", std::hex, entry.first, std::dec,
+                                       " static but non-affine (residual ", state.residualRel,
+                                       ") - requesting REST-CAPTURE reference"));
+            }
+          } else {
+            candidate.stuckFrames = 0;  // it moves - genuinely animated, leave on Path B
+          }
         } else if (!candidate.loggedTemporalHold
                    && (state.temporalDeformRel > ClusterLodOptions::Promotion::temporalEpsilon()
                        || state.residualRel > epsilon)) {
@@ -1119,6 +1185,45 @@ namespace dxvk {
         }
         if (!emitted.insert(hash).second) {
           continue;
+        }
+
+        // REST-CAPTURE staging: the frame pose IS the capture buffer, so stage the
+        // one-time readback here (copy recorded in dispatchBuild where ctx lives).
+        if (candidate.restState == PromotionCandidate::RestState::Requested) {
+          uint32_t topoVertexCount = 0;
+          {
+            std::lock_guard<std::mutex> topoLock(m_promoTopologyMutex);
+            const auto topoIt = m_promoTopologyByHash.find(hash);
+            if (topoIt != m_promoTopologyByHash.end()) {
+              topoVertexCount = topoIt->second.vertexCount;
+            }
+          }
+          const FramePose& pose = m_framePoses[framePoseIndex];
+          if (topoVertexCount > 0 && pose.positionsCount >= topoVertexCount
+              && pose.positionsStrideBytes >= 3 * sizeof(float)) {
+            DxvkBufferCreateInfo stagingInfo;
+            stagingInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            stagingInfo.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT;
+            stagingInfo.access = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+            stagingInfo.size = VkDeviceSize(topoVertexCount) * pose.positionsStrideBytes;
+            RestCaptureRequest request;
+            request.geometryHash = hash;
+            request.source = pose.positionsBuffer;
+            request.sourceOffset = pose.positionsBufferOffset;
+            request.strideBytes = pose.positionsStrideBytes;
+            request.vertexCount = topoVertexCount;
+            request.staging = m_device->createBuffer(stagingInfo,
+              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+              DxvkMemoryStats::Category::RTXBuffer, "promo rest-capture readback");
+            m_restCaptureRequests.push_back(std::move(request));
+            // Referenced = rest path initiated; the probe swap on adoption finishes it
+            candidate.restState = PromotionCandidate::RestState::Referenced;
+          } else {
+            // topology missing or pose too small - cannot rest-reference this one
+            candidate.restState = PromotionCandidate::RestState::Referenced;
+            ONCE(Logger::warn(str::format("[ClusterLOD] rest-capture: geometry 0x", std::hex, hash, std::dec,
+                                          " has no retained topology / undersized pose - stays Path B")));
+          }
         }
 
         lodclusters_remix::PromotionEntry promoEntry;
@@ -1878,7 +1983,11 @@ namespace dxvk {
         const auto candidate = m_promoCandidates.find(geometryHash);
         if (candidate != m_promoCandidates.end()
             && candidate->second.phase == PromotionCandidate::Phase::Promoted) {
-          const auto found = m_geometryIdByHash.find(geometryHash);
+          // rest-referenced candidates render the clusters built from their CAPTURED
+          // rest pose (space-tagged hash); everything else uses the object-space id
+          const uint64_t residencyHash = candidate->second.routeHash != 0
+                                       ? candidate->second.routeHash : geometryHash;
+          const auto found = m_geometryIdByHash.find(residencyHash);
           // DIAG (PathARoute): a geometry can PROMOTE (verdict) yet its instances still
           // render Path B when a per-geometry condition here fails. The prime suspect is
           // MISSING residency - m_geometryIdByHash miss = the Path A cluster/generation
@@ -2078,6 +2187,7 @@ namespace dxvk {
     // correspondence scan's reads; underestimate is safe, it only skips offsets)
     framePose.positionsCount = positions.stride() > 0 && positions.length() > positions.offsetFromSlice()
       ? uint32_t((positions.length() - positions.offsetFromSlice()) / positions.stride()) : 0;
+    framePose.positionsBufferOffset = positions.offset() + positions.offsetFromSlice();
     framePose.positionsBuffer = positions.buffer();
 
     const uint32_t framePoseIndex = uint32_t(m_framePoses.size());
@@ -2157,6 +2267,77 @@ namespace dxvk {
     return uint32_t(m_slots[tlasType].size() + m_slotsB[tlasType].size());
   }
 
+  void ClusterLodManager::processRestCaptureRequests(Rc<DxvkContext> ctx) {
+    if (m_restCaptureRequests.empty()) {
+      return;
+    }
+    const uint32_t currentFrame = m_device->getCurrentFrameId();
+    // frames the copy must retire before the host reads the staging mapping
+    constexpr uint32_t kReadbackLagFrames = 4;
+
+    for (auto it = m_restCaptureRequests.begin(); it != m_restCaptureRequests.end();) {
+      RestCaptureRequest& request = *it;
+
+      if (request.copyFrame == ~0u) {
+        // record the one-time copy (dxvk tracks the barriers/lifetimes)
+        ctx->copyBuffer(request.staging, 0, request.source,
+                        request.sourceOffset,
+                        VkDeviceSize(request.vertexCount) * request.strideBytes);
+        request.copyFrame = currentFrame;
+        ++it;
+        continue;
+      }
+      if (currentFrame - request.copyFrame < kReadbackLagFrames) {
+        ++it;
+        continue;
+      }
+
+      // copy retired: assemble the rest snapshot from the readback + retained topology
+      const uint8_t* mapped = (const uint8_t*) request.staging->mapPtr(0);
+      RetainedTopology topo;
+      bool haveTopo = false;
+      {
+        std::lock_guard<std::mutex> topoLock(m_promoTopologyMutex);
+        const auto topoIt = m_promoTopologyByHash.find(request.geometryHash);
+        if (topoIt != m_promoTopologyByHash.end()) {
+          topo = topoIt->second;
+          haveTopo = true;
+        }
+      }
+      if (mapped != nullptr && haveTopo && m_provider != nullptr) {
+        lodclusters_remix::GeometrySnapshot restSnap;
+        // space-tagged rest hash: distinct clusters/.nvsngeo/residency identity
+        constexpr uint64_t kRestSpaceTag = 0x9E3779B97F4A7C15ull;
+        restSnap.geometryHash = request.geometryHash ^ kRestSpaceTag;
+        restSnap.promoKeyHash = request.geometryHash;
+        restSnap.isRestCapture = true;
+        restSnap.name = topo.name + "_rest";
+        restSnap.indices = std::move(topo.indices);
+        restSnap.indicesHash = topo.indicesHash;
+        restSnap.topologyKey = topo.topologyKey;
+        restSnap.vertexCount = request.vertexCount;
+        restSnap.positions.resize(size_t(request.vertexCount) * 3);
+        for (uint32_t v = 0; v < request.vertexCount; v++) {
+          const float* src = (const float*) (mapped + size_t(v) * request.strideBytes);
+          restSnap.positions[size_t(v) * 3 + 0] = src[0];
+          restSnap.positions[size_t(v) * 3 + 1] = src[1];
+          restSnap.positions[size_t(v) * 3 + 2] = src[2];
+        }
+        restSnap.verticesHash = XXH3_64bits(restSnap.positions.data(),
+                                            restSnap.positions.size() * sizeof(float));
+        Logger::info(str::format("[ClusterLOD] rest-capture: geometry 0x", std::hex, request.geometryHash,
+                                 " read back -> rest snapshot 0x", restSnap.geometryHash, std::dec,
+                                 " (", request.vertexCount, " verts) queued for clusterization"));
+        m_provider->enqueueRestSnapshot(std::move(restSnap));
+      } else {
+        Logger::warn(str::format("[ClusterLOD] rest-capture: geometry 0x", std::hex, request.geometryHash, std::dec,
+                                 " readback unusable (mapped ", mapped != nullptr,
+                                 ", topo ", haveTopo, ") - stays Path B"));
+      }
+      it = m_restCaptureRequests.erase(it);
+    }
+  }
+
   void ClusterLodManager::dispatchBuild(Rc<DxvkContext> ctx, const CameraManager& cameraManager, AccelManager& accelManager) {
     const uint32_t numOpaque = uint32_t(m_slots[Tlas::Opaque].size());
     const uint32_t numUnordered = uint32_t(m_slots[Tlas::Unordered].size());
@@ -2175,6 +2356,10 @@ namespace dxvk {
     // lists, which are final here). Probing runs even when no Path A instance
     // rendered this frame - recordFrame handles the promotion-only case.
     buildPromotionEntries();
+
+    // REST-CAPTURE readbacks: record freshly-staged copies; drain finished ones
+    // (past the frames-in-flight window) into rest snapshots for the provider.
+    processRestCaptureRequests(ctx);
 
     const bool pathAActive = m_renderSystem != nullptr && m_renderSystem->hasGeneration()
                           && (count > 0 || !m_framePromoEntries.empty());

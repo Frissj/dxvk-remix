@@ -91,6 +91,15 @@ namespace lodclusters_remix {
     // it stays stable while a mesh deforms). Keys the template sets.
     uint64_t topologyKey = 0;
 
+    // REST-CAPTURE reference (promotion, non-affine leftovers): this snapshot's
+    // positions are a GPU readback of the mesh's vertex-CAPTURE output - the true
+    // rendered shape - instead of the CPU input stream. geometryHash carries the
+    // space-tagged rest hash (keys clusters/cache/residency); promoKeyHash carries
+    // the ORIGINAL geometry hash the promotion candidate and draw-time routing key
+    // on. Takes the plain Path A worker route + the promotion probe handler.
+    bool isRestCapture = false;
+    uint64_t promoKeyHash = 0;
+
     // chrono: steady-clock microseconds at enqueue time - the worker reports
     // how long the snapshot waited in the processing queue (a growing wait
     // means discovery outpaces the single processing worker)
