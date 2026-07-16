@@ -385,13 +385,15 @@ namespace dxvk {
                  "positions are read back and logged throttled ([PromoDump] cap). Diffing the two shows the\n"
                  "actual per-vertex displacement field - raw data, no interpretation.");
       RTX_OPTION("rtx.clusterLod.promotion", std::string, traceMaterialHash, "",
-                 "DIAGNOSTIC DRAW TRACE (empty = off). Hex MATERIAL hash (no 0x) as shown by the Remix picker.\n"
-                 "Every draw whose material matches is logged at three pipeline stages, throttled per geometry:\n"
-                 "[DrawTrace/scene] at SceneManager::processDrawCallState (BEFORE any cluster filtering - catches\n"
-                 "draws that are ignored/culled and never reach the cluster system at all), [DrawTrace/intake] at\n"
-                 "the cluster manager entry (empty-hash filtering), and [DrawTrace/provider] at the provider (the\n"
-                 "fast-path early-returns: already-known, mutating-skip, ineligible). Use it to see exactly how the\n"
-                 "game draws a user-identified surface - captured vs not, which sub-meshes reach the system.");
+                 "DIAGNOSTIC DRAW TRACE (empty = off). One or more hex MATERIAL hashes (no 0x) as shown by the\n"
+                 "Remix picker, separated by commas or spaces (e.g. 'a4e20a16f03bf6f8, 3857086b6625afcc').\n"
+                 "Every draw whose material matches ANY listed hash is logged at three pipeline stages, throttled\n"
+                 "per geometry: [DrawTrace/scene] at SceneManager::processDrawCallState (BEFORE any cluster\n"
+                 "filtering - catches draws that are ignored/culled and never reach the cluster system at all),\n"
+                 "[DrawTrace/intake] at the cluster manager entry (empty-hash filtering), and [DrawTrace/provider]\n"
+                 "at the provider (the fast-path early-returns: already-known, mutating-skip, ineligible). Use it\n"
+                 "to see exactly how the game draws a user-identified surface - captured vs not, which sub-meshes\n"
+                 "reach the system. Read live per draw, so it can be changed at runtime without a rebuild.");
       RTX_OPTION("rtx.clusterLod.promotion", bool, correspondenceScan, false,
                  "DIAGNOSTIC PROBE (no fix, off by default). For every candidate, the solve kernel also runs a\n"
                  "transform-invariant pairwise-distance scan over a fixed table of ref->capture vertex-index\n"
@@ -402,6 +404,47 @@ namespace dxvk {
                  "scan while enabled; bounds-clamped so it can never read past the capture buffer.");
     };
   };
+
+  // DIAG: true if matHash appears in rtx.clusterLod.promotion.traceMaterialHash,
+  // which accepts one or more hex material hashes separated by commas or spaces.
+  // Parses the option string once and re-parses only when it changes (so it stays
+  // runtime-tunable without a per-draw allocation). Shared by every DrawTrace probe
+  // site so they all match the same list. 0/empty option -> never matches.
+  inline bool clusterLodPromoTraceMatchesMaterial(uint64_t matHash) {
+    if (matHash == 0) {
+      return false;
+    }
+    const std::string& s = ClusterLodOptions::Promotion::traceMaterialHash();
+    if (s.empty()) {
+      return false;
+    }
+    static thread_local std::string s_cachedStr;
+    static thread_local std::vector<uint64_t> s_cachedHashes;
+    if (s != s_cachedStr) {
+      s_cachedStr = s;
+      s_cachedHashes.clear();
+      size_t i = 0;
+      while (i < s.size()) {
+        while (i < s.size() && (s[i] == ',' || s[i] == ' ' || s[i] == '\t')) {
+          i++;
+        }
+        size_t j = i;
+        while (j < s.size() && s[j] != ',' && s[j] != ' ' && s[j] != '\t') {
+          j++;
+        }
+        if (j > i) {
+          try { s_cachedHashes.push_back(std::stoull(s.substr(i, j - i), nullptr, 16)); } catch (...) {}
+        }
+        i = j;
+      }
+    }
+    for (const uint64_t h : s_cachedHashes) {
+      if (h == matHash) {
+        return true;
+      }
+    }
+    return false;
+  }
 
   // Owner of the cluster LOD subsystems on the Remix side:
   //  - P1: geometry intake (provider), background processing through NVIDIA's
@@ -657,6 +700,23 @@ namespace dxvk {
     // stable-topology -> candidate key (registered geometryHash). Lets a churned-hash
     // draw find its candidate every frame instead of only when the hash recurs.
     std::unordered_map<uint64_t, uint64_t> m_promoCandidateByTopology;
+
+    // ---- Path-A timing (churn-proof): first sight -> first ACTUAL Path A render ----
+    // Keyed by stable topology key, NOT the churning geometry hash. Measures wall-
+    // clock from the first frame a captured mesh is seen to the first frame it really
+    // routes Path A (established or pinned). pathAFrame==0 => STILL WAITING (never
+    // promoted to Path A yet). materialHash is stored so the report can name a
+    // pickable material for the worst offender. onFrameBegin reports the worst
+    // reached latency and the longest-still-waiting mesh.
+    struct PromoPathATiming {
+      uint32_t firstFrame = 0;
+      std::chrono::steady_clock::time_point firstSeen{};
+      uint32_t pathAFrame = 0;        // 0 = not yet on Path A
+      float secondsToPathA = -1.0f;   // <0 = still waiting
+      uint64_t materialHash = 0;
+      uint64_t lastGeomHash = 0;
+    };
+    std::unordered_map<uint64_t, PromoPathATiming> m_promoPathATiming;
     // worker -> main handoff of uploaded probes
     struct PendingProbe {
       uint64_t geometryHash = 0;  // candidate key (ORIGINAL hash for rest probes)
@@ -778,6 +838,18 @@ namespace dxvk {
     std::string m_generationConfigDigest;
     uint32_t m_lastGenerationFrame = 0;
     uint32_t m_generationCount = 0;
+
+    // [GenTrace] residency-stall instrumentation: per-frame diagnosis of WHY
+    // pending geometries did or did not join the render generation this frame.
+    // Wall-clock 1s throttle for the "still waiting" heartbeat + last-seen
+    // state so transitions log immediately (idle<->pending<->appending).
+    std::chrono::steady_clock::time_point m_lastGenTraceLog{};
+    size_t m_lastGenTracePending = 0;
+    uint64_t m_lastProviderQueueDepth = 0;
+    uint64_t m_lastProviderProcessed = 0;
+    uint64_t m_lastProviderSubmitted = 0;
+    uint32_t m_genTraceEnqueuedFrame = 0;   // frame the oldest still-pending hash was drained
+    uint32_t m_genTraceDeferrals = 0;       // consecutive frames pending>0 without an append
 
     std::unordered_map<uint64_t, uint32_t> m_geometryIdByHash;
 

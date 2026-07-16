@@ -383,15 +383,6 @@ namespace dxvk {
     return hasExtension && hasFeature && hasSubgroup32 && hasShaderInt64 && hasMinmaxSampler && hasMaintenance5;
   }
 
-  // DIAG: parse rtx.clusterLod.promotion.traceMaterialHash once; 0 = off.
-  static uint64_t clusterLodTraceMaterialHash() {
-    const std::string& s = ClusterLodOptions::Promotion::traceMaterialHash();
-    if (s.empty()) {
-      return 0;
-    }
-    try { return std::stoull(s, nullptr, 16); } catch (...) { return 0; }
-  }
-
   void ClusterLodManager::onDrawCallGeometry(const DrawCallState& drawCallState, bool vertexDataUpdated) {
     // Whatever happens below, drop the pre-capture staging hold on the way out:
     // the snapshot (if one is taken) copies the data, and holding longer would
@@ -421,8 +412,8 @@ namespace dxvk {
     // DIAG (DrawTrace/intake): this is the cluster manager's entry - a draw that
     // reaches here passed SceneManager but may still be dropped by the empty-hash
     // guard below (geometry with no hashable data never enters the cluster system).
-    const uint64_t traceMat = clusterLodTraceMaterialHash();
-    const bool traceThis = traceMat != 0 && drawCallState.getMaterialData().getHash() == traceMat;
+    const uint64_t drawMat = drawCallState.getMaterialData().getHash();
+    const bool traceThis = clusterLodPromoTraceMatchesMaterial(drawMat);
     if (traceThis) {
       const RasterGeometry& gd = drawCallState.getGeometryData();
       const bool captured = drawCallState.preCaptureVertexData != nullptr;
@@ -435,7 +426,7 @@ namespace dxvk {
       if (last == 0u || fr - last > 300u) {
         last = fr;
         Logger::info(str::format("[DrawTrace/intake] geom 0x", std::hex, geometryHash,
-                                 " mat 0x", traceMat, std::dec, " captured ", captured,
+                                 " mat 0x", drawMat, std::dec, " captured ", captured,
                                  " skinned ", skinned, " vtxUpd ", vertexDataUpdated,
                                  " verts ", gd.vertexCount, " indices ", gd.indexCount,
                                  " emptyHash ", (geometryHash == kEmptyHash),
@@ -1987,20 +1978,62 @@ namespace dxvk {
     }
 
     const bool needsCapacityGrowth = requestedCapacity > m_renderSystem->getMaxRenderInstances();
+    const uint32_t currentFrame = m_device->getCurrentFrameId();
+
+    // [GenTrace] 1s-throttled heartbeat helper: answers "why isn't residency
+    // growing right now?" every frame the pipeline is not idle. A transition
+    // (pending count changed) always logs immediately; otherwise throttled.
+    const bool genTraceThrottleOk =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - m_lastGenTraceLog).count() >= 1000;
 
     if (m_pendingGeometryHashes.empty() && !(needsCapacityGrowth && !m_residentGeometryHashes.empty())) {
+      // Nothing queued to append. Distinguish "workers still grinding" (discovery
+      // outpaced processing) from "truly idle" (game drew nothing new). This is
+      // the state during the observed 19s residency stall - it tells us whether
+      // the stall is the mesh optimiser/processing backlog or simply no intake.
+      const ClusterLodGeometryProvider::Stats st = m_provider->getStats();
+      const bool workersBusy = st.pending > 0;
+      const bool transition = m_lastGenTracePending != 0;  // was pending last frame, now drained/idle
+      if ((workersBusy || transition) && (genTraceThrottleOk || transition)) {
+        Logger::info(str::format("[GenTrace] IDLE-append: pending 0, ",
+                                 workersBusy ? "PROVIDER STILL PROCESSING" : "provider idle (no new intake)",
+                                 " | provider: submitted ", st.submitted, " processed ", st.processed,
+                                 " inFlightQueue ", st.pending, " deforming ", st.deforming,
+                                 " failed ", st.failed,
+                                 " | residentGens ", m_residentGeometryHashes.size(),
+                                 " frame ", currentFrame));
+        m_lastGenTraceLog = std::chrono::steady_clock::now();
+      }
+      m_lastGenTracePending = 0;
       return 0.0;
     }
 
     // batch generation updates. Cache-hit batches take the fast lane (P4c,
     // plan 7.7): a .nvsngeo load costs milliseconds, so the full cooldown
     // would delay the classic->cluster flip with nothing to amortize.
-    const uint32_t currentFrame = m_device->getCurrentFrameId();
     uint32_t cooldown = uint32_t(std::max(1, ClusterLodOptions::Render::generationCooldownFrames()));
     if (m_pendingHasCacheHit) {
       cooldown = std::min(cooldown, uint32_t(std::max(1, ClusterLodOptions::Render::cacheHitCooldownFrames())));
     }
     if (m_generationCount > 0 && currentFrame - m_lastGenerationFrame < cooldown) {
+      // [GenTrace] append is READY but held by the cooldown gate. Reports how
+      // many frames remain and how long this batch has now waited - if this is
+      // what owns the stall, the fix is a cooldown knob.
+      m_genTraceDeferrals++;
+      const uint32_t framesWaited = currentFrame - m_genTraceEnqueuedFrame;
+      const uint32_t framesLeft = cooldown - (currentFrame - m_lastGenerationFrame);
+      const bool transition = m_lastGenTracePending != m_pendingGeometryHashes.size();
+      if (genTraceThrottleOk || transition) {
+        Logger::info(str::format("[GenTrace] COOLDOWN-hold: pending ", m_pendingGeometryHashes.size(),
+                                 (m_pendingHasCacheHit ? " (has cache-hit, fast lane)" : ""),
+                                 " | cooldown ", cooldown, " frames, ", framesLeft, " left",
+                                 " | batch waited ", framesWaited, " frames over ", m_genTraceDeferrals,
+                                 " deferrals | lastGen frame ", m_lastGenerationFrame,
+                                 " now ", currentFrame));
+        m_lastGenTraceLog = std::chrono::steady_clock::now();
+      }
+      m_lastGenTracePending = m_pendingGeometryHashes.size();
       return 0.0;
     }
 
@@ -2011,6 +2044,31 @@ namespace dxvk {
 
     const lodclusters_remix::ProcessorConfig processorConfig = buildProcessorConfig();
     const std::string configDigest = lodclusters_remix::getConfigCacheDigestUtf8(processorConfig);
+
+    // [GenTrace] the cooldown has elapsed and we WILL touch the generation this
+    // frame. Report which route and why: an incremental append is O(new) and
+    // cheap; a full rebuild is a device-wait-idle swap (the ~1s hitch seen for
+    // gen 1). If a rebuild happens mid-session it is one of the three reasons
+    // below - this line names the culprit instead of guessing.
+    {
+      const bool hasGen = m_renderSystem->hasGeneration();
+      const bool digestMatch = (configDigest == m_generationConfigDigest);
+      const bool willAppend = hasGen && !needsCapacityGrowth && digestMatch && !m_pendingGeometryHashes.empty();
+      const uint32_t framesWaited = currentFrame - m_genTraceEnqueuedFrame;
+      Logger::info(str::format("[GenTrace] GENERATION-EVENT frame ", currentFrame,
+                               ": route=", willAppend ? "APPEND(O(new))" : "FULL-REBUILD(device-idle swap)",
+                               " | pending ", m_pendingGeometryHashes.size(),
+                               " batch waited ", framesWaited, " frames / ", m_genTraceDeferrals, " deferrals",
+                               " | rebuildReason=",
+                               willAppend ? "n/a"
+                                 : (!hasGen ? "no-generation(bootstrap)"
+                                    : needsCapacityGrowth ? "instance-capacity-growth"
+                                    : !digestMatch ? "SceneConfig-digest-changed"
+                                    : "pending-empty"),
+                               needsCapacityGrowth ? str::format(" [reqCap ", requestedCapacity,
+                                                                 " > cur ", m_renderSystem->getMaxRenderInstances(),
+                                                                 ", overflow ", m_frameOverflowCount, "]") : std::string()));
+    }
 
     // P2.5: while the running generation can absorb them, newly processed
     // geometries join incrementally - O(new) upload and CLAS/low-detail-BLAS
@@ -2045,11 +2103,15 @@ namespace dxvk {
 
         Logger::info(str::format("[ClusterLOD] render generation ", m_generationCount, " grew by ",
                                  m_pendingGeometryHashes.size(), " geometries (", infos.size(), " total)",
-                                 " in ", elapsedMs(generationStart), " ms (lock wait ", appendLockWaitMs, " ms)"));
+                                 " in ", elapsedMs(generationStart), " ms (lock wait ", appendLockWaitMs, " ms)",
+                                 " | [GenTrace] batch latency ", currentFrame - m_genTraceEnqueuedFrame,
+                                 " frames (", m_genTraceDeferrals, " deferrals)"));
 
         m_pendingGeometryHashes.clear();
         m_pendingHasCacheHit = false;
         m_lastGenerationFrame = currentFrame;
+        m_lastGenTracePending = 0;
+        m_genTraceDeferrals = 0;
 
         // instances of the appended geometries flip classic -> cluster: their
         // cached BLAS buckets are stale and the full-skip fast path must not
@@ -2083,6 +2145,8 @@ namespace dxvk {
                                     m_pendingGeometryHashes.begin(), m_pendingGeometryHashes.end());
     m_pendingGeometryHashes.clear();
     m_pendingHasCacheHit = false;
+    m_lastGenTracePending = 0;
+    m_genTraceDeferrals = 0;
 
     std::vector<std::string> cacheFiles;
     cacheFiles.reserve(m_residentGeometryHashes.size());
@@ -2198,6 +2262,41 @@ namespace dxvk {
                                  " scaleOvf ", m_diagReasonHist[5],
                                  " nonFin ", m_diagReasonHist[6], "]",
                                  ", statesValid ", (m_promoStatesValid ? 1 : 0)));
+
+        // PATH-A TIMING digest: worst first-sight -> Path A latency among meshes that
+        // made it, and the meshes STILL WAITING (never reached Path A) with how long
+        // they have been waiting. This is the churn-proof answer to "how long does it
+        // take, and which ones never promote" - keyed by stable topology, material
+        // hash named so the worst offender is pickable.
+        if (!m_promoPathATiming.empty()) {
+          uint32_t reached = 0, waiting = 0;
+          float worstReached = 0.0f, worstWaiting = 0.0f;
+          uint64_t worstReachedMat = 0, worstWaitingMat = 0, worstWaitingGeom = 0;
+          const auto nowT = std::chrono::steady_clock::now();
+          for (const auto& e : m_promoPathATiming) {
+            if (e.second.pathAFrame != 0) {
+              reached++;
+              if (e.second.secondsToPathA > worstReached) {
+                worstReached = e.second.secondsToPathA;
+                worstReachedMat = e.second.materialHash;
+              }
+            } else {
+              waiting++;
+              const float w = float(std::chrono::duration_cast<std::chrono::milliseconds>(nowT - e.second.firstSeen).count() / 1000.0);
+              if (w > worstWaiting) {
+                worstWaiting = w;
+                worstWaitingMat = e.second.materialHash;
+                worstWaitingGeom = e.second.lastGeomHash;
+              }
+            }
+          }
+          Logger::info(str::format("[PathATiming] meshes ", m_promoPathATiming.size(),
+                                   ", reached Path A ", reached, " (worst ", worstReached,
+                                   "s, mat 0x", std::hex, worstReachedMat, std::dec,
+                                   "), STILL WAITING ", waiting, " (longest ", worstWaiting,
+                                   "s and counting, mat 0x", std::hex, worstWaitingMat,
+                                   " geom 0x", worstWaitingGeom, std::dec, ")"));
+        }
       }
     }
 
@@ -2269,9 +2368,31 @@ namespace dxvk {
     // promote/demote state machine (plan 7.7)
     updatePromotionStates();
 
+    size_t drainedThisFrame = 0;
+    size_t drainedCacheHits = 0;
+    const size_t pendingBeforeDrain = m_pendingGeometryHashes.size();
     for (const ClusterLodGeometryProvider::ReadyGeometry& ready : m_provider->drainReadyGeometries()) {
       m_pendingGeometryHashes.push_back(ready.hash);
       m_pendingHasCacheHit |= ready.fromCache;
+      drainedThisFrame++;
+      if (ready.fromCache) {
+        drainedCacheHits++;
+      }
+    }
+
+    // [GenTrace] mark the frame the pending queue first became non-empty so the
+    // "how long has this batch been waiting" heartbeat below is meaningful.
+    if (pendingBeforeDrain == 0 && drainedThisFrame > 0) {
+      m_genTraceEnqueuedFrame = currentFrame;
+      m_genTraceDeferrals = 0;
+    }
+    if (drainedThisFrame > 0) {
+      const ClusterLodGeometryProvider::Stats st = m_provider->getStats();
+      Logger::info(str::format("[GenTrace] drained ", drainedThisFrame, " ready geometr(y/ies) (",
+                               drainedCacheHits, " cache-hit) -> pending now ", m_pendingGeometryHashes.size(),
+                               " | provider: submitted ", st.submitted, " processed ", st.processed,
+                               " inFlightQueue ", st.pending, " deforming ", st.deforming,
+                               " | frame ", currentFrame));
     }
 
     const double generationMs = buildGenerationIfDue(accelManager, instanceManager);
@@ -2322,6 +2443,70 @@ namespace dxvk {
     const bool updatedInPlace = blasEntry->frameLastUpdated == currentFrame
                              && blasEntry->frameLastUpdated != blasEntry->frameCreated;
 
+    // DIAG (RenderRoute): the ACTUAL per-frame routing outcome for a traced material.
+    // The "PROMOTED" verdict only means the candidate passed the rigidity gate; this
+    // shows whether the instance really renders Path A this frame or falls to Path B
+    // / classic (the layer the user actually sees). Filtered by traceMaterialHash,
+    // throttled per geometry.
+    const uint64_t routeMat = blasEntry->input.getMaterialData().getHash();
+    const bool traceRoute = clusterLodPromoTraceMatchesMaterial(routeMat);
+    // code: 0 pinned, 1 established, 2 Path B, 3 classic. Log on OUTCOME CHANGE
+    // (transition) plus a slow heartbeat, so the steady state and the exact frame a
+    // mesh flips Path B->Path A are both visible - a coarse throttle only sampled
+    // pre-promotion frames and hid the flip.
+    auto logRoute = [&](const char* outcome, uint32_t code) {
+      if (!traceRoute) {
+        return;
+      }
+      const uint64_t gk = geometryData.getHashForRule(RtxOptions::geometryAssetHashRule());
+      const uint64_t candKey = resolvePromoCandidateKey(geometryData);
+      const uint64_t key = candKey != 0 ? candKey : gk;
+      static std::mutex s_mx;
+      static std::unordered_map<uint64_t, uint32_t> s_lastCode;   // code+1 (0 = unseen)
+      static std::unordered_map<uint64_t, uint32_t> s_lastFrame;
+      std::lock_guard<std::mutex> lk(s_mx);
+      uint32_t& lastCode = s_lastCode[key];
+      uint32_t& lastFrame = s_lastFrame[key];
+      const bool changed = lastCode != code + 1u;
+      if (changed || currentFrame - lastFrame > 120u) {
+        Logger::info(str::format("[RenderRoute] mat 0x", std::hex, routeMat, " geomDraw 0x", gk,
+                                 " cand 0x", candKey, std::dec, " captured ", captured,
+                                 " updatedInPlace ", updatedInPlace, " frame ", currentFrame,
+                                 (changed && lastCode != 0u ? " CHANGED -> " : " -> "), outcome));
+        lastCode = code + 1u;
+        lastFrame = currentFrame;
+      }
+    };
+
+    // PATH-A TIMING (churn-proof): track first sight -> first actual Path A render by
+    // STABLE topology key (the geometry hash churns per frame and can't be tracked).
+    // markPathA() is called at the two Path A return points below; the report is in
+    // onFrameBegin. Independent of the trace-material filter - covers every mesh.
+    const uint64_t pathATopoKey = (captured && !skinned && ClusterLodOptions::Promotion::enable())
+      ? ClusterLodGeometryProvider::makeTopologyKey(geometryData) : 0;
+    if (pathATopoKey != 0) {
+      auto& t = m_promoPathATiming[pathATopoKey];
+      if (t.firstFrame == 0) {
+        t.firstFrame = currentFrame != 0 ? currentFrame : 1;
+        t.firstSeen = std::chrono::steady_clock::now();
+      }
+      t.materialHash = blasEntry->input.getMaterialData().getHash();
+      t.lastGeomHash = geometryData.getHashForRule(RtxOptions::geometryAssetHashRule());
+    }
+    auto markPathA = [&]() {
+      if (pathATopoKey == 0) {
+        return;
+      }
+      auto& t = m_promoPathATiming[pathATopoKey];
+      if (t.pathAFrame == 0) {
+        t.pathAFrame = currentFrame;
+        t.secondsToPathA = float(elapsedMs(t.firstSeen) / 1000.0);
+        Logger::info(str::format("[PathATiming] mesh reached Path A after ", t.secondsToPathA,
+                                 "s (mat 0x", std::hex, t.materialHash, " geom 0x", t.lastGeomHash,
+                                 " topo 0x", pathATopoKey, std::dec, ")"));
+      }
+    };
+
     if (skinned || captured || updatedInPlace) {
       // ---- pinned Path A fast-path ----
       // Once an instance has PROMOTED, it is identified by its stable BlasEntry*,
@@ -2346,6 +2531,8 @@ namespace dxvk {
               && (!ClusterLodOptions::Render::routeTrivialToClassic()
                   || m_trivialGeometryIds.count(pinIt->second.residentGeometryId) == 0)) {
             outGeometryId = kPromotedTag | (pinIt->second.stateSlot << kPromotedSlotShift) | pinIt->second.residentGeometryId;
+            markPathA();
+            logRoute("Path A (pinned)", 0u);
             return true;
           }
         }
@@ -2452,6 +2639,8 @@ namespace dxvk {
                 slotIt->second.geometryHash = geometryHash;
                 slotIt->second.blasFrameCreated = blasEntry->frameCreated;
                 outGeometryId = kPromotedTag | (slotIt->second.stateSlot << kPromotedSlotShift) | found->second;
+                markPathA();
+                logRoute("Path A (established)", 1u);
                 return true;
               }
               // DIAG (PathARoute): routable geometry whose INSTANCE still dropped here.
@@ -2513,6 +2702,7 @@ namespace dxvk {
           }
         }
       }
+      logRoute(routedPathB ? "Path B (cluster template)" : "classic (fell through - no cluster route)", routedPathB ? 2u : 3u);
       return routedPathB;
     }
 

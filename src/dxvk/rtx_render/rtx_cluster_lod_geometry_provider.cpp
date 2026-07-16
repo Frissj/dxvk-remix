@@ -300,7 +300,22 @@ namespace dxvk {
     m_stats.pending++;
     m_stats.pendingBytes += snapshot.approximateSizeBytes();
     snapshot.queuedAtUs = nowUs();  // chrono: worker reports the queue wait
+    const size_t queueDepthAtEnqueue = m_queue.size() + 1;
+    const uint64_t submittedTotal = m_stats.submitted;
+    const uint64_t pendingTotal = m_stats.pending;
     m_queue.push_back(std::move(snapshot));
+
+    // [GenTrace] discovery pulse: a NEW geometry hash was first-sighted this
+    // draw and queued for processing. The cadence of these lines IS the intake
+    // rate - a gap here (vs the render-generation "grew" cadence) proves a
+    // residency stall is discovery-limited (game drew nothing new), while a
+    // steady stream of these while residency is frozen proves the worker pool /
+    // mesh optimiser is the bottleneck. queueDepth is the worker backlog.
+    Logger::info(str::format("[GenTrace] ENQUEUE ", captured ? "captured" : (skinned ? "skinned"
+                             : (vertexDataUpdated ? "mutating" : "static")),
+                             " hash 0x", std::hex, geometryHash, std::dec,
+                             " | queueDepth ", queueDepthAtEnqueue,
+                             " | submitted(total) ", submittedTotal, " pending ", pendingTotal));
 
     lock.unlock();
     m_condition.notify_one();
