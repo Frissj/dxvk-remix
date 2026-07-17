@@ -428,19 +428,19 @@ namespace dxvk {
                  "motion after the proven fit, trace-normalizing to scale levels, and A carries any\n"
                  "anisotropic placement bake. Per-index residual/temporal signals only SCHEDULE\n"
                  "sweeps (suspicion -> verify), never demote. 0 disables the tolerance (any drift counts).");
-      RTX_OPTION("rtx.clusterLod.promotion", int, eigenDemoteSweeps, 1,
-                 "Consecutive drifting eigen sweeps before a PROMOTED content class un-promotes to Path B\n"
-                 "(direction 2: the demote verdict is per CONTENT CLASS, not per instance slot). Default 1\n"
-                 "= demote on the FIRST confirming sweep, so a mesh that starts rigid (e.g. a character in a\n"
-                 "T-pose) and then animates drops to Path B within one sweep + readback (gateLagFrames) of\n"
-                 "the deformation starting, instead of rendering a frozen Path-A pose. 1 is SAFE here because\n"
-                 "the streak is keyed on the content class and the eigen signal is permutation-invariant: a\n"
-                 "static mesh whose capture is merely re-batched reads drift ~0 every sweep and never counts,\n"
-                 "and a different piece rebinding through the slot is a DIFFERENT class that never touches\n"
-                 "this streak (the two false-positives the old per-slot '3 consecutive' guard existed for).\n"
-                 "Raise to 2+ only if a transient garbage capture ever demotes a genuinely static class (a\n"
-                 "clean sweep re-promotes it next readback either way). Suspicion arms the sweep immediately,\n"
-                 "so the streak accrues at the readback cadence, never the periodic stagger.");
+      RTX_OPTION("rtx.clusterLod.promotion", int, eigenDemoteSweeps, 3,
+                 "Consecutive CLEARLY-DRIFTING eigen sweeps before a PROMOTED content class un-promotes to\n"
+                 "Path B (direction 2: the demote verdict is per CONTENT CLASS, not per instance slot).\n"
+                 "'Clearly drifting' = drift above eigenEpsilon * demoteHysteresis (the hysteresis band\n"
+                 "between eigenEpsilon and that upper bound is a genuine minor content difference - a piece\n"
+                 "measured static and rigid but a few % off the shared reference - and is HELD, not demoted;\n"
+                 "any sweep at-or-below the band resets the streak). Default 3 keeps a static world promoted:\n"
+                 "a steady small offset never demotes, and noise spikes that occasionally cross the upper\n"
+                 "bound don't reach 3-in-a-row. Only sustained large drift (real deformation, or a genuinely\n"
+                 "different shape) demotes. Suspicion arms the next sweep immediately, so 3 accrues at the\n"
+                 "readback cadence (~3*gateLagFrames), not the periodic stagger. LOWER to 1 for games with\n"
+                 "rigid->animated transitions (e.g. a character leaving a T-pose) where the fastest possible\n"
+                 "demote matters more than tolerating a static variant's drift noise.");
       RTX_OPTION("rtx.clusterLod.promotion", bool, correspondenceScan, false,
                  "DIAGNOSTIC PROBE (no fix, off by default). For every candidate, the solve kernel also runs a\n"
                  "transform-invariant pairwise-distance scan over a fixed table of ref->capture vertex-index\n"

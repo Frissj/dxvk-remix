@@ -586,6 +586,44 @@ void main()
                         max(abs(lamCapHat.y - lamPredHat.y),
                             abs(lamCapHat.z - lamPredHat.z)));
           }
+
+          // [EigMetric] CONFIRMATION: recompute the drift using the CURRENT best-fit
+          // M (matrices[mB+0..10]) in place of lastRigidM (mB+24..34). If driftFit is
+          // ~0 while drift (above, lastRigidM) is large, the drift is a stale/rigid-A
+          // artifact - the capture IS the reference under its actual placement, the
+          // metric just compared it against the wrong transform. Traced slot only.
+          if(push.solveDumpVa != 0ul && entry.stateSlot == push.solveDumpSlot)
+          {
+            PromoMatrices mm = PromoMatrices(push.matricesVa);
+            const uint mB2 = entry.stateSlot * 40;
+            const vec3 f0 = vec3(mm.m[mB2 + 0], mm.m[mB2 + 1], mm.m[mB2 + 2]);   // M rows (3x3 linear)
+            const vec3 f1 = vec3(mm.m[mB2 + 4], mm.m[mB2 + 5], mm.m[mB2 + 6]);
+            const vec3 f2 = vec3(mm.m[mB2 + 8], mm.m[mB2 + 9], mm.m[mB2 + 10]);
+            const vec3 h0 = G * f0, h1 = G * f1, h2 = G * f2;
+            const float q00 = dot(h0, f0), q11 = dot(h1, f1), q22 = dot(h2, f2);
+            const float q01 = dot(h0, f1), q02 = dot(h0, f2), q12 = dot(h1, f2);
+            const float qTr = q00 + q11 + q22;
+            float driftFit = -3.0;
+            if(qTr > 1e-20 && !isnan(qTr) && !isinf(qTr))
+            {
+              const vec3 lamF = symEigenvaluesSorted(q00, q11, q22, q01, q02, q12);
+              const vec3 lamFHat = max(lamF, vec3(0.0)) / qTr;
+              driftFit = max(abs(lamCapHat.x - lamFHat.x),
+                             max(abs(lamCapHat.y - lamFHat.y), abs(lamCapHat.z - lamFHat.z)));
+            }
+            // SEPARATE region 276..296 - CapSigDump owns 180..275, so writing here
+            // avoids the collision that made the first attempt read vertex coords.
+            RawFloats dd = RawFloats(push.solveDumpVa);
+            dd.f[276] = drift;                 // drift via lastRigidM (the metric in use)
+            dd.f[277] = driftFit;              // drift via the current fitted M
+            dd.f[278] = float(push.frameId);
+            dd.f[279] = mm.m[mB2 + 0]; dd.f[280] = mm.m[mB2 + 1]; dd.f[281] = mm.m[mB2 + 2];
+            dd.f[282] = mm.m[mB2 + 4]; dd.f[283] = mm.m[mB2 + 5]; dd.f[284] = mm.m[mB2 + 6];
+            dd.f[285] = mm.m[mB2 + 8]; dd.f[286] = mm.m[mB2 + 9]; dd.f[287] = mm.m[mB2 + 10];
+            dd.f[288] = mm.m[mB2 + 24]; dd.f[289] = mm.m[mB2 + 25]; dd.f[290] = mm.m[mB2 + 26];
+            dd.f[291] = mm.m[mB2 + 28]; dd.f[292] = mm.m[mB2 + 29]; dd.f[293] = mm.m[mB2 + 30];
+            dd.f[294] = mm.m[mB2 + 32]; dd.f[295] = mm.m[mB2 + 33]; dd.f[296] = mm.m[mB2 + 34];
+          }
         }
       }
 

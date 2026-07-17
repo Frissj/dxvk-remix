@@ -188,7 +188,9 @@ struct ClusterRenderSystem::Impl
   // 16 header + SOLVE_DUMP_MAXVAL(16)*SOLVE_DUMP_STRIDE(10) = 176 for the M/validation
   // dump; + [176,177]=captureVa lo/hi, [178]=capSigVar, [179]=sigN, [180 + i*3]=the
   // actual capSig-sampled vertex positions (i<32) -> [CapSigDump] buffer-consistency probe
-  static constexpr uint32_t kPromoSolveDumpFloats = 16 + 16 * 10 + 4 + 32 * 3;
+  // (occupies 180..275); + 24 for [EigMetric] at 276..296 (MODE_EIGEN A-vs-M drift +
+  // both 3x3 matrices - a SEPARATE region so it never collides with the CapSigDump verts).
+  static constexpr uint32_t kPromoSolveDumpFloats = 16 + 16 * 10 + 4 + 32 * 3 + 24;
   nvvk::Buffer promoSolveDumpBuffer;
   nvvk::Buffer promoSolveDumpReadback[kStagingSlots];
   uint32_t promoSolveDumpFramesRecorded = 0;

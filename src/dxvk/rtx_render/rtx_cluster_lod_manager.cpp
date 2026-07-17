@@ -1195,6 +1195,27 @@ namespace dxvk {
                                    " v2 (", sd[186], ", ", sd[187], ", ", sd[188], ")",
                                    " v3 (", sd[189], ", ", sd[190], ", ", sd[191], ")"));
         }
+        // [EigMetric] A-vs-M confirmation (kernel dump floats 200..220): the drift
+        // computed with lastRigidM (sd[200]) vs with the current fitted M (sd[201]).
+        // driftFit ~0 while drift large => the drift is a stale/rigid-A metric artifact
+        // (same shape, wrong transform), NOT a real shape difference. The two 3x3
+        // linear matrices follow so we can see HOW A differs from M (rigid vs affine,
+        // stale scale). sd[202] is the sweep frame (0/uninitialized => no eigen sweep
+        // hit the traced slot this readback).
+        if (nF >= 297u) {
+          std::vector<float> em(nF);
+          if (m_renderSystem->readPromotionSolveDump(em.data()) && em[278] > 0.0f) {
+            Logger::info(str::format("[EigMetric] geom 0x", ClusterLodOptions::Promotion::dumpGeometryHash(),
+                                     " sweepFrame ", uint32_t(em[278]),
+                                     " driftLastRigidM ", em[276], " driftFitM ", em[277],
+                                     " | M [", em[279], " ", em[280], " ", em[281], " / ",
+                                     em[282], " ", em[283], " ", em[284], " / ",
+                                     em[285], " ", em[286], " ", em[287], "]",
+                                     " | A(lastRigid) [", em[288], " ", em[289], " ", em[290], " / ",
+                                     em[291], " ", em[292], " ", em[293], " / ",
+                                     em[294], " ", em[295], " ", em[296], "]"));
+          }
+        }
       }
     }
 
@@ -1859,42 +1880,66 @@ namespace dxvk {
           continue;
         }
 
-        // ---- direction 2: per-CLASS eigen demote (was per-slot) ----
-        // The slot reports each fresh eigen-sweep verdict into its CURRENT content
-        // class (cls). eigDrift compares the FULL referenced capture cloud's trace-
-        // normalized eigenvalues against the PREDICTION (last-RIGID M applied to the
-        // reference covariance) - order-free (sum over a set), rigid-motion-free,
-        // scale-free, aniso-bake-aware, so immune to the engine re-batching the
-        // vertex ORDER (the per-index poison). A drifting sweep increments the CLASS
-        // streak; a matching sweep from ANY member resets it. A PROMOTED class
-        // un-promotes (dropping ALL its slots to Path B) only after 3 CONSECUTIVE
-        // drifting sweeps - genuine deformation of that content. A slot merely
-        // rebinding to a different piece is a reclassify (contentClassQ moves to the
-        // other cell), never a demote - that is the whole point of direction 2.
-        // Re-promotion is automatic: an un-promoted class returns to Probing and its
-        // gate re-fires once clean sweeps resume.
+        // ---- direction 2: per-CLASS eigen demote, ATTRIBUTED TO THE MEASURED CELL ----
+        // ROOT CAUSE of the phantom-demote flood: an eigen sweep produces two things
+        // about ONE measured capture - its IDENTITY (lamHat -> cell) and its VERDICT
+        // (drift). They are the same measurement and must never be split. The code
+        // applied the verdict to the slot's `contentClassQ`, a SEPARATE pointer the
+        // classification freeze/debounce pins to a stale cell whenever content
+        // multiplexes under a stable BlasEntry (this game does constantly - 2249
+        // swaps). So a sweep of piece P (lamHat 0.896 = cell 184325, drift 0.37) had
+        // its drift charged to whatever stale cell the slot was frozen on (139280,
+        // 135185, ...) - condemning cells whose real content that sweep never touched.
+        // FIX: a sweep's verdict may only move the class the sweep ACTUALLY measured.
+        // If the measured cell != the slot's committed class, this sweep is about a
+        // DIFFERENT piece flowing through the slot - consume the bookkeeping but do
+        // NOT touch this class. Its own content's sweeps drive its verdict.
         if (state.eigFrame != 0u && state.eigFrame != promoInstance.lastEigenFrame) {
           promoInstance.lastEigenFrame = state.eigFrame;
           promoInstance.sweepPending = false;   // the in-flight eigen sweep landed
           const float eigEps = std::max(0.0f, ClusterLodOptions::Promotion::eigenEpsilon());
           const uint32_t demoteSweeps = uint32_t(std::max(1, ClusterLodOptions::Promotion::eigenDemoteSweeps()));
+          // the cell THIS sweep measured (its own lamHat). The verdict describes this
+          // content; it may only touch `cls` when `cls` IS this content's class.
+          const int32_t measuredQ = quantizeEigClass(state.eigLam1Hat, state.eigLam2Hat);
+          const bool sweepMeasuredThisClass = cls != nullptr
+            && measuredQ != INT32_MIN && measuredQ == promoInstance.contentClassQ;
           // is this class currently routing its members to Path A? rest candidates
           // route on phase==Promoted; non-rest route by default and drop to B only
           // when driftDemoted (see getGeometryId). Only an up class can demote.
           const bool restCand = candIt != m_promoCandidates.end() && candIt->second.routeHash != 0;
           const bool clsRoutesA = cls != nullptr
             && (restCand ? cls->phase == RestClassState::Phase::Promoted : !cls->driftDemoted);
-          if (state.eigDrift >= 0.0f) {         // <0 = no prediction/degenerate, no verdict
+          // HYSTERESIS: re-promote below eigEps, demote only above eigEps*demoteHysteresis.
+          // A class whose drift sits STEADILY in the band between the two is a genuine
+          // minor content difference (a piece ~5% off the shared reference - measured,
+          // static, rigid), NOT deformation; the OLD promotion kept those on Path A and
+          // demoting them on a single boundary-crossing sweep is exactly the A<->B flap
+          // observed (q110611 demoting 5x on drift 0.022/0.038/0.113). Only SUSTAINED,
+          // clearly-large drift (real deformation / a genuinely different shape) demotes;
+          // any sweep at-or-below the band resets the streak so it must be CONSECUTIVE.
+          const float eigDemote = eigEps * std::max(1.0f, ClusterLodOptions::Promotion::demoteHysteresis());
+          if (sweepMeasuredThisClass && state.eigDrift >= 0.0f) {  // <0 = no prediction/degenerate, no verdict
             if (state.eigDrift <= eigEps) {
               promoInstance.eigenSuspect = false;
               if (cls != nullptr) {
-                cls->eigenDriftStreak = 0;      // any matching member resets the class streak
-                cls->driftDemoted = false;      // clean shape - non-rest content routes Path A again
+                cls->eigenDriftStreak = 0;      // clearly clean - reset the streak
+                cls->driftDemoted = false;      // and route Path A again (non-rest)
               }
-            } else {
-              // keep suspicion armed while the class is up so the streak accrues at
-              // the readback cadence (immediate re-sweep), not the periodic stagger -
-              // a T-pose->animation transition then demotes within a sweep + readback.
+            } else if (state.eigDrift > eigDemote
+                       && state.temporalDeformRel > (std::max(0.0f, ClusterLodOptions::Promotion::temporalEpsilon())
+                                                     * std::max(1.0f, ClusterLodOptions::Promotion::demoteHysteresis()))) {
+              // DEMOTE REQUIRES ACTUAL DEFORMATION, not merely drift from the shared
+              // reference. Path B exists for geometry whose vertices deform per frame;
+              // a STABLE piece must stay on Path A even if its shape is far from the
+              // shared reference (it earns its own reference instead). The eigen drift-
+              // vs-reference is a SPATIAL misfit signal - it is large and noisy for a
+              // static piece that simply differs from the reference (q110611/q159755:
+              // steady, in-cell, drift 0.06-0.46 = a different STATIC shape). Gating on
+              // temporalDeformRel (which is ~0 for rigid geometry, moving OR still, and
+              // spikes only when the shape itself changes frame to frame) means only a
+              // genuinely deforming class can demote - stable geometry never leaves A.
+              // Keep suspicion armed while up so the streak accrues at readback cadence.
               promoInstance.eigenSuspect = clsRoutesA;
               if (cls != nullptr) {
                 cls->eigenDriftStreak++;
@@ -1913,12 +1958,23 @@ namespace dxvk {
                   Logger::info(str::format("[ClusterLOD] promotion: geometry 0x", std::hex,
                                            promoInstance.geometryHash, std::dec,
                                            " class q", cls->classQ, " sub ", cls->subId,
-                                           " DEMOTED to Path B - eigen shape drift ", state.eigDrift,
-                                           " > ", eigEps, " on ", demoteSweeps, " sweep(s) (lamHat ",
+                                           " DEMOTED to Path B - DEFORMING (tDeform ", state.temporalDeformRel,
+                                           ", eigen drift ", state.eigDrift, " > ", eigDemote,
+                                           ") on ", demoteSweeps, " consecutive sweep(s) (lamHat ",
                                            state.eigLam1Hat, ",", state.eigLam2Hat,
                                            ", sweepFrame ", state.eigFrame, ", ",
                                            (restCand ? "rest" : "non-rest"), ")"));
                 }
+              }
+            } else {
+              // Stays on Path A. Either the hysteresis band (eigEps < drift <= eps*hyst,
+              // a minor offset) OR large drift with LOW tDeform (a static piece that
+              // differs from the shared reference but is NOT deforming). Neither is a
+              // reason to leave Path A - hold routing state and reset the streak so only
+              // sustained, genuinely-deforming drift can ever demote.
+              promoInstance.eigenSuspect = clsRoutesA;
+              if (cls != nullptr) {
+                cls->eigenDriftStreak = 0;
               }
             }
           } else {
