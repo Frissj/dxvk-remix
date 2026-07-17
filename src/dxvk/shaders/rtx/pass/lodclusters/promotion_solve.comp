@@ -181,6 +181,11 @@ layout(buffer_reference, buffer_reference_align = 4, scalar) buffer RawUints
   uint u[];
 };
 
+layout(buffer_reference, buffer_reference_align = 8, scalar) buffer RawU64
+{
+  uint64_t v[];
+};
+
 layout(push_constant, scalar) uniform PushData
 {
   uint64_t entriesVa;
@@ -202,8 +207,26 @@ layout(push_constant, scalar) uniform PushData
   float    demoteHysteresis;       // residual multiplier for ALREADY-PROMOTED instances:
                                    // strict eps to enter, eps*this to stay (stops
                                    // epsilon-boundary promote/demote flapping)
+  uint64_t solveDumpVa;            // [SolveDump] buffer for M + per-validation-sample
+                                   // (ref,cap,dev) of ONE traced slot (0 = disabled)
+  uint     solveDumpSlot;          // [SolveDump] the stateSlot to dump (~0 = none)
+  uint     solveDumpPad;           // matches CPU PromoPush: 8-byte align the trailing u64
+  uint64_t lastCaptureVaVa;        // [slot] u64: the captureVa the stored last-frame samples
+                                   // came from. The game double-buffers the vertex capture, so
+                                   // the deformation gate below only compares frames that read
+                                   // the SAME allocation (captureVa match) - a like-to-like diff.
 }
 push;
+
+// [SolveDump] layout at solveDumpVa (floats): [0..11] decentered M (row-major 3x4)
+// [12]=sampleCount [13]=validationCount [14]=residualRel [15]=dirCoherence, then
+// up to 16 validation samples at 16 + i*10: [refIdx, ref.xyz, cap.xyz, dev.xyz]
+// (dev = fitted - cap). Lets the CPU see whether each cap pairs with its OWN ref
+// under M (fit error is a consistent transform = solve-math) or with a DIFFERENT
+// ref vertex (a correspondence permutation) - distinguishable because dev is a
+// per-sample VECTOR, not the reduced scalar residual.
+#define SOLVE_DUMP_STRIDE 10
+#define SOLVE_DUMP_MAXVAL 16
 
 // ---- shared reduction storage ----
 shared float s_b[64][16];      // per-thread partial sums: [0..11] cross-cov + Sum(cap),
@@ -534,13 +557,32 @@ void main()
     const float refVar = b[15] - n * dot(refBar, refBar);  // ref-sample spread
 
     // centered cross-covariance (GLSL mat3 is column-major: Mcov[col][row]):
-    //   Mcov[c][r] = Hyx[r][c] - n*capBar[r]*refBar[c]
-    mat3 Mcov;
-    for(uint c = 0; c < 3; c++)
+    //   Mcov[c][r] = sum (ref_c - refBar_c) * (cap_r - capBar_r)
+    // The one-pass computational form Hyx - n*capBar*refBar is CATASTROPHICALLY
+    // cancelling here: cap is UNCENTERED world space (a piece at world z~5.4 with
+    // a z-extent of ~0.006), so Hyx = sum(ref_c * cap_r) sums signed terms of
+    // magnitude ~|ref|*|cap| ~ 0.1 that must cancel down to the true covariance
+    // ~0.003 - a ~30x cancellation whose fp32 rounding survives into Mcov, is then
+    // amplified by the Gram pseudoinverse (1/eig, large on the thin axis) into a
+    // structurally wrong A. A faithful capture of static content then misfits
+    // itself by a per-content-constant residual (0.02-0.5) - the "solve is an
+    // arithmetic problem" self-misfit. Centering the cap by capBar BEFORE forming
+    // the products makes every term O(extent^2) ~ 4e-4, so the sum never loses the
+    // signal. Two-pass over the shared solve-sample captures (s_capNow) + the
+    // probe's per-sample ref; thread 0 only, O(sampleCount). Same Mcov, stable.
+    // (The original 4x4->3x3 sample-centering fix centered REF but left cap raw.)
+    mat3 Mcov = mat3(0.0);
+    for(uint t = 0; t < probe.sampleCount; t++)
     {
-      for(uint r = 0; r < 3; r++)
+      const PromoSample smp = probe.samples[t];
+      const vec3 refC = vec3(smp.refX, smp.refY, smp.refZ) - refBar;  // ref is centroid-centered; subtract sample mean too
+      const vec3 capC = s_capNow[t] - capBar;                         // centered cap: the fix - no huge-mean cancellation
+      for(uint c = 0; c < 3; c++)
       {
-        Mcov[c][r] = b[r * 4 + c] - n * capBar[r] * refBar[c];
+        for(uint r = 0; r < 3; r++)
+        {
+          Mcov[c][r] += refC[c] * capC[r];
+        }
       }
     }
 
@@ -879,8 +921,21 @@ void main()
   // report 0 (no penalty) and let the next contiguous frame judge.
   float temporalDeform = 0.0;
   {
+    // Buffer-phase gate ([BindTrace] proof): the game double-buffers the vertex
+    // capture, so a promoted slot's captureVa ping-pongs between two allocations
+    // frame-to-frame even though its BLAS is never rebuilt (blasFC constant).
+    // Diffing this frame's capNow (current buffer) against last frame's capPrev
+    // (the OTHER buffer) compares two unrelated allocations and reports up to ~5.0
+    // phantom "deformation" on a mesh that never moved -> the false demotes. Only
+    // measure drift when THIS frame reads the SAME physical capture as the stored
+    // prev samples (captureVa match) - a like-to-like diff. On a buffer switch we
+    // abstain (0, no penalty) and let the residual gate stand; a genuine deformer
+    // is still caught on any frame the capture allocation holds still (they do -
+    // observed multi-frame stuck runs on the same captureVa).
+    RawU64 lastCapVaBuf = RawU64(push.lastCaptureVaVa);
+    const uint64_t prevCaptureVa = lastCapVaBuf.v[entry.stateSlot];
     const uint prevFrame = statuses.s[entry.stateSlot].lastFrame;
-    if(prevFrame + 1u == push.frameId)
+    if(prevFrame + 1u == push.frameId && prevCaptureVa == entry.captureVa)
     {
       const uint nT = min(probe.sampleCount, 32u);
       float acc = 0.0;
@@ -897,6 +952,10 @@ void main()
       }
       temporalDeform = (den > 1e-6) ? (acc / den) : 0.0;
     }
+    // Record which capture allocation THIS frame's samples came from (paired with
+    // the capPrev the per-sample section just stored into lastSampleVa), so next
+    // frame can tell whether its capNow is comparable to that stored capPrev.
+    lastCapVaBuf.v[entry.stateSlot] = entry.captureVa;
   }
 
   // Hysteresis: candidate probes (patchSlot == ~0) must pass the STRICT epsilons to
@@ -1007,6 +1066,38 @@ void main()
   status.solveInfo = s_diagAffInfo;
   status.capSigBits = floatBitsToUint(s_capSigVar);  // [ShapeClass] probe-independent signature
   statuses.s[entry.stateSlot] = status;
+
+  // [SolveDump] one traced slot: emit M + per-validation (ref,cap,dev) so the CPU
+  // can tell a consistent transform error (solve-math) from a wrong pairing
+  // (correspondence permutation). Thread 0 only; s_devVec holds fitted-cap.
+  // Gated on the STEADY self-misfit band (0.05..0.6): excludes clean fits AND the
+  // huge-residual rebinds (an instance solving the base reference with the wrong
+  // content, residual >1) that would otherwise latch the ring first. This targets
+  // the class self-misfit (~0.235) we are diagnosing.
+  if(push.solveDumpVa != 0ul && entry.stateSlot == push.solveDumpSlot
+     && residualRel > 0.05 && residualRel < 0.6)
+  {
+    RawFloats d = RawFloats(push.solveDumpVa);
+    for(uint k = 0; k < 12; k++)
+    {
+      d.f[k] = M[k];
+    }
+    d.f[12] = float(probe.sampleCount);
+    d.f[13] = float(probe.validationCount);
+    d.f[14] = residualRel;
+    d.f[15] = dirCoherence;
+    const uint nDump = min(probe.validationCount, uint(SOLVE_DUMP_MAXVAL));
+    for(uint i = 0; i < nDump; i++)
+    {
+      const PromoSample vs = probe.samples[probe.sampleCount + i];
+      const vec3 cap = loadCapture(entry.captureVa, entry.captureStrideBytes, vs.index);
+      const uint base = 16u + i * uint(SOLVE_DUMP_STRIDE);
+      d.f[base + 0] = float(vs.index);
+      d.f[base + 1] = vs.refX; d.f[base + 2] = vs.refY; d.f[base + 3] = vs.refZ;  // centroid-centered
+      d.f[base + 4] = cap.x;   d.f[base + 5] = cap.y;   d.f[base + 6] = cap.z;
+      d.f[base + 7] = s_devVec[i].x; d.f[base + 8] = s_devVec[i].y; d.f[base + 9] = s_devVec[i].z;
+    }
+  }
 
   // ---- patch a promoted instance's slot: ALWAYS write when assigned - a
   //      non-rigid frame keeps the last good M (bounded staleness, the CPU

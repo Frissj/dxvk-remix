@@ -1080,6 +1080,57 @@ namespace dxvk {
             Logger::info(str::format("[PromoDump] cap[", i, "] pos (", cap[i * 3 + 0], ", ",
                                      cap[i * 3 + 1], ", ", cap[i * 3 + 2], ")"));
           }
+          // [SolveDump] M + per-validation (ref,cap,dev) for the same traced slot.
+          // For each validation sample the kernel emits the residual VECTOR (dev =
+          // fitted-cap). Two things settle the self-misfit's nature:
+          //  - is dev a CONSISTENT direction across samples? -> a transform/
+          //    translation error (solve-math). scattered -> pairing/shape.
+          //  - does each cap match ITS OWN ref under M, or a DIFFERENT sample's
+          //    cap? We test the latter: for each validation cap, find the nearest
+          //    OTHER validation cap and report whether |dev| exceeds it (a
+          //    permutation puts cap nearer some other sample's fitted point).
+          const uint32_t nF = lodclusters_remix::ClusterRenderSystem::promotionSolveDumpFloatCount();
+          std::vector<float> sd(nF);
+          // shader writes this buffer only on a STEADY self-misfit (residual
+          // 0.05..0.6); guard here against a stale buffer with the same band
+          if (m_renderSystem->readPromotionSolveDump(sd.data()) && sd[14] > 0.05f && sd[14] < 0.6f) {
+            const uint32_t sampleCount = uint32_t(sd[12]);
+            const uint32_t valCount = std::min<uint32_t>(uint32_t(sd[13]), 16u);
+            Logger::info(str::format("[SolveDump] geom 0x", ClusterLodOptions::Promotion::dumpGeometryHash(),
+                                     " M row0 (", sd[0], ", ", sd[1], ", ", sd[2], ", ", sd[3], ")"));
+            Logger::info(str::format("[SolveDump] M row1 (", sd[4], ", ", sd[5], ", ", sd[6], ", ", sd[7],
+                                     ") row2 (", sd[8], ", ", sd[9], ", ", sd[10], ", ", sd[11], ")"));
+            Logger::info(str::format("[SolveDump] sampleCount ", sampleCount, " valCount ", valCount,
+                                     " residualRel ", sd[14], " dirCoh ", sd[15]));
+            // mean dev vector (consistent-direction test) + per-sample detail
+            float mdx = 0.0f, mdy = 0.0f, mdz = 0.0f, sumMag = 0.0f;
+            for (uint32_t i = 0; i < valCount; i++) {
+              const float* e = &sd[16 + i * 10];
+              const float dmag = std::sqrt(e[7] * e[7] + e[8] * e[8] + e[9] * e[9]);
+              mdx += e[7]; mdy += e[8]; mdz += e[9]; sumMag += dmag;
+              // nearest OTHER validation cap to THIS cap (permutation probe)
+              float bestOther = std::numeric_limits<float>::max();
+              int32_t bestJ = -1;
+              for (uint32_t j = 0; j < valCount; j++) {
+                if (j == i) { continue; }
+                const float* o = &sd[16 + j * 10];
+                const float ddx = e[4] - o[4], ddy = e[5] - o[5], ddz = e[6] - o[6];
+                const float d2 = ddx * ddx + ddy * ddy + ddz * ddz;
+                if (d2 < bestOther) { bestOther = d2; bestJ = int32_t(j); }
+              }
+              Logger::info(str::format("[SolveDump] v", i, " idx ", uint32_t(e[0]),
+                                       " ref (", e[1], ", ", e[2], ", ", e[3], ")",
+                                       " cap (", e[4], ", ", e[5], ", ", e[6], ")",
+                                       " |dev| ", dmag, " nearestOtherCap ", std::sqrt(bestOther),
+                                       " (v", bestJ, ")"));
+            }
+            const float mMag = std::sqrt(mdx * mdx + mdy * mdy + mdz * mdz);
+            const float coh = sumMag > 1e-9f ? mMag / sumMag : 0.0f;
+            Logger::info(str::format("[SolveDump] devVec coherence ", coh,
+                                     " (~1 = systematic transform error -> solve-math; ~0 = scattered"
+                                     " -> pairing/shape) meanDevVec (", mdx / std::max(1u, valCount), ", ",
+                                     mdy / std::max(1u, valCount), ", ", mdz / std::max(1u, valCount), ")"));
+          }
         }
       }
     }
@@ -1380,15 +1431,25 @@ namespace dxvk {
                 // the new class's verdict) instead of routing stale clusters
                 promoInstance.residentGeometryId = ~0u;
                 // a DEMOTE verdict judged the OLD content; carrying it across a
-                // confirmed content change blocks the establish path even when the
-                // NEW content's class is already Promoted - a static building then
-                // blips to Path B on every rebind despite a valid verdict for what
-                // it now holds (observed: 139 static demotes in one session).
-                // Clear it: if the new content misfits, the 2-frame sustained-non-
-                // rigid persistence re-demotes immediately; if it fits (class
-                // promoted), the reroute is seamless.
-                promoInstance.demoted = false;
-                promoInstance.sweepPending = false;
+                // confirmed content change blocks the establish path when the NEW
+                // content's class is Promoted - a static building would blip to
+                // Path B on every rebind despite a valid verdict for what it holds.
+                // BUT only clear the demote when the new class is ACTUALLY Promoted:
+                // capSig jitters across neighbour buckets every few frames on this
+                // game's churning content, and clearing demoted for a NON-promoted
+                // neighbour re-admits the instance to Path A for exactly the 2 frames
+                // it takes sustained-non-rigid to re-demote it - the visible Path A
+                // <-> Path B flap. A non-promoted swap keeps the instance where it
+                // already was (Path B); a fresh rigid streak re-promotes it if the
+                // content genuinely fits, and a later class promotion re-routes it.
+                {
+                  const RestClassState* newCls = resolveRestClass(promoInstance.geometryHash,
+                                                                   promoInstance.pendingLog2CapVar, 0, false);
+                  if (newCls != nullptr && newCls->phase == RestClassState::Phase::Promoted) {
+                    promoInstance.demoted = false;
+                    promoInstance.sweepPending = false;
+                  }
+                }
                 Logger::info(str::format("[ShapeClass] slot ", promoInstance.stateSlot,
                                          " geom 0x", std::hex, promoInstance.geometryHash, std::dec,
                                          " content class SWAP ", promoInstance.contentClassQ, " -> ", newQ,
@@ -1721,33 +1782,84 @@ namespace dxvk {
         }
       }
 
+      // DEMOTE on genuine DEFORMATION, not on a steady residual (both the periodic
+      // full-mesh sweep below and the per-frame verdict). The residual alone ejected
+      // members that are static and rigid but a fixed ~5% off their reference
+      // (proven by [SolveDump]: clean uniform-scale M, correct correspondence,
+      // tDeform~0, scattered per-vertex residual = genuine content difference, NOT
+      // a solve error). The OLD geometry-level promotion kept those on Path A;
+      // per-instance residual-demotion is what flipped a working build into a
+      // demoting one. Require actual deformation (temporalDeformRel over the
+      // promoted threshold) - a moving-but-rigid or static-imperfect placement
+      // stays promoted; only a mesh whose SHAPE changes frame to frame drops.
+      const float tempEpsDemote = std::max(0.0f, ClusterLodOptions::Promotion::temporalEpsilon())
+                                * std::max(1.0f, ClusterLodOptions::Promotion::demoteHysteresis());
+      const float epsDemote = epsilon * std::max(1.0f, ClusterLodOptions::Promotion::demoteHysteresis());
+      // Demotion needs a BAD FIT *and* real deformation. tDeform alone is not
+      // deformation: this game rebinds a slot's content every frame, so the solve
+      // samples compare an OLD placement to a NEW one and tDeform SPIKES even when
+      // each frame fits perfectly (observed: residual 2.9e-6, tDeform 0.05-0.9 -
+      // a churning-but-fitting instance, must stay Path A). Requiring residualRel
+      // over the promoted threshold too keeps: static-perfect (both low), static-
+      // imperfect 5%-off (tDeform low), and churning-fit (residual low). Only a
+      // mesh whose SHAPE genuinely changes fails BOTH - true deformation.
+
       // periodic full-mesh sweep verdict (same lag handling as the gate). The sweep
-      // judges an ALREADY-PROMOTED instance, so the demote hysteresis applies here
-      // exactly like the per-frame solve verdict.
-      const float sweepEpsilon = epsilon * std::max(1.0f, ClusterLodOptions::Promotion::demoteHysteresis());
+      // judges an ALREADY-PROMOTED instance. Its residual catches partial deform a
+      // sparse solve misses (R20); deformation-gated so a steady 5%-off or a
+      // churning-but-fitting instance does not eject.
       if (promoInstance.sweepPending && ++promoInstance.sweepLagFrames >= gateLag) {
         promoInstance.sweepPending = false;
-        if (state.gateResidualRel > sweepEpsilon && !promoInstance.demoted) {
+        if (state.gateResidualRel > epsDemote && !promoInstance.demoted
+            && state.temporalDeformRel > tempEpsDemote) {
           promoInstance.demoted = true;
           Logger::info(str::format("[ClusterLOD] promotion: instance (slot ", promoInstance.stateSlot,
                                    ", geom 0x", std::hex, promoInstance.geometryHash, std::dec,
                                    ") DEMOTED to Path B - full-mesh sweep residual ", state.gateResidualRel,
-                                   " gateOver ", state.gateOverCount,
-                                   " (sparse-blind partial deformation, risk R20)"));
+                                   " tDeform ", state.temporalDeformRel,
+                                   " gateOver ", state.gateOverCount, " (deforming partial mesh, R20)"));
         }
       }
 
-      if (!promoInstance.demoted && (state.flags & 4u) != 0) {
+      if (!promoInstance.demoted && (state.flags & 4u) != 0
+          && state.temporalDeformRel > tempEpsDemote && state.residualRel > epsDemote) {
         promoInstance.demoted = true;
-        // DIAG: WHY it went non-rigid - the offending solve's residual + temporal drift.
-        // A static building spiking residual >> its steady value on isolated frames is
-        // a capture-data glitch (mid-upload read / wrong buffer), not motion; steady
-        // moderate residual is the calibration mystery; high tDeform is real deform.
+        // DIAG: name the mechanism behind this demote's GENUINE residual (the
+        // residual gate cleared, so the fit is really bad - decide WHY without a
+        // rebuild). Decodes the same status bits the "stuck in Probing" candidate
+        // log uses, but here for a PROMOTED INSTANCE (the slot that actually
+        // demotes; the traced candidate self-fits and never enters this path).
+        //   aff FAIL-aniso            => rigid fallback can't do a per-instance
+        //                                non-uniform scale (fix: affine guards)
+        //   scanVerdict COLLAPSE      => ref->cap index skew; rigid pairing exists
+        //                                at scanOff (fix: read capture at scanOff)
+        //   dirCoh~1 + scan none      => coherent stretch (anisotropy / space) not
+        //                                a permutation; meanDev~residual = uniform
+        const uint32_t dScanIdx   = (state.diagGuard >> 2) & 0x3Fu;
+        const uint32_t dScanScoreQ= (state.diagGuard >> 27) & 0x1Fu;
+        const uint32_t dReflected = (state.diagGuard >> 26) & 0x1u;
+        const uint32_t dScanVerd  = (state.diagGuard >> 24) & 0x3u;
+        const int      dScanOff   = kPromoScanOffsets[dScanIdx];
+        const char*    dScanStr   = dScanVerd == 2u ? "COLLAPSE(fixable-skew)"
+                                  : dScanVerd == 1u ? "improved(partial)" : "none";
+        const std::string dScanScore = dScanScoreQ >= 31u ? std::string("n/a")
+                                     : str::format(float(dScanScoreQ) / 20.0f);
+        const uint32_t dAffFail   = state.solveInfo & 0xFFu;
+        const char*    dAffStr    = (state.solveInfo & 0x100u) != 0u ? "used"
+                                  : dAffFail == 1u ? "FAIL-finite"
+                                  : dAffFail == 2u ? "FAIL-norm"
+                                  : dAffFail == 3u ? "FAIL-aniso"
+                                  : dAffFail == 4u ? "FAIL-cond"
+                                  : dAffFail == 5u ? "FAIL-refVar" : "none";
         Logger::info(str::format("[ClusterLOD] promotion: instance (slot ", promoInstance.stateSlot,
                                  ", geom 0x", std::hex, promoInstance.geometryHash, std::dec,
-                                 ") DEMOTED to Path B (solve non-rigid: residual ", state.residualRel,
-                                 ", tDeform ", state.temporalDeformRel,
-                                 ", solveFrame ", state.lastFrame, ")"));
+                                 ") DEMOTED to Path B (DEFORMING: tDeform ", state.temporalDeformRel,
+                                 " > ", tempEpsDemote, " AND residual ", state.residualRel,
+                                 " > ", epsDemote, ", solveFrame ", state.lastFrame,
+                                 ") | aff ", dAffStr, ", scanVerdict ", dScanStr,
+                                 ", scanOff ", dScanOff, ", scanScore ", dScanScore,
+                                 ", dirCoh ", state.dirCoherence, ", meanDev ", state.meanDevRel,
+                                 ", refl ", dReflected));
       } else if (promoInstance.demoted && state.rigidStreak >= rigidFrames) {
         promoInstance.demoted = false;
         Logger::info(str::format("[ClusterLOD] promotion: instance (slot ", promoInstance.stateSlot,
@@ -2290,6 +2402,42 @@ namespace dxvk {
         promoEntry.stateSlot = (slot.geometryId >> kPromotedSlotShift) & 0x1FFFu;
         promoEntry.patchSlot = flatIndex;
         m_framePromoEntries.push_back(promoEntry);
+
+        // [BindTrace] per-frame capture-binding identity for the traced geometry.
+        // The tDeform=5.0 false-demotes are on SAME-hash slots that fit rest-pose
+        // at ~2% each frame - so the captured verts we read for that slot cannot be
+        // a rigid/animated version of the same mesh; the read is inconsistent. This
+        // trace settles which of the three roots it is, by following one slot across
+        // consecutive frames (post-process: group by slot):
+        //   captureVa moves frame-to-frame  -> shared-buffer aliasing (same VA slot
+        //                                       reused by different draws)
+        //   blas ptr / blasFC moves         -> BLAS rebuilt each frame (the pointer
+        //                                       identity the promo state keys on churns)
+        //   all three stable but tDeform hi -> BLAS geometry updated IN PLACE (dynamic
+        //                                       mesh) -> per-BLAS-slot state is the wrong
+        //                                       identity for this game (needs content key)
+        // Traced hash only; self-limited line budget so it can never flood the log.
+        {
+          const std::string& btHashStr = ClusterLodOptions::Promotion::dumpGeometryHash();
+          if (!btHashStr.empty()) {
+            uint64_t btHash = 0;
+            try { btHash = std::stoull(btHashStr, nullptr, 16); } catch (...) { btHash = 0; }
+            static uint32_t s_bindTraceBudget = 2000u;
+            if (btHash != 0 && hash == btHash && s_bindTraceBudget > 0u) {
+              --s_bindTraceBudget;
+              Logger::info(str::format("[BindTrace] geom 0x", std::hex, hash, std::dec,
+                                       " frame ", m_device->getCurrentFrameId(),
+                                       " stateSlot ", promoEntry.stateSlot,
+                                       " patchSlot ", promoEntry.patchSlot,
+                                       " blas ", reinterpret_cast<uintptr_t>(blasEntry),
+                                       " blasFC ", (blasEntry != nullptr ? blasEntry->frameCreated : 0u),
+                                       " captureVa 0x", std::hex, promoEntry.captureVa, std::dec,
+                                       " stride ", promoEntry.captureStrideBytes,
+                                       " vtxCount ", promoEntry.captureVertexCount,
+                                       " geomId 0x", std::hex, slot.geometryId, std::dec, ")"));
+            }
+          }
+        }
 
         // [ShapeClass] class service for a promoted slot whose class is still
         // working toward its own reference (misfit dwells happen while the

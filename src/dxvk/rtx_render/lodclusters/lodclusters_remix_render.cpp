@@ -173,9 +173,22 @@ struct ClusterRenderSystem::Impl
   nvvk::Buffer promoStatusBuffer;
   nvvk::Buffer promoLastSampleBuffer;  // [slot][kPromoSolveSamples][3]: last frame's solve-sample
                                        // capture, for the inter-frame deformation gate
+  nvvk::Buffer promoLastCaptureVaBuffer;  // [slot] u64: the captureVa the stored last-frame samples
+                                          // came from. The game double-buffers the vertex capture
+                                          // (captureVa ping-pongs for a stable instance), so the
+                                          // inter-frame deformation gate must only compare frames
+                                          // that read the SAME capture allocation - else it diffs
+                                          // two unrelated buffers and reports phantom deformation.
   static constexpr uint32_t kPromoSolveSamples = 64;  // mirrors PROMO_SOLVE_SAMPLES in the shader
   nvvk::Buffer promoDumpReadback[kStagingSlots];      // DIAG: raw-dump ring (one slot's samples)
   uint32_t promoDumpFramesRecorded = 0;
+  // [SolveDump] M + per-validation (ref,cap,dev) of one traced slot: 16 header
+  // floats + SOLVE_DUMP_MAXVAL(16) * SOLVE_DUMP_STRIDE(10). Device buffer the
+  // kernel writes, copied to a host ring for readback.
+  static constexpr uint32_t kPromoSolveDumpFloats = 16 + 16 * 10;
+  nvvk::Buffer promoSolveDumpBuffer;
+  nvvk::Buffer promoSolveDumpReadback[kStagingSlots];
+  uint32_t promoSolveDumpFramesRecorded = 0;
   nvvk::Buffer promoEntryBuffers[kStagingSlots];
   nvvk::Buffer promoReadbackBuffers[kStagingSlots];
   uint32_t promoUsedSlots = 0;                        // stateSlot high-water + 1
@@ -263,6 +276,10 @@ struct PromoPush
   uint32_t promoScanEnable;          // DIAG: 1 = run the correspondence offset scan
   float    temporalEpsilon;          // max inter-frame sample-distance drift for "rigid"
   float    demoteHysteresis;         // promoted instances demote only past eps*this
+  uint64_t solveDumpVa;              // [SolveDump] M + per-validation dump target (0 = off)
+  uint32_t solveDumpSlot;            // [SolveDump] traced stateSlot (~0 = none)
+  uint32_t solveDumpPad;             // std430 8-byte align of the trailing u64/u32 pair
+  uint64_t lastCaptureVaVa;          // [slot] last frame's captureVa - tDeform buffer-phase gate
 };
 
 bool ClusterRenderSystem::Impl::initPromotion()
@@ -299,10 +316,24 @@ bool ClusterRenderSystem::Impl::initPromotion()
                               size_t(kPromoSolveSamples) * 3 * sizeof(float) * kPromotionSlotCapacity,
                               VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT
                                   | VK_BUFFER_USAGE_2_TRANSFER_DST_BIT | VK_BUFFER_USAGE_2_TRANSFER_SRC_BIT));
+  NVVK_CHECK(res.createBuffer(promoLastCaptureVaBuffer,
+                              sizeof(uint64_t) * kPromotionSlotCapacity,
+                              VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT
+                                  | VK_BUFFER_USAGE_2_TRANSFER_DST_BIT));
   for(uint32_t i = 0; i < kStagingSlots; i++)
   {
     // DIAG raw-dump readback: one slot's 64 solve-sample capture positions
     NVVK_CHECK(res.createBuffer(promoDumpReadback[i], size_t(kPromoSolveSamples) * 3 * sizeof(float),
+                                VK_BUFFER_USAGE_2_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                                VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT));
+  }
+  // [SolveDump] device buffer the kernel writes + host ring for readback
+  NVVK_CHECK(res.createBuffer(promoSolveDumpBuffer, size_t(kPromoSolveDumpFloats) * sizeof(float),
+                              VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT
+                                  | VK_BUFFER_USAGE_2_TRANSFER_SRC_BIT));
+  for(uint32_t i = 0; i < kStagingSlots; i++)
+  {
+    NVVK_CHECK(res.createBuffer(promoSolveDumpReadback[i], size_t(kPromoSolveDumpFloats) * sizeof(float),
                                 VK_BUFFER_USAGE_2_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
                                 VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT));
   }
@@ -347,11 +378,26 @@ void ClusterRenderSystem::Impl::deinitPromotion()
   {
     res.m_allocator.destroyBuffer(promoLastSampleBuffer);
   }
+  if(promoLastCaptureVaBuffer.buffer)
+  {
+    res.m_allocator.destroyBuffer(promoLastCaptureVaBuffer);
+  }
   for(uint32_t i = 0; i < kStagingSlots; i++)
   {
     if(promoDumpReadback[i].buffer)
     {
       res.m_allocator.destroyBuffer(promoDumpReadback[i]);
+    }
+  }
+  if(promoSolveDumpBuffer.buffer)
+  {
+    res.m_allocator.destroyBuffer(promoSolveDumpBuffer);
+  }
+  for(uint32_t i = 0; i < kStagingSlots; i++)
+  {
+    if(promoSolveDumpReadback[i].buffer)
+    {
+      res.m_allocator.destroyBuffer(promoSolveDumpReadback[i]);
     }
   }
   for(uint32_t i = 0; i < kStagingSlots; i++)
@@ -384,6 +430,7 @@ void ClusterRenderSystem::Impl::recordPromotion(VkCommandBuffer cmd, const Frame
     vkCmdFillBuffer(cmd, promoMatricesBuffer.buffer, 0, VK_WHOLE_SIZE, 0);
     vkCmdFillBuffer(cmd, promoStatusBuffer.buffer, 0, VK_WHOLE_SIZE, 0);
     vkCmdFillBuffer(cmd, promoLastSampleBuffer.buffer, 0, VK_WHOLE_SIZE, 0);
+    vkCmdFillBuffer(cmd, promoLastCaptureVaBuffer.buffer, 0, VK_WHOLE_SIZE, 0);
     promoStateCleared = true;
   }
 
@@ -462,8 +509,15 @@ void ClusterRenderSystem::Impl::recordPromotion(VkCommandBuffer cmd, const Frame
   push.gateEntryIndex       = 0xFFFFFFFFu;
   push.promoScanEnable      = frame.promotionCorrespondenceScan ? 1u : 0u;
   push.lastSampleVa         = promoLastSampleBuffer.address;
+  push.lastCaptureVaVa      = promoLastCaptureVaBuffer.address;
   push.temporalEpsilon      = frame.promotionTemporalEpsilon;
   push.demoteHysteresis     = frame.promotionDemoteHysteresis;
+  // [SolveDump] the kernel writes M + per-validation (ref,cap,dev) for the traced
+  // slot into this buffer; copied to the host ring below. Reuses the resolved
+  // dump slot (frame.promotionDumpStateSlot). ~0u slot => no write.
+  push.solveDumpVa   = promoSolveDumpBuffer.address;
+  push.solveDumpSlot = frame.promotionDumpStateSlot;
+  push.solveDumpPad  = 0u;
 
   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, promoPipeline);
   vkCmdPushConstants(cmd, promoPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PromoPush), &push);
@@ -524,6 +578,14 @@ void ClusterRenderSystem::Impl::recordPromotion(VkCommandBuffer cmd, const Frame
       VkBufferCopy region{VkDeviceSize(frame.promotionDumpStateSlot) * bytes, 0, bytes};
       vkCmdCopyBuffer(cmd, promoLastSampleBuffer.buffer, promoDumpReadback[slot].buffer, 1, &region);
       promoDumpFramesRecorded++;
+    }
+
+    // [SolveDump] M + per-validation (ref,cap,dev) the kernel wrote for this slot
+    if(promoSolveDumpReadback[slot].buffer != VK_NULL_HANDLE)
+    {
+      VkBufferCopy region{0, 0, VkDeviceSize(kPromoSolveDumpFloats) * sizeof(float)};
+      vkCmdCopyBuffer(cmd, promoSolveDumpBuffer.buffer, promoSolveDumpReadback[slot].buffer, 1, &region);
+      promoSolveDumpFramesRecorded++;
     }
   }
 
@@ -1130,6 +1192,28 @@ bool ClusterRenderSystem::readPromotionSampleDump(float* outPositions192)
     return false;
   }
   memcpy(outPositions192, src, size_t(Impl::kPromoSolveSamples) * 3 * sizeof(float));
+  return true;
+}
+
+uint32_t ClusterRenderSystem::promotionSolveDumpFloatCount()
+{
+  return Impl::kPromoSolveDumpFloats;
+}
+
+bool ClusterRenderSystem::readPromotionSolveDump(float* outFloats)
+{
+  Impl& impl = *m_impl;
+  if(!impl.promoReady || outFloats == nullptr || impl.promoSolveDumpFramesRecorded < Impl::kStagingSlots)
+  {
+    return false;
+  }
+  const uint32_t slot = (impl.frameIndex + 1u) % Impl::kStagingSlots;
+  const void* src = impl.promoSolveDumpReadback[slot].mapping;
+  if(src == nullptr)
+  {
+    return false;
+  }
+  memcpy(outFloats, src, size_t(Impl::kPromoSolveDumpFloats) * sizeof(float));
   return true;
 }
 

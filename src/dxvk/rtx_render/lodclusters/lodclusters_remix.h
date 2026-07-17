@@ -660,6 +660,13 @@ namespace lodclusters_remix {
     // out = 64 * 3 floats. False until the ring is primed or dump inactive.
     bool readPromotionSampleDump(float* outPositions192);
 
+    // [SolveDump] the traced slot's solved M + per-validation (ref,cap,dev). See
+    // the SolveDump layout in promotion_solve.comp. out = promotionSolveDumpFloatCount()
+    // floats; same ring lag. Distinguishes solve-math (consistent transform error)
+    // from a correspondence permutation (cap pairs with the wrong ref vertex).
+    static uint32_t promotionSolveDumpFloatCount();
+    bool readPromotionSolveDump(float* outFloats);
+
     // delayed statistics (a few frames old); false while nothing rendered yet
     bool getFrameStats(FrameStats& outStats) const;
 
