@@ -1046,10 +1046,8 @@ namespace dxvk {
             // moved to the rest hash and the reference content changed
             for (auto& slotEntry : m_promoSlotByBlas) {
               if (slotEntry.second.geometryHash == pending.geometryHash) {
-                slotEntry.second.demoted = false;
                 slotEntry.second.sweepPending = false;
                 slotEntry.second.eigenSuspect = false;
-                slotEntry.second.eigenDriftStreak = 0;
                 slotEntry.second.residentGeometryId = ~0u;
                 slotEntry.second.contentClassQ = INT32_MIN;  // reclassify vs the new reference
                 slotEntry.second.classSubId = 0;
@@ -1458,7 +1456,7 @@ namespace dxvk {
         break;
 
       case PromotionCandidate::Phase::Promoted:
-        break;  // demotion is detected on the per-instance slots below
+        break;  // direction 2: routing + demote are per CONTENT CLASS (below)
 
       default:
         break;
@@ -1537,18 +1535,10 @@ namespace dxvk {
                 classSwapped = true;
                 m_swapCommitted++;
                 promoInstance.residentGeometryId = ~0u;  // old cell's residency is stale
-                // clear a stale demote only when the NEW cell is actually Promoted,
-                // so the instance routes Path A immediately for what it now holds
-                // (clearing it toward a non-promoted cell would re-admit it for the
-                // few frames until re-demote - the visible A<->B flap).
-                {
-                  const RestClassState* newCls = resolveRestClass(promoInstance.geometryHash,
-                                                                   newQ, 0, false);
-                  if (newCls != nullptr && newCls->phase == RestClassState::Phase::Promoted) {
-                    promoInstance.demoted = false;
-                    promoInstance.sweepPending = false;
-                  }
-                }
+                // direction 2: routing follows the NEW cell's class verdict
+                // automatically (getGeometryId reads the slot's current class),
+                // so a swap needs no per-slot demote clearing - if the new cell
+                // is Promoted the slot routes Path A next frame, else Path B.
                 Logger::info(str::format("[ShapeClass] slot ", promoInstance.stateSlot,
                                          " geom 0x", std::hex, promoInstance.geometryHash, std::dec,
                                          " content class SWAP cell ", promoInstance.contentClassQ, " -> ", newQ,
@@ -1585,35 +1575,32 @@ namespace dxvk {
       // over time - and a verdict keyed by content survives every rebind.
       // Two populations feed it:
       //  - rest-world slots (rest-referenced candidates): all phases.
-      //  - DEMOTED slots of PROMOTED non-rest candidates: divergent content that
-      //    misfits the candidate's own reference (64/66 static-demote geoms in
-      //    the 23:00 run were this class). Their demoted-branch solves drive the
-      //    same machine, earning the divergent class its OWN rest reference and
-      //    a promotion path - previously they could only demote-cycle forever.
+      //  - ALL slots of a PROMOTED non-rest candidate (direction 2). Routing is
+      //    now class-governed, so EVERY piece behind a promoted candidate needs
+      //    its own class to reach Promoted before its slots route Path A - not
+      //    just the divergent (misfitting) ones. The fitting content's class
+      //    gates against the candidate's own object-space probe and promotes;
+      //    divergent content earns its own rest reference exactly as before.
       {
         const auto candIt = m_promoCandidates.find(promoInstance.geometryHash);
         const bool restWorld = promoInstance.isRestWorld
                             && candIt != m_promoCandidates.end()
                             && candIt->second.routeHash != 0
                             && candIt->second.restState == PromotionCandidate::RestState::Referenced;
-        // divergent evidence exists whenever a promoted candidate's slot MISFITS -
-        // not only while flagged demoted. The slots ALTERNATE contents (fit <->
-        // misfit dwells of a few frames); gating on `demoted` lost most of each
-        // misfit dwell (swap-clear un-demotes, the 2-frame demote persistence eats
-        // the start) and the divergent class never accrued its stuck threshold
-        // (observed: 198 truly-static demotes but only 2 class requests).
-        const bool divergentOfPromoted = !promoInstance.isRestWorld
+        // direction 2: any slot of a PROMOTED non-rest candidate feeds its content
+        // class - the class is the routing authority, so the fitting content must
+        // classify and gate-promote too (formerly only demoted/misfitting slots
+        // fed classes, which left the fitting content routing off a per-slot flag).
+        const bool memberOfPromoted = !promoInstance.isRestWorld
                             && candIt != m_promoCandidates.end()
-                            && candIt->second.phase == PromotionCandidate::Phase::Promoted
-                            && (promoInstance.demoted
-                                || (freshSolve && state.residualRel > epsilon));
+                            && candIt->second.phase == PromotionCandidate::Phase::Promoted;
         // class CREATION is gated on temporal calm: continuously-deforming content
         // sweeps through buckets and would mint a class per bucket visited (observed:
         // 15 classes on one pulsing animator) - junk no verdict can ever serve.
         // Existing classes still MATCH regardless (evidence/verdicts continue).
         const bool tempCalm = state.temporalDeformRel <= ClusterLodOptions::Promotion::temporalEpsilon();
         RestClassState* cls = nullptr;
-        if ((restWorld || divergentOfPromoted) && promoInstance.contentClassQ != INT32_MIN) {
+        if ((restWorld || memberOfPromoted) && promoInstance.contentClassQ != INT32_MIN) {
           cls = resolveRestClass(promoInstance.geometryHash, promoInstance.contentClassQ,
                                  promoInstance.classSubId, false);
           if (cls == nullptr && promoInstance.classSubId != 0) {
@@ -1871,95 +1858,89 @@ namespace dxvk {
             && (cls == nullptr || cls->phase != RestClassState::Phase::Promoted)) {
           continue;
         }
-      }
 
-      // DEMOTE on genuine DEFORMATION, not on a steady residual (both the periodic
-      // full-mesh sweep below and the per-frame verdict). The residual alone ejected
-      // members that are static and rigid but a fixed ~5% off their reference
-      // (proven by [SolveDump]: clean uniform-scale M, correct correspondence,
-      // tDeform~0, scattered per-vertex residual = genuine content difference, NOT
-      // a solve error). The OLD geometry-level promotion kept those on Path A;
-      // per-instance residual-demotion is what flipped a working build into a
-      // demoting one. Require actual deformation (temporalDeformRel over the
-      // promoted threshold) - a moving-but-rigid or static-imperfect placement
-      // stays promoted; only a mesh whose SHAPE changes frame to frame drops.
-      const float tempEpsDemote = std::max(0.0f, ClusterLodOptions::Promotion::temporalEpsilon())
-                                * std::max(1.0f, ClusterLodOptions::Promotion::demoteHysteresis());
-      const float epsDemote = epsilon * std::max(1.0f, ClusterLodOptions::Promotion::demoteHysteresis());
-      // Demotion needs a BAD FIT *and* real deformation. tDeform alone is not
-      // deformation: this game rebinds a slot's content every frame, so the solve
-      // samples compare an OLD placement to a NEW one and tDeform SPIKES even when
-      // each frame fits perfectly (observed: residual 2.9e-6, tDeform 0.05-0.9 -
-      // a churning-but-fitting instance, must stay Path A). Requiring residualRel
-      // over the promoted threshold too keeps: static-perfect (both low), static-
-      // imperfect 5%-off (tDeform low), and churning-fit (residual low). Only a
-      // mesh whose SHAPE genuinely changes fails BOTH - true deformation.
-
-      // ---- Option 1: eigen sweep verdict (permutation-invariant, replaces the
-      // index-paired full-mesh sweep demote). A fresh eigFrame = a mode-2 sweep
-      // landed: eigDrift compares the FULL referenced capture cloud's trace-
-      // normalized eigenvalues against the PREDICTION (last-RIGID M applied to
-      // the reference covariance) - order-free (sum over a set), rigid-motion-
-      // free, scale-free, aniso-bake-aware. One mismatching sweep is NOT a
-      // demote: this game rebinds a slot's capture content between draws, so a
-      // mismatch can be the OTHER content passing through. Demote only when the
-      // mismatch PERSISTS across 3 consecutive sweeps (genuine deformation /
-      // permanent content change never matches; alternating content matches
-      // every other sweep and resets the streak). A matching sweep on a demoted
-      // slot re-promotes (EVERRIGID guarantees a proven M to patch). ----
-      if (state.eigFrame != 0u && state.eigFrame != promoInstance.lastEigenFrame) {
-        promoInstance.lastEigenFrame = state.eigFrame;
-        promoInstance.sweepPending = false;   // the in-flight eigen sweep landed
-        const float eigEps = std::max(0.0f, ClusterLodOptions::Promotion::eigenEpsilon());
-        if (state.eigDrift >= 0.0f) {         // <0 = no prediction/degenerate, no verdict
-          if (state.eigDrift <= eigEps) {
-            promoInstance.eigenDriftStreak = 0;
-            promoInstance.eigenSuspect = false;
-            if (promoInstance.demoted && (state.flags & 8u) != 0u) {  // EVERRIGID
-              promoInstance.demoted = false;
-              Logger::info(str::format("[ClusterLOD] promotion: instance (slot ", promoInstance.stateSlot,
-                                       ", geom 0x", std::hex, promoInstance.geometryHash, std::dec,
-                                       ") RE-PROMOTED to Path A - eigen shape matches prediction (drift ",
-                                       state.eigDrift, " <= ", eigEps, ")"));
+        // ---- direction 2: per-CLASS eigen demote (was per-slot) ----
+        // The slot reports each fresh eigen-sweep verdict into its CURRENT content
+        // class (cls). eigDrift compares the FULL referenced capture cloud's trace-
+        // normalized eigenvalues against the PREDICTION (last-RIGID M applied to the
+        // reference covariance) - order-free (sum over a set), rigid-motion-free,
+        // scale-free, aniso-bake-aware, so immune to the engine re-batching the
+        // vertex ORDER (the per-index poison). A drifting sweep increments the CLASS
+        // streak; a matching sweep from ANY member resets it. A PROMOTED class
+        // un-promotes (dropping ALL its slots to Path B) only after 3 CONSECUTIVE
+        // drifting sweeps - genuine deformation of that content. A slot merely
+        // rebinding to a different piece is a reclassify (contentClassQ moves to the
+        // other cell), never a demote - that is the whole point of direction 2.
+        // Re-promotion is automatic: an un-promoted class returns to Probing and its
+        // gate re-fires once clean sweeps resume.
+        if (state.eigFrame != 0u && state.eigFrame != promoInstance.lastEigenFrame) {
+          promoInstance.lastEigenFrame = state.eigFrame;
+          promoInstance.sweepPending = false;   // the in-flight eigen sweep landed
+          const float eigEps = std::max(0.0f, ClusterLodOptions::Promotion::eigenEpsilon());
+          const uint32_t demoteSweeps = uint32_t(std::max(1, ClusterLodOptions::Promotion::eigenDemoteSweeps()));
+          // is this class currently routing its members to Path A? rest candidates
+          // route on phase==Promoted; non-rest route by default and drop to B only
+          // when driftDemoted (see getGeometryId). Only an up class can demote.
+          const bool restCand = candIt != m_promoCandidates.end() && candIt->second.routeHash != 0;
+          const bool clsRoutesA = cls != nullptr
+            && (restCand ? cls->phase == RestClassState::Phase::Promoted : !cls->driftDemoted);
+          if (state.eigDrift >= 0.0f) {         // <0 = no prediction/degenerate, no verdict
+            if (state.eigDrift <= eigEps) {
+              promoInstance.eigenSuspect = false;
+              if (cls != nullptr) {
+                cls->eigenDriftStreak = 0;      // any matching member resets the class streak
+                cls->driftDemoted = false;      // clean shape - non-rest content routes Path A again
+              }
+            } else {
+              // keep suspicion armed while the class is up so the streak accrues at
+              // the readback cadence (immediate re-sweep), not the periodic stagger -
+              // a T-pose->animation transition then demotes within a sweep + readback.
+              promoInstance.eigenSuspect = clsRoutesA;
+              if (cls != nullptr) {
+                cls->eigenDriftStreak++;
+                if (clsRoutesA && cls->eigenDriftStreak >= demoteSweeps) {
+                  // non-rest: flip driftDemoted (routes B, keeps its proven object-
+                  // space residency for instant re-promote on a clean sweep). rest:
+                  // drop the phase so it re-gates against its own captured reference.
+                  if (restCand) {
+                    cls->phase = RestClassState::Phase::Probing;
+                    cls->gateFrames = 0;
+                    cls->gateStateSlot = ~0u;
+                  } else {
+                    cls->driftDemoted = true;
+                  }
+                  cls->eigenDriftStreak = 0;
+                  Logger::info(str::format("[ClusterLOD] promotion: geometry 0x", std::hex,
+                                           promoInstance.geometryHash, std::dec,
+                                           " class q", cls->classQ, " sub ", cls->subId,
+                                           " DEMOTED to Path B - eigen shape drift ", state.eigDrift,
+                                           " > ", eigEps, " on ", demoteSweeps, " sweep(s) (lamHat ",
+                                           state.eigLam1Hat, ",", state.eigLam2Hat,
+                                           ", sweepFrame ", state.eigFrame, ", ",
+                                           (restCand ? "rest" : "non-rest"), ")"));
+                }
+              }
             }
           } else {
-            promoInstance.eigenDriftStreak++;
-            // keep suspicion armed (promoted slots only) so the next sweep runs
-            // immediately - the streak either confirms (3 in a row -> demote)
-            // or a matching content pass resets it. Demoted slots stay on the
-            // cadence: re-sweeping a mismatching demoted slot fast changes
-            // nothing and would burn a full-set pass every other frame.
-            promoInstance.eigenSuspect = !promoInstance.demoted;
-            if (!promoInstance.demoted && promoInstance.eigenDriftStreak >= 3u) {
-              promoInstance.demoted = true;
-              promoInstance.eigenSuspect = false;
-              Logger::info(str::format("[ClusterLOD] promotion: instance (slot ", promoInstance.stateSlot,
-                                       ", geom 0x", std::hex, promoInstance.geometryHash, std::dec,
-                                       ") DEMOTED to Path B - eigen shape drift ", state.eigDrift,
-                                       " > ", eigEps, " on 3 consecutive sweeps (lamHat ", state.eigLam1Hat,
-                                       ",", state.eigLam2Hat, ", sweepFrame ", state.eigFrame, ") - persistent shape mismatch"));
-            }
+            promoInstance.eigenSuspect = false;  // no prediction yet - cadence retries
           }
-        } else {
-          promoInstance.eigenSuspect = false;  // no prediction yet - cadence retries
+        } else if (promoInstance.sweepPending && ++promoInstance.sweepLagFrames > 4u * gateLag) {
+          // eigen sweep verdict lost (slot left view / entry dropped mid-flight):
+          // release the in-flight guard so the cadence can schedule a fresh one
+          promoInstance.sweepPending = false;
         }
-      } else if (promoInstance.sweepPending && ++promoInstance.sweepLagFrames > 4u * gateLag) {
-        // eigen sweep verdict lost (slot left view / entry dropped mid-flight):
-        // release the in-flight guard so the cadence can schedule a fresh one
-        promoInstance.sweepPending = false;
-      }
 
-      if (!promoInstance.demoted && (state.flags & 4u) != 0
-          && state.temporalDeformRel > tempEpsDemote && state.residualRel > epsDemote) {
-        // ---- Option 1: per-index signals no longer demote - they are POISONED
-        // by the engine re-batching the capture's vertex ORDER (the solve pairs
-        // vertex[i] <-> reference[i]; a permuted buffer explodes residual AND
-        // tDeform on a perfectly static mesh - the false-demote-and-stick bug).
-        // They become a SUSPICION trigger: schedule a permutation-invariant
-        // eigen sweep (buildPromotionEntries emits mode 2 next frame) and let
-        // its set-wise verdict decide. Real deformers demote within ~a sweep +
-        // readback lag; permuted frames read eigen-clean and hold Path A. ----
-        if (!promoInstance.eigenSuspect && !promoInstance.sweepPending) {
+        // per-index signals (residual/tDeform) NEVER demote - they are POISONED by
+        // the engine re-batching the capture's vertex ORDER (a permuted buffer
+        // explodes residual AND tDeform on a perfectly static mesh). They only
+        // SCHEDULE a permutation-invariant eigen sweep to verify; the set-wise
+        // verdict above is the sole demote authority.
+        const float tempEpsDemote = std::max(0.0f, ClusterLodOptions::Promotion::temporalEpsilon())
+                                  * std::max(1.0f, ClusterLodOptions::Promotion::demoteHysteresis());
+        const float epsDemote = epsilon * std::max(1.0f, ClusterLodOptions::Promotion::demoteHysteresis());
+        if ((state.flags & 4u) != 0
+            && state.temporalDeformRel > tempEpsDemote && state.residualRel > epsDemote
+            && !promoInstance.eigenSuspect && !promoInstance.sweepPending) {
           promoInstance.eigenSuspect = true;
           static std::mutex s_susMx;
           static std::unordered_map<uint64_t, uint32_t> s_susLast;
@@ -1975,10 +1956,6 @@ namespace dxvk {
                                      ") - eigen sweep scheduled to verify (no demote on per-index signals)"));
           }
         }
-      } else if (promoInstance.demoted && state.rigidStreak >= rigidFrames) {
-        promoInstance.demoted = false;
-        Logger::info(str::format("[ClusterLOD] promotion: instance (slot ", promoInstance.stateSlot,
-                                 ") RE-PROMOTED to Path A (rigid streak rebuilt)"));
       }
     }
 
@@ -2158,10 +2135,8 @@ namespace dxvk {
             // recycled BlasEntry address = fresh capture content on the same slot
             promoInstance.blasFrameCreated = blasEntry->frameCreated;
             promoInstance.geometryHash = hash;
-            promoInstance.demoted = false;
             promoInstance.sweepPending = false;
             promoInstance.eigenSuspect = false;
-            promoInstance.eigenDriftStreak = 0;
             promoInstance.residentGeometryId = ~0u;
             promoInstance.contentClassQ = INT32_MIN;  // fresh content - reclassify
             promoInstance.classSubId = 0;
@@ -2177,8 +2152,8 @@ namespace dxvk {
             ? resolveRestClass(hash, promoInstance.contentClassQ, promoInstance.classSubId, false)
             : nullptr;
 
-          if (cls != nullptr && cls->phase == RestClassState::Phase::Promoted && !promoInstance.demoted) {
-            // routes Path A; the promoted Path A emit below handles its solve
+          if (cls != nullptr && cls->phase == RestClassState::Phase::Promoted) {
+            // routes Path A (class-governed); the promoted Path A emit below handles its solve
             continue;
           }
 
@@ -2294,17 +2269,24 @@ namespace dxvk {
         // will actually be judged makes re-promotion self-consistent.
         if (candidate.phase == PromotionCandidate::Phase::Promoted && candidate.probeVa != 0) {
           const auto instanceIt = m_promoSlotByBlas.find(blasEntry);
-          if (instanceIt != m_promoSlotByBlas.end() && instanceIt->second.demoted
-              && emittedInstanceSlots.insert(instanceIt->second.stateSlot).second) {
-            PromoInstance& demotedInst = instanceIt->second;
-            // [ShapeClass] a demoted slot's class (divergent content). Its solves
-            // run against the class's OWN reference once it earns one - fitting
-            // solves then rebuild the streak, the demote logic re-promotes, and
-            // the instance routes the class's residency. That is the promotion
-            // path for divergent content on non-rest candidates.
-            RestClassState* cls = demotedInst.contentClassQ != INT32_MIN
-              ? resolveRestClass(hash, demotedInst.contentClassQ, demotedInst.classSubId, false)
+          if (instanceIt != m_promoSlotByBlas.end()) {
+            PromoInstance& pathBInst = instanceIt->second;
+            // [ShapeClass] this Path-B slot's current content class. It solves
+            // against the class's OWN reference once the class earns one; its
+            // solves + eigen sweeps are how the class reaches (or returns to)
+            // Promoted - the promotion path for every piece behind this candidate.
+            RestClassState* cls = pathBInst.contentClassQ != INT32_MIN
+              ? resolveRestClass(hash, pathBInst.contentClassQ, pathBInst.classSubId, false)
               : nullptr;
+            // direction 2: emit for any slot routing Path B under a promoted
+            // candidate so it keeps solving/sweeping and its class can (re)promote.
+            // That is a class not yet Promoted (rest, still gating) OR a drift-
+            // demoted class (non-rest that deformed - phase may still be Promoted,
+            // so driftDemoted must be checked or it would get no sweeps and never
+            // recover). Slots routing Path A are served by the promoted emit below.
+            // dedup by state slot (instances sharing a BlasEntry share content+slot).
+            if ((cls == nullptr || cls->phase != RestClassState::Phase::Promoted || cls->driftDemoted)
+                && emittedInstanceSlots.insert(pathBInst.stateSlot).second) {
             const RaytraceBuffer& rePositions = blasEntry->modifiedGeometryData.positionBuffer;
             lodclusters_remix::PromotionEntry probeEntry;
             probeEntry.probeVa = (cls != nullptr && cls->ref == RestClassState::Ref::Own && cls->probeVa != 0)
@@ -2313,7 +2295,7 @@ namespace dxvk {
             probeEntry.captureStrideBytes = rePositions.stride();
             probeEntry.captureVertexCount = rePositions.stride() > 0 && rePositions.length() > rePositions.offsetFromSlice()
               ? uint32_t((rePositions.length() - rePositions.offsetFromSlice()) / rePositions.stride()) : 0;
-            probeEntry.stateSlot = demotedInst.stateSlot;
+            probeEntry.stateSlot = pathBInst.stateSlot;
             probeEntry.patchSlot = 0xFFFFFFFFu;
             m_framePromoEntries.push_back(probeEntry);
 
@@ -2325,14 +2307,14 @@ namespace dxvk {
             // frames the permutation alternation denies). The streak route
             // stays as a second, faster path when correspondence holds.
             const uint32_t eigInterval = uint32_t(std::max(0, ClusterLodOptions::Promotion::fullSweepIntervalFrames()));
-            if (eigInterval > 0 && !demotedInst.sweepPending
-                && (demotedInst.eigenSuspect
-                    || ((m_device->getCurrentFrameId() + demotedInst.stateSlot) % eigInterval) == 0)) {
+            if (eigInterval > 0 && !pathBInst.sweepPending
+                && (pathBInst.eigenSuspect
+                    || ((m_device->getCurrentFrameId() + pathBInst.stateSlot) % eigInterval) == 0)) {
               lodclusters_remix::PromotionEntry eigEntry = probeEntry;
               eigEntry.mode = 2;  // PROMO_MODE_EIGEN
               m_framePromoEntries.push_back(eigEntry);
-              demotedInst.sweepPending = true;
-              demotedInst.sweepLagFrames = 0;
+              pathBInst.sweepPending = true;
+              pathBInst.sweepLagFrames = 0;
             }
 
             if (cls != nullptr) {
@@ -2363,7 +2345,7 @@ namespace dxvk {
                   request.sourceOffset = rePositions.offset() + rePositions.offsetFromSlice();
                   request.strideBytes = rePositions.stride();
                   request.vertexCount = topoVertexCount;
-                  request.stateSlot = demotedInst.stateSlot;  // [RestCapProbe] same-frame solve reads this buffer
+                  request.stateSlot = pathBInst.stateSlot;  // [RestCapProbe] same-frame solve reads this buffer
                   request.staging = m_device->createBuffer(stagingInfo,
                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                     DxvkMemoryStats::Category::RTXBuffer, "promo class rest-capture readback");
@@ -2379,8 +2361,8 @@ namespace dxvk {
               }
               // same-frame class gate pairing (solves -> barrier -> gates)
               if (cls->phase == RestClassState::Phase::GateScheduled
-                  && (cls->gateStateSlot == demotedInst.stateSlot || cls->gateStateSlot == ~0u)) {
-                cls->gateStateSlot = demotedInst.stateSlot;
+                  && (cls->gateStateSlot == pathBInst.stateSlot || cls->gateStateSlot == ~0u)) {
+                cls->gateStateSlot = pathBInst.stateSlot;
                 lodclusters_remix::PromotionEntry gateEntry = probeEntry;
                 gateEntry.mode = 2;  // Option 1: eigen gate (permutation-invariant)
                 gateEntry.vertexCount = (cls->ref == RestClassState::Ref::Own && cls->vertexCount != 0)
@@ -2389,10 +2371,11 @@ namespace dxvk {
                 cls->phase = RestClassState::Phase::GateRunning;
                 cls->gateFrames = 0;
                 cls->lastGateTickFrame = m_device->getCurrentFrameId();
-                cls->gateEigMark = (m_promoStatesValid && demotedInst.stateSlot < m_promoStates.size())
-                  ? m_promoStates[demotedInst.stateSlot].eigFrame : 0;  // verdict = eigFrame advances past this
+                cls->gateEigMark = (m_promoStatesValid && pathBInst.stateSlot < m_promoStates.size())
+                  ? m_promoStates[pathBInst.stateSlot].eigFrame : 0;  // verdict = eigFrame advances past this
               }
             }
+            }  // close the class-not-Promoted emit gate
           }
           continue;
         }
@@ -3572,6 +3555,25 @@ namespace dxvk {
       }
     };
 
+    // direction 2: does an instance of promoted candidate `candHash` holding the
+    // content class (classQ, subId) route Path A this frame? NON-rest content
+    // routes A by DEFAULT (the candidate itself is proven rigid) and drops to B
+    // only when its class is driftDemoted - so a freshly promoted building appears
+    // on Path A immediately, with no per-class gate latency. REST candidates still
+    // gate on the class reaching Promoted (they render their own captured pose).
+    auto routesPathA = [this](uint64_t candHash, int32_t classQ, int32_t subId) -> bool {
+      const auto cIt = m_promoCandidates.find(candHash);
+      if (cIt == m_promoCandidates.end() || cIt->second.phase != PromotionCandidate::Phase::Promoted) {
+        return false;
+      }
+      RestClassState* c = (classQ != INT32_MIN)
+        ? resolveRestClass(candHash, classQ, subId, false) : nullptr;
+      if (cIt->second.routeHash != 0) {
+        return c != nullptr && c->phase == RestClassState::Phase::Promoted;  // rest: needs own gate
+      }
+      return c == nullptr || !c->driftDemoted;  // non-rest: A by default, B only if drift-demoted
+    };
+
     if (skinned || captured || updatedInPlace) {
       // ---- pinned Path A fast-path ----
       // Once an instance has PROMOTED, it is identified by its stable BlasEntry*,
@@ -3582,13 +3584,21 @@ namespace dxvk {
       // (all-cyan in the Path Class view). Route straight off the cached
       // residentGeometryId, deliberately IGNORING updatedInPlace: a changed asset
       // hash on an already-rigid promoted instance is the transform moving, not
-      // deformation. Genuine deformation is still caught by the promotion solve
-      // (which sets slot.demoted), so the pin releases on real deform.
+      // deformation. Genuine deformation is still caught by the promotion solve,
+      // which un-promotes the CONTENT CLASS (direction 2) - the pin below reads
+      // the slot's current class and releases the moment that class is no longer
+      // Promoted, so real deform still drops the mesh to Path B.
       if (!skinned && ClusterLodOptions::Promotion::enable()
           && m_renderSystem != nullptr && m_renderSystem->hasGeneration()) {
         auto pinIt = m_promoSlotByBlas.find(blasEntry);
+        // direction 2: the pin holds while the slot's CONTENT CLASS still routes
+        // Path A (permissive for non-rest, gated for rest - see routesPathA). A
+        // class that drift-demotes releases the pin the same frame; the slot then
+        // re-routes through the establish path (to Path B) below.
         if (pinIt != m_promoSlotByBlas.end()
-            && !pinIt->second.demoted
+            && pinIt->second.geometryHash != 0
+            && routesPathA(pinIt->second.geometryHash, pinIt->second.contentClassQ,
+                           pinIt->second.classSubId)
             && pinIt->second.residentGeometryId != ~0u
             && pinIt->second.blasFrameCreated == blasEntry->frameCreated
             // content-rebind guard: a stable BlasEntry* can bind DIFFERENT content across
@@ -3698,14 +3708,12 @@ namespace dxvk {
                          && slotIt->second.blasFrameCreated != blasEntry->frameCreated) {
                 // recycled BlasEntry address: this map is never GC'd, so a freed
                 // entry's address coming back carries the OLD tenant's state
-                // (demoted flag, rest phase, pin) into a brand-new instance -
-                // reset everything but keep the slot (its stale GPU temporal
-                // sample is one isolated spike, which persistence now absorbs)
+                // (rest phase, pin) into a brand-new instance - reset everything
+                // but keep the slot (its stale GPU temporal sample is one isolated
+                // spike, which persistence now absorbs)
                 slotIt->second.blasFrameCreated = blasEntry->frameCreated;
-                slotIt->second.demoted = false;
                 slotIt->second.sweepPending = false;
                 slotIt->second.eigenSuspect = false;
-                slotIt->second.eigenDriftStreak = 0;
                 slotIt->second.residentGeometryId = ~0u;
                 slotIt->second.geometryHash = 0;
                 slotIt->second.contentClassQ = INT32_MIN;  // fresh content - reclassify
@@ -3727,10 +3735,8 @@ namespace dxvk {
                 // reset the content-derived state so the frozen class (updatePromotionStates)
                 // re-derives for the NEW content instead of the pin/establish routing the OLD
                 // content's stale Path A clusters. This IS the class freeze's release signal.
-                slotIt->second.demoted = false;
                 slotIt->second.sweepPending = false;
                 slotIt->second.eigenSuspect = false;
-                slotIt->second.eigenDriftStreak = 0;
                 slotIt->second.residentGeometryId = ~0u;
                 slotIt->second.contentClassQ = INT32_MIN;  // new content - reclassify
                 slotIt->second.classSubId = 0;
@@ -3748,14 +3754,17 @@ namespace dxvk {
                 slotIt->second.geometryHash = geometryHash;  // adopt the new content key
                 routeCls = nullptr;  // the class was resolved from the OLD content's classification
               }
-              // [ShapeClass] rest-referenced candidates promote PER CONTENT CLASS:
-              // an instance routes Path A only when the class its current capture
-              // classifies into has passed its gate - a divergent-shape class
-              // stays Path B (until its own reference promotes it) instead of
-              // promoting wrongly and demote-flapping
-              const bool restGated = candidate->second.routeHash != 0
-                && (routeCls == nullptr
-                    || routeCls->phase != RestClassState::Phase::Promoted);
+              // [ShapeClass] direction 2: routing follows the slot's CONTENT CLASS,
+              // not a per-slot flag - so a slot multiplexing pieces routes by
+              // whichever piece's class it currently holds instead of thrashing.
+              // NON-rest content routes Path A by DEFAULT (immediately on candidate
+              // promotion, no per-class gate latency) and drops to B only when the
+              // class drift-demotes; REST content gates on class==Promoted. The
+              // routesPathA applies the same rule the pin uses, re-resolving the
+              // slot's class (so it reflects any content-rebind reset just above).
+              const bool classGated = !routesPathA(geometryHash,
+                                                   slotIt != m_promoSlotByBlas.end() ? slotIt->second.contentClassQ : INT32_MIN,
+                                                   slotIt != m_promoSlotByBlas.end() ? slotIt->second.classSubId : 0);
 
               // [RouteTrace] per-frame Path-A-vs-Path-B verdict for the traced geom.
               // This is the VISIBLE pop the [DEFORMING] demote metric missed: capSig
@@ -3778,15 +3787,14 @@ namespace dxvk {
                     const float rtCapSig = (m_promoStatesValid && rtSlot < m_promoStates.size())
                       ? m_promoStates[rtSlot].capSig : -1.0f;
                     const int32_t rtPhase = routeCls != nullptr ? int32_t(routeCls->phase) : -1;
-                    const bool rtRouteA = !slotIt->second.demoted && !restGated;
+                    const bool rtRouteA = !classGated;
                     Logger::info(str::format("[RouteTrace] geom 0x", std::hex, geometryHash, std::dec,
                                              " frame ", currentFrame, " slot ", rtSlot,
                                              " capSig ", rtCapSig,
                                              " classQ ", slotIt->second.contentClassQ,
-                                             " log2cap ", slotIt->second.contentClassQ,
+                                             " subId ", slotIt->second.classSubId,
                                              " clsPhase ", rtPhase,
-                                             " demoted ", slotIt->second.demoted,
-                                             " restGated ", restGated,
+                                             " classGated ", classGated,
                                              " route ", (rtRouteA ? "PATH_A" : "PATH_B")));
                   }
                 }
@@ -3829,17 +3837,17 @@ namespace dxvk {
                                                " subId ", slotIt->second.classSubId,
                                                " capSig ", caCapSig,
                                                " residual ", caResid,
-                                               " demoted ", slotIt->second.demoted,
                                                " ext (", caEx, ", ", caEy, ", ", caEz, ")"));
                     }
                   }
                 }
               }
 
-              // per-instance demotion: a demoted instance falls through to
-              // Path B below while its siblings stay promoted; its slot keeps
-              // solving (buildPromotionEntries) so it can re-promote
-              if (slotIt != m_promoSlotByBlas.end() && !slotIt->second.demoted && !restGated) {
+              // direction 2: route by the content class. A slot whose current
+              // class is Promoted renders Path A; anything else falls through to
+              // Path B below and keeps solving (buildPromotionEntries) so its
+              // class can (re)promote. No per-slot demote flag is involved.
+              if (slotIt != m_promoSlotByBlas.end() && !classGated) {
                 // Cache the stable identity so the pinned fast-path above can route
                 // this instance every subsequent frame WITHOUT the churning-hash lookup.
                 slotIt->second.residentGeometryId = found->second;
@@ -3851,10 +3859,10 @@ namespace dxvk {
                 return true;
               }
               // DIAG (PathARoute): routable geometry whose INSTANCE still dropped here.
-              // The only two ways to reach this line: the per-instance slot is DEMOTED
-              // (solve flagged non-rigid for this instance's own capture) or the slot
-              // pool is exhausted. Names the last silent drop between "routable" and
-              // the screen. Throttled per geometry per 300 frames.
+              // Under direction 2 the drop is either the content class not (yet)
+              // Promoted - unclassified, still gating, or un-promoted by drift - or
+              // the state-slot pool being exhausted. Names the last silent drop
+              // between "routable" and the screen.
               {
                 static std::mutex s_m2;
                 static std::unordered_map<uint64_t, uint32_t> s_lastLogFrame;
@@ -3862,10 +3870,8 @@ namespace dxvk {
                 uint32_t& last = s_lastLogFrame[geometryHash];
                 if (currentFrame - last > 300u || last == 0u) {
                   last = currentFrame;
-                  const char* why2 = (slotIt != m_promoSlotByBlas.end() && slotIt->second.demoted)
-                                   ? "instance DEMOTED (per-instance solve non-rigid)"
-                                   : restGated
-                                   ? "content-class verdict pending/failed ([ShapeClass] rest reference)"
+                  const char* why2 = classGated
+                                   ? "content-class not Promoted ([ShapeClass] pending/gating/drift-demoted)"
                                    : "promo state slot pool exhausted";
                   Logger::info(str::format("[PathARoute] geometry 0x", std::hex, geometryHash, std::dec,
                                            " instance dropped to Path B: ", why2,

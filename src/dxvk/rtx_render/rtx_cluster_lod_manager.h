@@ -426,10 +426,21 @@ namespace dxvk {
                  "ALTERNATING between draws (measured: temporal sweep-to-sweep comparison false-demoted at\n"
                  "drift median 0.18 on static geometry); eig(R*X*R^T) = eig(X) keeps it immune to rigid\n"
                  "motion after the proven fit, trace-normalizing to scale levels, and A carries any\n"
-                 "anisotropic placement bake. A PROMOTED instance demotes only after 3 CONSECUTIVE\n"
-                 "drifting sweeps (alternating content matches every other sweep and resets the streak;\n"
-                 "genuine deformation never matches). Per-index residual/temporal signals only SCHEDULE\n"
+                 "anisotropic placement bake. Per-index residual/temporal signals only SCHEDULE\n"
                  "sweeps (suspicion -> verify), never demote. 0 disables the tolerance (any drift counts).");
+      RTX_OPTION("rtx.clusterLod.promotion", int, eigenDemoteSweeps, 1,
+                 "Consecutive drifting eigen sweeps before a PROMOTED content class un-promotes to Path B\n"
+                 "(direction 2: the demote verdict is per CONTENT CLASS, not per instance slot). Default 1\n"
+                 "= demote on the FIRST confirming sweep, so a mesh that starts rigid (e.g. a character in a\n"
+                 "T-pose) and then animates drops to Path B within one sweep + readback (gateLagFrames) of\n"
+                 "the deformation starting, instead of rendering a frozen Path-A pose. 1 is SAFE here because\n"
+                 "the streak is keyed on the content class and the eigen signal is permutation-invariant: a\n"
+                 "static mesh whose capture is merely re-batched reads drift ~0 every sweep and never counts,\n"
+                 "and a different piece rebinding through the slot is a DIFFERENT class that never touches\n"
+                 "this streak (the two false-positives the old per-slot '3 consecutive' guard existed for).\n"
+                 "Raise to 2+ only if a transient garbage capture ever demotes a genuinely static class (a\n"
+                 "clean sweep re-promotes it next readback either way). Suspicion arms the sweep immediately,\n"
+                 "so the streak accrues at the readback cadence, never the periodic stagger.");
       RTX_OPTION("rtx.clusterLod.promotion", bool, correspondenceScan, false,
                  "DIAGNOSTIC PROBE (no fix, off by default). For every candidate, the solve kernel also runs a\n"
                  "transform-invariant pairwise-distance scan over a fixed table of ref->capture vertex-index\n"
@@ -881,6 +892,29 @@ namespace dxvk {
       // only valid once eigFrame has ADVANCED past this mark (else a stale
       // instance-sweep verdict would be misread as the gate's).
       uint32_t gateEigMark = 0;
+      // ---- direction 2 (content governs routing): per-CLASS demote streak ----
+      // The demote verdict is a property of the CONTENT, not the slot. This game
+      // multiplexes many distinct pieces through one BlasEntry slot, so a per-slot
+      // demote flag thrashed every time a slot's content changed piece (the 122:2
+      // Path_B:Path_A split). Instead, every slot that currently holds this class
+      // contributes its eigen-sweep verdict here: a drifting sweep (capture shape
+      // vs the last-RIGID-M prediction, permutation-invariant) increments the
+      // streak, a matching sweep resets it. When a PROMOTED class accrues 3
+      // CONSECUTIVE drifting sweeps (from any of its members) it un-promotes -
+      // demoting ALL its slots to Path B together - which is genuine deformation
+      // of that content, never a slot simply rebinding to a different piece.
+      uint32_t eigenDriftStreak = 0;
+      // driftDemoted: the class's members currently route Path B because the
+      // content DEFORMED (3 consecutive drifting sweeps), NOT because it hasn't
+      // proven itself yet. This is the demote authority for NON-rest candidates:
+      // their content routes Path A by DEFAULT (the candidate is already proven
+      // rigid against its object-space probe - forcing every piece back through a
+      // fresh per-class gate before routing A cost tens of seconds at this game's
+      // frame rate and effectively promoted nothing). Only a class that eigen-
+      // drifts flips this and drops to Path B; a clean sweep clears it and the
+      // content routes A again next frame. Rest candidates ignore this and gate
+      // on `phase == Promoted` (they need their own captured reference first).
+      bool driftDemoted = false;
     };
     // candidate key -> its content classes (small vectors, linear exact-match)
     std::unordered_map<uint64_t, std::vector<RestClassState>> m_restClassesByCandidate;
@@ -899,15 +933,19 @@ namespace dxvk {
     // instance - every captured instance's buffer carries its own transform -
     // so patch/prevM state must never alias across instances; the candidate's
     // own slot serves only the geometry-level probe/gate verdict).
-    // demoted: instance-level demotion (former V1 limitation was geometry-
-    // level) - this instance renders Path B while its solves stay non-rigid;
-    // a fresh rigid streak re-promotes it. sweepPending/sweepLagFrames track
-    // the periodic full-mesh sweep verdict (risk R20).
+    // sweepPending/sweepLagFrames track this slot's in-flight eigen sweep; the
+    // verdict feeds the slot's CONTENT CLASS, which is the routing+demote
+    // authority (direction 2 - see the field comments below).
     struct PromoInstance {
       uint32_t stateSlot = 0;
       uint32_t sweepLagFrames = 0;
       bool sweepPending = false;
-      bool demoted = false;
+      // ---- direction 2: no per-slot demote flag ----
+      // Routing and demotion are now a property of the slot's CONTENT CLASS
+      // (RestClassState), not the slot. A slot routes Path A iff the cell it
+      // currently classifies into is Promoted; the per-class eigenDriftStreak
+      // carries the demote verdict. The old per-slot `demoted` flag thrashed
+      // whenever a slot rebound to a different piece and is gone.
       // ---- REST verdicts moved to RestClassState ([ShapeClass]) ----
       // Formerly per-instance (RestPhase et al.), which keyed verdicts by
       // BlasEntry - an identity the churning-hash draw matching does NOT keep
@@ -960,13 +998,11 @@ namespace dxvk {
       // signals (residual/tDeform - permutation-POISONED, never demote directly)
       // flagged this slot; buildPromotionEntries schedules an eigen sweep to
       // verify. sweepPending doubles as the in-flight guard for eigen sweeps.
-      // eigenDriftStreak: CONSECUTIVE mismatching sweeps (capture shape vs the
-      // last-RIGID-M prediction); demote needs 3 in a row - a single mismatch
-      // can be the slot's ALTERNATING capture content passing through, which a
-      // matching sweep then resets. Reset on any match.
+      // The demote streak itself lives on the CLASS now (RestClassState::
+      // eigenDriftStreak), aggregated across whichever slots hold that content;
+      // this slot only reports each sweep verdict into its current class.
       uint32_t lastEigenFrame = 0;
       bool eigenSuspect = false;
-      uint32_t eigenDriftStreak = 0;
     };
     std::unordered_map<const BlasEntry*, PromoInstance> m_promoSlotByBlas;
     // per-frame kernel work items (built in dispatchBuild, consumed by
