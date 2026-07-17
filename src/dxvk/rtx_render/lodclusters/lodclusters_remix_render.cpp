@@ -163,7 +163,7 @@ struct ClusterRenderSystem::Impl
   // host-visible BDA ring; the status array is copied into a host readback
   // ring each frame promotion work ran.
   static constexpr uint32_t kPromoMatricesStride = 96;
-  static constexpr uint32_t kPromoStatusStride   = 60;  // 8 base + gateOver/gateStale/temporalDeform + meanDev/dirCoh/normAlign/solveInfo (DIAG)
+  static constexpr uint32_t kPromoStatusStride   = 64;  // 8 base + gateOver/gateStale/temporalDeform + meanDev/dirCoh/normAlign/solveInfo (DIAG) + capSig ([ShapeClass])
   static constexpr uint32_t kPromoEntryStride    = sizeof(PromotionEntry);
 
   shaderc::SpvCompilationResult promoShader;
@@ -506,13 +506,25 @@ void ClusterRenderSystem::Impl::recordPromotion(VkCommandBuffer cmd, const Frame
 
   // DIAG raw dump: the requested slot's solve-sample capture positions (the solve
   // kernel stored them in the last-sample buffer this frame; barrier above covers it)
-  if(frame.promotionDumpStateSlot != ~0u && frame.promotionDumpStateSlot < kPromotionSlotCapacity
-     && promoDumpReadback[slot].buffer != VK_NULL_HANDLE)
+  if(frame.promotionDumpStateSlot != ~0u && frame.promotionDumpStateSlot < kPromotionSlotCapacity)
   {
     const VkDeviceSize bytes = VkDeviceSize(kPromoSolveSamples) * 3 * sizeof(float);
-    VkBufferCopy region{VkDeviceSize(frame.promotionDumpStateSlot) * bytes, 0, bytes};
-    vkCmdCopyBuffer(cmd, promoLastSampleBuffer.buffer, promoDumpReadback[slot].buffer, 1, &region);
-    promoDumpFramesRecorded++;
+    if(frame.promotionDumpTargetBuffer != VK_NULL_HANDLE)
+    {
+      // [RestCapProbe] one-shot: the manager supplied its own staging so this
+      // frame's solve view survives until its paired rest-capture copy drains
+      // (the ring below is per-frame transient). Does not touch the ring or
+      // its recorded-frames counter - the config [PromoDump] path is unaffected.
+      VkBufferCopy region{VkDeviceSize(frame.promotionDumpStateSlot) * bytes,
+                          frame.promotionDumpTargetOffset, bytes};
+      vkCmdCopyBuffer(cmd, promoLastSampleBuffer.buffer, frame.promotionDumpTargetBuffer, 1, &region);
+    }
+    else if(promoDumpReadback[slot].buffer != VK_NULL_HANDLE)
+    {
+      VkBufferCopy region{VkDeviceSize(frame.promotionDumpStateSlot) * bytes, 0, bytes};
+      vkCmdCopyBuffer(cmd, promoLastSampleBuffer.buffer, promoDumpReadback[slot].buffer, 1, &region);
+      promoDumpFramesRecorded++;
+    }
   }
 
   promoFramesRecorded++;
@@ -1170,6 +1182,7 @@ bool ClusterRenderSystem::readPromotionStates(PromotionStateView* outStates)
     memcpy(&v.dirCoherence, s + 48, sizeof(float));
     memcpy(&v.normAlign, s + 52, sizeof(float));
     memcpy(&v.solveInfo, s + 56, sizeof(uint32_t));
+    memcpy(&v.capSig, s + 60, sizeof(float));  // [ShapeClass] probe-independent signature
   }
   return true;
 }

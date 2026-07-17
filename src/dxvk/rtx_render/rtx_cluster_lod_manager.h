@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -350,6 +351,11 @@ namespace dxvk {
       RTX_OPTION("rtx.clusterLod.promotion", int, gateLagFrames, 6,
                  "Frames between dispatching the full-mesh gate sweep and reading its verdict (covers the\n"
                  "readback ring lag).");
+      RTX_OPTION("rtx.clusterLod.promotion", int, restRejectRetryFrames, 600,
+                 "Frames after which a REST-rejected instance re-enters probing. Rejection cannot be terminal\n"
+                 "on games whose captured-draw hash churns: the BlasEntry<->capture-content binding can swap\n"
+                 "when the draw set changes (verified: a gating slot's capture changed scale mid-gate), so a\n"
+                 "terminal verdict condemns a slot for content it no longer holds. 0 keeps rejection terminal.");
       RTX_OPTION("rtx.clusterLod.promotion", int, fullSweepIntervalFrames, 32,
                  "Steady-state full-mesh residual sweep cadence per PROMOTED instance (plan 7.7, risk R20):\n"
                  "the sparse per-frame solve can miss a VS animating a small vertex subset, so every promoted\n"
@@ -373,6 +379,20 @@ namespace dxvk {
       RTX_OPTION("rtx.clusterLod.promotion", int, restCaptureStuckFrames, 120,
                  "Consecutive temporally-static frames a candidate must stay above residualEpsilon before the\n"
                  "rest-capture path triggers (avoids re-referencing meshes that are merely briefly stuck).");
+      RTX_OPTION("rtx.clusterLod.promotion", int, restClassStuckFrames, 24,
+                 "Misfit accruals (temporally-calm fresh solves) a CONTENT CLASS needs before requesting its\n"
+                 "own rest reference. Much lower than restCaptureStuckFrames: candidate probes solve every\n"
+                 "frame, but a class only accrues evidence during its content's dwell windows (bind-churn\n"
+                 "games rotate content across slots). Low is safe - a class promotes only through its own\n"
+                 "gate against the captured reference, so a premature request costs one readback, never a\n"
+                 "wrong verdict.");
+      RTX_OPTION("rtx.clusterLod.promotion", int, restClassMaxRefs, 4,
+                 "Identity-by-fit sibling cap per content-class bucket. The spread signature cannot separate\n"
+                 "non-affine-equivalent contents (different SHAPES share a bucket), so class membership is\n"
+                 "decided by FIT: an instance persistently misfitting sibling N's own reference advances to\n"
+                 "sibling N+1 (existing first, else a new capture from the misfitting member). This bounds\n"
+                 "how many sibling references one bucket may hold; past the cap the chain REJECTS and retries\n"
+                 "after restRejectRetryFrames as before.");
       RTX_OPTION("rtx.clusterLod.promotion", float, demoteHysteresis, 2.0f,
                  "Residual multiplier an ALREADY-PROMOTED instance is allowed before demoting to Path B\n"
                  "(candidates still need the strict residualEpsilon to promote). A rigid mesh whose residual\n"
@@ -740,6 +760,9 @@ namespace dxvk {
       uint32_t vertexCount = 0;
       uint64_t routeHash = 0;     // rest probes: space-tagged residency hash; else 0
       uint64_t topologyKey = 0;   // stable identity for the churning-hash draw side
+      int32_t classQ = INT32_MIN; // [ShapeClass] class-scoped rest probe target; INT32_MIN = candidate-level
+      int32_t classSubId = 0;     // identity-by-fit sibling the reference belongs to
+      bool restored = false;      // [PromoRefs] sidecar restore: adoption skips the class-wipe
     };
     std::mutex m_promoPendingMutex;
     std::vector<PendingProbe> m_promoPendingProbes;
@@ -755,6 +778,13 @@ namespace dxvk {
       uint64_t topologyKey = 0;
       uint32_t vertexCount = 0;
       std::string name;
+      // [RestCapProbe] weld baseline measured from the BASE (candidate-level)
+      // rest capture: counts of exact-duplicate position triples. Welds are
+      // affine-invariant, so ANY faithful single-pose capture of this content
+      // must reproduce them - a class capture with fewer welded verts is
+      // per-vertex corrupt or mid-deform, never a scaled/rotated sibling.
+      uint32_t weldGroups = ~0u;  // ~0u = baseline not measured yet
+      uint32_t weldVerts = 0;
     };
     std::mutex m_promoTopologyMutex;
     std::unordered_map<uint64_t, RetainedTopology> m_promoTopologyByHash;
@@ -769,8 +799,72 @@ namespace dxvk {
       uint32_t vertexCount = 0;
       Rc<DxvkBuffer> staging;          // host-visible readback target
       uint32_t copyFrame = ~0u;        // frame the copy was recorded (~0 = not yet)
+      int32_t classQ = INT32_MIN;      // [ShapeClass] class-scoped request; INT32_MIN = candidate-level
+      int32_t classSubId = 0;          // identity-by-fit sibling this capture is for
+      // [RestCapProbe] the state slot whose solve reads the SAME capture buffer
+      // this request copies. When the copy is recorded, a same-frame snapshot of
+      // that slot's solve-sample view (promoLastSampleBuffer region) is taken
+      // into sampleStaging; the drain bit-compares the two. ~0u = no probe.
+      uint32_t stateSlot = ~0u;
+      Rc<DxvkBuffer> sampleStaging;    // 64*vec3 solve-view snapshot (null = not probed)
     };
     std::vector<RestCaptureRequest> m_restCaptureRequests;
+    // [RestCapProbe] one probe in flight at a time; the pending fields carry the
+    // armed request's slot + staging handle from processRestCaptureRequests to
+    // the same-frame frameParams fill later in dispatchBuild.
+    bool m_restCapProbeInFlight = false;
+    uint32_t m_restCapProbeSlotPending = ~0u;
+    VkBuffer m_restCapProbeTargetPending = VK_NULL_HANDLE;
+    VkDeviceSize m_restCapProbeTargetOffsetPending = 0;
+
+    // ---- [ShapeClass] per-CONTENT-CLASS rest verdicts ----
+    // The verdict layer is keyed by WHAT the capture holds (content class =
+    // quantized log2 capture-spread), not by WHICH BlasEntry/buffer holds it -
+    // the binding between the two is unstable on churning-hash games (verified:
+    // a slot's capture content changed scale mid-gate, globally at one frame).
+    // Each class of a rest-referenced candidate earns its own verdict, and a
+    // class the shared reference cannot fit earns its OWN rest reference
+    // (probeVa/routeHash) - so every scale/shape variant can promote, not just
+    // the placement the first rest capture happened to be read from.
+    struct RestClassState {
+      int32_t classQ = INT32_MIN;   // canonical bucket at creation
+      float log2CapVar = 0.0f;      // raw signature at creation (nearest-merge tolerance)
+      // Identity-by-FIT sibling id within the bucket. The spread signature cannot
+      // separate non-affine-equivalent contents (verified: faithful captures +
+      // static content still misfit their class's own reference by a per-content
+      // constant - two different SHAPES share one bucket). Membership is therefore
+      // decided by fit: an instance that persistently misfits sibling N's
+      // reference advances to sibling N+1 (existing first, else freshly minted,
+      // each running the full ladder: shared probe -> own capture). subId is the
+      // instance cursor's target; references/residency are salted per sibling.
+      int32_t subId = 0;
+      enum class Phase : uint32_t { Probing, GateScheduled, GateRunning, Promoted, Rejected };
+      Phase phase = Phase::Probing;
+      // which reference this class solves against: the candidate's shared rest
+      // probe, or (after the shared one failed it) its own class-scoped one
+      enum class Ref : uint32_t { CandidateProbe, Requested, Own };
+      Ref ref = Ref::CandidateProbe;
+      uint64_t probeVa = 0;         // own reference (Ref::Own); 0 = candidate's
+      uint64_t routeHash = 0;       // own residency hash (Ref::Own); 0 = candidate's
+      uint32_t vertexCount = 0;     // gate range for the own probe
+      uint32_t gateFrames = 0;
+      uint32_t stuckFrames = 0;
+      uint32_t gateStateSlot = ~0u; // instance slot whose capture the in-flight gate reads
+      uint32_t rejectedFrame = 0;   // retry cooldown (restRejectRetryFrames)
+      bool captureStaged = false;   // Ref::Requested: readback already staged
+      // wedge guard: frame of the last gate schedule/tick. A gate whose owning
+      // slot's content swapped away (or left the scene) would wait forever -
+      // stale Gate* phases reset to Probing after 4*gateLagFrames.
+      uint32_t lastGateTickFrame = 0;
+    };
+    // candidate key -> its content classes (small vectors, linear nearest-merge)
+    std::unordered_map<uint64_t, std::vector<RestClassState>> m_restClassesByCandidate;
+    // find (createIfMissing: or create) with nearest-bucket merge (+-1.5 buckets)
+    // so identical content straddling a bucket boundary on two slots maps to ONE
+    // class. subId selects the identity-by-fit sibling within the bucket (the
+    // instance's cursor). Returned pointer is invalidated by the next creating
+    // call for the same candidate - resolve, use, drop.
+    RestClassState* resolveRestClass(uint64_t candidateHash, float log2CapVar, int32_t subId, bool createIfMissing);
     // per-INSTANCE state slots for PROMOTED instances (plan risk R21: M is per
     // instance - every captured instance's buffer carries its own transform -
     // so patch/prevM state must never alias across instances; the candidate's
@@ -784,23 +878,16 @@ namespace dxvk {
       uint32_t sweepLagFrames = 0;
       bool sweepPending = false;
       bool demoted = false;
-      // ---- per-instance REST verdicts (rest-referenced candidates only) ----
-      // A rest-referenced candidate's instances promote INDIVIDUALLY: each
-      // instance's VS can build a genuinely different shape, so each solves
-      // ITS OWN capture buffer against the shared rest reference and passes
-      // its own gate before routing Path A. Solving against the shared probe
-      // IS the match test - an instance whose shape diverges from the shared
-      // rest reference never fits and terminates (Rejected) after the
-      // restCaptureStuckFrames patience, ending its per-frame solve cost.
-      // None = not a rest-verdict instance (normal geometry-level promotion).
-      enum class RestPhase : uint32_t { None, Probing, GateScheduled, GateRunning, Promoted, Rejected };
-      RestPhase restPhase = RestPhase::None;
-      uint32_t restGateFrames = 0;
-      uint32_t restStuckFrames = 0;
-      // last state.lastFrame the stuck detector consumed: the terminal verdict
-      // must count SOLVED frames only - an instance that leaves the scene stops
-      // solving, and ticking on its stale state would reject it in absentia
-      uint32_t restLastSolveFrame = 0;
+      // ---- REST verdicts moved to RestClassState ([ShapeClass]) ----
+      // Formerly per-instance (RestPhase et al.), which keyed verdicts by
+      // BlasEntry - an identity the churning-hash draw matching does NOT keep
+      // stable (a slot's capture content can be rebound to a different
+      // placement mid-verdict). Verdicts now live on the candidate's content
+      // classes (m_restClassesByCandidate); this slot contributes evidence to
+      // whichever class its CURRENT content classifies into (contentClassQ).
+      // isRestWorld: this slot serves a rest-referenced candidate - set at
+      // emit time; the verdict pass only reads class evidence from these.
+      bool isRestWorld = false;
       // NV-DXVK: pinned Path A residency. Once an instance PROMOTES, its identity
       // is this stable BlasEntry* (the draw-call cache keeps the same BlasEntry
       // across camera moves), NOT the asset hash. This game's captured draws
@@ -814,6 +901,34 @@ namespace dxvk {
       uint32_t residentGeometryId = ~0u;
       uint64_t geometryHash = 0;
       uint32_t blasFrameCreated = 0;
+      // [RestGateTrace] the capture buffer address this slot's solve/gate read
+      // on the most recent emit (diagnostic only - address is NOT identity).
+      uint64_t lastCaptureVa = 0;
+
+      // ---- [ShapeClass] content-class identity (from the capture itself) ----
+      // The solve readback carries capVar (PromotionStateView::affineNonRigid,
+      // repurposed): the spread of the solved capture samples - rotation/
+      // translation-invariant, scale-variant. Quantized in log2 (1/16-bucket ~
+      // 4.4% in capVar ~ 2.2% in scale; observed distinct content classes are
+      // >= 11% apart in scale, fp noise ~1e-5) it identifies WHICH content this
+      // slot's capture currently holds, independent of the unstable BlasEntry/
+      // buffer binding. classLog2CapVar keeps the raw log at classification so
+      // reclassification needs a full-bucket move (hysteresis: no boundary
+      // flicker). INT32_MIN = not yet classified.
+      int32_t contentClassQ = INT32_MIN;
+      float classLog2CapVar = 0.0f;
+      // identity-by-fit cursor: which SIBLING reference of the bucket this
+      // instance is currently judged against (see RestClassState::subId).
+      // Resets with contentClassQ - a bucket move re-enters at sibling 0.
+      int32_t classSubId = 0;
+      uint32_t lastClassifiedFrame = 0;  // last state.lastFrame consumed
+      // swap confirmation (time hysteresis): a single divergent signature can
+      // be a transient garbage read (mid-upload buffer rename), and committing
+      // it unpins the instance's Path A route for nothing. A swap commits only
+      // after 2 CONSECUTIVE solves classify into the same new bucket.
+      int32_t pendingClassQ = INT32_MIN;
+      float pendingLog2CapVar = 0.0f;
+      uint32_t pendingClassCount = 0;
     };
     std::unordered_map<const BlasEntry*, PromoInstance> m_promoSlotByBlas;
     // per-frame kernel work items (built in dispatchBuild, consumed by
@@ -866,6 +981,20 @@ namespace dxvk {
     uint64_t m_lastProviderSubmitted = 0;
     uint32_t m_genTraceEnqueuedFrame = 0;   // frame the oldest still-pending hash was drained
     uint32_t m_genTraceDeferrals = 0;       // consecutive frames pending>0 without an append
+
+    // [ScanProbe] throttle for the periodic correspondence-scan readout of the
+    // single targeted candidate (Promotion::dumpGeometryHash).
+    uint32_t m_scanProbeLastFrame = 0;
+    // [ShapeClass] 1s throttle for the per-candidate content-class histogram.
+    std::chrono::steady_clock::time_point m_lastShapeClassLog{};
+    // [SwapDebounce] verdict on whether single-solve transient reads exist:
+    // abandoned = pending swaps that never confirmed (1-solve excursions -
+    // proven transients); committed = swaps that held for 2+ solves (real
+    // content changes). abandoned == 0 across runs => the debounce guards a
+    // ghost and should be deleted; abandoned > 0 => a real transient-read
+    // path exists and deserves a root-cause chase (buffer lifetime/rename).
+    uint32_t m_swapPendingAbandoned = 0;
+    uint32_t m_swapCommitted = 0;
 
     std::unordered_map<uint64_t, uint32_t> m_geometryIdByHash;
 

@@ -24,6 +24,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <thread>
 #include <utility>
 
@@ -44,6 +46,101 @@ namespace dxvk {
     uint64_t elapsedUs(const std::chrono::steady_clock::time_point& since) {
       return uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now() - since).count());
+    }
+
+    // ---- [PromoRefs] sidecar serialization ----
+    // <candidateHash>.promorefs, little-endian:
+    //   u32 magic 'PRF1' | u64 candidateHash | u64 topologyKey | u64 indicesHash
+    //   u32 entryCount | entries
+    // entry: i32 classQ | i32 subId | u64 restHash | u32 vertexCount
+    //        | u32 nameLen | name bytes | f32 positions[vertexCount*3]
+    // topologyKey + indicesHash gate restore: a content patch that changes the
+    // mesh invalidates the whole file (it is rediscovered and rewritten once).
+    constexpr uint32_t kPromoRefsMagic = 0x31465250u;  // 'PRF1'
+    constexpr uint32_t kPromoRefsMaxEntries = 64u;     // sanity bound on read
+    constexpr uint32_t kPromoRefsMaxVerts = 4u * 1024u * 1024u;
+
+    struct PromoRefEntry {
+      int32_t classQ = INT32_MIN;
+      int32_t subId = 0;
+      uint64_t restHash = 0;
+      std::string name;
+      std::vector<float> positions;  // 3 floats per vertex
+    };
+
+    struct PromoRefsFile {
+      uint64_t candidateHash = 0;
+      uint64_t topologyKey = 0;
+      uint64_t indicesHash = 0;
+      std::vector<PromoRefEntry> entries;
+    };
+
+    bool readPromoRefs(const std::string& pathUtf8, PromoRefsFile& out) {
+      std::ifstream f(std::filesystem::u8path(pathUtf8), std::ios::binary);
+      if (!f.is_open()) {
+        return false;
+      }
+      auto rd = [&f](void* dst, size_t bytes) -> bool {
+        f.read(reinterpret_cast<char*>(dst), std::streamsize(bytes));
+        return f.good();
+      };
+      uint32_t magic = 0;
+      uint32_t count = 0;
+      if (!rd(&magic, 4) || magic != kPromoRefsMagic
+          || !rd(&out.candidateHash, 8) || !rd(&out.topologyKey, 8) || !rd(&out.indicesHash, 8)
+          || !rd(&count, 4) || count > kPromoRefsMaxEntries) {
+        return false;
+      }
+      out.entries.resize(count);
+      for (PromoRefEntry& e : out.entries) {
+        uint32_t vertexCount = 0;
+        uint32_t nameLen = 0;
+        if (!rd(&e.classQ, 4) || !rd(&e.subId, 4) || !rd(&e.restHash, 8)
+            || !rd(&vertexCount, 4) || vertexCount == 0 || vertexCount > kPromoRefsMaxVerts
+            || !rd(&nameLen, 4) || nameLen > 1024u) {
+          return false;
+        }
+        e.name.resize(nameLen);
+        if (nameLen > 0 && !rd(e.name.data(), nameLen)) {
+          return false;
+        }
+        e.positions.resize(size_t(vertexCount) * 3);
+        if (!rd(e.positions.data(), e.positions.size() * sizeof(float))) {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    bool writePromoRefs(const std::string& pathUtf8, const PromoRefsFile& in) {
+      std::ofstream f(std::filesystem::u8path(pathUtf8), std::ios::binary | std::ios::trunc);
+      if (!f.is_open()) {
+        return false;
+      }
+      auto wr = [&f](const void* src, size_t bytes) {
+        f.write(reinterpret_cast<const char*>(src), std::streamsize(bytes));
+      };
+      const uint32_t count = uint32_t(std::min<size_t>(in.entries.size(), kPromoRefsMaxEntries));
+      wr(&kPromoRefsMagic, 4);
+      wr(&in.candidateHash, 8);
+      wr(&in.topologyKey, 8);
+      wr(&in.indicesHash, 8);
+      wr(&count, 4);
+      for (uint32_t i = 0; i < count; i++) {
+        const PromoRefEntry& e = in.entries[i];
+        const uint32_t vertexCount = uint32_t(e.positions.size() / 3);
+        const uint32_t nameLen = uint32_t(std::min<size_t>(e.name.size(), 1024u));
+        wr(&e.classQ, 4);
+        wr(&e.subId, 4);
+        wr(&e.restHash, 8);
+        wr(&vertexCount, 4);
+        wr(&nameLen, 4);
+        if (nameLen > 0) {
+          wr(e.name.data(), nameLen);
+        }
+        wr(e.positions.data(), e.positions.size() * sizeof(float));
+      }
+      return f.good();
     }
 
     uint64_t nowUs() {
@@ -358,6 +455,103 @@ namespace dxvk {
 
     lock.unlock();
     m_condition.notify_one();
+  }
+
+  void ClusterLodGeometryProvider::savePromoRef(const lodclusters_remix::GeometrySnapshot& snapshot,
+                                                const lodclusters_remix::ProcessorConfig& config) {
+    // keyed by the ORIGINAL candidate hash; upserts this (classQ, subId) entry
+    if (snapshot.promoKeyHash == 0 || snapshot.positions.empty()) {
+      return;
+    }
+    const std::string path = lodclusters_remix::getPromoRefsFileUtf8(snapshot.promoKeyHash, config);
+    std::lock_guard<std::mutex> lock(m_promoRefsMutex);
+    PromoRefsFile file;
+    if (!readPromoRefs(path, file)
+        || file.candidateHash != snapshot.promoKeyHash
+        || file.topologyKey != snapshot.topologyKey
+        || file.indicesHash != snapshot.indicesHash) {
+      // absent or stale (topology changed): start the sidecar fresh
+      file = PromoRefsFile();
+      file.candidateHash = snapshot.promoKeyHash;
+      file.topologyKey = snapshot.topologyKey;
+      file.indicesHash = snapshot.indicesHash;
+    }
+    PromoRefEntry* slot = nullptr;
+    for (PromoRefEntry& e : file.entries) {
+      if (e.classQ == snapshot.promoClassQ && e.subId == snapshot.promoClassSubId) {
+        slot = &e;
+        break;
+      }
+    }
+    if (slot == nullptr) {
+      if (file.entries.size() >= kPromoRefsMaxEntries) {
+        return;
+      }
+      file.entries.emplace_back();
+      slot = &file.entries.back();
+    }
+    slot->classQ = snapshot.promoClassQ;
+    slot->subId = snapshot.promoClassSubId;
+    slot->restHash = snapshot.geometryHash;
+    slot->name = snapshot.name;
+    slot->positions = snapshot.positions;
+    if (writePromoRefs(path, file)) {
+      Logger::info(str::format("[PromoRefs] saved rest reference: candidate 0x", std::hex,
+                               snapshot.promoKeyHash, std::dec, " classQ ", snapshot.promoClassQ,
+                               " sub ", snapshot.promoClassSubId, " (", file.entries.size(),
+                               " entries, ", snapshot.positions.size() / 3, " verts)"));
+    }
+  }
+
+  void ClusterLodGeometryProvider::restorePromoRefs(const lodclusters_remix::GeometrySnapshot& snapshot,
+                                                    const lodclusters_remix::ProcessorConfig& config) {
+    PromoRefsFile file;
+    {
+      std::lock_guard<std::mutex> lock(m_promoRefsMutex);
+      if (!m_promoRefsRestored.insert(snapshot.geometryHash).second) {
+        return;  // once per candidate per session
+      }
+      if (!readPromoRefs(lodclusters_remix::getPromoRefsFileUtf8(snapshot.geometryHash, config), file)) {
+        return;  // no sidecar - nothing resolved for this candidate yet
+      }
+    }
+    if (file.candidateHash != snapshot.geometryHash
+        || file.topologyKey != snapshot.topologyKey
+        || file.indicesHash != snapshot.indicesHash) {
+      Logger::info(str::format("[PromoRefs] sidecar stale for candidate 0x", std::hex,
+                               snapshot.geometryHash, std::dec, " (topology changed) - ignored"));
+      return;
+    }
+    // candidate-level entry FIRST: its adoption resets the candidate's class
+    // state, so it must not land after the sibling adoptions it would wipe
+    std::stable_sort(file.entries.begin(), file.entries.end(),
+                     [](const PromoRefEntry& a, const PromoRefEntry& b) {
+                       return (a.classQ == INT32_MIN) > (b.classQ == INT32_MIN);
+                     });
+    uint32_t restored = 0;
+    for (PromoRefEntry& e : file.entries) {
+      lodclusters_remix::GeometrySnapshot rest;
+      rest.geometryHash = e.restHash;
+      rest.promoKeyHash = snapshot.geometryHash;
+      rest.promoClassQ = e.classQ;
+      rest.promoClassSubId = e.subId;
+      rest.isRestCapture = true;
+      rest.promoRestored = true;
+      rest.name = e.name;
+      rest.indices = snapshot.indices;  // same topology - indicesHash verified above
+      rest.indicesHash = snapshot.indicesHash;
+      rest.topologyKey = snapshot.topologyKey;
+      rest.vertexCount = uint32_t(e.positions.size() / 3);
+      rest.positions = std::move(e.positions);
+      rest.verticesHash = XXH3_64bits(rest.positions.data(), rest.positions.size() * sizeof(float));
+      enqueueRestSnapshot(std::move(rest));
+      restored++;
+    }
+    if (restored > 0) {
+      Logger::info(str::format("[PromoRefs] restored ", restored, " rest reference(s) for candidate 0x",
+                               std::hex, snapshot.geometryHash, std::dec,
+                               " - re-enqueued through the rest pipeline"));
+    }
   }
 
   void ClusterLodGeometryProvider::enqueueRestSnapshot(lodclusters_remix::GeometrySnapshot&& snapshot) {
@@ -904,6 +1098,18 @@ namespace dxvk {
       if ((snapshot.isCaptured || snapshot.isRestCapture) && m_capturedProcessedHandler) {
         std::lock_guard<std::mutex> templateLock(m_templateSerialMutex);
         m_capturedProcessedHandler(snapshot);
+      }
+
+      // [PromoRefs] cross-session persistence: a completed rest capture saves
+      // its reference; a candidate's plain captured processing (which just
+      // queued the candidate's probe pending above, so adoption ordering is
+      // guaranteed) restores any references resolved in earlier sessions.
+      if (snapshot.isRestCapture) {
+        if (!snapshot.promoRestored) {  // restored entries came FROM the sidecar - nothing new to save
+          savePromoRef(snapshot, config);
+        }
+      } else if (snapshot.isCaptured) {
+        restorePromoRefs(snapshot, config);
       }
 
       if (m_verifyProvider && m_verifyProvider()) {

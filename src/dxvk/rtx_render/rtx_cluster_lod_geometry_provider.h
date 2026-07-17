@@ -173,6 +173,21 @@ namespace dxvk {
 
     void workerLoop();
 
+    // [PromoRefs] cross-session persistence of promotion rest references.
+    // A completed rest capture SAVES its entry (positions + class identity)
+    // into the candidate's .promorefs sidecar; a candidate's plain captured
+    // processing RESTORES the sidecar by re-enqueueing the saved snapshots
+    // through the normal rest pipeline (clusterize hits the .nvsngeo cache,
+    // probes upload, adoption creates the classes with Ref::Own) - so verdicts
+    // resolved in ANY earlier session promote within frames instead of
+    // re-running minutes of ladder discovery every launch. Worker thread.
+    void savePromoRef(const lodclusters_remix::GeometrySnapshot& snapshot,
+                      const lodclusters_remix::ProcessorConfig& config);
+    void restorePromoRefs(const lodclusters_remix::GeometrySnapshot& snapshot,
+                          const lodclusters_remix::ProcessorConfig& config);
+    std::mutex m_promoRefsMutex;                       // sidecar file I/O + restored-set
+    std::unordered_set<uint64_t> m_promoRefsRestored;  // once per candidate per session
+
     ConfigProvider m_configProvider;
     VerifyProvider m_verifyProvider;
     AnimatedHandler m_animatedHandler;

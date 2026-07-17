@@ -26,7 +26,9 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <mutex>
+#include <unordered_set>
 
 #include "rtx_cluster_lod_manager.h"
 #include "rtx_cluster_lod_geometry_provider.h"
@@ -799,8 +801,19 @@ namespace dxvk {
       if (!dumpHashStr.empty()) {
         uint64_t dumpHash = 0;
         try { dumpHash = std::stoull(dumpHashStr, nullptr, 16); } catch (...) { dumpHash = 0; }
-        if (dumpHash != 0 && dumpHash == snapshot.geometryHash) {
+        // Match the BASE candidate too: an OWN REST CAPTURE snapshot carries a
+        // SALTED geometryHash (restHash ^ classQ*mix, see restSnap.geometryHash),
+        // so keying on geometryHash alone dumps ref[] only for the SHARED/base probe
+        // build, never the own-reference (self-misfit) build we actually need. A rest
+        // capture's promoKeyHash is the original base candidate hash - match that so a
+        // single base-hash dumpGeometryHash emits ref[] for BOTH probes, tagged apart.
+        const bool refDumpMatch = dumpHash != 0
+            && (dumpHash == snapshot.geometryHash
+                || (snapshot.isRestCapture && dumpHash == snapshot.promoKeyHash));
+        if (refDumpMatch) {
           Logger::info(str::format("[PromoDump] ref geometry 0x", std::hex, snapshot.geometryHash, std::dec,
+                                   snapshot.isRestCapture ? " (OWN rest q" : " (SHARED",
+                                   snapshot.isRestCapture ? str::format(snapshot.promoClassQ, ")") : std::string(")"),
                                    " solveSamples ", pickedSolve,
                                    " centroid (", float(cx), ", ", float(cy), ", ", float(cz),
                                    ") radius ", radius));
@@ -842,6 +855,9 @@ namespace dxvk {
       pending.vertexCount = refCount;
       pending.routeHash = snapshot.isRestCapture ? snapshot.geometryHash : 0;
       pending.topologyKey = snapshot.topologyKey;  // stable identity for the churning-hash draw side
+      pending.classQ = snapshot.promoClassQ;       // [ShapeClass] class-scoped rest probes land on their class
+      pending.classSubId = snapshot.promoClassSubId;  // ... and on the right identity-by-fit sibling
+      pending.restored = snapshot.promoRestored;   // [PromoRefs] sidecar adoptions skip the class-wipe
       m_promoPendingProbes.push_back(pending);
     }
 
@@ -860,6 +876,55 @@ namespace dxvk {
     1536,-1536, 2048,-2048, 3072,-3072, 4096,-4096, 8192,-8192,16384,-16384,32768,-32768,65536
   };
 
+  ClusterLodManager::RestClassState* ClusterLodManager::resolveRestClass(uint64_t candidateHash,
+                                                                         float log2CapVar,
+                                                                         int32_t subId,
+                                                                         bool createIfMissing) {
+    // subId selects the identity-by-fit SIBLING within the nearest bucket (an
+    // instance's cursor): siblings share log2CapVar-space, so nearest-merge alone
+    // would be ambiguous among them - the cursor disambiguates.
+    if (!createIfMissing) {
+      // find-only: never insert (routing/emit call this every frame)
+      const auto it = m_restClassesByCandidate.find(candidateHash);
+      if (it == m_restClassesByCandidate.end()) {
+        return nullptr;
+      }
+      RestClassState* best = nullptr;
+      float bestDist = 1.5f / 16.0f;
+      for (RestClassState& c : it->second) {
+        const float d = std::abs(c.log2CapVar - log2CapVar);
+        if (d <= bestDist && c.subId == subId) {
+          bestDist = d;
+          best = &c;
+        }
+      }
+      return best;
+    }
+    std::vector<RestClassState>& classes = m_restClassesByCandidate[candidateHash];
+    RestClassState* best = nullptr;
+    float bestDist = 1.5f / 16.0f;  // nearest-merge: boundary-straddling identical content -> one class
+    for (RestClassState& c : classes) {
+      const float d = std::abs(c.log2CapVar - log2CapVar);
+      if (d <= bestDist && c.subId == subId) {
+        bestDist = d;
+        best = &c;
+      }
+    }
+    if (best != nullptr || !createIfMissing) {
+      return best;
+    }
+    classes.emplace_back();
+    RestClassState& fresh = classes.back();
+    fresh.classQ = int32_t(std::lround(log2CapVar * 16.0f));
+    fresh.log2CapVar = log2CapVar;
+    fresh.subId = subId;
+    Logger::info(str::format("[ShapeClass] geom 0x", std::hex, candidateHash, std::dec,
+                             " new content class q", fresh.classQ,
+                             subId != 0 ? str::format(" sibling ", subId, " (identity-by-fit split)") : std::string(),
+                             " (", classes.size(), " classes total)"));
+    return &fresh;
+  }
+
   void ClusterLodManager::updatePromotionStates() {
     if (m_renderSystem == nullptr || !ClusterLodOptions::Promotion::enable()) {
       return;
@@ -874,7 +939,47 @@ namespace dxvk {
         // route residency to the space-tagged rest hash. The state slot persists.
         const auto existing = m_promoCandidates.find(pending.geometryHash);
         if (existing != m_promoCandidates.end()) {
-          if (pending.routeHash != 0) {
+          if (pending.routeHash != 0 && pending.classQ != INT32_MIN) {
+            // [ShapeClass] CLASS-scoped rest probe: this reference was captured
+            // FROM a specific content class (the shared one failed it). Adopt it
+            // onto that class; the candidate's shared reference stays untouched
+            // for the classes it does fit.
+            std::vector<RestClassState>& classes = m_restClassesByCandidate[pending.geometryHash];
+            RestClassState* cls = nullptr;
+            for (RestClassState& c : classes) {
+              if (c.classQ == pending.classQ && c.subId == pending.classSubId) {
+                cls = &c;
+                break;
+              }
+            }
+            if (cls == nullptr) {
+              // class vanished meanwhile (content left the scene) - keep the
+              // reference under a fresh entry so returning content finds it
+              classes.emplace_back();
+              cls = &classes.back();
+              cls->classQ = pending.classQ;
+              cls->log2CapVar = float(pending.classQ) / 16.0f;
+              cls->subId = pending.classSubId;
+            }
+            if (m_templateSystemMT != nullptr && cls->probeVa != 0) {
+              m_templateSystemMT->freePromotionProbe(cls->probeVa);
+            }
+            cls->probeVa = pending.probeVa;
+            cls->routeHash = pending.routeHash;
+            cls->vertexCount = pending.vertexCount;
+            cls->ref = RestClassState::Ref::Own;
+            cls->phase = RestClassState::Phase::Probing;
+            cls->gateFrames = 0;
+            cls->stuckFrames = 0;
+            cls->gateStateSlot = ~0u;
+            cls->rejectedFrame = 0;
+            cls->captureStaged = false;
+            Logger::info(str::format("[ClusterLOD] promotion: geometry 0x", std::hex, pending.geometryHash,
+                                     std::dec, " class q", pending.classQ, " sub ", pending.classSubId,
+                                     " re-referenced to OWN REST CAPTURE 0x", std::hex, pending.routeHash, std::dec));
+          }
+          else if (pending.routeHash != 0) {
+            // candidate-level (first/shared) rest reference
             if (m_templateSystemMT != nullptr && existing->second.probeVa != 0) {
               m_templateSystemMT->freePromotionProbe(existing->second.probeVa);
             }
@@ -886,18 +991,34 @@ namespace dxvk {
             existing->second.stuckFrames = 0;
             existing->second.loggedTemporalHold = false;
             existing->second.restState = PromotionCandidate::RestState::Referenced;
-            // per-instance rest verdicts start fresh: instance state from the
-            // object-space probe era (pins, demotions, GPU streaks) is void -
-            // residency moved to the rest hash and the reference content changed
+            // class verdicts start fresh against the new shared reference; any
+            // class-scoped own probes from the old era are freed with it.
+            // [PromoRefs] EXCEPT for sidecar restores: the restored candidate-
+            // level + sibling references are one internally-consistent set, and
+            // the worker pool may adopt them out of order - wiping here would
+            // destroy siblings that adopted first (and free their probes).
+            if (!pending.restored) {
+              auto classesIt = m_restClassesByCandidate.find(pending.geometryHash);
+              if (classesIt != m_restClassesByCandidate.end()) {
+                for (RestClassState& c : classesIt->second) {
+                  if (m_templateSystemMT != nullptr && c.probeVa != 0) {
+                    m_templateSystemMT->freePromotionProbe(c.probeVa);
+                  }
+                }
+                m_restClassesByCandidate.erase(classesIt);
+              }
+            }
+            // instance state from the object-space probe era is void - residency
+            // moved to the rest hash and the reference content changed
             for (auto& slotEntry : m_promoSlotByBlas) {
               if (slotEntry.second.geometryHash == pending.geometryHash) {
-                slotEntry.second.restPhase = PromoInstance::RestPhase::Probing;
-                slotEntry.second.restGateFrames = 0;
-                slotEntry.second.restStuckFrames = 0;
-                slotEntry.second.restLastSolveFrame = 0;
                 slotEntry.second.demoted = false;
                 slotEntry.second.sweepPending = false;
                 slotEntry.second.residentGeometryId = ~0u;
+                slotEntry.second.contentClassQ = INT32_MIN;  // reclassify vs the new reference
+                slotEntry.second.classLog2CapVar = 0.0f;
+                slotEntry.second.classSubId = 0;
+                slotEntry.second.lastClassifiedFrame = 0;
               }
             }
             Logger::info(str::format("[ClusterLOD] promotion: geometry 0x", std::hex, pending.geometryHash,
@@ -1068,6 +1189,15 @@ namespace dxvk {
           const uint32_t scanScoreQ = (state.diagGuard >> 27) & 0x1Fu;
           const uint32_t reflected = (state.diagGuard >> 26) & 0x1u;
           const int scanOff = kPromoScanOffsets[scanIdx];
+          // scanVerdict [24:26]: 0 = offset 0 best / no signal, 1 = a nonzero
+          // offset IMPROVED the fit (partial), 2 = a nonzero offset COLLAPSED the
+          // mismatch to near-zero (a clean rigid pairing exists there). Verdict 2
+          // == this mesh IS rigid and would promote if the solve read capture at
+          // scanOff instead of 0 - the decisive "fixable index skew" signal.
+          const uint32_t scanVerdict = (state.diagGuard >> 24) & 0x3u;
+          const char* scanVerdictStr = scanVerdict == 2u ? "COLLAPSE(fixable-skew)"
+                                      : scanVerdict == 1u ? "improved(partial)"
+                                      : "none";
           const std::string scanScore = scanScoreQ >= 31u ? std::string("n/a")
                                                           : str::format(float(scanScoreQ) / 20.0f);
           // aff: which solve ran - "used" = affine accepted; otherwise the first
@@ -1085,8 +1215,36 @@ namespace dxvk {
                                    ", meanDev ", state.meanDevRel,
                                    ", dirCoh ", state.dirCoherence,
                                    ", tDeform ", state.temporalDeformRel,
-                                   ", scanOff ", scanOff, ", scanScore ", scanScore, ", refl ", reflected,
+                                   ", scanOff ", scanOff, ", scanScore ", scanScore,
+                                   ", scanVerdict ", scanVerdictStr, ", refl ", reflected,
                                    ", verts ", candidate.vertexCount, ")"));
+        }
+
+        // [ScanProbe] PERIODIC (not one-shot) correspondence-scan readout for a
+        // single targeted candidate (rtx.clusterLod.promotion.dumpGeometryHash =
+        // the stuck geometry's candidate key). Lets us watch whether scanOff is
+        // stable at one nonzero value (a fixed shared-buffer baseVertex skew ->
+        // applying the offset fixes it) or varies frame to frame (a moving
+        // correspondence -> the probe basis itself is wrong). Throttled 120 frames.
+        if (!ClusterLodOptions::Promotion::dumpGeometryHash().empty()) {
+          uint64_t dumpKey = 0;
+          const std::string& dh = ClusterLodOptions::Promotion::dumpGeometryHash();
+          try { dumpKey = std::stoull(dh, nullptr, 16); } catch (...) { dumpKey = 0; }
+          if (dumpKey != 0 && entry.first == dumpKey
+              && (m_scanProbeLastFrame == 0u || m_device->getCurrentFrameId() - m_scanProbeLastFrame >= 120u)) {
+            m_scanProbeLastFrame = m_device->getCurrentFrameId();
+            const uint32_t sIdx = (state.diagGuard >> 2) & 0x3Fu;
+            const uint32_t sVerdict = (state.diagGuard >> 24) & 0x3u;
+            const uint32_t sScoreQ = (state.diagGuard >> 27) & 0x1Fu;
+            Logger::info(str::format("[ScanProbe] geom 0x", std::hex, entry.first, std::dec,
+                                     " phase ", uint32_t(candidate.phase),
+                                     " residual ", state.residualRel, " (eps ", epsilon, ")",
+                                     " | scanOff ", kPromoScanOffsets[sIdx],
+                                     " verdict ", sVerdict, " (0=none 1=improved 2=COLLAPSE)",
+                                     " off0mismatchQ ", sScoreQ,
+                                     " rigidStreak ", state.rigidStreak,
+                                     " frame ", m_device->getCurrentFrameId()));
+          }
         }
         break;
 
@@ -1188,77 +1346,379 @@ namespace dxvk {
       PromoInstance& promoInstance = slotEntry.second;
       const lodclusters_remix::PromotionStateView& state = m_promoStates[promoInstance.stateSlot];
 
-      // ---- per-instance REST verdicts (pre-promotion phases) ----
-      // Mirrors the candidate state machine, per instance: streak -> gate ->
-      // Promoted/Rejected. Pre-promotion phases skip the demote logic below
-      // (their solves legitimately read non-rigid while they probe). Rejection
-      // is terminal: a static instance that never fits the shared rest
-      // reference has a divergent VS-built shape - buildPromotionEntries stops
-      // emitting its solves, so it costs nothing steady-state.
-      if (promoInstance.restPhase != PromoInstance::RestPhase::None
-          && promoInstance.restPhase != PromoInstance::RestPhase::Promoted) {
-        switch (promoInstance.restPhase) {
-        case PromoInstance::RestPhase::Probing:
-          if (state.rigidStreak >= rigidFrames) {
-            promoInstance.restPhase = PromoInstance::RestPhase::GateScheduled;
-          } else if (state.lastFrame != 0u && state.lastFrame != promoInstance.restLastSolveFrame) {
-            // a fresh solve landed (stale passes change nothing - an absent
-            // instance must not be judged on its last state)
-            promoInstance.restLastSolveFrame = state.lastFrame;
-            if (state.residualRel > epsilon
-                && state.temporalDeformRel <= ClusterLodOptions::Promotion::temporalEpsilon()) {
-              // static but not matching the shared rest reference; same patience
-              // the rest trigger itself used before terminating
-              if (++promoInstance.restStuckFrames
-                  >= uint32_t(std::max(10, ClusterLodOptions::Promotion::restCaptureStuckFrames()))) {
-                promoInstance.restPhase = PromoInstance::RestPhase::Rejected;
-                Logger::info(str::format("[ClusterLOD] promotion: instance (slot ", promoInstance.stateSlot,
-                                         ", geom 0x", std::hex, promoInstance.geometryHash, std::dec,
-                                         ") REST verdict: static but does not match the shared rest reference (residual ",
-                                         state.residualRel, ") - stays Path B (terminal)"));
+      // ---- [ShapeClass] classify the content currently behind this slot ----
+      // capVar (state.affineNonRigid, repurposed) is a rigid-invariant, scale-
+      // variant signature of the capture content the slot's last solve read.
+      // Quantize in log2 with full-bucket hysteresis; a class CHANGE on a live
+      // slot is a binding swap (the draw matching re-bound this BlasEntry to a
+      // different placement's content) - the event every downstream verdict
+      // has to be robust against. Classification itself has no side effects
+      // yet: the [ShapeClass] logs validate bucket stability on real runs
+      // before the verdict layer keys on contentClassQ.
+      bool classSwapped = false;
+      const bool freshSolve = state.lastFrame != 0u && state.lastFrame != promoInstance.lastClassifiedFrame;
+      if (freshSolve) {
+        promoInstance.lastClassifiedFrame = state.lastFrame;
+        const float capSig = state.capSig;  // probe-INDEPENDENT (stable across probe swaps)
+        if (capSig > 0.0f && std::isfinite(capSig)) {
+          const float logNow = std::log2(capSig);
+          const bool unclassified = promoInstance.contentClassQ == INT32_MIN;
+          if (unclassified) {
+            promoInstance.contentClassQ = int32_t(std::lround(logNow * 16.0f));
+            promoInstance.classLog2CapVar = logNow;
+          } else if (std::abs(logNow - promoInstance.classLog2CapVar) > (1.0f / 16.0f)) {
+            // candidate swap: confirm on 2 CONSECUTIVE solves before committing
+            // (one divergent read is a transient - unpinning on it caused Path B
+            // blips on perfectly static meshes)
+            const int32_t newQ = int32_t(std::lround(logNow * 16.0f));
+            if (promoInstance.pendingClassQ == newQ) {
+              if (++promoInstance.pendingClassCount >= 2u) {
+                classSwapped = true;
+                m_swapCommitted++;
+                // the cached Path A residency belongs to the OLD content's class -
+                // force this instance back through the establish path (which reads
+                // the new class's verdict) instead of routing stale clusters
+                promoInstance.residentGeometryId = ~0u;
+                // a DEMOTE verdict judged the OLD content; carrying it across a
+                // confirmed content change blocks the establish path even when the
+                // NEW content's class is already Promoted - a static building then
+                // blips to Path B on every rebind despite a valid verdict for what
+                // it now holds (observed: 139 static demotes in one session).
+                // Clear it: if the new content misfits, the 2-frame sustained-non-
+                // rigid persistence re-demotes immediately; if it fits (class
+                // promoted), the reroute is seamless.
+                promoInstance.demoted = false;
+                promoInstance.sweepPending = false;
+                Logger::info(str::format("[ShapeClass] slot ", promoInstance.stateSlot,
+                                         " geom 0x", std::hex, promoInstance.geometryHash, std::dec,
+                                         " content class SWAP ", promoInstance.contentClassQ, " -> ", newQ,
+                                         " (capSig ", capSig,
+                                         ", frame ", m_device->getCurrentFrameId(), ")"));
+                promoInstance.contentClassQ = newQ;
+                promoInstance.classLog2CapVar = promoInstance.pendingLog2CapVar;
+                promoInstance.classSubId = 0;  // new bucket - re-enter the sibling chain at 0
+                promoInstance.pendingClassQ = INT32_MIN;
+                promoInstance.pendingClassCount = 0;
               }
             } else {
-              promoInstance.restStuckFrames = 0;
-            }
-          }
-          break;
-
-        case PromoInstance::RestPhase::GateRunning:
-          if (++promoInstance.restGateFrames >= gateLag) {
-            if (state.gateResidualRel > 0.0f && state.gateResidualRel <= epsilon) {
-              promoInstance.restPhase = PromoInstance::RestPhase::Promoted;
-              Logger::info(str::format("[ClusterLOD] promotion: instance (slot ", promoInstance.stateSlot,
-                                       ", geom 0x", std::hex, promoInstance.geometryHash, std::dec,
-                                       ") REST instance PROMOTED to Path A (full-mesh residual ",
-                                       state.gateResidualRel, ")"));
-              // first instance to pass promotes the candidate (routing gate)
-              const auto candIt = m_promoCandidates.find(promoInstance.geometryHash);
-              if (candIt != m_promoCandidates.end()
-                  && candIt->second.phase != PromotionCandidate::Phase::Promoted) {
-                candIt->second.phase = PromotionCandidate::Phase::Promoted;
-                m_statsPromoted++;
-                Logger::info(str::format("[ClusterLOD] promotion: geometry 0x", std::hex,
-                                         promoInstance.geometryHash, std::dec,
-                                         " PROMOTED to Path A via per-instance REST verdict"));
+              if (promoInstance.pendingClassQ != INT32_MIN) {
+                // [SwapDebounce] pending swap REPLACED by a different bucket before
+                // confirming - a 1-solve excursion (transient read), not a swap
+                m_swapPendingAbandoned++;
+                Logger::info(str::format("[SwapDebounce] TRANSIENT: slot ", promoInstance.stateSlot,
+                                         " geom 0x", std::hex, promoInstance.geometryHash, std::dec,
+                                         " committed q", promoInstance.contentClassQ,
+                                         " saw q", promoInstance.pendingClassQ, " for 1 solve, now q", newQ,
+                                         " (frame ", m_device->getCurrentFrameId(), ")"));
               }
-            } else if (state.gateResidualRel > epsilon) {
-              promoInstance.restPhase = PromoInstance::RestPhase::Rejected;
-              Logger::info(str::format("[ClusterLOD] promotion: instance (slot ", promoInstance.stateSlot,
-                                       ", geom 0x", std::hex, promoInstance.geometryHash, std::dec,
-                                       ") REST gate REJECTED (full-mesh residual ", state.gateResidualRel,
-                                       ") - stays Path B (terminal)"));
-            } else {
-              // gate never accumulated (instance off-screen that frame) - retry
-              promoInstance.restPhase = PromoInstance::RestPhase::GateScheduled;
-              promoInstance.restGateFrames = 0;
+              promoInstance.pendingClassQ = newQ;
+              promoInstance.pendingLog2CapVar = logNow;
+              promoInstance.pendingClassCount = 1;
             }
+          } else {
+            if (promoInstance.pendingClassQ != INT32_MIN) {
+              // [SwapDebounce] pending swap DROPPED by returning to the committed
+              // bucket - a proven single-solve transient. If this NEVER fires
+              // across runs, transients don't exist and the debounce is dead code
+              // (delete it); if it fires, the transient read path is real and the
+              // proper fix is chasing WHERE a one-frame divergent read comes from
+              // (buffer lifetime / rename race), not this filter.
+              m_swapPendingAbandoned++;
+              Logger::info(str::format("[SwapDebounce] TRANSIENT: slot ", promoInstance.stateSlot,
+                                       " geom 0x", std::hex, promoInstance.geometryHash, std::dec,
+                                       " committed q", promoInstance.contentClassQ,
+                                       " saw q", promoInstance.pendingClassQ, " for ",
+                                       promoInstance.pendingClassCount, " solve(s), returned to committed",
+                                       " (capSig ", capSig,
+                                       ", frame ", m_device->getCurrentFrameId(), ")"));
+            }
+            promoInstance.pendingClassQ = INT32_MIN;
+            promoInstance.pendingClassCount = 0;
           }
-          break;
-
-        default:
-          break;  // GateScheduled waits on buildPromotionEntries; Rejected is terminal
         }
-        continue;
+      }
+      (void) classSwapped;
+
+      // ---- [ShapeClass] class-keyed verdicts ----
+      // This slot contributes EVIDENCE (rigid streak, residual, gate result) to
+      // whichever content class its CURRENT capture classifies into; the phase
+      // machine and verdicts live on the CLASS. The BlasEntry<->content binding
+      // is unstable on churning-hash games, so any slot may speak for any class
+      // over time - and a verdict keyed by content survives every rebind.
+      // Two populations feed it:
+      //  - rest-world slots (rest-referenced candidates): all phases.
+      //  - DEMOTED slots of PROMOTED non-rest candidates: divergent content that
+      //    misfits the candidate's own reference (64/66 static-demote geoms in
+      //    the 23:00 run were this class). Their demoted-branch solves drive the
+      //    same machine, earning the divergent class its OWN rest reference and
+      //    a promotion path - previously they could only demote-cycle forever.
+      {
+        const auto candIt = m_promoCandidates.find(promoInstance.geometryHash);
+        const bool restWorld = promoInstance.isRestWorld
+                            && candIt != m_promoCandidates.end()
+                            && candIt->second.routeHash != 0
+                            && candIt->second.restState == PromotionCandidate::RestState::Referenced;
+        // divergent evidence exists whenever a promoted candidate's slot MISFITS -
+        // not only while flagged demoted. The slots ALTERNATE contents (fit <->
+        // misfit dwells of a few frames); gating on `demoted` lost most of each
+        // misfit dwell (swap-clear un-demotes, the 2-frame demote persistence eats
+        // the start) and the divergent class never accrued its stuck threshold
+        // (observed: 198 truly-static demotes but only 2 class requests).
+        const bool divergentOfPromoted = !promoInstance.isRestWorld
+                            && candIt != m_promoCandidates.end()
+                            && candIt->second.phase == PromotionCandidate::Phase::Promoted
+                            && (promoInstance.demoted
+                                || (freshSolve && state.residualRel > epsilon));
+        // class CREATION is gated on temporal calm: continuously-deforming content
+        // sweeps through buckets and would mint a class per bucket visited (observed:
+        // 15 classes on one pulsing animator) - junk no verdict can ever serve.
+        // Existing classes still MATCH regardless (evidence/verdicts continue).
+        const bool tempCalm = state.temporalDeformRel <= ClusterLodOptions::Promotion::temporalEpsilon();
+        RestClassState* cls = nullptr;
+        if ((restWorld || divergentOfPromoted) && promoInstance.contentClassQ != INT32_MIN) {
+          cls = resolveRestClass(promoInstance.geometryHash, promoInstance.classLog2CapVar,
+                                 promoInstance.classSubId, false);
+          if (cls == nullptr && promoInstance.classSubId != 0) {
+            // stale cursor (sibling chain gone for this bucket) - rehome at 0
+            promoInstance.classSubId = 0;
+            cls = resolveRestClass(promoInstance.geometryHash, promoInstance.classLog2CapVar, 0, false);
+          }
+          if (cls == nullptr && tempCalm) {
+            cls = resolveRestClass(promoInstance.geometryHash, promoInstance.classLog2CapVar, 0, true);
+          }
+        }
+
+        if (cls != nullptr) {
+          switch (cls->phase) {
+          case RestClassState::Phase::Probing:
+            if (freshSolve && !classSwapped) {  // swap frames carry cross-content temporal state - not evidence
+              if (state.rigidStreak >= rigidFrames) {
+                cls->phase = RestClassState::Phase::GateScheduled;
+                cls->gateStateSlot = promoInstance.stateSlot;
+                cls->lastGateTickFrame = m_device->getCurrentFrameId();
+              } else if (state.residualRel > epsilon
+                         && state.temporalDeformRel <= ClusterLodOptions::Promotion::temporalEpsilon()) {
+                // static but not fitting this class's current reference. CLASS
+                // threshold (restClassStuckFrames, not the candidate's 120):
+                // classes accrue only during their content's dwell windows, so
+                // the candidate-scale threshold starved them (1 request per
+                // session while 198 static demotes cycled).
+                if (++cls->stuckFrames
+                    >= uint32_t(std::max(4, ClusterLodOptions::Promotion::restClassStuckFrames()))) {
+                  cls->stuckFrames = 0;
+                  if (cls->ref == RestClassState::Ref::CandidateProbe) {
+                    // the SHARED reference cannot fit this content class - give the
+                    // class its OWN reference (readback staged at the next emit from
+                    // any class member)
+                    cls->ref = RestClassState::Ref::Requested;
+                    cls->captureStaged = false;
+                    Logger::info(str::format("[ClusterLOD] promotion: geometry 0x", std::hex,
+                                             promoInstance.geometryHash, std::dec,
+                                             " class q", cls->classQ, " static but misfits the shared reference (residual ",
+                                             state.residualRel, ") - requesting CLASS rest capture"));
+                  } else if (cls->ref == RestClassState::Ref::Own) {
+                    // Misfits the sibling reference it is currently judged against.
+                    // This is NOT "content deforms in place": the [RestCapProbe]
+                    // chain proved captures faithful and content static - it means
+                    // THIS content is a DIFFERENT SHAPE than the member whose pose
+                    // the reference captured (the spread signature cannot separate
+                    // non-affine-equivalent contents; verified per-content-constant
+                    // residuals across sessions, refl 0, affine used). Identity is
+                    // decided by FIT: advance this instance's cursor to the bucket's
+                    // next sibling - an existing one first (its reference may be this
+                    // content's), else mint a new sibling that runs the full ladder
+                    // (shared probe -> own capture). The current entry stays: its
+                    // reference fits the member it was captured from.
+                    const int32_t nextSub = cls->subId + 1;
+                    const int32_t curQ = cls->classQ;
+                    const int32_t curSub = cls->subId;
+                    RestClassState* nextCls = resolveRestClass(promoInstance.geometryHash,
+                                                               promoInstance.classLog2CapVar, nextSub, false);
+                    if (nextCls != nullptr) {
+                      promoInstance.classSubId = nextSub;
+                      Logger::info(str::format("[ClusterLOD] promotion: geometry 0x", std::hex,
+                                               promoInstance.geometryHash, std::dec,
+                                               " class q", curQ, " sub ", curSub,
+                                               " misfit by fit (residual ", state.residualRel,
+                                               ", meanDev ", state.meanDevRel,
+                                               ") - instance advances to EXISTING sibling ", nextSub));
+                      cls = nextCls;  // post-switch checks read the instance's CURRENT class
+                    } else if (nextSub < std::max(1, ClusterLodOptions::Promotion::restClassMaxRefs())) {
+                      promoInstance.classSubId = nextSub;
+                      Logger::info(str::format("[ClusterLOD] promotion: geometry 0x", std::hex,
+                                               promoInstance.geometryHash, std::dec,
+                                               " class q", curQ, " sub ", curSub,
+                                               " misfit by fit (residual ", state.residualRel,
+                                               ", meanDev ", state.meanDevRel,
+                                               ") - identity-by-fit SPLIT: minting sibling ", nextSub));
+                      // creates via emplace_back - every pointer into the vector is
+                      // INVALID after this call; re-resolve for the post-switch reads
+                      resolveRestClass(promoInstance.geometryHash, promoInstance.classLog2CapVar, nextSub, true);
+                      cls = resolveRestClass(promoInstance.geometryHash, promoInstance.classLog2CapVar, nextSub, false);
+                      if (cls != nullptr) {
+                        // skip the CandidateProbe re-proof: the advancing content
+                        // already misfit the shared reference (its demote stream)
+                        // and every earlier sibling - re-proving costs a full
+                        // stuck ladder for zero information. Worst case is one
+                        // redundant readback, never a wrong verdict (a capture
+                        // still only promotes through its own full-mesh gate).
+                        cls->ref = RestClassState::Ref::Requested;
+                        cls->captureStaged = false;
+                      }
+                    } else {
+                      // sibling cap: park THIS entry on the retry cooldown (as the old
+                      // terminal reject did) and rewind the instance to sibling 0
+                      cls->phase = RestClassState::Phase::Rejected;
+                      cls->rejectedFrame = m_device->getCurrentFrameId();
+                      promoInstance.classSubId = 0;
+                      Logger::info(str::format("[ClusterLOD] promotion: geometry 0x", std::hex,
+                                               promoInstance.geometryHash, std::dec,
+                                               " class q", curQ, " sub ", curSub,
+                                               " misfits ALL ", ClusterLodOptions::Promotion::restClassMaxRefs(),
+                                               " sibling refs (residual ", state.residualRel,
+                                               ") - REJECTED, retries after ",
+                                               ClusterLodOptions::Promotion::restRejectRetryFrames(), " frames"));
+                    }
+                  }
+                  // Ref::Requested: reference in flight - keep waiting
+                }
+              } else {
+                cls->stuckFrames = 0;
+              }
+            }
+            break;
+
+          case RestClassState::Phase::GateRunning:
+            // only the slot whose capture the gate actually read judges it
+            if (promoInstance.stateSlot == cls->gateStateSlot) {
+              cls->lastGateTickFrame = m_device->getCurrentFrameId();
+              if (++cls->gateFrames >= gateLag) {
+                if (state.gateResidualRel > 0.0f && state.gateResidualRel <= epsilon) {
+                  cls->phase = RestClassState::Phase::Promoted;
+                  m_statsPromoted++;
+                  Logger::info(str::format("[ClusterLOD] promotion: geometry 0x", std::hex,
+                                           promoInstance.geometryHash, std::dec,
+                                           " class q", cls->classQ, " PROMOTED to Path A (full-mesh residual ",
+                                           state.gateResidualRel, ", ref ",
+                                           cls->ref == RestClassState::Ref::Own ? "own" : "shared", ")"));
+                  // first class to pass promotes the candidate (routing gate)
+                  if (candIt->second.phase != PromotionCandidate::Phase::Promoted) {
+                    candIt->second.phase = PromotionCandidate::Phase::Promoted;
+                  }
+                } else if (state.gateResidualRel > epsilon && state.residualRel > epsilon) {
+                  // CONTRADICTED: the gate slot's own sparse solve fails too - the
+                  // content behind the slot changed mid-gate. Not a class verdict.
+                  cls->phase = RestClassState::Phase::Probing;
+                  cls->gateFrames = 0;
+                  cls->gateStateSlot = ~0u;
+                } else if (state.gateResidualRel > epsilon) {
+                  // clean gate failure on consistent content
+                  if (cls->ref == RestClassState::Ref::CandidateProbe) {
+                    // shared reference misfits this class's FULL mesh (sparse fit,
+                    // full fail = partial divergence) - class needs its own reference
+                    cls->ref = RestClassState::Ref::Requested;
+                    cls->captureStaged = false;
+                    cls->phase = RestClassState::Phase::Probing;
+                    cls->gateFrames = 0;
+                    cls->gateStateSlot = ~0u;
+                    Logger::info(str::format("[ClusterLOD] promotion: geometry 0x", std::hex,
+                                             promoInstance.geometryHash, std::dec,
+                                             " class q", cls->classQ, " gate misfits the shared reference (residual ",
+                                             state.gateResidualRel, ") - requesting CLASS rest capture"));
+                  } else {
+                    // Clean full-mesh failure vs this sibling's OWN reference: same
+                    // identity-by-fit consequence as the sparse case - the judging
+                    // member is a DIFFERENT SHAPE than the captured one. The entry
+                    // returns to Probing (its reference may fit other members);
+                    // THIS instance advances along the sibling chain.
+                    cls->phase = RestClassState::Phase::Probing;
+                    cls->gateFrames = 0;
+                    cls->gateStateSlot = ~0u;
+                    const uint32_t rr_refl = (state.diagGuard >> 26) & 0x1u;
+                    const int32_t nextSub = cls->subId + 1;
+                    const int32_t curQ = cls->classQ;
+                    const int32_t curSub = cls->subId;
+                    Logger::info(str::format("[ClusterLOD] promotion: geometry 0x", std::hex,
+                                             promoInstance.geometryHash, std::dec,
+                                             " class q", curQ, " sub ", curSub, " gate misfit by fit",
+                                             " | [RestReject] gate ", state.gateResidualRel,
+                                             ", sparse ", state.residualRel,
+                                             ", meanDev ", state.meanDevRel,
+                                             ", dirCoh ", state.dirCoherence,
+                                             ", tDeform ", state.temporalDeformRel,
+                                             ", refl ", rr_refl));
+                    RestClassState* nextCls = resolveRestClass(promoInstance.geometryHash,
+                                                               promoInstance.classLog2CapVar, nextSub, false);
+                    if (nextCls != nullptr) {
+                      promoInstance.classSubId = nextSub;
+                      Logger::info(str::format("[ClusterLOD] promotion: geometry 0x", std::hex,
+                                               promoInstance.geometryHash, std::dec,
+                                               " class q", curQ, " sub ", curSub,
+                                               " - instance advances to EXISTING sibling ", nextSub));
+                      cls = nextCls;
+                    } else if (nextSub < std::max(1, ClusterLodOptions::Promotion::restClassMaxRefs())) {
+                      promoInstance.classSubId = nextSub;
+                      Logger::info(str::format("[ClusterLOD] promotion: geometry 0x", std::hex,
+                                               promoInstance.geometryHash, std::dec,
+                                               " class q", curQ, " sub ", curSub,
+                                               " - identity-by-fit SPLIT: minting sibling ", nextSub));
+                      // creates via emplace_back - re-resolve for the post-switch reads
+                      resolveRestClass(promoInstance.geometryHash, promoInstance.classLog2CapVar, nextSub, true);
+                      cls = resolveRestClass(promoInstance.geometryHash, promoInstance.classLog2CapVar, nextSub, false);
+                      if (cls != nullptr) {
+                        // skip the CandidateProbe re-proof (see the sparse mint site)
+                        cls->ref = RestClassState::Ref::Requested;
+                        cls->captureStaged = false;
+                      }
+                    } else {
+                      cls->phase = RestClassState::Phase::Rejected;
+                      cls->rejectedFrame = m_device->getCurrentFrameId();
+                      promoInstance.classSubId = 0;
+                      Logger::info(str::format("[ClusterLOD] promotion: geometry 0x", std::hex,
+                                               promoInstance.geometryHash, std::dec,
+                                               " class q", curQ, " sub ", curSub,
+                                               " misfits ALL ", ClusterLodOptions::Promotion::restClassMaxRefs(),
+                                               " sibling refs (gate) - REJECTED, retries after ",
+                                               ClusterLodOptions::Promotion::restRejectRetryFrames(), " frames"));
+                    }
+                  }
+                } else {
+                  // gate never accumulated (slot skipped that frame) - reschedule
+                  cls->phase = RestClassState::Phase::GateScheduled;
+                  cls->gateFrames = 0;
+                }
+              }
+            }
+            break;
+
+          case RestClassState::Phase::Rejected: {
+            const uint32_t retry = uint32_t(std::max(0, ClusterLodOptions::Promotion::restRejectRetryFrames()));
+            if (retry > 0 && cls->rejectedFrame != 0
+                && m_device->getCurrentFrameId() - cls->rejectedFrame >= retry) {
+              cls->phase = RestClassState::Phase::Probing;
+              cls->gateFrames = 0;
+              cls->stuckFrames = 0;
+              cls->gateStateSlot = ~0u;
+              cls->rejectedFrame = 0;
+            }
+            break;
+          }
+
+          default:
+            break;  // GateScheduled pairs in buildPromotionEntries; Promoted routes
+          }
+        }
+
+        // pre-promotion REST-world slots skip the demote logic below (their
+        // solves legitimately read non-rigid while a class probes); members of
+        // a PROMOTED class fall through - they render Path A and demote per
+        // slot. Divergent-of-promoted slots ALWAYS fall through: the demote
+        // logic's re-promote-on-streak is exactly how they return to Path A
+        // once their solves (against their class's own reference) fit.
+        if (promoInstance.isRestWorld
+            && (cls == nullptr || cls->phase != RestClassState::Phase::Promoted)) {
+          continue;
+        }
       }
 
       // periodic full-mesh sweep verdict (same lag handling as the gate). The sweep
@@ -1292,6 +1752,59 @@ namespace dxvk {
         promoInstance.demoted = false;
         Logger::info(str::format("[ClusterLOD] promotion: instance (slot ", promoInstance.stateSlot,
                                  ") RE-PROMOTED to Path A (rigid streak rebuilt)"));
+      }
+    }
+
+    // [ShapeClass] wedge guard: a class stuck in GateScheduled/GateRunning whose
+    // owning slot's content swapped away (or left the scene) would wait forever -
+    // no slot classifies into it to tick the gate. Reset stale gates to Probing.
+    {
+      const uint32_t frameNow = m_device->getCurrentFrameId();
+      const uint32_t staleAfter = 4u * uint32_t(std::max(2, ClusterLodOptions::Promotion::gateLagFrames()));
+      for (auto& candClasses : m_restClassesByCandidate) {
+        for (RestClassState& c : candClasses.second) {
+          if ((c.phase == RestClassState::Phase::GateScheduled || c.phase == RestClassState::Phase::GateRunning)
+              && c.lastGateTickFrame != 0 && frameNow - c.lastGateTickFrame > staleAfter) {
+            c.phase = RestClassState::Phase::Probing;
+            c.gateFrames = 0;
+            c.gateStateSlot = ~0u;
+          }
+        }
+      }
+    }
+
+    // [ShapeClass] periodic histogram (1s throttle): per candidate, the distinct
+    // content classes its live slots currently hold. Multi-class candidates are
+    // exactly the population the shared rest reference CANNOT serve (each class
+    // needs its own reference); single-class candidates validate that the
+    // bucketing is stable (no boundary flicker = no spurious classes).
+    {
+      const auto nowT = std::chrono::steady_clock::now();
+      if (std::chrono::duration_cast<std::chrono::milliseconds>(nowT - m_lastShapeClassLog).count() >= 1000) {
+        m_lastShapeClassLog = nowT;
+        // [SwapDebounce] running totals (only when nonzero - quiet when healthy):
+        // the committed-vs-abandoned ratio decides the debounce's fate (see .h)
+        if (m_swapPendingAbandoned + m_swapCommitted > 0) {
+          Logger::info(str::format("[SwapDebounce] totals: committed ", m_swapCommitted,
+                                   ", abandoned(transients) ", m_swapPendingAbandoned));
+        }
+        std::unordered_map<uint64_t, std::map<int32_t, uint32_t>> classesByGeom;
+        for (const auto& slotEntry : m_promoSlotByBlas) {
+          if (slotEntry.second.contentClassQ != INT32_MIN && slotEntry.second.geometryHash != 0) {
+            classesByGeom[slotEntry.second.geometryHash][slotEntry.second.contentClassQ]++;
+          }
+        }
+        for (const auto& g : classesByGeom) {
+          if (g.second.size() < 2) {
+            continue;  // single-class candidates are the healthy default - stay quiet
+          }
+          std::string buckets;
+          for (const auto& c : g.second) {
+            buckets += str::format(" q", c.first, "x", c.second);
+          }
+          Logger::info(str::format("[ShapeClass] geom 0x", std::hex, g.first, std::dec,
+                                   " holds ", g.second.size(), " content classes:", buckets));
+        }
       }
     }
   }
@@ -1392,12 +1905,12 @@ namespace dxvk {
         }
         PromotionCandidate& candidate = found->second;
 
-        // REST-referenced candidate: PER-INSTANCE solve/gate entries, deduped by
-        // BlasEntry state slot instead of by hash. Every instance's VS can build
-        // a different shape, so each solves ITS OWN capture buffer against the
-        // shared rest reference and promotes (or terminally fails) individually -
-        // a divergent sibling then never routes Path A instead of promoting
-        // wrongly and demote-flapping (0x84974cdd instance 1181, residual 0.223).
+        // REST-referenced candidate ([ShapeClass]): per-slot SOLVES feed the
+        // class verdict layer. Every slot solves its own capture every frame -
+        // that solve simultaneously (a) classifies the slot's current content,
+        // (b) builds rigidity evidence for that class, and (c) provides the M
+        // the class gate scores. Gates and rest-capture readbacks are per
+        // CLASS, staged from whichever slot currently holds that content.
         if (candidate.routeHash != 0
             && candidate.restState == PromotionCandidate::RestState::Referenced
             && candidate.probeVa != 0) {
@@ -1411,55 +1924,113 @@ namespace dxvk {
             promoInstance.stateSlot = m_promoNextStateSlot++;
             promoInstance.geometryHash = hash;
             promoInstance.blasFrameCreated = blasEntry->frameCreated;
-            promoInstance.restPhase = PromoInstance::RestPhase::Probing;
             instanceIt = m_promoSlotByBlas.emplace(blasEntry, promoInstance).first;
           }
           PromoInstance& promoInstance = instanceIt->second;
           if (promoInstance.blasFrameCreated != blasEntry->frameCreated) {
-            // recycled BlasEntry address = fresh capture content on the same slot:
-            // restart this instance's rest probing
+            // recycled BlasEntry address = fresh capture content on the same slot
             promoInstance.blasFrameCreated = blasEntry->frameCreated;
             promoInstance.geometryHash = hash;
-            promoInstance.restPhase = PromoInstance::RestPhase::Probing;
-            promoInstance.restGateFrames = 0;
-            promoInstance.restStuckFrames = 0;
-            promoInstance.restLastSolveFrame = 0;
             promoInstance.demoted = false;
             promoInstance.sweepPending = false;
             promoInstance.residentGeometryId = ~0u;
+            promoInstance.contentClassQ = INT32_MIN;  // fresh content - reclassify
+            promoInstance.classLog2CapVar = 0.0f;
+            promoInstance.classSubId = 0;
+            promoInstance.lastClassifiedFrame = 0;
           }
-          if (promoInstance.restPhase == PromoInstance::RestPhase::None) {
-            // instance predates the rest swap (pre-rest establish) - enter probing
-            promoInstance.restPhase = PromoInstance::RestPhase::Probing;
-            promoInstance.geometryHash = hash;
-            promoInstance.restStuckFrames = 0;
-          }
-          if (promoInstance.restPhase == PromoInstance::RestPhase::Rejected
-              || (promoInstance.restPhase == PromoInstance::RestPhase::Promoted && !promoInstance.demoted)) {
-            // terminal / routes Path A (a demoted rest instance falls through and
-            // keeps solving so a rebuilt rigid streak re-promotes it)
+          promoInstance.isRestWorld = true;
+          promoInstance.geometryHash = hash;
+
+          // the slot's class (from its last classified solve; null until the
+          // first solve classifies it). Find-only: emits never create classes.
+          RestClassState* cls = promoInstance.contentClassQ != INT32_MIN
+            ? resolveRestClass(hash, promoInstance.classLog2CapVar, promoInstance.classSubId, false)
+            : nullptr;
+
+          if (cls != nullptr && cls->phase == RestClassState::Phase::Promoted && !promoInstance.demoted) {
+            // routes Path A; the promoted Path A emit below handles its solve
             continue;
           }
+
           if (!emittedInstanceSlots.insert(promoInstance.stateSlot).second) {
             continue;  // instances sharing a BlasEntry share capture content + slot
           }
+
+          // NOTE (VA-pin reverted): capture ADDRESS is not identity (double-
+          // buffering + content rebinds). Content classes are - see [ShapeClass].
           lodclusters_remix::PromotionEntry instEntry;
-          instEntry.probeVa = candidate.probeVa;
+          // solve against the class's OWN reference once it has one, else the shared one
+          instEntry.probeVa = (cls != nullptr && cls->ref == RestClassState::Ref::Own && cls->probeVa != 0)
+            ? cls->probeVa : candidate.probeVa;
           instEntry.captureVa = m_framePoses[framePoseIndex].positionsAddress;
           instEntry.captureStrideBytes = m_framePoses[framePoseIndex].positionsStrideBytes;
           instEntry.captureVertexCount = m_framePoses[framePoseIndex].positionsCount;
           instEntry.stateSlot = promoInstance.stateSlot;
           instEntry.patchSlot = 0xFFFFFFFFu;
           m_framePromoEntries.push_back(instEntry);
-          if (promoInstance.restPhase == PromoInstance::RestPhase::GateScheduled) {
-            // same-frame gate pairing as the candidate flow (solves -> barrier ->
-            // gates in recordPromotion, so the gate reads this frame's fresh M)
-            lodclusters_remix::PromotionEntry gateEntry = instEntry;
-            gateEntry.mode = 1;
-            gateEntry.vertexCount = candidate.vertexCount;
-            m_framePromoEntries.push_back(gateEntry);
-            promoInstance.restPhase = PromoInstance::RestPhase::GateRunning;
-            promoInstance.restGateFrames = 0;
+
+          promoInstance.lastCaptureVa = instEntry.captureVa;  // [RestGateTrace] address is diagnostic only
+
+          if (cls != nullptr) {
+            // CLASS rest-capture readback: this slot holds the class's content -
+            // stage the one-time copy of ITS capture as the class's reference
+            if (cls->ref == RestClassState::Ref::Requested && !cls->captureStaged) {
+              uint32_t topoVertexCount = 0;
+              {
+                std::lock_guard<std::mutex> topoLock(m_promoTopologyMutex);
+                const auto topoIt = m_promoTopologyByHash.find(hash);
+                if (topoIt != m_promoTopologyByHash.end()) {
+                  topoVertexCount = topoIt->second.vertexCount;
+                }
+              }
+              const FramePose& pose = m_framePoses[framePoseIndex];
+              if (topoVertexCount > 0 && pose.positionsCount >= topoVertexCount
+                  && pose.positionsStrideBytes >= 3 * sizeof(float)) {
+                DxvkBufferCreateInfo stagingInfo;
+                stagingInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+                stagingInfo.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT;
+                stagingInfo.access = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+                stagingInfo.size = VkDeviceSize(topoVertexCount) * pose.positionsStrideBytes;
+                RestCaptureRequest request;
+                request.geometryHash = hash;
+                request.classQ = cls->classQ;
+                request.classSubId = cls->subId;
+                request.source = pose.positionsBuffer;
+                request.sourceOffset = pose.positionsBufferOffset;
+                request.strideBytes = pose.positionsStrideBytes;
+                request.vertexCount = topoVertexCount;
+                request.stateSlot = promoInstance.stateSlot;  // [RestCapProbe] same-frame solve reads this buffer
+                request.staging = m_device->createBuffer(stagingInfo,
+                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                  DxvkMemoryStats::Category::RTXBuffer, "promo class rest-capture readback");
+                m_restCaptureRequests.push_back(std::move(request));
+                cls->captureStaged = true;
+              } else {
+                // topology missing / pose too small: this class cannot be
+                // rest-referenced - park it as Rejected (retry-cooled)
+                cls->ref = RestClassState::Ref::CandidateProbe;
+                cls->phase = RestClassState::Phase::Rejected;
+                cls->rejectedFrame = m_device->getCurrentFrameId();
+                ONCE(Logger::warn(str::format("[ClusterLOD] class rest-capture: geometry 0x", std::hex, hash, std::dec,
+                                              " q", cls->classQ, " has no retained topology / undersized pose")));
+              }
+            }
+
+            // same-frame gate pairing (solves -> barrier -> gates in recordPromotion):
+            // the scheduled slot's own capture scores the class gate
+            if (cls->phase == RestClassState::Phase::GateScheduled
+                && (cls->gateStateSlot == promoInstance.stateSlot || cls->gateStateSlot == ~0u)) {
+              cls->gateStateSlot = promoInstance.stateSlot;
+              lodclusters_remix::PromotionEntry gateEntry = instEntry;
+              gateEntry.mode = 1;
+              gateEntry.vertexCount = (cls->ref == RestClassState::Ref::Own && cls->vertexCount != 0)
+                ? cls->vertexCount : candidate.vertexCount;
+              m_framePromoEntries.push_back(gateEntry);
+              cls->phase = RestClassState::Phase::GateRunning;
+              cls->gateFrames = 0;
+              cls->lastGateTickFrame = m_device->getCurrentFrameId();
+            }
           }
           continue;
         }
@@ -1467,19 +2038,95 @@ namespace dxvk {
         // DEMOTED promoted-instance rendering Path B: keep solving ITS OWN
         // slot so a rebuilt rigid streak re-promotes it (per-instance
         // demotion; dedup by state slot - instances sharing a BlasEntry share
-        // capture content and therefore a slot)
+        // capture content and therefore a slot).
+        // SOURCE = modifiedGeometryData, the SAME buffer the post-promotion
+        // Path A solve judges. Re-proving on the pose buffer while the
+        // promoted solve reads modifiedGeometryData let the two disagree
+        // (rebind churn): pose fits -> re-promote -> modifiedGeometryData
+        // misfits -> demote, forever (observed: the same slots demoting 3x,
+        // 237 demotes/87 re-promotes in one session). Judging the buffer that
+        // will actually be judged makes re-promotion self-consistent.
         if (candidate.phase == PromotionCandidate::Phase::Promoted && candidate.probeVa != 0) {
           const auto instanceIt = m_promoSlotByBlas.find(blasEntry);
           if (instanceIt != m_promoSlotByBlas.end() && instanceIt->second.demoted
               && emittedInstanceSlots.insert(instanceIt->second.stateSlot).second) {
+            PromoInstance& demotedInst = instanceIt->second;
+            // [ShapeClass] a demoted slot's class (divergent content). Its solves
+            // run against the class's OWN reference once it earns one - fitting
+            // solves then rebuild the streak, the demote logic re-promotes, and
+            // the instance routes the class's residency. That is the promotion
+            // path for divergent content on non-rest candidates.
+            RestClassState* cls = demotedInst.contentClassQ != INT32_MIN
+              ? resolveRestClass(hash, demotedInst.classLog2CapVar, demotedInst.classSubId, false)
+              : nullptr;
+            const RaytraceBuffer& rePositions = blasEntry->modifiedGeometryData.positionBuffer;
             lodclusters_remix::PromotionEntry probeEntry;
-            probeEntry.probeVa = candidate.probeVa;
-            probeEntry.captureVa = m_framePoses[framePoseIndex].positionsAddress;
-            probeEntry.captureStrideBytes = m_framePoses[framePoseIndex].positionsStrideBytes;
-            probeEntry.captureVertexCount = m_framePoses[framePoseIndex].positionsCount;
-            probeEntry.stateSlot = instanceIt->second.stateSlot;
+            probeEntry.probeVa = (cls != nullptr && cls->ref == RestClassState::Ref::Own && cls->probeVa != 0)
+              ? cls->probeVa : candidate.probeVa;
+            probeEntry.captureVa = rePositions.getDeviceAddress() + rePositions.offsetFromSlice();
+            probeEntry.captureStrideBytes = rePositions.stride();
+            probeEntry.captureVertexCount = rePositions.stride() > 0 && rePositions.length() > rePositions.offsetFromSlice()
+              ? uint32_t((rePositions.length() - rePositions.offsetFromSlice()) / rePositions.stride()) : 0;
+            probeEntry.stateSlot = demotedInst.stateSlot;
             probeEntry.patchSlot = 0xFFFFFFFFu;
             m_framePromoEntries.push_back(probeEntry);
+
+            if (cls != nullptr) {
+              // class rest-capture readback: source = the SAME buffer the solves
+              // judge (modifiedGeometryData), so the reference captures exactly
+              // the content the class verdicts are about
+              if (cls->ref == RestClassState::Ref::Requested && !cls->captureStaged) {
+                uint32_t topoVertexCount = 0;
+                {
+                  std::lock_guard<std::mutex> topoLock(m_promoTopologyMutex);
+                  const auto topoIt = m_promoTopologyByHash.find(hash);
+                  if (topoIt != m_promoTopologyByHash.end()) {
+                    topoVertexCount = topoIt->second.vertexCount;
+                  }
+                }
+                if (topoVertexCount > 0 && probeEntry.captureVertexCount >= topoVertexCount
+                    && rePositions.stride() >= 3 * sizeof(float)) {
+                  DxvkBufferCreateInfo stagingInfo;
+                  stagingInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+                  stagingInfo.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT;
+                  stagingInfo.access = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+                  stagingInfo.size = VkDeviceSize(topoVertexCount) * rePositions.stride();
+                  RestCaptureRequest request;
+                  request.geometryHash = hash;
+                  request.classQ = cls->classQ;
+                  request.classSubId = cls->subId;
+                  request.source = rePositions.buffer();
+                  request.sourceOffset = rePositions.offset() + rePositions.offsetFromSlice();
+                  request.strideBytes = rePositions.stride();
+                  request.vertexCount = topoVertexCount;
+                  request.stateSlot = demotedInst.stateSlot;  // [RestCapProbe] same-frame solve reads this buffer
+                  request.staging = m_device->createBuffer(stagingInfo,
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                    DxvkMemoryStats::Category::RTXBuffer, "promo class rest-capture readback");
+                  m_restCaptureRequests.push_back(std::move(request));
+                  cls->captureStaged = true;
+                } else {
+                  cls->ref = RestClassState::Ref::CandidateProbe;
+                  cls->phase = RestClassState::Phase::Rejected;
+                  cls->rejectedFrame = m_device->getCurrentFrameId();
+                  ONCE(Logger::warn(str::format("[ClusterLOD] class rest-capture: geometry 0x", std::hex, hash, std::dec,
+                                                " q", cls->classQ, " (demoted path) no topology / undersized capture")));
+                }
+              }
+              // same-frame class gate pairing (solves -> barrier -> gates)
+              if (cls->phase == RestClassState::Phase::GateScheduled
+                  && (cls->gateStateSlot == demotedInst.stateSlot || cls->gateStateSlot == ~0u)) {
+                cls->gateStateSlot = demotedInst.stateSlot;
+                lodclusters_remix::PromotionEntry gateEntry = probeEntry;
+                gateEntry.mode = 1;
+                gateEntry.vertexCount = (cls->ref == RestClassState::Ref::Own && cls->vertexCount != 0)
+                  ? cls->vertexCount : candidate.vertexCount;
+                m_framePromoEntries.push_back(gateEntry);
+                cls->phase = RestClassState::Phase::GateRunning;
+                cls->gateFrames = 0;
+                cls->lastGateTickFrame = m_device->getCurrentFrameId();
+              }
+            }
           }
           continue;
         }
@@ -1549,6 +2196,7 @@ namespace dxvk {
             request.sourceOffset = pose.positionsBufferOffset;
             request.strideBytes = pose.positionsStrideBytes;
             request.vertexCount = topoVertexCount;
+            request.stateSlot = candidate.stateSlot;  // [RestCapProbe] same-frame solve reads this buffer
             request.staging = m_device->createBuffer(stagingInfo,
               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
               DxvkMemoryStats::Category::RTXBuffer, "promo rest-capture readback");
@@ -1613,8 +2261,28 @@ namespace dxvk {
 
         const RaytraceBuffer& positions = blasEntry->modifiedGeometryData.positionBuffer;
 
+        // [ShapeClass] a member of an own-referenced class solves against ITS
+        // class's probe - the M must map the class's reference (whose clusters
+        // it renders) into the capture, not the candidate's shared reference.
+        uint64_t promotedProbeVa = found->second.probeVa;
+        uint32_t promotedGateVerts = found->second.vertexCount;
+        RestClassState* promotedCls = nullptr;
+        {
+          const auto slotInfoIt = m_promoSlotByBlas.find(blasEntry);
+          if (slotInfoIt != m_promoSlotByBlas.end() && slotInfoIt->second.contentClassQ != INT32_MIN) {
+            promotedCls = resolveRestClass(hash, slotInfoIt->second.classLog2CapVar,
+                                           slotInfoIt->second.classSubId, false);
+            if (promotedCls != nullptr && promotedCls->ref == RestClassState::Ref::Own && promotedCls->probeVa != 0) {
+              promotedProbeVa = promotedCls->probeVa;
+              if (promotedCls->vertexCount != 0) {
+                promotedGateVerts = promotedCls->vertexCount;
+              }
+            }
+          }
+        }
+
         lodclusters_remix::PromotionEntry promoEntry;
-        promoEntry.probeVa = found->second.probeVa;
+        promoEntry.probeVa = promotedProbeVa;
         promoEntry.captureVa = positions.getDeviceAddress() + positions.offsetFromSlice();
         promoEntry.captureStrideBytes = positions.stride();
         promoEntry.captureVertexCount = positions.stride() > 0 && positions.length() > positions.offsetFromSlice()
@@ -1622,6 +2290,58 @@ namespace dxvk {
         promoEntry.stateSlot = (slot.geometryId >> kPromotedSlotShift) & 0x1FFFu;
         promoEntry.patchSlot = flatIndex;
         m_framePromoEntries.push_back(promoEntry);
+
+        // [ShapeClass] class service for a promoted slot whose class is still
+        // working toward its own reference (misfit dwells happen while the
+        // instance routes Path A between demote windows - their solves flow
+        // through HERE, so the staging/gate pairing must exist here too, or
+        // the class wedges in Requested/GateScheduled)
+        if (promotedCls != nullptr && promotedCls->phase != RestClassState::Phase::Promoted) {
+          if (promotedCls->ref == RestClassState::Ref::Requested && !promotedCls->captureStaged) {
+            uint32_t topoVertexCount = 0;
+            {
+              std::lock_guard<std::mutex> topoLock(m_promoTopologyMutex);
+              const auto topoIt = m_promoTopologyByHash.find(hash);
+              if (topoIt != m_promoTopologyByHash.end()) {
+                topoVertexCount = topoIt->second.vertexCount;
+              }
+            }
+            if (topoVertexCount > 0 && promoEntry.captureVertexCount >= topoVertexCount
+                && positions.stride() >= 3 * sizeof(float)) {
+              DxvkBufferCreateInfo stagingInfo;
+              stagingInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+              stagingInfo.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT;
+              stagingInfo.access = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+              stagingInfo.size = VkDeviceSize(topoVertexCount) * positions.stride();
+              RestCaptureRequest request;
+              request.geometryHash = hash;
+              request.classQ = promotedCls->classQ;
+              request.classSubId = promotedCls->subId;
+              request.source = positions.buffer();
+              request.sourceOffset = positions.offset() + positions.offsetFromSlice();
+              request.strideBytes = positions.stride();
+              request.vertexCount = topoVertexCount;
+              request.stateSlot = promoEntry.stateSlot;  // [RestCapProbe] same-frame solve reads this buffer
+              request.staging = m_device->createBuffer(stagingInfo,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                DxvkMemoryStats::Category::RTXBuffer, "promo class rest-capture readback");
+              m_restCaptureRequests.push_back(std::move(request));
+              promotedCls->captureStaged = true;
+            }
+          }
+          if (promotedCls->phase == RestClassState::Phase::GateScheduled
+              && (promotedCls->gateStateSlot == promoEntry.stateSlot || promotedCls->gateStateSlot == ~0u)) {
+            promotedCls->gateStateSlot = promoEntry.stateSlot;
+            lodclusters_remix::PromotionEntry gateEntry = promoEntry;
+            gateEntry.patchSlot = 0xFFFFFFFFu;
+            gateEntry.mode = 1;
+            gateEntry.vertexCount = promotedGateVerts;
+            m_framePromoEntries.push_back(gateEntry);
+            promotedCls->phase = RestClassState::Phase::GateRunning;
+            promotedCls->gateFrames = 0;
+            promotedCls->lastGateTickFrame = m_device->getCurrentFrameId();
+          }
+        }
 
         // periodic full-mesh residual sweep (risk R20): the sparse solve can
         // miss a VS animating a small vertex subset, so every promoted
@@ -1636,7 +2356,7 @@ namespace dxvk {
             lodclusters_remix::PromotionEntry sweepEntry = promoEntry;
             sweepEntry.patchSlot = 0xFFFFFFFFu;
             sweepEntry.mode = 1;
-            sweepEntry.vertexCount = found->second.vertexCount;
+            sweepEntry.vertexCount = promotedGateVerts;  // class's own reference range when own-referenced
             m_framePromoEntries.push_back(sweepEntry);
             instanceIt->second.sweepPending = true;
             instanceIt->second.sweepLagFrames = 0;
@@ -2595,11 +3315,27 @@ namespace dxvk {
         const auto candidate = m_promoCandidates.find(geometryHash);
         if (candidate != m_promoCandidates.end()
             && candidate->second.phase == PromotionCandidate::Phase::Promoted) {
+          // [ShapeClass] this instance's CONTENT CLASS decides its route: the
+          // class's verdict (not a per-BlasEntry one - the binding is unstable),
+          // and the class's residency when it owns its own rest reference.
+          RestClassState* routeCls = nullptr;
+          {
+            const auto slotPre = m_promoSlotByBlas.find(blasEntry);
+            if (slotPre != m_promoSlotByBlas.end()
+                && slotPre->second.blasFrameCreated == blasEntry->frameCreated
+                && slotPre->second.contentClassQ != INT32_MIN) {
+              routeCls = resolveRestClass(geometryHash, slotPre->second.classLog2CapVar,
+                                          slotPre->second.classSubId, false);
+            }
+          }
           // rest-referenced candidates render the clusters built from their CAPTURED
-          // rest pose (space-tagged hash); everything else uses the object-space id
-          // (the stable candidate key, which m_geometryIdByHash is keyed by).
-          const uint64_t residencyHash = candidate->second.routeHash != 0
-                                       ? candidate->second.routeHash : geometryHash;
+          // rest pose (space-tagged hash) - the CLASS's own one when it has it;
+          // everything else uses the object-space id (the stable candidate key).
+          const uint64_t residencyHash =
+              (routeCls != nullptr && routeCls->phase == RestClassState::Phase::Promoted
+               && routeCls->routeHash != 0)
+            ? routeCls->routeHash
+            : (candidate->second.routeHash != 0 ? candidate->second.routeHash : geometryHash);
           const auto found = m_geometryIdByHash.find(residencyHash);
           // DIAG (PathARoute): a geometry can PROMOTE (verdict) yet its instances still
           // render Path B when a per-geometry condition here fails. The prime suspect is
@@ -2654,20 +3390,22 @@ namespace dxvk {
                 slotIt->second.blasFrameCreated = blasEntry->frameCreated;
                 slotIt->second.demoted = false;
                 slotIt->second.sweepPending = false;
-                slotIt->second.restPhase = PromoInstance::RestPhase::None;
-                slotIt->second.restGateFrames = 0;
-                slotIt->second.restStuckFrames = 0;
-                slotIt->second.restLastSolveFrame = 0;
                 slotIt->second.residentGeometryId = ~0u;
                 slotIt->second.geometryHash = 0;
+                slotIt->second.contentClassQ = INT32_MIN;  // fresh content - reclassify
+                slotIt->second.classLog2CapVar = 0.0f;
+                slotIt->second.classSubId = 0;
+                slotIt->second.lastClassifiedFrame = 0;
+                routeCls = nullptr;  // the class was resolved from the OLD tenant's classification
               }
-              // rest-referenced candidates promote PER-INSTANCE: an instance
-              // routes Path A only after ITS OWN solve+gate against the shared
-              // rest reference passed - a divergent-shape sibling stays Path B
-              // instead of promoting wrongly and demote-flapping
+              // [ShapeClass] rest-referenced candidates promote PER CONTENT CLASS:
+              // an instance routes Path A only when the class its current capture
+              // classifies into has passed its gate - a divergent-shape class
+              // stays Path B (until its own reference promotes it) instead of
+              // promoting wrongly and demote-flapping
               const bool restGated = candidate->second.routeHash != 0
-                && (slotIt == m_promoSlotByBlas.end()
-                    || slotIt->second.restPhase != PromoInstance::RestPhase::Promoted);
+                && (routeCls == nullptr
+                    || routeCls->phase != RestClassState::Phase::Promoted);
               // per-instance demotion: a demoted instance falls through to
               // Path B below while its siblings stay promoted; its slot keeps
               // solving (buildPromotionEntries) so it can re-promote
@@ -2697,7 +3435,7 @@ namespace dxvk {
                   const char* why2 = (slotIt != m_promoSlotByBlas.end() && slotIt->second.demoted)
                                    ? "instance DEMOTED (per-instance solve non-rigid)"
                                    : restGated
-                                   ? "REST instance verdict pending/failed (per-instance rest reference)"
+                                   ? "content-class verdict pending/failed ([ShapeClass] rest reference)"
                                    : "promo state slot pool exhausted";
                   Logger::info(str::format("[PathARoute] geometry 0x", std::hex, geometryHash, std::dec,
                                            " instance dropped to Path B: ", why2,
@@ -2956,6 +3694,29 @@ namespace dxvk {
                         request.sourceOffset,
                         VkDeviceSize(request.vertexCount) * request.strideBytes);
         request.copyFrame = currentFrame;
+        // [RestCapProbe] pair this copy with a SAME-FRAME snapshot of the solve
+        // kernel's view of the same capture buffer: the slot's solve (dispatched
+        // later this frame, in the same exec cmd stream) writes its sampled
+        // capture positions to promoLastSampleBuffer, and the frameParams fill
+        // later in dispatchBuild routes this frame's dump copy into our staging.
+        // At drain, bit-comparing the two separates an UNFAITHFUL copy (tear/
+        // ordering/rename - solve saw different bytes than we copied) from a
+        // faithful copy of content that genuinely held that pose this frame.
+        if (request.stateSlot != ~0u && !m_restCapProbeInFlight) {
+          DxvkBufferCreateInfo sampleInfo;
+          sampleInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+          sampleInfo.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT;
+          sampleInfo.access = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+          sampleInfo.size = VkDeviceSize(64) * 3 * sizeof(float);
+          request.sampleStaging = m_device->createBuffer(sampleInfo,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            DxvkMemoryStats::Category::RTXBuffer, "promo rest-capture probe sample view");
+          const DxvkBufferSliceHandle slice = request.sampleStaging->getSliceHandle();
+          m_restCapProbeInFlight = true;
+          m_restCapProbeSlotPending = request.stateSlot;
+          m_restCapProbeTargetPending = slice.handle;
+          m_restCapProbeTargetOffsetPending = slice.offset;
+        }
         ++it;
         continue;
       }
@@ -2965,6 +3726,9 @@ namespace dxvk {
       }
 
       // copy retired: assemble the rest snapshot from the readback + retained topology
+      if (request.sampleStaging != nullptr) {
+        m_restCapProbeInFlight = false;  // [RestCapProbe] the armed probe drains with this request
+      }
       const uint8_t* mapped = (const uint8_t*) request.staging->mapPtr(0);
       RetainedTopology topo;
       bool haveTopo = false;
@@ -2978,12 +3742,30 @@ namespace dxvk {
       }
       if (mapped != nullptr && haveTopo && m_provider != nullptr) {
         lodclusters_remix::GeometrySnapshot restSnap;
-        // space-tagged rest hash: distinct clusters/.nvsngeo/residency identity
+        // space-tagged rest hash: distinct clusters/.nvsngeo/residency identity.
+        // Class-scoped references ([ShapeClass]) salt the class in so every
+        // content class of one candidate gets its own clusters + residency.
         constexpr uint64_t kRestSpaceTag = 0x9E3779B97F4A7C15ull;
-        restSnap.geometryHash = request.geometryHash ^ kRestSpaceTag;
+        uint64_t restHash = request.geometryHash ^ kRestSpaceTag;
+        if (request.classQ != INT32_MIN) {
+          restHash ^= (uint64_t(uint32_t(request.classQ)) * 0xBF58476D1CE4E5B9ull) | 1ull;
+          // identity-by-fit siblings share classQ but hold DIFFERENT content -
+          // each needs its own clusters/cache/residency identity (subId 0 keeps
+          // the pre-sibling hash so existing caches stay valid)
+          if (request.classSubId != 0) {
+            restHash ^= (uint64_t(uint32_t(request.classSubId)) * 0x94D049BB133111EBull) | 1ull;
+          }
+        }
+        restSnap.geometryHash = restHash;
         restSnap.promoKeyHash = request.geometryHash;
+        restSnap.promoClassQ = request.classQ;
+        restSnap.promoClassSubId = request.classSubId;
         restSnap.isRestCapture = true;
-        restSnap.name = topo.name + "_rest";
+        restSnap.name = request.classQ != INT32_MIN
+          ? (request.classSubId != 0
+               ? str::format(topo.name, "_rest_q", request.classQ, "_s", request.classSubId)
+               : str::format(topo.name, "_rest_q", request.classQ))
+          : (topo.name + "_rest");
         restSnap.indices = std::move(topo.indices);
         restSnap.indicesHash = topo.indicesHash;
         restSnap.topologyKey = topo.topologyKey;
@@ -2997,6 +3779,129 @@ namespace dxvk {
         }
         restSnap.verticesHash = XXH3_64bits(restSnap.positions.data(),
                                             restSnap.positions.size() * sizeof(float));
+
+        // ---- [RestCapProbe] copy-fidelity + weld-structure verdict ----
+        // Welds = exact-duplicate position triples. Affine-invariant: ANY faithful
+        // single-pose capture of this content reproduces the base capture's weld
+        // pattern, so fewer welded verts = per-vertex corruption or mid-deform
+        // content - never a scaled/rotated sibling placement.
+        {
+          uint32_t weldGroups = 0, weldVerts = 0;
+          {
+            std::unordered_map<uint64_t, uint32_t> counts;
+            counts.reserve(size_t(request.vertexCount) * 2);
+            for (uint32_t v = 0; v < request.vertexCount; v++) {
+              counts[XXH3_64bits(&restSnap.positions[size_t(v) * 3], 3 * sizeof(float))]++;
+            }
+            for (const auto& kv : counts) {
+              if (kv.second >= 2) {
+                weldGroups++;
+                weldVerts += kv.second;
+              }
+            }
+          }
+          uint32_t baseGroups = ~0u, baseVerts = 0;
+          {
+            std::lock_guard<std::mutex> topoLock(m_promoTopologyMutex);
+            const auto weldIt = m_promoTopologyByHash.find(request.geometryHash);
+            if (weldIt != m_promoTopologyByHash.end()) {
+              if (request.classQ == INT32_MIN) {
+                // the BASE capture defines the weld baseline for later class captures
+                weldIt->second.weldGroups = weldGroups;
+                weldIt->second.weldVerts = weldVerts;
+              }
+              baseGroups = weldIt->second.weldGroups;
+              baseVerts = weldIt->second.weldVerts;
+            }
+          }
+
+          if (request.sampleStaging != nullptr) {
+            const float* sv = (const float*) request.sampleStaging->mapPtr(0);
+            if (sv != nullptr) {
+              // Solve-view membership: the solve kernel and this request's transfer
+              // copy read the SAME buffer range in the SAME frame's cmd stream, so a
+              // faithful copy contains every solve-sampled position BIT-exactly.
+              // Kernel writes lastSample[threadId] only for threadId < sampleCount,
+              // so tail slots hold stale earlier frames - misses strictly AFTER the
+              // matched prefix are expected; misses INSIDE the prefix are not.
+              std::unordered_set<uint64_t> posSet;
+              posSet.reserve(size_t(request.vertexCount) * 2);
+              for (uint32_t v = 0; v < request.vertexCount; v++) {
+                posSet.insert(XXH3_64bits(&restSnap.positions[size_t(v) * 3], 3 * sizeof(float)));
+              }
+              char svMap[65];
+              uint32_t svMatches = 0, svMisses = 0, svZeros = 0;
+              int32_t lastMatch = -1, firstMiss = -1;
+              for (uint32_t i = 0; i < 64; i++) {
+                const float* s = &sv[i * 3];
+                if (s[0] == 0.0f && s[1] == 0.0f && s[2] == 0.0f) {
+                  svMap[i] = 'z';
+                  svZeros++;
+                } else if (posSet.count(XXH3_64bits(s, 3 * sizeof(float))) != 0) {
+                  svMap[i] = 'M';
+                  svMatches++;
+                  lastMatch = int32_t(i);
+                } else {
+                  svMap[i] = '?';
+                  svMisses++;
+                  if (firstMiss < 0) {
+                    firstMiss = int32_t(i);
+                  }
+                }
+              }
+              svMap[64] = '\0';
+              // hint only: ring-lagged sampleCount of the slot's recent solves
+              const uint32_t sampleHint = (m_promoStatesValid && request.stateSlot < m_promoStates.size())
+                ? ((m_promoStates[request.stateSlot].diagGuard >> 8) & 0xFFu) : 0u;
+              Logger::info(str::format("[RestCapProbe] geometry 0x", std::hex, request.geometryHash, std::dec,
+                                       " classQ ", request.classQ, " slot ", request.stateSlot,
+                                       " copyFrame ", request.copyFrame, " verts ", request.vertexCount,
+                                       " | solveView ", svMap,
+                                       " (M ", svMatches, " / ? ", svMisses, " / z ", svZeros,
+                                       ", sampleHint ", sampleHint, ")"));
+              // raw detail for the first misses: distance to the nearest copied
+              // position names the magnitude (tear ~ inter-frame motion; garbage ~ huge)
+              uint32_t detailed = 0;
+              for (uint32_t i = 0; i < 64 && detailed < 4; i++) {
+                if (svMap[i] != '?') {
+                  continue;
+                }
+                const float* s = &sv[i * 3];
+                float bestD2 = std::numeric_limits<float>::max();
+                for (uint32_t v = 0; v < request.vertexCount; v++) {
+                  const float dx = restSnap.positions[size_t(v) * 3 + 0] - s[0];
+                  const float dy = restSnap.positions[size_t(v) * 3 + 1] - s[1];
+                  const float dz = restSnap.positions[size_t(v) * 3 + 2] - s[2];
+                  bestD2 = std::min(bestD2, dx * dx + dy * dy + dz * dz);
+                }
+                Logger::info(str::format("[RestCapProbe] miss[", i, "] sv (", s[0], ", ", s[1], ", ", s[2],
+                                         ") nearestCopyDist ", std::sqrt(bestD2)));
+                detailed++;
+              }
+              Logger::info(str::format("[RestCapProbe] welds copy ", weldGroups, " groups / ", weldVerts,
+                                       " verts | base ", int32_t(baseGroups), " groups / ",
+                                       (baseGroups == ~0u ? -1 : int32_t(baseVerts)), " verts"));
+              const bool headMiss = firstMiss >= 0 && firstMiss < lastMatch;
+              const char* verdict =
+                  svMatches == 0                                 ? "NO OVERLAP - copy and solve saw DIFFERENT content (rebind/full tear)"
+                : headMiss                                       ? "UNFAITHFUL COPY - solve-view mismatch inside the sample prefix (tear/ordering)"
+                : (baseGroups != ~0u && weldVerts < baseVerts)   ? "copy FAITHFUL to solve view; content WELD-SPLIT on copy frame (not at rest)"
+                :                                                  "copy FAITHFUL to solve view; welds intact vs base";
+              Logger::info(str::format("[RestCapProbe] verdict: ", verdict));
+            } else {
+              Logger::warn("[RestCapProbe] sample staging not mappable - probe skipped");
+            }
+          } else if (request.classQ != INT32_MIN) {
+            // un-probed class capture (another probe held the single slot): the weld
+            // comparison alone still separates corrupt from faithful
+            Logger::info(str::format("[RestCapProbe] geometry 0x", std::hex, request.geometryHash, std::dec,
+                                     " classQ ", request.classQ, " (no solve-view probe) welds copy ",
+                                     weldGroups, " groups / ", weldVerts, " verts | base ",
+                                     int32_t(baseGroups), " groups / ",
+                                     (baseGroups == ~0u ? -1 : int32_t(baseVerts)), " verts"));
+          }
+        }
+
         Logger::info(str::format("[ClusterLOD] rest-capture: geometry 0x", std::hex, request.geometryHash,
                                  " read back -> rest snapshot 0x", restSnap.geometryHash, std::dec,
                                  " (", request.vertexCount, " verts) queued for clusterization"));
@@ -3156,6 +4061,18 @@ namespace dxvk {
           frameParams.promotionDumpStateSlot = it->second.stateSlot;
         }
       }
+    }
+    // [RestCapProbe] a rest-capture copy recorded THIS frame (processRestCaptureRequests
+    // above) overrides the config-driven dump for one frame: the solve-view snapshot
+    // must be of the SAME frame as the capture copy, and it lands in the request's own
+    // staging - the internal ring (and the config [PromoDump] cadence) is untouched.
+    if (m_restCapProbeSlotPending != ~0u) {
+      frameParams.promotionDumpStateSlot = m_restCapProbeSlotPending;
+      frameParams.promotionDumpTargetBuffer = m_restCapProbeTargetPending;
+      frameParams.promotionDumpTargetOffset = m_restCapProbeTargetOffsetPending;
+      m_restCapProbeSlotPending = ~0u;
+      m_restCapProbeTargetPending = VK_NULL_HANDLE;
+      m_restCapProbeTargetOffsetPending = 0;
     }
 
     // P4: HiZ occlusion feed. This runs from SceneManager::prepareSceneData,

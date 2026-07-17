@@ -158,6 +158,12 @@ struct PromoStatus
   uint  solveInfo;         // DIAG: which solve produced M. bit8 = affine used; low byte =
                            // affine guard fail reason (0 used/none, 1 non-finite, 2 norm
                            // window, 3 anisotropy cap, 4 condition/det, 5 refVar~0).
+  uint  capSigBits;        // [ShapeClass] PROBE-INDEPENDENT content signature (float bits):
+                           // spread of the first min(captureVertexCount,64) capture slots.
+                           // Unlike diagShearBits/capVar (probe-sampled), this does not
+                           // change basis when a class adopts its own reference probe, so
+                           // the CPU's content classification stays stable across probe
+                           // swaps. Rotation/translation-invariant, scale-variant (~s^2).
 };
 
 layout(buffer_reference, buffer_reference_align = 4, scalar) buffer PromoStatuses
@@ -216,6 +222,11 @@ shared float s_diagMcovDet;    // DIAG: det(cross-covariance) sign = reflection 
 shared float s_scanScore[64];  // DIAG: per-offset correspondence mismatch (one offset per thread)
 shared vec3  s_capNow[64];     // this frame's solve-sample capture positions
 shared vec3  s_capPrev[64];    // last frame's, for the inter-frame deformation gate
+// [ShapeClass] probe-independent signature accumulators: first min(capCount,64)
+// capture SLOTS (fixed sample set - identical for any probe solving this content)
+shared vec3  s_sigPos[64];
+shared float s_sigSq[64];
+shared float s_capSigVar;      // thread-0 reduced signature (written to capSigBits)
 shared vec3  s_devVec[64];     // DIAG: validation deviation VECTORS (error-shape stats)
 shared float s_normAlign[64];  // DIAG: |dot(error dir, ref normal)| per validation sample
 shared uint  s_diagAffInfo;    // DIAG: affine-solve outcome (bit8 used; low byte guard fail)
@@ -408,6 +419,27 @@ void main()
   s_capNow[threadId]  = vec3(0.0);
   s_capPrev[threadId] = vec3(0.0);
 
+  // [ShapeClass] probe-independent content signature: the sample set is the
+  // FIRST min(vertexCount, 64) capture slots - a function of the content alone,
+  // never of which probe's sample indices this solve used. Same content =>
+  // same signature under ANY reference probe (candidate's or a class's own).
+  // Window bound = probe.vertexCount (the MESH's referenced-vert count, equal
+  // across all probes of one topology), NOT captureVertexCount: the promoted
+  // path derives the latter from the BUFFER length (shared buffers -> slots
+  // beyond the mesh hold other draws' churning data; sampling them made the
+  // signature noise -> spurious class swaps -> unpin storms on static meshes).
+  s_sigPos[threadId] = vec3(0.0);
+  s_sigSq[threadId]  = 0.0;
+  {
+    const uint sigN = min(min(probe.vertexCount, entry.captureVertexCount), 64u);
+    if(threadId < sigN)
+    {
+      const vec3 sp = loadCapture(entry.captureVa, entry.captureStrideBytes, threadId);
+      s_sigPos[threadId] = sp;
+      s_sigSq[threadId]  = dot(sp, sp);
+    }
+  }
+
   if(threadId < probe.sampleCount)
   {
     const PromoSample smp = probe.samples[threadId];
@@ -462,6 +494,19 @@ void main()
     for(uint t = 0; t < 64; t++)
     {
       sumCapSq += s_capSq[t];
+    }
+
+    // [ShapeClass] reduce the probe-independent signature (see s_sigPos)
+    {
+      const uint sigN = min(min(probe.vertexCount, entry.captureVertexCount), 64u);
+      vec3  sigSum = vec3(0.0);
+      float sigSq  = 0.0;
+      for(uint t = 0; t < sigN; t++)
+      {
+        sigSum += s_sigPos[t];
+        sigSq  += s_sigSq[t];
+      }
+      s_capSigVar = sigN > 0u ? max(sigSq - dot(sigSum, sigSum) / float(sigN), 0.0) : 0.0;
     }
 
     // Solve strategy (P4c anisotropic-instance fix): GUARDED AFFINE first, rigid
@@ -960,6 +1005,7 @@ void main()
   status.dirCohBits  = floatBitsToUint(clamp(dirCoherence, 0.0, 1.0));
   status.normAlignBits = floatBitsToUint(normAlign);
   status.solveInfo = s_diagAffInfo;
+  status.capSigBits = floatBitsToUint(s_capSigVar);  // [ShapeClass] probe-independent signature
   statuses.s[entry.stateSlot] = status;
 
   // ---- patch a promoted instance's slot: ALWAYS write when assigned - a

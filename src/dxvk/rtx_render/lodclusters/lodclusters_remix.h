@@ -99,6 +99,20 @@ namespace lodclusters_remix {
     // on. Takes the plain Path A worker route + the promotion probe handler.
     bool isRestCapture = false;
     uint64_t promoKeyHash = 0;
+    // [ShapeClass] which CONTENT CLASS of the candidate this rest capture was
+    // read from (quantized log2 capture-spread bucket; INT32_MIN = not class-
+    // scoped, i.e. the candidate's first/shared rest reference). Rides the
+    // provider round-trip so the probe adoption lands on the right class.
+    int32_t promoClassQ = INT32_MIN;
+    // identity-by-fit sibling within the bucket this capture belongs to (the
+    // spread bucket alone is not content identity - different shapes collide);
+    // pairs with promoClassQ so adoption lands on the right SIBLING.
+    int32_t promoClassSubId = 0;
+    // [PromoRefs] this rest snapshot was restored from the cross-session
+    // sidecar (not freshly captured). Adoption must NOT run the "reference
+    // content changed" class-wipe for these: the sidecar set is internally
+    // consistent, and the worker pool may adopt its entries out of order.
+    bool promoRestored = false;
 
     // chrono: steady-clock microseconds at enqueue time - the worker reports
     // how long the snapshot waited in the processing queue (a growing wait
@@ -196,6 +210,11 @@ namespace lodclusters_remix {
   // UTF-8 path of the .nvsngeo cache file a processed geometry hash resolves to
   // under the given config (same layout GeometryProcessor writes).
   std::string getGeometryCacheFileUtf8(uint64_t geometryHash, const ProcessorConfig& config);
+
+  // [PromoRefs] UTF-8 path of the .promorefs sidecar next to a candidate's
+  // .nvsngeo: persisted promotion rest references (candidate-level + identity-
+  // by-fit siblings) so verdicts resolved once survive across sessions.
+  std::string getPromoRefsFileUtf8(uint64_t geometryHash, const ProcessorConfig& config);
 
   // Whether that .nvsngeo already exists on disk. Used by the P4c interim-
   // template skip: on a cache hit Path A lands within the cache-hit cooldown,
@@ -408,6 +427,14 @@ namespace lodclusters_remix {
     // to a host-readback ring each frame (pairs with the CPU-side ref-sample log).
     // ~0u = disabled.
     uint32_t promotionDumpStateSlot = ~0u;
+    // [RestCapProbe] when set, THIS frame's sample dump copies into this external
+    // host-visible buffer (at the byte offset) instead of the internal ring. The
+    // manager pairs it with a same-frame rest-capture copy of the same capture
+    // buffer: at readback, solve-view vs copied bytes proves or disproves the
+    // copy's fidelity (the ring is overwritten per frame and its retirement
+    // indexing is unrelated to the pairing frame, so it cannot serve this).
+    VkBuffer promotionDumpTargetBuffer = VK_NULL_HANDLE;
+    VkDeviceSize promotionDumpTargetOffset = 0;
   };
 
   // P4c: one promotion work item (40 bytes, mirrored by promotion_solve.comp
@@ -435,9 +462,12 @@ namespace lodclusters_remix {
     uint32_t flags = 0;               // bit0 rigid, bit2 demoted (last solve non-rigid)
     uint32_t lastFrame = 0;           // renderer frameIndex of the last solve
     // diagnostics (kernel pads; see PromoStatus in promotion_solve.comp)
-    float affineNonRigid = 0.0f;      // ||A^T A - I||_F of the fitted affine A:
-                                      // shear+scale content (0 == pure rotation).
-                                      // High => the rigid Umeyama solve is warranted.
+    float affineNonRigid = 0.0f;      // REPURPOSED (kernel writes s_diagCapVar): capture-
+                                      // sample spread capVar = sum|cap - capBar|^2 over the
+                                      // solve samples. Rotation/translation-invariant but
+                                      // scale-VARIANT (~s^2) - the content signature the
+                                      // CPU classifies capture content by ([ShapeClass]).
+                                      // Historic name kept to avoid a cross-file rename.
     uint32_t diagGuard = 0;           // bit0: probeVa==0 guard fired for this slot
     uint32_t diagAux = 0;             // slot 0: frame-global stateSlot-OOB count
     uint32_t gateOverCount = 0;       // DIAG: full-mesh verts with residual > epsilon
@@ -447,6 +477,11 @@ namespace lodclusters_remix {
     float dirCoherence = 0.0f;        // DIAG: error-direction coherence (1=systematic, 0=scatter)
     float normAlign = -1.0f;          // DIAG: error-vs-normal alignment (1=normal-push, -1=n/a)
     uint32_t solveInfo = 0;           // DIAG: bit8 = affine used; low byte = affine guard fail
+    float capSig = 0.0f;              // [ShapeClass] PROBE-INDEPENDENT content signature:
+                                      // spread of the first min(captureVertexCount,64)
+                                      // capture slots. Stable across reference-probe swaps
+                                      // (unlike affineNonRigid/capVar, which is sampled by
+                                      // probe indices) - the classification input.
   };
 
   // P3: semaphores the caller must attach to the queue submission that

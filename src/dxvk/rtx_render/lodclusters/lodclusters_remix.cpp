@@ -229,6 +229,13 @@ std::string getGeometryCacheFileUtf8(uint64_t geometryHash, const ProcessorConfi
   return nvutils::utf8FromPath(path);
 }
 
+std::string getPromoRefsFileUtf8(uint64_t geometryHash, const ProcessorConfig& config)
+{
+  std::filesystem::path path = cacheBasePath(geometryHash, config);
+  path += ".promorefs";
+  return nvutils::utf8FromPath(path);
+}
+
 bool geometryCacheFileExists(uint64_t geometryHash, const ProcessorConfig& config)
 {
   std::filesystem::path path = cacheBasePath(geometryHash, config);
