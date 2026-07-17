@@ -56,12 +56,29 @@ layout(local_size_x = 64) in;
 
 #define PROMO_MODE_SOLVE 0
 #define PROMO_MODE_GATE  1
+// Option 1: permutation-invariant shape verdict. One workgroup strides the FULL
+// referenced capture set (the probe's appended full ref list carries every
+// referenced vertex's capture slot), accumulates the centered 3x3 covariance,
+// and compares its TRACE-NORMALIZED sorted eigenvalues against the previous
+// sweep's. A sum over a SET is order-free - immune to the engine re-batching
+// the vertex ORDER, which poisons every per-index signal (residual, tDeform,
+// the solve's Mcov pairing). Eigenvalues are invariant under any rigid motion
+// R*s*x+t (a MOVING rigid body stays clean - covariance rotates congruently),
+// and trace-normalizing removes the pooled-capture discrete SCALE levels
+// ([ShapeClass]: proven un-de-noisable downstream). Only a genuine SHAPE
+// change moves the triple - this replaces the index-paired DEMOTE verdict.
+#define PROMO_MODE_EIGEN 2
 
 #define PROMO_FLAG_RIGID   1u
 // last solve's raw verdict was non-rigid (persistence history for the demote/
 // streak-reset decision below - one isolated non-rigid frame must not act)
 #define PROMO_FLAG_NONRIGID_LAST 2u
 #define PROMO_FLAG_DEMOTED 4u
+// STICKY: this slot has produced at least one rigid solve, i.e. the last-RIGID
+// M region [24,36) is written. Gates the patch fallback (a misfit frame patches
+// a PROVEN transform, not prevM = last frame's possibly-misfit M) and the CPU's
+// eigen re-promotion (only re-promote when a proven M exists to patch).
+#define PROMO_FLAG_EVERRIGID 8u
 
 // mirror of ClusterRenderSystem::kPromotionSlotCapacity - defensive in-shader
 // bound so a bad stateSlot can never scribble the promo buffers (would device-lost)
@@ -95,6 +112,13 @@ layout(buffer_reference, buffer_reference_align = 4, scalar) buffer ProbeBlob
                           // [9..11]: null-plane normal nHat (rank-2 planar sets only);
                           // [12]: 1.0 = rank-2 -> kernel completes A's out-of-plane
                           // column with s*R*nHat. [13..15] unused.
+  float refCov[6];        // Option 1: FULL-referenced-set centered covariance of the
+                          // reference (xx,yy,zz,xy,xz,yz; /n, CPU doubles). MODE_EIGEN
+                          // compares eig(capture cov) to eig(A*refCov*A^T), A =
+                          // last-RIGID affine M - A carries the anisotropic placement
+                          // bake that a direct eig(refCov) comparison cannot.
+  float refCovValid;      // 1.0 when populated (0 on probes built before this field)
+  float _pad1;
   PromoSample samples[];  // [sampleCount] solve + [validationCount] validation
                           // + full ref positions appended as PromoSample
                           // {index = i} for the gate sweep
@@ -117,10 +141,14 @@ layout(buffer_reference, buffer_reference_align = 8, scalar) buffer PromoEntries
   PromoEntry entries[];
 };
 
-// SoA promo state: matrices (96 B / slot - M then prevM, row-major 3x4 each)
+// SoA promo state: matrices + eigen baseline (160 B / slot)
 layout(buffer_reference, buffer_reference_align = 4, scalar) buffer PromoMatrices
 {
-  float m[];  // slot * 24 + [0,12) = M rows, [12,24) = prevM rows
+  float m[];  // slot * 40 + [0,12) = M rows, [12,24) = prevM rows,
+              // [24,36) = last-RIGID M (written only by rigid solves; the patch
+              // fallback source AND MODE_EIGEN's prediction transform - prevM
+              // is just last frame's M and can itself be a misfit under
+              // sustained capture permutation), [36,40) reserved
 };
 
 // status (32 B / slot) - the part read back to the CPU
@@ -164,6 +192,16 @@ struct PromoStatus
                            // change basis when a class adopts its own reference probe, so
                            // the CPU's content classification stays stable across probe
                            // swaps. Rotation/translation-invariant, scale-variant (~s^2).
+  // ---- Option 1 (MODE_EIGEN) results ----
+  uint  eigDriftBits;      // float bits: DEMOTE verdict - max |lamCapHat_i - lamPredHat_i|
+                           // over the trace-normalized eigenvalue triple, capture vs the
+                           // reference mapped through the last-RIGID A. -1 = no verdict
+                           // (no proven A / no refCov), -2 = degenerate. >= 0 = verdict.
+  uint  eigFrame;          // frameId of the last MODE_EIGEN sweep (0 = never ran)
+  uint  eigLam1HatBits;    // CONTENT-IDENTITY key .x: capture's own trace-normalized
+                           // largest eigenvalue (A-free; rigid/uniform-scale invariant).
+                           // -1 = degenerate. The CPU classifies content on (.x,.y).
+  uint  eigLam2HatBits;    // content-identity key .y: 2nd trace-normalized eigenvalue
 };
 
 layout(buffer_reference, buffer_reference_align = 4, scalar) buffer PromoStatuses
@@ -321,6 +359,38 @@ mat3 extractRotationRobust(mat3 A)
   return quatToMat3(q);
 }
 
+// Sorted (desc) eigenvalues of a symmetric 3x3 given its unique entries -
+// closed-form trigonometric method (Smith 1961). With phi in [0, pi/3],
+// q + 2p*cos(phi) is the largest root and q + 2p*cos(phi + 2pi/3) the
+// smallest, so the returned vec3 is already ordered l1 >= l2 >= l3.
+// Used by MODE_EIGEN on the centered capture covariance (PSD, so real roots).
+vec3 symEigenvaluesSorted(float a00, float a11, float a22, float a01, float a02, float a12)
+{
+  const float p1 = a01 * a01 + a02 * a02 + a12 * a12;
+  const float q  = (a00 + a11 + a22) / 3.0;
+  if(p1 < 1e-30)
+  {
+    // already diagonal - sort the diagonal
+    const float l1 = max(a00, max(a11, a22));
+    const float l3 = min(a00, min(a11, a22));
+    return vec3(l1, (a00 + a11 + a22) - l1 - l3, l3);
+  }
+  const float p2 = (a00 - q) * (a00 - q) + (a11 - q) * (a11 - q) + (a22 - q) * (a22 - q) + 2.0 * p1;
+  const float p  = sqrt(p2 / 6.0);
+  const float invP = 1.0 / max(p, 1e-30);
+  // B = (A - q*I) / p; r = det(B) / 2
+  const float b00 = (a00 - q) * invP, b11 = (a11 - q) * invP, b22 = (a22 - q) * invP;
+  const float b01 = a01 * invP, b02 = a02 * invP, b12 = a12 * invP;
+  const float detB = b00 * (b11 * b22 - b12 * b12)
+                   - b01 * (b01 * b22 - b12 * b02)
+                   + b02 * (b01 * b12 - b11 * b02);
+  const float r   = clamp(detB * 0.5, -1.0, 1.0);
+  const float phi = acos(r) / 3.0;
+  const float l1  = q + 2.0 * p * cos(phi);
+  const float l3  = q + 2.0 * p * cos(phi + 2.0943951023931953);  // + 2*pi/3
+  return vec3(l1, 3.0 * q - l1 - l3, l3);
+}
+
 void main()
 {
   const uint threadId = gl_LocalInvocationID.x;
@@ -369,6 +439,165 @@ void main()
   ProbeBlob probe = ProbeBlob(entry.probeVa);
 
   // ======================================================================
+  // MODE_EIGEN (Option 1): permutation-invariant shape verdict over the FULL
+  // referenced capture set. Single-workgroup per-entry dispatch (gateEntryIndex
+  // set); 64 threads stride the probe's appended full ref list, whose .index
+  // fields enumerate every REFERENCED capture slot (unreferenced slots hold
+  // stale VRAM and must never be read - same rule as the probe builder).
+  // Two passes (mean, then centered second moments): the one-pass form
+  // sum(p p^T) - n*mu*mu^T cancels catastrophically in fp32 on world-space
+  // captures (see the Mcov centering comment below - same failure mode).
+  // Reuses s_b for the reductions and s_M for the mean broadcast - both are
+  // otherwise untouched until the solve path, and this branch returns.
+  // ======================================================================
+  if(entry.mode == PROMO_MODE_EIGEN)
+  {
+    const uint fullBase = probe.sampleCount + probe.validationCount;
+    const uint nVerts   = probe.vertexCount;
+
+    // pass 1: per-thread partial sum + count of usable verts
+    vec3  acc = vec3(0.0);
+    float cnt = 0.0;
+    for(uint v = threadId; v < nVerts; v += 64u)
+    {
+      const uint idx = probe.samples[fullBase + v].index;
+      if(entry.captureVertexCount != 0u && idx >= entry.captureVertexCount)
+      {
+        continue;  // capture slot out of range this frame - unreadable
+      }
+      acc += loadCapture(entry.captureVa, entry.captureStrideBytes, idx);
+      cnt += 1.0;
+    }
+    s_b[threadId][0] = acc.x;
+    s_b[threadId][1] = acc.y;
+    s_b[threadId][2] = acc.z;
+    s_b[threadId][3] = cnt;
+    barrier();
+    if(threadId == 0u)
+    {
+      vec3  meanSum = vec3(0.0);
+      float nSum    = 0.0;
+      for(uint t = 0; t < 64u; t++)
+      {
+        meanSum += vec3(s_b[t][0], s_b[t][1], s_b[t][2]);
+        nSum    += s_b[t][3];
+      }
+      const float invN = nSum > 0.0 ? (1.0 / nSum) : 0.0;
+      s_M[0] = meanSum.x * invN;
+      s_M[1] = meanSum.y * invN;
+      s_M[2] = meanSum.z * invN;
+      s_M[3] = nSum;
+    }
+    barrier();
+    const vec3  eigMean = vec3(s_M[0], s_M[1], s_M[2]);
+    const float eigN    = s_M[3];
+
+    // pass 2: centered second moments (6 unique entries of the symmetric 3x3)
+    float xx = 0.0, yy = 0.0, zz = 0.0, xy = 0.0, xz = 0.0, yz = 0.0;
+    if(eigN >= 4.0)
+    {
+      for(uint v = threadId; v < nVerts; v += 64u)
+      {
+        const uint idx = probe.samples[fullBase + v].index;
+        if(entry.captureVertexCount != 0u && idx >= entry.captureVertexCount)
+        {
+          continue;
+        }
+        const vec3 d = loadCapture(entry.captureVa, entry.captureStrideBytes, idx) - eigMean;
+        xx += d.x * d.x; yy += d.y * d.y; zz += d.z * d.z;
+        xy += d.x * d.y; xz += d.x * d.z; yz += d.y * d.z;
+      }
+    }
+    s_b[threadId][4] = xx; s_b[threadId][5] = yy; s_b[threadId][6] = zz;
+    s_b[threadId][7] = xy; s_b[threadId][8] = xz; s_b[threadId][9] = yz;
+    barrier();
+
+    if(threadId == 0u)
+    {
+      float c00 = 0.0, c11 = 0.0, c22 = 0.0, c01 = 0.0, c02 = 0.0, c12 = 0.0;
+      for(uint t = 0; t < 64u; t++)
+      {
+        c00 += s_b[t][4]; c11 += s_b[t][5]; c22 += s_b[t][6];
+        c01 += s_b[t][7]; c02 += s_b[t][8]; c12 += s_b[t][9];
+      }
+
+      // ---- verdict = capture shape vs the reference shape mapped through the
+      // last-RIGID affine A: predCov = A * refCov * A^T. A is REQUIRED, not
+      // optional: this game places pieces with ANISOTROPIC scale (measured
+      // 1.47x one-axis), and anisotropic placement does NOT preserve covariance
+      // eigenvalues - so comparing eig(capture) to eig(refCov) DIRECTLY flags
+      // every aniso placement as a false shape mismatch (measured: that form
+      // quadrupled demotes 24->102). A is affine, so it maps the reference onto
+      // this placement including the aniso, and eig(A refCov A^T) then matches
+      // the capture's eigenvalues for the same piece. Trace-normalized triples =
+      // scale-free; the covariance is a SUM over the referenced set = re-batch
+      // order-free. A comes from the last PROVEN-rigid solve (EVERRIGID), so a
+      // single permuted frame's misfit A is never used. Only a genuine SHAPE
+      // change - real deformation, or a different piece under a shared slot -
+      // moves the triple; the CPU requires 3 consecutive sweeps before demoting
+      // so a transient slot-rebind to another piece does not eject. ----
+      // Two independent outputs from the one covariance:
+      //  * lam1Hat/lam2Hat = the capture's OWN trace-normalized eigenvalue triple
+      //    (A-free). Permutation/rigid/uniform-scale INVARIANT, so it is the stable
+      //    CONTENT-IDENTITY key the CPU classifies on - the same piece at any
+      //    rigid/uniform placement yields the same pair. Computed whenever the
+      //    covariance is well-formed (no proven M required - classification must
+      //    work before promotion).
+      //  * drift = demote verdict: the capture triple vs the reference mapped
+      //    through the last-RIGID affine A (predCov = A*refCov*A^T). A is required
+      //    here because the game places pieces with anisotropic scale, which the
+      //    identity key deliberately folds together but the demote must not.
+      float lam1Hat = -1.0, lam2Hat = -1.0;
+      float drift = -2.0;
+      const float capTrace = c00 + c11 + c22;
+      if(eigN >= 4.0 && capTrace > 1e-20 && !isnan(capTrace) && !isinf(capTrace))
+      {
+        const vec3 lamCap = symEigenvaluesSorted(c00, c11, c22, c01, c02, c12);
+        const vec3 lamCapHat = max(lamCap, vec3(0.0)) / capTrace;
+        lam1Hat = lamCapHat.x;
+        lam2Hat = lamCapHat.y;
+
+        const bool everRigid = (statuses.s[entry.stateSlot].flags & PROMO_FLAG_EVERRIGID) != 0u;
+        if(probe.refCovValid == 0.0 || !everRigid)
+        {
+          drift = -1.0;  // no reference cov, or no proven A to map it through yet
+        }
+        else
+        {
+          // predicted shape: last-RIGID affine A applied to the reference covariance
+          PromoMatrices matrices = PromoMatrices(push.matricesVa);
+          const uint mB = entry.stateSlot * 40;
+          const vec3 a0 = vec3(matrices.m[mB + 24], matrices.m[mB + 25], matrices.m[mB + 26]);
+          const vec3 a1 = vec3(matrices.m[mB + 28], matrices.m[mB + 29], matrices.m[mB + 30]);
+          const vec3 a2 = vec3(matrices.m[mB + 32], matrices.m[mB + 33], matrices.m[mB + 34]);
+          const mat3 G = mat3(probe.refCov[0], probe.refCov[3], probe.refCov[4],   // symmetric
+                              probe.refCov[3], probe.refCov[1], probe.refCov[5],
+                              probe.refCov[4], probe.refCov[5], probe.refCov[2]);
+          const vec3 g0 = G * a0, g1 = G * a1, g2 = G * a2;
+          // P = A G A^T -> P[r][c] = dot(G*a_r, a_c)
+          const float p00 = dot(g0, a0), p11 = dot(g1, a1), p22 = dot(g2, a2);
+          const float p01 = dot(g0, a1), p02 = dot(g0, a2), p12 = dot(g1, a2);
+          const float predTrace = p00 + p11 + p22;
+          if(predTrace > 1e-20 && !isnan(predTrace) && !isinf(predTrace))
+          {
+            const vec3 lamPred = symEigenvaluesSorted(p00, p11, p22, p01, p02, p12);
+            const vec3 lamPredHat = max(lamPred, vec3(0.0)) / predTrace;
+            drift = max(abs(lamCapHat.x - lamPredHat.x),
+                        max(abs(lamCapHat.y - lamPredHat.y),
+                            abs(lamCapHat.z - lamPredHat.z)));
+          }
+        }
+      }
+
+      statuses.s[entry.stateSlot].eigDriftBits   = floatBitsToUint(drift);
+      statuses.s[entry.stateSlot].eigLam1HatBits = floatBitsToUint(lam1Hat);  // content-identity key .x
+      statuses.s[entry.stateSlot].eigLam2HatBits = floatBitsToUint(lam2Hat);  // content-identity key .y
+      statuses.s[entry.stateSlot].eigFrame       = push.frameId;
+    }
+    return;
+  }
+
+  // ======================================================================
   // MODE_GATE: full-mesh residual sweep with the already-solved M (grid of
   // groups over vertexCount; probe stores the full ref positions after the
   // solve + validation samples)
@@ -376,7 +605,7 @@ void main()
   if(entry.mode == PROMO_MODE_GATE)
   {
     PromoMatrices matrices = PromoMatrices(push.matricesVa);
-    const uint mBase = entry.stateSlot * 24;
+    const uint mBase = entry.stateSlot * 40;
 
     // rows of M (last good solve)
     vec4 r0 = vec4(matrices.m[mBase + 0], matrices.m[mBase + 1], matrices.m[mBase + 2], matrices.m[mBase + 3]);
@@ -989,7 +1218,7 @@ void main()
 
   // ---- state update ----
   PromoMatrices matrices = PromoMatrices(push.matricesVa);
-  const uint mBase = entry.stateSlot * 24;
+  const uint mBase = entry.stateSlot * 40;
 
   PromoStatus status = statuses.s[entry.stateSlot];
   const bool contiguous = (status.lastFrame + 1u == push.frameId);
@@ -1001,6 +1230,18 @@ void main()
     const float prev = contiguous ? matrices.m[mBase + k] : M[k];
     matrices.m[mBase + 12 + k] = prev;
     matrices.m[mBase + k]      = M[k];
+  }
+
+  // last-RIGID M ([24,36)): the patch-fallback source. Misfit solves (permuted
+  // captures) never touch it, so it always holds a transform a rigid verdict
+  // stood behind - unlike prevM, which is just last frame's M and can itself
+  // be a misfit under sustained capture permutation.
+  if(rigid)
+  {
+    for(uint k = 0; k < 12; k++)
+    {
+      matrices.m[mBase + 24 + k] = M[k];
+    }
   }
 
   // ---- affine-upgrade monitor: how far the fitted 3x3 A is from a pure
@@ -1045,7 +1286,8 @@ void main()
   status.lastFrame   = push.frameId;
   status.flags       = (status.flags & ~(PROMO_FLAG_RIGID | PROMO_FLAG_NONRIGID_LAST | PROMO_FLAG_DEMOTED))
                      | (rigid ? PROMO_FLAG_RIGID : PROMO_FLAG_NONRIGID_LAST)
-                     | (sustainedNonRigid ? PROMO_FLAG_DEMOTED : 0u);
+                     | (sustainedNonRigid ? PROMO_FLAG_DEMOTED : 0u)
+                     | (rigid ? PROMO_FLAG_EVERRIGID : 0u);  // sticky (not in the clear mask)
   status.diagShearBits = floatBitsToUint(max(s_diagCapVar, 0.0));  // DIAG: capVar (was affineNonRigid)
   // degeneracy forensics: diagAux = refVar (float bits); diagGuard keeps the probeVa
   // bit0, adds bit1 = degenerate fit, packs sampleCount into bits [8:16], and the
@@ -1165,10 +1407,13 @@ void main()
     return;
   }
 
+  // non-rigid frames patch the last PROVEN-rigid M (see the [24,36) region
+  // comment); prevM only serves as the fallback before the first rigid solve
+  const bool everRigid = (status.flags & PROMO_FLAG_EVERRIGID) != 0u;
   float P[12];
   for(uint k = 0; k < 12; k++)
   {
-    P[k] = rigid ? M[k] : matrices.m[mBase + 12 + k];
+    P[k] = rigid ? M[k] : (everRigid ? matrices.m[mBase + 24 + k] : matrices.m[mBase + 12 + k]);
   }
 
   // shaderio::RenderInstance.worldMatrix / worldMatrixI: glm::mat4x3,

@@ -370,8 +370,9 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
   // PROMOTED instances' transforms exist only on the GPU (the promotion kernel
   // solves them from the vertex-capture output every frame) - the surface's
   // CPU-written objectToWorld/prevObjectToWorld/normalObjectToWorld are
-  // meaningless for them. Matrices array: 96 B per slot, row-major 3x4 M at
-  // +0, prevM at +48.
+  // meaningless for them. Matrices array: 160 B per slot, row-major 3x4 M at
+  // +0, prevM at +48 (last-RIGID M at +96 and the eigen baseline at +144 are
+  // kernel-internal; +0/+48 stay the authoritative hit-side transforms).
   const bool isPromotedHit =
     promoStateSlotPlusOne != 0 && (cb.promotionStateAddressLo | cb.promotionStateAddressHi) != 0;
 
@@ -387,7 +388,7 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
   {
     const uint64_t promotionStateAddress =
       (uint64_t(cb.promotionStateAddressHi) << 32) | uint64_t(cb.promotionStateAddressLo);
-    const uint64_t rowsAddress = promotionStateAddress + uint64_t(promoStateSlotPlusOne - 1) * 96;
+    const uint64_t rowsAddress = promotionStateAddress + uint64_t(promoStateSlotPlusOne - 1) * 160;
 
     const float4 promoCurRow0 = *(Ptr<float4>(rowsAddress + 0));
     const float4 promoCurRow1 = *(Ptr<float4>(rowsAddress + 16));

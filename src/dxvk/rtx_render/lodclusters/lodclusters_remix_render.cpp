@@ -162,8 +162,8 @@ struct ClusterRenderSystem::Impl
   // holds the 36 B/slot compact state the CPU reads back. Entries ride a
   // host-visible BDA ring; the status array is copied into a host readback
   // ring each frame promotion work ran.
-  static constexpr uint32_t kPromoMatricesStride = 96;
-  static constexpr uint32_t kPromoStatusStride   = 64;  // 8 base + gateOver/gateStale/temporalDeform + meanDev/dirCoh/normAlign/solveInfo (DIAG) + capSig ([ShapeClass])
+  static constexpr uint32_t kPromoMatricesStride = 160;  // M + prevM + lastRigidM + eigen baseline (kernel mBase = slot*40 floats)
+  static constexpr uint32_t kPromoStatusStride   = 80;   // 8 base + gateOver/gateStale/temporalDeform + meanDev/dirCoh/normAlign/solveInfo (DIAG) + capSig ([ShapeClass]) + eigDrift/eigFrame/eigLam1Hat/eigLam2Hat (Option 1)
   static constexpr uint32_t kPromoEntryStride    = sizeof(PromotionEntry);
 
   shaderc::SpvCompilationResult promoShader;
@@ -465,7 +465,7 @@ void ClusterRenderSystem::Impl::recordPromotion(VkCommandBuffer cmd, const Frame
       entry.patchSlot = 0xFFFFFFFFu;
       entry.stateSlot = kPromotionSlotCapacity - 1;
     }
-    anyGate |= entry.mode == 1;
+    anyGate |= entry.mode == 1 || entry.mode == 2;  // gates AND eigen sweeps use the per-entry pass
     usedSlots = std::max(usedSlots, entry.stateSlot + 1);
     stagedEntries[i] = entry;
   }
@@ -537,13 +537,20 @@ void ClusterRenderSystem::Impl::recordPromotion(VkCommandBuffer cmd, const Frame
     for(uint32_t i = 0; i < entryCount; i++)
     {
       const PromotionEntry& entry = stagedEntries[i];
-      if(entry.mode != 1 || entry.vertexCount == 0)
+      if(entry.mode == 1 && entry.vertexCount != 0)
       {
-        continue;
+        // full-mesh residual gate: grid over vertexCount
+        push.gateEntryIndex = i;
+        vkCmdPushConstants(cmd, promoPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PromoPush), &push);
+        vkCmdDispatch(cmd, (entry.vertexCount + 63u) / 64u, 1, 1);
       }
-      push.gateEntryIndex = i;
-      vkCmdPushConstants(cmd, promoPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PromoPush), &push);
-      vkCmdDispatch(cmd, (entry.vertexCount + 63u) / 64u, 1, 1);
+      else if(entry.mode == 2)
+      {
+        // Option 1 eigen sweep: ONE workgroup strides the full referenced set
+        push.gateEntryIndex = i;
+        vkCmdPushConstants(cmd, promoPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PromoPush), &push);
+        vkCmdDispatch(cmd, 1, 1, 1);
+      }
     }
   }
 
@@ -1176,7 +1183,8 @@ uint64_t ClusterRenderSystem::getGeometriesTableAddress() const
 
 uint64_t ClusterRenderSystem::getPromotionStateAddress() const
 {
-  // 96 B per slot: M rows (row-major 3x4) at +0, prevM rows at +48
+  // 160 B per slot: M rows (row-major 3x4) at +0, prevM rows at +48,
+  // last-RIGID M at +96, eigen baseline at +144 (kernel-internal)
   Impl& impl = *m_impl;
   return impl.promoReady ? impl.promoMatricesBuffer.address : 0;
 }
@@ -1270,6 +1278,11 @@ bool ClusterRenderSystem::readPromotionStates(PromotionStateView* outStates)
     memcpy(&v.normAlign, s + 52, sizeof(float));
     memcpy(&v.solveInfo, s + 56, sizeof(uint32_t));
     memcpy(&v.capSig, s + 60, sizeof(float));  // [ShapeClass] probe-independent signature
+    // Option 1 eigen verdict + content-identity key (plain float bits - single writer)
+    memcpy(&v.eigDrift, s + 64, sizeof(float));
+    memcpy(&v.eigFrame, s + 68, sizeof(uint32_t));
+    memcpy(&v.eigLam1Hat, s + 72, sizeof(float));
+    memcpy(&v.eigLam2Hat, s + 76, sizeof(float));
   }
   return true;
 }

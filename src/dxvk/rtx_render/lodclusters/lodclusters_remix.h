@@ -445,7 +445,10 @@ namespace lodclusters_remix {
     uint32_t captureStrideBytes = 0;
     uint32_t stateSlot = 0;           // persistent promo state slot
     uint32_t patchSlot = 0xFFFFFFFFu; // RenderInstance/TlasInstance index; ~0 = probe-only
-    uint32_t mode = 0;                // 0 = solve (+patch), 1 = full-mesh gate
+    uint32_t mode = 0;                // 0 = solve (+patch), 1 = full-mesh gate,
+                                      // 2 = eigen sweep (Option 1: permutation-invariant shape
+                                      //     verdict over the full referenced capture set;
+                                      //     single-workgroup dispatch, vertexCount unused)
     uint32_t vertexCount = 0;         // gate dispatch sizing (mode 1)
     uint32_t captureVertexCount = 0;  // DIAG: valid capture slots from captureVa (0 =
                                       // unknown -> correspondence scan self-disables).
@@ -459,7 +462,9 @@ namespace lodclusters_remix {
     float residualRel = 0.0f;         // sparse validation residual, last solve
     float gateResidualRel = 0.0f;     // full-mesh sweep max residual
     uint32_t rigidStreak = 0;
-    uint32_t flags = 0;               // bit0 rigid, bit2 demoted (last solve non-rigid)
+    uint32_t flags = 0;               // bit0 rigid, bit2 demoted (last solve non-rigid),
+                                      // bit3 everRigid (STICKY: >=1 rigid solve; the kernel's
+                                      // last-RIGID M is written - eigen re-promote precondition)
     uint32_t lastFrame = 0;           // renderer frameIndex of the last solve
     // diagnostics (kernel pads; see PromoStatus in promotion_solve.comp)
     float affineNonRigid = 0.0f;      // REPURPOSED (kernel writes s_diagCapVar): capture-
@@ -482,6 +487,15 @@ namespace lodclusters_remix {
                                       // capture slots. Stable across reference-probe swaps
                                       // (unlike affineNonRigid/capVar, which is sampled by
                                       // probe indices) - the classification input.
+    // ---- Option 1 (mode-2 eigen sweep) ----
+    float eigDrift = -1.0f;           // DEMOTE verdict: capture triple vs the reference mapped
+                                      // through the last-RIGID A. Permutation/rigid/uniform-scale
+                                      // invariant + anisotropy-aware. -1 = no verdict (no proven
+                                      // A / no refCov), -2 = degenerate; >= 0 = real verdict.
+    uint32_t eigFrame = 0;            // frameId of the last eigen sweep (0 = never ran)
+    float eigLam1Hat = -1.0f;         // CONTENT-IDENTITY key .x: capture's own trace-normalized
+                                      // largest eigenvalue (A-free, rigid/uniform-scale invariant)
+    float eigLam2Hat = -1.0f;         // content-identity key .y: 2nd trace-normalized eigenvalue
   };
 
   // P3: semaphores the caller must attach to the queue submission that

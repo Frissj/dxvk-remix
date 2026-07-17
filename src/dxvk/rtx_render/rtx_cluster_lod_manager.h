@@ -414,6 +414,22 @@ namespace dxvk {
                  "at the provider (the fast-path early-returns: already-known, mutating-skip, ineligible). Use it\n"
                  "to see exactly how the game draws a user-identified surface - captured vs not, which sub-meshes\n"
                  "reach the system. Read live per draw, so it can be changed at runtime without a rebuild.");
+      RTX_OPTION("rtx.clusterLod.promotion", float, eigenEpsilon, 0.02f,
+                 "Option 1 (permutation-invariant rigidity): max allowed mismatch between the capture\n"
+                 "cloud's TRACE-NORMALIZED sorted covariance eigenvalues and the PREDICTION (last-RIGID M\n"
+                 "applied to the reference's full-set covariance: eig(A*refCov*A^T)) before an eigen sweep\n"
+                 "counts as drifting. The triple is computed over the FULL referenced capture set as a SUM\n"
+                 "(order-free), so it is immune to the engine re-batching the vertex ORDER - the failure\n"
+                 "that poisons every per-index signal (residual, temporal drift) and made perfectly static\n"
+                 "buildings demote on phantom deformation and stick on Path B. Comparing against the\n"
+                 "prediction (NOT the previous sweep) makes it immune to the slot's capture content\n"
+                 "ALTERNATING between draws (measured: temporal sweep-to-sweep comparison false-demoted at\n"
+                 "drift median 0.18 on static geometry); eig(R*X*R^T) = eig(X) keeps it immune to rigid\n"
+                 "motion after the proven fit, trace-normalizing to scale levels, and A carries any\n"
+                 "anisotropic placement bake. A PROMOTED instance demotes only after 3 CONSECUTIVE\n"
+                 "drifting sweeps (alternating content matches every other sweep and resets the streak;\n"
+                 "genuine deformation never matches). Per-index residual/temporal signals only SCHEDULE\n"
+                 "sweeps (suspicion -> verify), never demote. 0 disables the tolerance (any drift counts).");
       RTX_OPTION("rtx.clusterLod.promotion", bool, correspondenceScan, false,
                  "DIAGNOSTIC PROBE (no fix, off by default). For every candidate, the solve kernel also runs a\n"
                  "transform-invariant pairwise-distance scan over a fixed table of ref->capture vertex-index\n"
@@ -827,8 +843,12 @@ namespace dxvk {
     // (probeVa/routeHash) - so every scale/shape variant can promote, not just
     // the placement the first rest capture happened to be read from.
     struct RestClassState {
-      int32_t classQ = INT32_MIN;   // canonical bucket at creation
-      float log2CapVar = 0.0f;      // raw signature at creation (nearest-merge tolerance)
+      // Content identity = the capture's trace-normalized eigenvalue pair (lam1,lam2)
+      // quantized to an eigenEpsilon grid (see quantizeEigClass). It is a rigid- and
+      // uniform-scale-INVARIANT descriptor, so the same piece at any placement lands
+      // on the same cell EXACTLY - no nearest-merge tolerance needed (the old capSig
+      // key was scale-variant and noisy, which is why it needed the 1.5/16 hack).
+      int32_t classQ = INT32_MIN;   // quantized eigen-key cell (== match key, exact)
       // Identity-by-FIT sibling id within the bucket. The spread signature cannot
       // separate non-affine-equivalent contents (verified: faithful captures +
       // static content still misfit their class's own reference by a per-content
@@ -856,15 +876,25 @@ namespace dxvk {
       // slot's content swapped away (or left the scene) would wait forever -
       // stale Gate* phases reset to Probing after 4*gateLagFrames.
       uint32_t lastGateTickFrame = 0;
+      // Option 1: the judging slot's eigFrame AT GATE EMISSION. The slot's
+      // status also receives per-instance eigen sweeps, so the gate verdict is
+      // only valid once eigFrame has ADVANCED past this mark (else a stale
+      // instance-sweep verdict would be misread as the gate's).
+      uint32_t gateEigMark = 0;
     };
-    // candidate key -> its content classes (small vectors, linear nearest-merge)
+    // candidate key -> its content classes (small vectors, linear exact-match)
     std::unordered_map<uint64_t, std::vector<RestClassState>> m_restClassesByCandidate;
-    // find (createIfMissing: or create) with nearest-bucket merge (+-1.5 buckets)
-    // so identical content straddling a bucket boundary on two slots maps to ONE
-    // class. subId selects the identity-by-fit sibling within the bucket (the
-    // instance's cursor). Returned pointer is invalidated by the next creating
-    // call for the same candidate - resolve, use, drop.
-    RestClassState* resolveRestClass(uint64_t candidateHash, float log2CapVar, int32_t subId, bool createIfMissing);
+    // Quantize the capture's trace-normalized eigenvalue pair to an eigenEpsilon
+    // grid cell = the content-class id. Stable invariant -> the same shape always
+    // maps to the same cell, so classes match EXACTLY (no tolerance). INT32_MIN
+    // when the eigen key is not yet available (degenerate / no sweep landed).
+    static int32_t quantizeEigClass(float lam1Hat, float lam2Hat);
+    // find (or create) the class with this EXACT quantized eigen-key cell. subId
+    // selects the identity-by-fit sibling for the rare case where two genuinely
+    // different shapes share an eigen cell (the pair is necessary, the gate fit
+    // is sufficient). Returned pointer is invalidated by the next creating call
+    // for the same candidate - resolve, use, drop.
+    RestClassState* resolveRestClass(uint64_t candidateHash, int32_t classQ, int32_t subId, bool createIfMissing);
     // per-INSTANCE state slots for PROMOTED instances (plan risk R21: M is per
     // instance - every captured instance's buffer carries its own transform -
     // so patch/prevM state must never alias across instances; the candidate's
@@ -905,30 +935,38 @@ namespace dxvk {
       // on the most recent emit (diagnostic only - address is NOT identity).
       uint64_t lastCaptureVa = 0;
 
-      // ---- [ShapeClass] content-class identity (from the capture itself) ----
-      // The solve readback carries capVar (PromotionStateView::affineNonRigid,
-      // repurposed): the spread of the solved capture samples - rotation/
-      // translation-invariant, scale-variant. Quantized in log2 (1/16-bucket ~
-      // 4.4% in capVar ~ 2.2% in scale; observed distinct content classes are
-      // >= 11% apart in scale, fp noise ~1e-5) it identifies WHICH content this
-      // slot's capture currently holds, independent of the unstable BlasEntry/
-      // buffer binding. classLog2CapVar keeps the raw log at classification so
-      // reclassification needs a full-bucket move (hysteresis: no boundary
-      // flicker). INT32_MIN = not yet classified.
+      // ---- [ShapeClass] content-class identity (from the capture's SHAPE) ----
+      // The eigen sweep readback carries the capture's trace-normalized eigenvalue
+      // pair (eigLam1Hat, eigLam2Hat) - a rigid- and uniform-scale-INVARIANT shape
+      // descriptor. quantizeEigClass() maps it to a stable cell id = contentClassQ,
+      // which identifies WHICH content this slot's capture holds independent of the
+      // unstable BlasEntry/buffer binding. Unlike the old scale-variant capSig it is
+      // stable across placements, so classes match EXACTLY (no merge tolerance).
+      // INT32_MIN = not yet classified.
       int32_t contentClassQ = INT32_MIN;
-      float classLog2CapVar = 0.0f;
-      // identity-by-fit cursor: which SIBLING reference of the bucket this
-      // instance is currently judged against (see RestClassState::subId).
-      // Resets with contentClassQ - a bucket move re-enters at sibling 0.
+      // identity-by-fit cursor: which SIBLING reference of the cell this instance
+      // is currently judged against (see RestClassState::subId). Resets with
+      // contentClassQ - a cell move re-enters at sibling 0.
       int32_t classSubId = 0;
       uint32_t lastClassifiedFrame = 0;  // last state.lastFrame consumed
-      // swap confirmation (time hysteresis): a single divergent signature can
-      // be a transient garbage read (mid-upload buffer rename), and committing
-      // it unpins the instance's Path A route for nothing. A swap commits only
-      // after 2 CONSECUTIVE solves classify into the same new bucket.
+      // swap confirmation: a single divergent read can be a transient garbage
+      // capture (mid-upload rename), so a class change commits only after 2
+      // CONSECUTIVE eigen sweeps land on the same new cell.
       int32_t pendingClassQ = INT32_MIN;
-      float pendingLog2CapVar = 0.0f;
       uint32_t pendingClassCount = 0;
+      // ---- Option 1 (eigen verdict) ----
+      // lastEigenFrame: the eigFrame of the last CONSUMED eigen sweep readback
+      // (a new eigFrame = a fresh verdict landed). eigenSuspect: the per-index
+      // signals (residual/tDeform - permutation-POISONED, never demote directly)
+      // flagged this slot; buildPromotionEntries schedules an eigen sweep to
+      // verify. sweepPending doubles as the in-flight guard for eigen sweeps.
+      // eigenDriftStreak: CONSECUTIVE mismatching sweeps (capture shape vs the
+      // last-RIGID-M prediction); demote needs 3 in a row - a single mismatch
+      // can be the slot's ALTERNATING capture content passing through, which a
+      // matching sweep then resets. Reset on any match.
+      uint32_t lastEigenFrame = 0;
+      bool eigenSuspect = false;
+      uint32_t eigenDriftStreak = 0;
     };
     std::unordered_map<const BlasEntry*, PromoInstance> m_promoSlotByBlas;
     // per-frame kernel work items (built in dispatchBuild, consumed by
