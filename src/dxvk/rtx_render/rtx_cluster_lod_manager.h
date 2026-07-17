@@ -1018,6 +1018,12 @@ namespace dxvk {
       // this slot only reports each sweep verdict into its current class.
       uint32_t lastEigenFrame = 0;
       bool eigenSuspect = false;
+      // [EigSettle] VERIFY PROBE: was the source vertex buffer being rewritten in
+      // place (updatedInPlace) on the frame the currently in-flight eigen sweep was
+      // ENQUEUED? Stamped at enqueue, read when that sweep's result lands, to prove
+      // whether unsettled captures are what produce the off-cell (phantom) eigen
+      // readings that flap stable geometry to Path B. Diagnostic only (no gating yet).
+      bool sweepSrcUnsettled = false;
     };
     std::unordered_map<const BlasEntry*, PromoInstance> m_promoSlotByBlas;
     // per-frame kernel work items (built in dispatchBuild, consumed by

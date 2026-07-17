@@ -937,6 +937,18 @@ namespace dxvk {
     if (!(lam1Hat >= 0.0f) || !(lam2Hat >= 0.0f)) {
       return INT32_MIN;  // no eigen key yet (degenerate / no sweep landed)
     }
+    // DEGENERATE-CAPTURE REJECT: for a trace-normalized covariance (lam1+lam2+lam3=1,
+    // lam1>=lam2>=lam3>=0) the largest eigenvalue is ALWAYS >= 1/3 - see line below,
+    // "lam1Hat in [1/3,1]". A lam1Hat under that floor is impossible for a real shape;
+    // it is an empty / mid-in-place-update capture read while the source buffer was
+    // being rewritten (observed as cell 0 = (0,0)). Returning "no key" here stops that
+    // garbage from being minted/adopted as a phantom content class that then swaps to
+    // the true cell and bounces stable geometry to Path B (the swap resets residency).
+    // Margin (2 grid cells below 1/3) absorbs float noise at the boundary; the smallest
+    // VALID lam1Hat observed in-session was 0.46, far above this.
+    if (lam1Hat < 1.0f / 3.0f - 2.0f * std::max(1e-4f, ClusterLodOptions::Promotion::eigenEpsilon())) {
+      return INT32_MIN;  // degenerate/unsettled capture - not a real shape
+    }
     const float grid = std::max(1e-4f, ClusterLodOptions::Promotion::eigenEpsilon());
     // lam1Hat in [1/3,1], lam2Hat in [0,1/2] -> q1 in [0,~1024], q2 in [0,~512]
     const int32_t q1 = int32_t(std::lround(std::min(1.0f, lam1Hat) / grid));
@@ -1581,7 +1593,27 @@ namespace dxvk {
                                  && curClsFreeze != nullptr
                                  && curClsFreeze->phase == RestClassState::Phase::Promoted;
           if (unclassified) {
-            promoInstance.contentClassQ = newQ;
+            // DEBOUNCE THE INITIAL ADOPTION (same 2-consecutive-sweep confirm the swap
+            // path below uses). A fresh/rebound slot's FIRST eigen read can be a
+            // mid-update transient - valid-range but the WRONG cell (observed: a static
+            // piece that always settles on 0.78,0.22 also momentarily read 0.92,0.06 and
+            // 0.80,0.10). Committing that first read seeds a phantom class that is never
+            // Promoted, so the slot swaps to the true cell a sweep later - and the swap's
+            // residency reset drops the mesh to Path B for a frame. While unclassified the
+            // slot still routes Path A off the candidate's DEFAULT residency (getGeometryId:
+            // null routeCls -> candidate routeHash; routesPathA true for a null class on a
+            // non-rest candidate), so waiting one extra sweep costs no Path-A frames and it
+            // then commits the SETTLED cell directly, never minting the phantom.
+            if (promoInstance.pendingClassQ == newQ) {
+              if (++promoInstance.pendingClassCount >= 2u) {
+                promoInstance.contentClassQ = newQ;
+                promoInstance.pendingClassQ = INT32_MIN;
+                promoInstance.pendingClassCount = 0;
+              }
+            } else {
+              promoInstance.pendingClassQ = newQ;
+              promoInstance.pendingClassCount = 1;
+            }
           } else if (classFrozen) {
             promoInstance.pendingClassQ = INT32_MIN;
             promoInstance.pendingClassCount = 0;
@@ -1939,6 +1971,25 @@ namespace dxvk {
           // the cell THIS sweep measured (its own lamHat). The verdict describes this
           // content; it may only touch `cls` when `cls` IS this content's class.
           const int32_t measuredQ = quantizeEigClass(state.eigLam1Hat, state.eigLam2Hat);
+          // [EigSettle] VERIFY PROBE: a sweep just landed. Log the source-settled bit
+          // stamped at enqueue against the cell this sweep measured vs the slot's
+          // committed class. The hypothesis (root cause) is that OFF-CELL readings
+          // (measuredQ != contentClassQ, incl. INT32_MIN degenerate) are the ones
+          // whose source was unsettled (sweepSrcUnsettled=1) - i.e. the sweep sampled
+          // a mid-in-place-update capture. Only the interesting cases are logged
+          // (off-cell OR unsettled), so a healthy settled sweep on its own cell stays
+          // quiet. If unsettled==1 tracks the off-cell reads, gate the enqueue on it.
+          if (promoInstance.sweepSrcUnsettled || measuredQ != promoInstance.contentClassQ) {
+            Logger::info(str::format("[EigSettle] slot ", promoInstance.stateSlot,
+                                     " geom 0x", std::hex, promoInstance.geometryHash, std::dec,
+                                     " srcUnsettled ", promoInstance.sweepSrcUnsettled,
+                                     " measuredQ ", measuredQ,
+                                     " curClass ", promoInstance.contentClassQ,
+                                     " offCell ", (measuredQ != promoInstance.contentClassQ),
+                                     " lam ", state.eigLam1Hat, ",", state.eigLam2Hat,
+                                     " eigDrift ", state.eigDrift,
+                                     " eigFrame ", state.eigFrame));
+          }
           const bool sweepMeasuredThisClass = cls != nullptr
             && measuredQ != INT32_MIN && measuredQ == promoInstance.contentClassQ;
           // is this class currently routing its members to Path A? rest candidates
@@ -2732,7 +2783,18 @@ namespace dxvk {
         const uint32_t sweepInterval = uint32_t(std::max(0, ClusterLodOptions::Promotion::fullSweepIntervalFrames()));
         if (sweepInterval > 0 && found->second.probeVa != 0) {
           const auto instanceIt = m_promoSlotByBlas.find(blasEntry);
-          if (instanceIt != m_promoSlotByBlas.end() && !instanceIt->second.sweepPending
+          // ROOT FIX (verified): never sweep a capture whose source vertex buffer is
+          // being rewritten in place THIS frame. The eigen sweep would compute its
+          // covariance over a HALF-WRITTEN mesh and read a wrong cell, minting a
+          // phantom content class that swaps and bounces the (stable, single-shape)
+          // piece to Path B. Proven by the [EigSettle] probe: the visible flappers
+          // read exactly ONE cell on settled sweeps, and every extra (phantom) cell
+          // appeared ONLY on srcUnsettled sweeps. Skipping this cycle just defers to
+          // the next settled frame - the eigen key persists from the last good sweep
+          // meanwhile. Same updatedInPlace test getGeometryId uses for Path-B routing.
+          const bool srcUnsettled = blasEntry->frameLastUpdated == m_device->getCurrentFrameId()
+                                 && blasEntry->frameLastUpdated != blasEntry->frameCreated;
+          if (instanceIt != m_promoSlotByBlas.end() && !instanceIt->second.sweepPending && !srcUnsettled
               && (instanceIt->second.eigenSuspect
                   || ((m_device->getCurrentFrameId() + instanceIt->second.stateSlot) % sweepInterval) == 0)) {
             lodclusters_remix::PromotionEntry sweepEntry = promoEntry;
@@ -2742,6 +2804,13 @@ namespace dxvk {
             m_framePromoEntries.push_back(sweepEntry);
             instanceIt->second.sweepPending = true;
             instanceIt->second.sweepLagFrames = 0;
+            // [EigSettle] POST-FIX CHECK: with the gate above, only settled captures
+            // reach here, so this is always false now - and the [EigSettle] result log
+            // should therefore show the flappers' off-cell (phantom) reads collapse to
+            // ~none. Any off-cell reads that remain will carry srcUnsettled=0 and be
+            // the genuinely-multiplexing hashes (different content under one hash), the
+            // separate parked question - not the visible flap.
+            instanceIt->second.sweepSrcUnsettled = srcUnsettled;
           }
         }
       }
