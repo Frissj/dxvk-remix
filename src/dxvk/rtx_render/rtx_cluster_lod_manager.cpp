@@ -441,6 +441,28 @@ namespace dxvk {
       return;
     }
 
+    // [DrawCoverage] stamp this captured draw (CS thread, BEFORE any Remix visibility
+    // culling) by its STABLE topology key, so the promotion diagnostics can separate
+    // genuine off-screen (game never submits the draw -> no stamp) from a cluster-side
+    // drop (drawn here but never solved). One count per distinct frame per topology.
+    {
+      const RasterGeometry& gd = drawCallState.getGeometryData();
+      const bool captured = drawCallState.preCaptureVertexData != nullptr;
+      const bool skinned = drawCallState.getSkinningState().numBones > 0 && gd.numBonesPerVertex > 0;
+      if (captured && !skinned) {
+        const uint64_t topo = ClusterLodGeometryProvider::makeTopologyKey(gd);
+        if (topo != 0) {
+          const uint32_t fr = m_device->getCurrentFrameId();
+          std::lock_guard<std::mutex> lk(m_promoDrawMutex);
+          uint32_t& lastF = m_promoDrawnFrameByTopo[topo];
+          if (lastF != fr) {
+            lastF = fr;
+            m_promoDrawnCountByTopo[topo]++;
+          }
+        }
+      }
+    }
+
     m_provider->onDrawCallGeometry(drawCallState, geometryHash, vertexDataUpdated, traceThis);
   }
 
@@ -1202,12 +1224,14 @@ namespace dxvk {
         // linear matrices follow so we can see HOW A differs from M (rigid vs affine,
         // stale scale). sd[202] is the sweep frame (0/uninitialized => no eigen sweep
         // hit the traced slot this readback).
-        if (nF >= 297u) {
+        if (nF >= 300u) {
           std::vector<float> em(nF);
           if (m_renderSystem->readPromotionSolveDump(em.data()) && em[278] > 0.0f) {
             Logger::info(str::format("[EigMetric] geom 0x", ClusterLodOptions::Promotion::dumpGeometryHash(),
                                      " sweepFrame ", uint32_t(em[278]),
-                                     " driftLastRigidM ", em[276], " driftFitM ", em[277],
+                                     " VERDICT ", em[298], " (usedM ", (em[297] > 0.5f ? 1 : 0),
+                                     ", meanDev ", em[299], ") | driftLastRigidM ", em[276],
+                                     " driftFitM ", em[277],
                                      " | M [", em[279], " ", em[280], " ", em[281], " / ",
                                      em[282], " ", em[283], " ", em[284], " / ",
                                      em[285], " ", em[286], " ", em[287], "]",
@@ -1412,13 +1436,26 @@ namespace dxvk {
               std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - candidate.createdTime).count() / 1000.0;
             const double coverage = elapsedFrames > 0 ? double(candidate.solveCount) / double(elapsedFrames) : 0.0;
+            // [DrawCoverage] frames the GAME actually submitted this geometry's draw
+            // (topology-keyed, pre-culling). drawn ~ solved => genuinely off-screen;
+            // drawn >> solved => drawn on-screen but the cluster path dropped it.
+            uint32_t drawnFrames = 0;
+            {
+              std::lock_guard<std::mutex> lk(m_promoDrawMutex);
+              auto dIt = m_promoDrawnCountByTopo.find(candidate.topologyKey);
+              if (dIt != m_promoDrawnCountByTopo.end()) { drawnFrames = dIt->second; }
+            }
+            const double drawnCov = elapsedFrames > 0 ? double(drawnFrames) / double(elapsedFrames) : 0.0;
+            const bool drawnNotSolved = drawnFrames > candidate.solveCount + candidate.solveCount / 2u + 2u;
             Logger::info(str::format("[ClusterLOD] promotion: geometry 0x", std::hex, entry.first, std::dec,
                                      " PROMOTED to Path A (eigen gate drift ", state.eigDrift, ")",
                                      " | [PromoLat] ", elapsedSec, "s over ", elapsedFrames, " frames",
                                      " | solved ", candidate.solveCount, " (coverage ", coverage,
+                                     ") | drawn ", drawnFrames, " (drawnCov ", drawnCov,
                                      ") | probing ", probingFrames, " frames, gate ", candidate.gateFrames,
                                      " frames | streakResets ", candidate.streakResets,
-                                     " | verdict=", coverage < 0.5 ? "OFF-SCREEN-BOUND(inherent)"
+                                     " | verdict=", drawnNotSolved ? "OVER-CULLED(drawn but not solved)"
+                                       : drawnCov < 0.5 ? "OFF-SCREEN-BOUND(game not drawing it)"
                                        : candidate.streakResets > 3 ? "STREAK-THRASH(non-rigid spikes)"
                                        : "solve-bound"));
           } else if (state.eigFrame != 0u && state.eigDrift > eigenEps) {
@@ -2774,9 +2811,20 @@ namespace dxvk {
           // orphaning the promotion candidate here forever. residentPathA=1 +
           // never-advancing solveFrame is that bug's signature.
           const bool residentPathA = m_geometryIdByHash.count(e.first) != 0;
+          // [DrawCoverage] frames the GAME submitted this geometry's draw (pre-culling).
+          // drawnFrames 0 => genuinely off-screen (benign). drawnFrames climbing while
+          // lastSolveFrame is stuck => drawn on-screen but the cluster path never
+          // solves it - the real "on-screen but never promotes" bug.
+          uint32_t drawnFrames = 0;
+          {
+            std::lock_guard<std::mutex> lk(m_promoDrawMutex);
+            auto dIt = m_promoDrawnCountByTopo.find(c.topologyKey);
+            if (dIt != m_promoDrawnCountByTopo.end()) { drawnFrames = dIt->second; }
+          }
           Logger::info(str::format("[PromoLimbo] geometry 0x", std::hex, e.first, std::dec,
                                    " uploaded but NOT solved this frame (phase ", ph,
                                    ", inPathB ", inB, ", residentPathA ", residentPathA,
+                                   ", drawnFrames ", drawnFrames,
                                    ", rigidStreak ", rigidStreak,
                                    ", lastSolveFrame ", lastSolveFrame, ", frameNow ", frameNow,
                                    ", restState ", uint32_t(c.restState), ")"));

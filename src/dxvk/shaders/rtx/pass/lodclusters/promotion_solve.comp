@@ -391,6 +391,24 @@ vec3 symEigenvaluesSorted(float a00, float a11, float a22, float a01, float a02,
   return vec3(l1, 3.0 * q - l1 - l3, l3);
 }
 
+// Option 1 drift: max trace-normalized eigenvalue mismatch between the capture
+// (lamCapHat, already trace-normalized+sorted) and the reference covariance G
+// mapped through a transform whose 3x3 linear ROWS are a0,a1,a2 -> predCov = A*G*A^T.
+// -3 on a degenerate prediction (caller maps to a no-verdict sentinel).
+float eigDriftFor(mat3 G, vec3 a0, vec3 a1, vec3 a2, vec3 lamCapHat)
+{
+  const vec3 g0 = G * a0, g1 = G * a1, g2 = G * a2;
+  const float p00 = dot(g0, a0), p11 = dot(g1, a1), p22 = dot(g2, a2);
+  const float p01 = dot(g0, a1), p02 = dot(g0, a2), p12 = dot(g1, a2);
+  const float predTrace = p00 + p11 + p22;
+  if(!(predTrace > 1e-20) || isnan(predTrace) || isinf(predTrace))
+    return -3.0;
+  const vec3 lamPred    = symEigenvaluesSorted(p00, p11, p22, p01, p02, p12);
+  const vec3 lamPredHat = max(lamPred, vec3(0.0)) / predTrace;
+  return max(abs(lamCapHat.x - lamPredHat.x),
+             max(abs(lamCapHat.y - lamPredHat.y), abs(lamCapHat.z - lamPredHat.z)));
+}
+
 void main()
 {
   const uint threadId = gl_LocalInvocationID.x;
@@ -560,69 +578,58 @@ void main()
         const bool everRigid = (statuses.s[entry.stateSlot].flags & PROMO_FLAG_EVERRIGID) != 0u;
         if(probe.refCovValid == 0.0 || !everRigid)
         {
-          drift = -1.0;  // no reference cov, or no proven A to map it through yet
+          drift = -1.0;  // no reference cov, or no proven rigid A yet
         }
         else
         {
-          // predicted shape: last-RIGID affine A applied to the reference covariance
+          // METRIC FIX: verdict = the SMALLEST drift over BOTH prediction transforms.
+          // The capture is the SAME shape as the reference if EITHER maps it:
+          //  * fitted M (mB+0..)  = this frame's live placement, incl. anisotropy -> ~0
+          //    for stable geometry (fixes the stale-lastRigidM spurious drift the
+          //    [EigMetric] confirmed: 0.06-0.46 on identical shapes while M fit at ~0).
+          //  * lastRigidM (mB+24..) = the last PROVEN-rigid A, permutation-robust ->
+          //    covers a re-batched frame (same shape, scrambled order) whose index-
+          //    paired M fails (high meanDev), where M's drift is garbage but A's is ~0.
+          // A genuinely DIFFERENT shape matches NEITHER, so min stays large - no
+          // threshold to tune, and a permuted/garbage M can never false-demote because
+          // the proven-A term already reads ~0 for the same shape. meanDev is dumped
+          // for context only; it no longer gates the choice.
           PromoMatrices matrices = PromoMatrices(push.matricesVa);
           const uint mB = entry.stateSlot * 40;
-          const vec3 a0 = vec3(matrices.m[mB + 24], matrices.m[mB + 25], matrices.m[mB + 26]);
-          const vec3 a1 = vec3(matrices.m[mB + 28], matrices.m[mB + 29], matrices.m[mB + 30]);
-          const vec3 a2 = vec3(matrices.m[mB + 32], matrices.m[mB + 33], matrices.m[mB + 34]);
           const mat3 G = mat3(probe.refCov[0], probe.refCov[3], probe.refCov[4],   // symmetric
                               probe.refCov[3], probe.refCov[1], probe.refCov[5],
                               probe.refCov[4], probe.refCov[5], probe.refCov[2]);
-          const vec3 g0 = G * a0, g1 = G * a1, g2 = G * a2;
-          // P = A G A^T -> P[r][c] = dot(G*a_r, a_c)
-          const float p00 = dot(g0, a0), p11 = dot(g1, a1), p22 = dot(g2, a2);
-          const float p01 = dot(g0, a1), p02 = dot(g0, a2), p12 = dot(g1, a2);
-          const float predTrace = p00 + p11 + p22;
-          if(predTrace > 1e-20 && !isnan(predTrace) && !isinf(predTrace))
-          {
-            const vec3 lamPred = symEigenvaluesSorted(p00, p11, p22, p01, p02, p12);
-            const vec3 lamPredHat = max(lamPred, vec3(0.0)) / predTrace;
-            drift = max(abs(lamCapHat.x - lamPredHat.x),
-                        max(abs(lamCapHat.y - lamPredHat.y),
-                            abs(lamCapHat.z - lamPredHat.z)));
-          }
+          const vec3 m0 = vec3(matrices.m[mB + 0], matrices.m[mB + 1], matrices.m[mB + 2]);
+          const vec3 m1 = vec3(matrices.m[mB + 4], matrices.m[mB + 5], matrices.m[mB + 6]);
+          const vec3 m2 = vec3(matrices.m[mB + 8], matrices.m[mB + 9], matrices.m[mB + 10]);
+          const vec3 r0 = vec3(matrices.m[mB + 24], matrices.m[mB + 25], matrices.m[mB + 26]);
+          const vec3 r1 = vec3(matrices.m[mB + 28], matrices.m[mB + 29], matrices.m[mB + 30]);
+          const vec3 r2 = vec3(matrices.m[mB + 32], matrices.m[mB + 33], matrices.m[mB + 34]);
+          const float driftM = eigDriftFor(G, m0, m1, m2, lamCapHat);  // via fitted M
+          const float driftR = eigDriftFor(G, r0, r1, r2, lamCapHat);  // via lastRigidM
+          if(driftM >= 0.0 && driftR >= 0.0)      drift = min(driftM, driftR);
+          else if(driftM >= 0.0)                  drift = driftM;
+          else if(driftR >= 0.0)                  drift = driftR;
+          else                                    drift = -2.0;  // both degenerate
 
-          // [EigMetric] CONFIRMATION: recompute the drift using the CURRENT best-fit
-          // M (matrices[mB+0..10]) in place of lastRigidM (mB+24..34). If driftFit is
-          // ~0 while drift (above, lastRigidM) is large, the drift is a stale/rigid-A
-          // artifact - the capture IS the reference under its actual placement, the
-          // metric just compared it against the wrong transform. Traced slot only.
+          // [EigMetric] dump both transforms' drift + which won. Traced slot only.
           if(push.solveDumpVa != 0ul && entry.stateSlot == push.solveDumpSlot)
           {
-            PromoMatrices mm = PromoMatrices(push.matricesVa);
-            const uint mB2 = entry.stateSlot * 40;
-            const vec3 f0 = vec3(mm.m[mB2 + 0], mm.m[mB2 + 1], mm.m[mB2 + 2]);   // M rows (3x3 linear)
-            const vec3 f1 = vec3(mm.m[mB2 + 4], mm.m[mB2 + 5], mm.m[mB2 + 6]);
-            const vec3 f2 = vec3(mm.m[mB2 + 8], mm.m[mB2 + 9], mm.m[mB2 + 10]);
-            const vec3 h0 = G * f0, h1 = G * f1, h2 = G * f2;
-            const float q00 = dot(h0, f0), q11 = dot(h1, f1), q22 = dot(h2, f2);
-            const float q01 = dot(h0, f1), q02 = dot(h0, f2), q12 = dot(h1, f2);
-            const float qTr = q00 + q11 + q22;
-            float driftFit = -3.0;
-            if(qTr > 1e-20 && !isnan(qTr) && !isinf(qTr))
-            {
-              const vec3 lamF = symEigenvaluesSorted(q00, q11, q22, q01, q02, q12);
-              const vec3 lamFHat = max(lamF, vec3(0.0)) / qTr;
-              driftFit = max(abs(lamCapHat.x - lamFHat.x),
-                             max(abs(lamCapHat.y - lamFHat.y), abs(lamCapHat.z - lamFHat.z)));
-            }
-            // SEPARATE region 276..296 - CapSigDump owns 180..275, so writing here
-            // avoids the collision that made the first attempt read vertex coords.
+            const float meanDevNow = uintBitsToFloat(statuses.s[entry.stateSlot].meanDevBits);
+            const bool  usedM = (driftM >= 0.0) && (driftR < 0.0 || driftM <= driftR);
             RawFloats dd = RawFloats(push.solveDumpVa);
-            dd.f[276] = drift;                 // drift via lastRigidM (the metric in use)
-            dd.f[277] = driftFit;              // drift via the current fitted M
+            dd.f[276] = driftR;                // drift via lastRigidM
+            dd.f[277] = driftM;                // drift via fitted M
             dd.f[278] = float(push.frameId);
-            dd.f[279] = mm.m[mB2 + 0]; dd.f[280] = mm.m[mB2 + 1]; dd.f[281] = mm.m[mB2 + 2];
-            dd.f[282] = mm.m[mB2 + 4]; dd.f[283] = mm.m[mB2 + 5]; dd.f[284] = mm.m[mB2 + 6];
-            dd.f[285] = mm.m[mB2 + 8]; dd.f[286] = mm.m[mB2 + 9]; dd.f[287] = mm.m[mB2 + 10];
-            dd.f[288] = mm.m[mB2 + 24]; dd.f[289] = mm.m[mB2 + 25]; dd.f[290] = mm.m[mB2 + 26];
-            dd.f[291] = mm.m[mB2 + 28]; dd.f[292] = mm.m[mB2 + 29]; dd.f[293] = mm.m[mB2 + 30];
-            dd.f[294] = mm.m[mB2 + 32]; dd.f[295] = mm.m[mB2 + 33]; dd.f[296] = mm.m[mB2 + 34];
+            dd.f[279] = m0.x; dd.f[280] = m0.y; dd.f[281] = m0.z;
+            dd.f[282] = m1.x; dd.f[283] = m1.y; dd.f[284] = m1.z;
+            dd.f[285] = m2.x; dd.f[286] = m2.y; dd.f[287] = m2.z;
+            dd.f[288] = r0.x; dd.f[289] = r0.y; dd.f[290] = r0.z;
+            dd.f[291] = r1.x; dd.f[292] = r1.y; dd.f[293] = r1.z;
+            dd.f[294] = r2.x; dd.f[295] = r2.y; dd.f[296] = r2.z;
+            dd.f[297] = usedM ? 1.0 : 0.0;     // which transform won the min (1 = fitted M)
+            dd.f[298] = drift;                 // the verdict actually written
+            dd.f[299] = meanDevNow;
           }
         }
       }

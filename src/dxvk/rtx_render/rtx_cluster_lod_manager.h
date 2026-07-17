@@ -764,6 +764,21 @@ namespace dxvk {
     // draw find its candidate every frame instead of only when the hash recurs.
     std::unordered_map<uint64_t, uint64_t> m_promoCandidateByTopology;
 
+    // ---- [DrawCoverage] genuine-offscreen vs over-culling probe ----
+    // The promotion pipeline only advances a candidate on frames its geometry is
+    // DRAWN (routed Path B and solved). Most candidates promote OFF-SCREEN-BOUND
+    // (coverage < 0.2) - but that "off-screen" is measured as solveCount/elapsed, so
+    // it cannot tell "the game never submitted the draw" (genuinely off-screen) from
+    // "the game drew it but the cluster path/culling dropped it before it could solve"
+    // (a fixable over-cull). onDrawCallGeometry (CS thread, BEFORE any Remix visibility
+    // culling) stamps every captured draw's TOPOLOGY key here; updatePromotionStates
+    // joins it by candidate.topologyKey and logs drawnFrames vs solveCount. drawn ~
+    // solved => genuinely off-screen (game culls); drawn >> solved => a cluster-side
+    // drop worth chasing. Mutex-guarded: written on the CS thread, read on main.
+    std::mutex m_promoDrawMutex;
+    std::unordered_map<uint64_t, uint32_t> m_promoDrawnFrameByTopo;  // topo -> last frame the game drew it
+    std::unordered_map<uint64_t, uint32_t> m_promoDrawnCountByTopo;  // topo -> # distinct frames drawn
+
     // ---- Path-A timing (churn-proof): first sight -> first ACTUAL Path A render ----
     // Keyed by stable topology key, NOT the churning geometry hash. Measures wall-
     // clock from the first frame a captured mesh is seen to the first frame it really
