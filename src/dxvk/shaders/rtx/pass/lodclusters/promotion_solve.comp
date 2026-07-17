@@ -1064,7 +1064,40 @@ void main()
   status.dirCohBits  = floatBitsToUint(clamp(dirCoherence, 0.0, 1.0));
   status.normAlignBits = floatBitsToUint(normAlign);
   status.solveInfo = s_diagAffInfo;
-  status.capSigBits = floatBitsToUint(s_capSigVar);  // [ShapeClass] probe-independent signature
+  // [ShapeClass] content signature from the SOLVE (|det(A)|^(2/3)*refVar) instead of the
+  // raw capture spread s_capSigVar. This is PARTIAL de-noising, kept for PRE-PROMOTION
+  // classification only - do NOT expect it to stop the Path A<->B pop on its own (it does
+  // not; that is the class FREEZE in rtx_cluster_lod_manager.cpp updatePromotionStates).
+  //
+  // WHY it is not enough (measured - do not re-attempt): the raw s_capSigVar jitters ~5% on
+  // a PROVABLY rigid instance (pairwise dists constant to 5 figures while capSigVar swings
+  // 0.47-0.52), which crosses the 4.4% class bands and churns the class. The solve scale
+  // here is smoother per-frame (holds a few frames vs raw changing every frame) BUT still
+  // STEPS between discrete levels (0.48->0.42->0.38 observed) that cross bands - because the
+  // double-buffered/pooled capture holds content at discrete DIFFERENT levels and the solve
+  // faithfully fits whichever buffer it read, so det(A) inherits those levels. Everything
+  // derived from the capture (raw capSig, this det(A), the residual's discrete 0.13/0.235
+  // levels) inherits the buffer inconsistency; it cannot be de-noised downstream. A producer
+  // barrier was tried and RULED OUT (raw capSig did not stabilise -> not a same-queue write/
+  // read timing race; the buffers genuinely differ, i.e. pool aliasing or async producer).
+  // Band-widening/hysteresis cannot help either (the level jumps exceed any band width).
+  //
+  // Formula is EXACT for uniform scale (det(A)=s^3 -> |det|^(2/3)=s^2) and probe-independent
+  // (A and refVar co-vary with the reference). Falls back to raw capSigVar when the solve is
+  // degenerate (s_M zeroed) - unsolved instances do not route Path A so their class is moot.
+  float capSigStable = s_capSigVar;
+  {
+    const float detA =
+        s_M[0] * (s_M[5] * s_M[10] - s_M[6] * s_M[9])
+      - s_M[1] * (s_M[4] * s_M[10] - s_M[6] * s_M[8])
+      + s_M[2] * (s_M[4] * s_M[9]  - s_M[5] * s_M[8]);
+    const float refVarPos = max(s_diagRefVar, 0.0);
+    if(abs(detA) > 1e-20 && refVarPos > 0.0)
+    {
+      capSigStable = pow(abs(detA), 2.0 / 3.0) * refVarPos;
+    }
+  }
+  status.capSigBits = floatBitsToUint(max(capSigStable, 0.0));  // [ShapeClass] stable signature
   statuses.s[entry.stateSlot] = status;
 
   // [SolveDump] one traced slot: emit M + per-validation (ref,cap,dev) so the CPU
@@ -1096,6 +1129,31 @@ void main()
       d.f[base + 1] = vs.refX; d.f[base + 2] = vs.refY; d.f[base + 3] = vs.refZ;  // centroid-centered
       d.f[base + 4] = cap.x;   d.f[base + 5] = cap.y;   d.f[base + 6] = cap.z;
       d.f[base + 7] = s_devVec[i].x; d.f[base + 8] = s_devVec[i].y; d.f[base + 9] = s_devVec[i].z;
+    }
+  }
+
+  // [CapSigDump] the ACTUAL vertices capSig samples (raw capture slots 0..sigN) plus
+  // this frame's captureVa and the reduced capSigVar, for the traced slot, EVERY frame
+  // (NO residual gate - popping instances have varying residual). The game double-
+  // buffers the capture, so captureVa ping-pongs; dumping the sampled verts on
+  // consecutive frames settles WHY capSig jitters: identical verts+scale in both
+  // buffers => a capSig computation bug (cheap fix); different content/scale => the
+  // double-buffered read is inconsistent (root fix, and this shows which kind).
+  if(push.solveDumpVa != 0ul && entry.stateSlot == push.solveDumpSlot)
+  {
+    RawFloats d = RawFloats(push.solveDumpVa);
+    const uint sigN = min(min(probe.vertexCount, entry.captureVertexCount), 64u);
+    d.f[176] = uintBitsToFloat(uint(entry.captureVa & 0xFFFFFFFFul));
+    d.f[177] = uintBitsToFloat(uint(entry.captureVa >> 32));
+    d.f[178] = s_capSigVar;
+    d.f[179] = float(sigN);
+    const uint nS = min(sigN, 32u);
+    for(uint i = 0; i < 32u; i++)
+    {
+      const vec3 p = (i < nS) ? s_sigPos[i] : vec3(0.0);
+      d.f[180u + i * 3u + 0u] = p.x;
+      d.f[180u + i * 3u + 1u] = p.y;
+      d.f[180u + i * 3u + 2u] = p.z;
     }
   }
 

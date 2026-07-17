@@ -1135,6 +1135,35 @@ namespace dxvk {
       }
     }
 
+    // [CapSigDump] EVERY frame (un-throttled, small budget): the actual verts capSig
+    // sampled + this frame's captureVa + capSigVar, for the traced instance. Consecutive
+    // lines cover consecutive frames, so the captureVa ping-pong is visible and we can see
+    // whether the two buffers hold the same instance at the same scale (=> capSig compute
+    // bug) or different content (=> the double-buffered read is inconsistent).
+    if (!ClusterLodOptions::Promotion::dumpGeometryHash().empty()) {
+      static uint32_t s_capSigDumpBudget = 400u;
+      const uint32_t nF = lodclusters_remix::ClusterRenderSystem::promotionSolveDumpFloatCount();
+      if (s_capSigDumpBudget > 0u && nF >= 276u) {
+        std::vector<float> sd(nF);
+        if (m_renderSystem->readPromotionSolveDump(sd.data()) && sd[179] > 0.0f) {
+          --s_capSigDumpBudget;
+          uint32_t vaLo = 0, vaHi = 0;
+          std::memcpy(&vaLo, &sd[176], 4);
+          std::memcpy(&vaHi, &sd[177], 4);
+          const uint64_t captureVa = (uint64_t(vaHi) << 32) | uint64_t(vaLo);
+          const uint32_t sigN = uint32_t(sd[179]);
+          Logger::info(str::format("[CapSigDump] geom 0x", ClusterLodOptions::Promotion::dumpGeometryHash(),
+                                   " frame ", m_device->getCurrentFrameId(),
+                                   " captureVa 0x", std::hex, captureVa, std::dec,
+                                   " capSigVar ", sd[178], " sigN ", sigN,
+                                   " v0 (", sd[180], ", ", sd[181], ", ", sd[182], ")",
+                                   " v1 (", sd[183], ", ", sd[184], ", ", sd[185], ")",
+                                   " v2 (", sd[186], ", ", sd[187], ", ", sd[188], ")",
+                                   " v3 (", sd[189], ", ", sd[190], ", ", sd[191], ")"));
+        }
+      }
+    }
+
     const uint32_t rigidFrames = uint32_t(std::max(1, ClusterLodOptions::Promotion::rigidFrames()));
     const float epsilon = std::max(1e-5f, ClusterLodOptions::Promotion::residualEpsilon());
     const uint32_t gateLag = uint32_t(std::max(2, ClusterLodOptions::Promotion::gateLagFrames()));
@@ -1398,14 +1427,39 @@ namespace dxvk {
       const lodclusters_remix::PromotionStateView& state = m_promoStates[promoInstance.stateSlot];
 
       // ---- [ShapeClass] classify the content currently behind this slot ----
-      // capVar (state.affineNonRigid, repurposed) is a rigid-invariant, scale-
-      // variant signature of the capture content the slot's last solve read.
-      // Quantize in log2 with full-bucket hysteresis; a class CHANGE on a live
-      // slot is a binding swap (the draw matching re-bound this BlasEntry to a
-      // different placement's content) - the event every downstream verdict
-      // has to be robust against. Classification itself has no side effects
-      // yet: the [ShapeClass] logs validate bucket stability on real runs
-      // before the verdict layer keys on contentClassQ.
+      // capSig (state.capSig) is a scale-variant signature of the capture content;
+      // class = round(log2(capSig)*16), so each class band is 2^(1/16) ~ 4.4% of capSig.
+      // A class change re-routes: a non-Promoted class restGates the instance to Path B
+      // (see getGeometryId), so class churn = the instance flapping Path A<->Path B.
+      //
+      // LANDMINE MAP (settle before re-investigating - all points measured, not guessed):
+      //  * The VISIBLE "buildings pop A<->B" symptom is THIS class churn / restGate, NOT the
+      //    [DEFORMING] demote below. The demote path is a separate, minor route to Path B; it
+      //    was its own regression, fixed independently by the tDeform buffer-phase gate in
+      //    promotion_solve.comp (tDeform was reading across a double-buffer boundary).
+      //  * capSig is NOISY and CANNOT be de-noised downstream. The capture (positionBuffer at
+      //    entry.captureVa) is double-buffered/pooled: captureVa ping-pongs between allocations
+      //    every frame for a stable instance (BLAS never rebuilt), and the buffers hold content
+      //    at discrete DIFFERENT levels. So capSig jitters ~5% on a PROVABLY rigid instance
+      //    (pairwise vtx dists constant to 5 figures) and crosses the 4.4% bands -> churn.
+      //  * RULED OUT, do not retry: (a) a producer memory barrier before the solve - the raw
+      //    capSig did NOT stabilise, so it is not a same-queue write/read timing race, the
+      //    buffers genuinely differ (pool aliasing or async producer); (b) reformulating the
+      //    signature from the de-noised solve scale |det(A)|^(2/3)*refVar - the solve fits
+      //    whichever buffer it read, so det(A) inherits the discrete levels and still steps
+      //    across bands; (c) band-widening / swap hysteresis - the level jumps exceed any band.
+      //  * THE FIX (implemented): freeze the class UNCONDITIONALLY once an instance is
+      //    classified into a currently-Promoted class - never re-derive from capSig OR the
+      //    residual (both double-buffer-corrupted). The old residual-based RELEASE popped the
+      //    instance on the exact frame the pool served a different-scale buffer, so the release
+      //    is now a CONTENT-derived signal instead: getGeometryId resets contentClassQ when the
+      //    STABLE resolved candidate key (resolvePromoCandidateKey) changes = a genuine content
+      //    rebind. The recycled-BlasEntry reset (blasFrameCreated mismatch) does NOT cover this:
+      //    frameCreated is stamped ONCE at DrawCallCache::allocateEntry and a continuously-
+      //    visible BlasEntry is NEVER GC'd, yet the cache rebinds different content onto one
+      //    entry on a material match - so the ~4/34 slots carrying 2 geom hashes under one
+      //    pointer keep a constant frameCreated. The geom-key reset (getGeometryId) + the pin
+      //    fast-path's matching geom-key guard are what actually release the freeze. See HANDOFF.
       bool classSwapped = false;
       const bool freshSolve = state.lastFrame != 0u && state.lastFrame != promoInstance.lastClassifiedFrame;
       if (freshSolve) {
@@ -1414,9 +1468,33 @@ namespace dxvk {
         if (capSig > 0.0f && std::isfinite(capSig)) {
           const float logNow = std::log2(capSig);
           const bool unclassified = promoInstance.contentClassQ == INT32_MIN;
+          // [ShapeClass] FREEZE (the fix): once an instance is classified into a
+          // currently-Promoted class, HOLD the class unconditionally - never re-derive it
+          // from the un-de-noisable per-frame capSig OR the (equally double-buffer-corrupted)
+          // residual. The OLD residual-based release (residualRel <= epsFit) popped the
+          // instance on the exact frame the pooled capture served a different-scale buffer
+          // (measured: slot 517 f309 Promoted class -20 -> f336 capSig 0.41->2.15 -> residual
+          // spike -> release -> PATH_B). The genuine release now comes from getGeometryId's
+          // content-rebind reset: when the STABLE resolved candidate key changes (a real content
+          // swap, immune to this game's per-frame asset-hash churn) it sets contentClassQ =
+          // INT32_MIN and this branch re-derives cleanly. That key change is the ONLY
+          // content-derived, buffer-noise-immune release signal (blasFrameCreated does NOT fire
+          // for the ~4/34 slots that rebind content under one never-GC'd BlasEntry).
+          const RestClassState* curClsFreeze = unclassified ? nullptr
+            : resolveRestClass(promoInstance.geometryHash, promoInstance.classLog2CapVar,
+                               promoInstance.classSubId, false);
+          const bool classFrozen = !unclassified
+                                 && curClsFreeze != nullptr
+                                 && curClsFreeze->phase == RestClassState::Phase::Promoted;
           if (unclassified) {
             promoInstance.contentClassQ = int32_t(std::lround(logNow * 16.0f));
             promoInstance.classLog2CapVar = logNow;
+          } else if (classFrozen) {
+            // hold the class; drop any half-formed pending swap. A genuine later change
+            // arrives as contentClassQ = INT32_MIN (getGeometryId's content-rebind reset),
+            // which takes the `unclassified` branch above and re-derives cleanly.
+            promoInstance.pendingClassQ = INT32_MIN;
+            promoInstance.pendingClassCount = 0;
           } else if (std::abs(logNow - promoInstance.classLog2CapVar) > (1.0f / 16.0f)) {
             // candidate swap: confirm on 2 CONSECUTIVE solves before committing
             // (one divergent read is a transient - unpinning on it caused Path B
@@ -3432,7 +3510,15 @@ namespace dxvk {
         if (pinIt != m_promoSlotByBlas.end()
             && !pinIt->second.demoted
             && pinIt->second.residentGeometryId != ~0u
-            && pinIt->second.blasFrameCreated == blasEntry->frameCreated) {
+            && pinIt->second.blasFrameCreated == blasEntry->frameCreated
+            // content-rebind guard: a stable BlasEntry* can bind DIFFERENT content across
+            // frames (draw-call cache material-match reuse) with frameCreated unchanged;
+            // routing off the cached residentGeometryId would render the OLD content's Path A
+            // clusters. Release the pin when the STABLE resolved candidate key no longer
+            // matches the cached one (short-circuited so the key is only resolved for an
+            // otherwise-valid pin). The establish path + getGeometryId reset then re-derive.
+            && pinIt->second.geometryHash != 0
+            && pinIt->second.geometryHash == resolvePromoCandidateKey(blasEntry->input.getGeometryData())) {
           const uint32_t usedSlots = uint32_t(m_slots[Tlas::Opaque].size() + m_slots[Tlas::Unordered].size());
           if (usedSlots < m_renderSystem->getMaxRenderInstances()
               && (!ClusterLodOptions::Render::routeTrivialToClassic()
@@ -3545,6 +3631,38 @@ namespace dxvk {
                 slotIt->second.classSubId = 0;
                 slotIt->second.lastClassifiedFrame = 0;
                 routeCls = nullptr;  // the class was resolved from the OLD tenant's classification
+              } else if (slotIt != m_promoSlotByBlas.end()
+                         && slotIt->second.geometryHash != 0
+                         && slotIt->second.geometryHash != geometryHash) {
+                // [ShapeClass] CONTENT REBIND under a STABLE BlasEntry* (same frameCreated).
+                // The draw-call cache reuses one BlasEntry across frames on a material match
+                // even when the geometry differs (DrawCallCache::get loose match), and a
+                // continuously-visible entry is never GC'd - so frameCreated is stamped ONCE
+                // and the blasFrameCreated reset above NEVER fires for the ~4/34 slots that
+                // carry 2 geom hashes under one pointer. Detect the genuine content change by
+                // the STABLE resolved candidate key (resolvePromoCandidateKey - topology
+                // resolved, immune to this game's per-frame asset-hash churn) changing, and
+                // reset the content-derived state so the frozen class (updatePromotionStates)
+                // re-derives for the NEW content instead of the pin/establish routing the OLD
+                // content's stale Path A clusters. This IS the class freeze's release signal.
+                slotIt->second.demoted = false;
+                slotIt->second.sweepPending = false;
+                slotIt->second.residentGeometryId = ~0u;
+                slotIt->second.contentClassQ = INT32_MIN;  // new content - reclassify
+                slotIt->second.classLog2CapVar = 0.0f;
+                slotIt->second.classSubId = 0;
+                slotIt->second.lastClassifiedFrame = 0;
+                // [ShapeClass] verify the handoff's ~4/34 "2 geom hashes under one BlasEntry"
+                // claim and how often the freeze actually releases here. Logs the OLD->NEW
+                // stable candidate key BEFORE the overwrite (blasFC constant proves the
+                // recycled-BlasEntry reset above did NOT fire for this content change).
+                Logger::info(str::format("[ShapeClass] slot ", slotIt->second.stateSlot,
+                                         " CONTENT REBIND geom 0x", std::hex, slotIt->second.geometryHash,
+                                         " -> 0x", geometryHash, std::dec,
+                                         " (blasFC ", blasEntry->frameCreated,
+                                         ", frame ", currentFrame, ") - class released"));
+                slotIt->second.geometryHash = geometryHash;  // adopt the new content key
+                routeCls = nullptr;  // the class was resolved from the OLD content's classification
               }
               // [ShapeClass] rest-referenced candidates promote PER CONTENT CLASS:
               // an instance routes Path A only when the class its current capture
@@ -3554,6 +3672,86 @@ namespace dxvk {
               const bool restGated = candidate->second.routeHash != 0
                 && (routeCls == nullptr
                     || routeCls->phase != RestClassState::Phase::Promoted);
+
+              // [RouteTrace] per-frame Path-A-vs-Path-B verdict for the traced geom.
+              // This is the VISIBLE pop the [DEFORMING] demote metric missed: capSig
+              // jitter (~15%) crosses the fine content-class bands (class = round(
+              // log2(capSig)*16) => 4.4% bands, see updatePromotionStates) so the
+              // class reclassifies, and a non-Promoted class restGates the instance
+              // to Path B mid-flight -> it pops A<->B every few frames. Logs the whole
+              // capSig -> class -> restGate -> route chain so we can confirm the pop
+              // and whether the capSig jitter is buffer-noise (join by slot+frame with
+              // [BindTrace]'s captureVa). Traced hash only; self-limited line budget.
+              {
+                const std::string& rtHashStr = ClusterLodOptions::Promotion::dumpGeometryHash();
+                if (!rtHashStr.empty() && slotIt != m_promoSlotByBlas.end()) {
+                  uint64_t rtHash = 0;
+                  try { rtHash = std::stoull(rtHashStr, nullptr, 16); } catch (...) { rtHash = 0; }
+                  static uint32_t s_routeTraceBudget = 3000u;
+                  if (rtHash != 0 && geometryHash == rtHash && s_routeTraceBudget > 0u) {
+                    --s_routeTraceBudget;
+                    const uint32_t rtSlot = slotIt->second.stateSlot;
+                    const float rtCapSig = (m_promoStatesValid && rtSlot < m_promoStates.size())
+                      ? m_promoStates[rtSlot].capSig : -1.0f;
+                    const int32_t rtPhase = routeCls != nullptr ? int32_t(routeCls->phase) : -1;
+                    const bool rtRouteA = !slotIt->second.demoted && !restGated;
+                    Logger::info(str::format("[RouteTrace] geom 0x", std::hex, geometryHash, std::dec,
+                                             " frame ", currentFrame, " slot ", rtSlot,
+                                             " capSig ", rtCapSig,
+                                             " classQ ", slotIt->second.contentClassQ,
+                                             " log2cap ", slotIt->second.classLog2CapVar,
+                                             " clsPhase ", rtPhase,
+                                             " demoted ", slotIt->second.demoted,
+                                             " restGated ", restGated,
+                                             " route ", (rtRouteA ? "PATH_A" : "PATH_B")));
+                  }
+                }
+              }
+
+              // [ClassAlias] confirm/deny capSig aliasing (the shape-signature decision).
+              // For the traced candidate, dump each instance's CLASS identity (classQ +
+              // subId), its capSig, its residual against the class reference, and a RAW
+              // object-space shape descriptor (bbox extents ex,ey,ez). Read as: instances
+              // that share (classQ, subId) but show DIFFERENT extents AND high residual =
+              // the 1-D capSig band is grouping non-corresponding shapes under ONE
+              // reference and the sibling chain is not splitting them -> the shape-signature
+              // class key is warranted. blasEntry is LIVE here (draw thread), so reading its
+              // bbox is safe. Raw values, no threshold; throttled per slot per 10 frames.
+              {
+                const std::string& caHashStr = ClusterLodOptions::Promotion::dumpGeometryHash();
+                if (!caHashStr.empty() && slotIt != m_promoSlotByBlas.end()) {
+                  uint64_t caHash = 0;
+                  try { caHash = std::stoull(caHashStr, nullptr, 16); } catch (...) { caHash = 0; }
+                  if (caHash != 0 && geometryHash == caHash) {
+                    const uint32_t caSlot = slotIt->second.stateSlot;
+                    static std::mutex s_caMutex;
+                    static std::unordered_map<uint32_t, uint32_t> s_caLast;  // slot -> last logged frame
+                    std::lock_guard<std::mutex> caLk(s_caMutex);
+                    uint32_t& caLastFrame = s_caLast[caSlot];
+                    if (caLastFrame == 0u || currentFrame - caLastFrame > 10u) {
+                      caLastFrame = currentFrame;
+                      const auto& caBox = blasEntry->input.getGeometryData().boundingBox;
+                      const bool caValid = caBox.isValid();
+                      const float caEx = caValid ? (caBox.maxPos.x - caBox.minPos.x) : 0.0f;
+                      const float caEy = caValid ? (caBox.maxPos.y - caBox.minPos.y) : 0.0f;
+                      const float caEz = caValid ? (caBox.maxPos.z - caBox.minPos.z) : 0.0f;
+                      const float caCapSig = (m_promoStatesValid && caSlot < m_promoStates.size())
+                        ? m_promoStates[caSlot].capSig : -1.0f;
+                      const float caResid = (m_promoStatesValid && caSlot < m_promoStates.size())
+                        ? m_promoStates[caSlot].residualRel : -1.0f;
+                      Logger::info(str::format("[ClassAlias] geom 0x", std::hex, geometryHash, std::dec,
+                                               " frame ", currentFrame, " slot ", caSlot,
+                                               " classQ ", slotIt->second.contentClassQ,
+                                               " subId ", slotIt->second.classSubId,
+                                               " capSig ", caCapSig,
+                                               " residual ", caResid,
+                                               " demoted ", slotIt->second.demoted,
+                                               " ext (", caEx, ", ", caEy, ", ", caEz, ")"));
+                    }
+                  }
+                }
+              }
+
               // per-instance demotion: a demoted instance falls through to
               // Path B below while its siblings stay promoted; its slot keeps
               // solving (buildPromotionEntries) so it can re-promote
@@ -4207,6 +4405,18 @@ namespace dxvk {
         const auto it = dumpHash != 0 ? m_promoCandidates.find(dumpHash) : m_promoCandidates.end();
         if (it != m_promoCandidates.end()) {
           frameParams.promotionDumpStateSlot = it->second.stateSlot;
+        }
+        // [CapSigDump] prefer a PROMOTED INSTANCE of the traced hash over the candidate:
+        // the candidate is a probe-only slot with a stable capture, but the popping is on
+        // instance slots whose captureVa ping-pongs (double buffer). Trace one of those so
+        // the capSig-vertex dump compares the two ping-pong buffers of a real instance.
+        if (dumpHash != 0) {
+          for (const auto& kv : m_promoSlotByBlas) {
+            if (kv.second.geometryHash == dumpHash && kv.second.contentClassQ != INT32_MIN) {
+              frameParams.promotionDumpStateSlot = kv.second.stateSlot;
+              break;
+            }
+          }
         }
       }
     }

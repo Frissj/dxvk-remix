@@ -185,7 +185,10 @@ struct ClusterRenderSystem::Impl
   // [SolveDump] M + per-validation (ref,cap,dev) of one traced slot: 16 header
   // floats + SOLVE_DUMP_MAXVAL(16) * SOLVE_DUMP_STRIDE(10). Device buffer the
   // kernel writes, copied to a host ring for readback.
-  static constexpr uint32_t kPromoSolveDumpFloats = 16 + 16 * 10;
+  // 16 header + SOLVE_DUMP_MAXVAL(16)*SOLVE_DUMP_STRIDE(10) = 176 for the M/validation
+  // dump; + [176,177]=captureVa lo/hi, [178]=capSigVar, [179]=sigN, [180 + i*3]=the
+  // actual capSig-sampled vertex positions (i<32) -> [CapSigDump] buffer-consistency probe
+  static constexpr uint32_t kPromoSolveDumpFloats = 16 + 16 * 10 + 4 + 32 * 3;
   nvvk::Buffer promoSolveDumpBuffer;
   nvvk::Buffer promoSolveDumpReadback[kStagingSlots];
   uint32_t promoSolveDumpFramesRecorded = 0;
