@@ -260,9 +260,13 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
   {
     const uint64_t clusterGeometriesTableAddress =
       (uint64_t(cb.clusterGeometriesTableAddressHi) << 32) | uint64_t(cb.clusterGeometriesTableAddressLo);
+    // streaming resident cluster table (0 = preloaded mode); see clusterGeometryCreate
+    const uint64_t clusterResidentClustersAddress =
+      (uint64_t(cb.clusterResidentClustersAddressHi) << 32) | uint64_t(cb.clusterResidentClustersAddressLo);
 
     clusterGeometry = clusterGeometryCreate(
-      clusterGeometriesTableAddress, surface.clusterGeometryId & 0x3FFFF, rayInteraction.clusterId);
+      clusterGeometriesTableAddress, surface.clusterGeometryId & 0x3FFFF, rayInteraction.clusterId,
+      clusterResidentClustersAddress);
     clusterIndices = clusterGeometryGetTriangleIndices(clusterGeometry, rayInteraction.primitiveIndex);
   }
   else if (isTemplateHit)

@@ -570,6 +570,10 @@ namespace dxvk {
     // device address of the generation's shaderio::Geometry table (0 if none);
     // consumed by the path tracer's hit-side cluster fetch via raytrace_args
     uint64_t getGeometriesTableAddress() const;
+    // Streaming resident cluster-address table (0 when preloaded/not streaming).
+    // The hit shader needs it because shaderio::Geometry::preloadedClusters is
+    // null in streaming mode - see ClusterRenderSystem::getResidentClustersAddress.
+    uint64_t getResidentClustersAddress() const;
 
     // P4c: device address of the promotion matrices array (M/prevM per state
     // slot; 0 while inactive) - consumed by promoted surfaces via raytrace_args

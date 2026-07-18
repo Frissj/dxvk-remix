@@ -1183,6 +1183,23 @@ uint64_t ClusterRenderSystem::getGeometriesTableAddress() const
   return impl.rscene->getShaderGeometriesBuffer().address;
 }
 
+uint64_t ClusterRenderSystem::getResidentClustersAddress() const
+{
+  Impl& impl = *m_impl;
+  if(!impl.hasGeneration || !impl.rscene)
+  {
+    return 0;
+  }
+  // Preloaded mode resolves clusters through shaderio::Geometry::preloadedClusters
+  // (geometry-local ClusterID), so it must report 0 here - see the header note:
+  // the ClusterID spaces are NOT interchangeable between the two modes.
+  if(!impl.rscene->useStreaming)
+  {
+    return 0;
+  }
+  return impl.rscene->sceneStreaming.getShaderStreamingData().resident.clusters;
+}
+
 uint64_t ClusterRenderSystem::getPromotionStateAddress() const
 {
   // 160 B per slot: M rows (row-major 3x4) at +0, prevM rows at +48,

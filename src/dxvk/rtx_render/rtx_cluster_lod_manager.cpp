@@ -5720,6 +5720,13 @@ namespace dxvk {
     return m_renderSystem->getGeometriesTableAddress();
   }
 
+  uint64_t ClusterLodManager::getResidentClustersAddress() const {
+    if (m_renderSystem == nullptr) {
+      return 0;
+    }
+    return m_renderSystem->getResidentClustersAddress();
+  }
+
   uint64_t ClusterLodManager::getPromotionStateAddress() const {
     if (m_renderSystem == nullptr || !ClusterLodOptions::Promotion::enable()) {
       return 0;

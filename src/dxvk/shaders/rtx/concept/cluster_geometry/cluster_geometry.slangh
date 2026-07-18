@@ -119,7 +119,8 @@ struct ClusterGeometry
 // clusterId (ClusterIDNV, geometry-local in the preloaded path) to the cluster
 // header. geometriesTableAddress comes from the raytrace args (0 while no
 // cluster render generation is active).
-ClusterGeometry clusterGeometryCreate(uint64_t geometriesTableAddress, uint geometryId, uint clusterId)
+ClusterGeometry clusterGeometryCreate(uint64_t geometriesTableAddress, uint geometryId, uint clusterId,
+                                      uint64_t residentClustersAddress)
 {
   ClusterGeometry clusterGeometry;
 
@@ -128,19 +129,42 @@ ClusterGeometry clusterGeometryCreate(uint64_t geometriesTableAddress, uint geom
     return clusterGeometry;
   }
 
-  // Geometry table entry -> preloaded cluster address array -> cluster
-  const uint64_t geometryAddress =
-    geometriesTableAddress + uint64_t(geometryId) * CLUSTER_GEOMETRY_SIZEOF_SHADERIO_GEOMETRY;
+  uint64_t clusterAddress;
 
-  const uint64_t preloadedClusters =
-    clusterGeometryLoadU64(geometryAddress + CLUSTER_GEOMETRY_OFFSETOF_PRELOADED_CLUSTERS);
-
-  if (preloadedClusters == 0)
+  if (residentClustersAddress != 0)
   {
-    return clusterGeometry;
+    // STREAMING: shaderio::Geometry::preloadedClusters is only ever written by
+    // ScenePreloaded, so it is null here and the preloaded lookup below would
+    // return an attribute-less default - that is what stripped texcoords/normals
+    // from every Path A surface. Streaming keeps the same per-cluster headers in
+    // the resident table instead.
+    //
+    // clusterId is ClusterIDNV, which stream_update_scene.comp tags as the
+    // RESIDENT cluster index (it writes resident.clusters[clusterResidentID] and
+    // sets buildInfo.clusterID = clusterResidentID for the CLAS it builds), so it
+    // indexes this table directly - no per-geometry base. This is deliberately
+    // authoritative and has NO fallback to preloadedClusters: that array is
+    // indexed by a GEOMETRY-LOCAL ClusterID, so the same integer denotes a
+    // different cluster there and a fallback would silently fetch foreign
+    // geometry rather than fail.
+    clusterAddress = clusterGeometryLoadU64(residentClustersAddress + uint64_t(clusterId) * 8);
   }
+  else
+  {
+    // PRELOADED: geometry table entry -> preloaded cluster address array -> cluster
+    const uint64_t geometryAddress =
+      geometriesTableAddress + uint64_t(geometryId) * CLUSTER_GEOMETRY_SIZEOF_SHADERIO_GEOMETRY;
 
-  const uint64_t clusterAddress = clusterGeometryLoadU64(preloadedClusters + uint64_t(clusterId) * 8);
+    const uint64_t preloadedClusters =
+      clusterGeometryLoadU64(geometryAddress + CLUSTER_GEOMETRY_OFFSETOF_PRELOADED_CLUSTERS);
+
+    if (preloadedClusters == 0)
+    {
+      return clusterGeometry;
+    }
+
+    clusterAddress = clusterGeometryLoadU64(preloadedClusters + uint64_t(clusterId) * 8);
+  }
 
   // Stale / never-published cluster-table entry: a Path B ClusterID past the
   // animated table's boundary that was never written, or an in-flight instance

@@ -653,6 +653,25 @@ namespace lodclusters_remix {
     // Remix's hit-side cluster fetch (raytrace_args)
     uint64_t getGeometriesTableAddress() const;
 
+    // device address of the STREAMING resident cluster-address table
+    // (SceneStreaming.resident.clusters), or 0 when not streaming.
+    //
+    // Why the hit side needs this: shaderio::Geometry::preloadedClusters is only
+    // ever written by ScenePreloaded, so in streaming mode it is null and the hit
+    // shader's clusterGeometryCreate bails before reading the cluster header -
+    // every Path A surface then renders with attributeBits = 0 (no texcoords, no
+    // normals) no matter what the snapshot baked in. Streaming keeps the same
+    // per-cluster headers in this resident table instead.
+    //
+    // Indexing (verified): stream_update_scene.comp writes
+    // resident.clusters[clusterResidentID] and tags the CLAS it builds with
+    // buildInfo.clusterID = clusterResidentID, so the ClusterIDNV reported at hit
+    // time IS the index into this table. NOTE this differs from the preloaded
+    // path, where ClusterIDNV is GEOMETRY-LOCAL - the same integer means different
+    // things in the two modes, so a consumer must treat this table as
+    // authoritative when non-zero and must NOT fall back to preloadedClusters.
+    uint64_t getResidentClustersAddress() const;
+
     // ---- P4c rigid-capture promotion (plan 7.7 spec) ----
 
     // fixed number of persistent promotion state slots (system scope -

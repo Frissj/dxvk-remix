@@ -665,8 +665,12 @@ void geometryResolverVertexOutputDebugView(
     {
       const uint64_t clusterGeometriesTableAddress =
         (uint64_t(cb.clusterGeometriesTableAddressHi) << 32) | uint64_t(cb.clusterGeometriesTableAddressLo);
+      // streaming resident cluster table (0 = preloaded mode); see clusterGeometryCreate
+      const uint64_t clusterResidentClustersAddress =
+        (uint64_t(cb.clusterResidentClustersAddressHi) << 32) | uint64_t(cb.clusterResidentClustersAddressLo);
       const ClusterGeometry clusterGeometry = clusterGeometryCreate(
-        clusterGeometriesTableAddress, surface.clusterGeometryId, rayInteraction.clusterId);
+        clusterGeometriesTableAddress, surface.clusterGeometryId, rayInteraction.clusterId,
+        clusterResidentClustersAddress);
 
       if (cb.debugView == DEBUG_VIEW_CLUSTER_LOD_LEVEL)
       {

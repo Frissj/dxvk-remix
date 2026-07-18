@@ -424,6 +424,18 @@ struct RaytraceArgs {
   uint clusterGeometriesTableAddressLo;
   uint clusterGeometriesTableAddressHi;
 
+  // NV-DXVK: STREAMING resident cluster-address table (SceneStreaming.resident.
+  // clusters), 0 when preloaded / not streaming. shaderio::Geometry::
+  // preloadedClusters is only written by ScenePreloaded, so under streaming the
+  // hit-side lookup has no cluster to resolve and every Path A surface loses its
+  // texcoords/normals; this table carries the same per-cluster headers.
+  // Indexed by ClusterIDNV, which stream_update_scene.comp tags as the resident
+  // cluster index. That is a DIFFERENT index space from the preloaded path's
+  // geometry-local ClusterID, so when this is non-zero it is authoritative -
+  // never fall back to preloadedClusters on a miss.
+  uint clusterResidentClustersAddressLo;
+  uint clusterResidentClustersAddressHi;
+
   // NV-DXVK: RTX Mega Geometry Path B (P4b, deforming geometry).
   // Device address (BDA) of the global animated cluster table: one uint64 per
   // cluster holding the device address of the cluster's triangles inside its

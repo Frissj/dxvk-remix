@@ -1385,6 +1385,14 @@ namespace dxvk {
       constants.clusterGeometriesTableAddressLo = uint32_t(clusterGeometriesTableAddress);
       constants.clusterGeometriesTableAddressHi = uint32_t(clusterGeometriesTableAddress >> 32);
 
+      // Streaming resident cluster table: non-zero only under streaming, where
+      // shaderio::Geometry::preloadedClusters is null and the hit side would
+      // otherwise resolve no cluster at all (attribute-less Path A surfaces).
+      const uint64_t clusterResidentClustersAddress =
+        clusterLodManager != nullptr ? clusterLodManager->getResidentClustersAddress() : 0;
+      constants.clusterResidentClustersAddressLo = uint32_t(clusterResidentClustersAddress);
+      constants.clusterResidentClustersAddressHi = uint32_t(clusterResidentClustersAddress >> 32);
+
       // P4b Path B: animated cluster table for the hit-side primitive remap
       const uint64_t animatedClusterTableAddress =
         clusterLodManager != nullptr ? clusterLodManager->getAnimatedClusterTableAddress() : 0;
