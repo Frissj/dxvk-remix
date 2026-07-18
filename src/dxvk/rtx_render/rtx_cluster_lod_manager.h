@@ -1059,6 +1059,34 @@ namespace dxvk {
       // whether unsettled captures are what produce the off-cell (phantom) eigen
       // readings that flap stable geometry to Path B. Diagnostic only (no gating yet).
       bool sweepSrcUnsettled = false;
+      // [BucketCensus] DIAGNOSTIC-ONLY mirror of the resolved candidate key, stamped
+      // every frame this slot is routed. Deliberately separate from `geometryHash`
+      // above, which is load-bearing: it is only written at establish time and its
+      // 0/non-0 state drives the CONTENT REBIND detector, so the census must not
+      // write it. Lets the census group live slots by candidate key WITHOUT
+      // dereferencing the BlasEntry* keys of m_promoSlotByBlas - that map is never
+      // GC'd and holds freed/recycled addresses, so walking it and touching the
+      // pointee is a use-after-free.
+      uint64_t censusKey = 0;
+      uint32_t censusFrame = 0;
+      // [EigConsume] FIX 3: eigFrame of the last eigen verdict CONSUMED by the
+      // classifier, and the stale-verdict fence. The GPU status slot persists
+      // eigLam/eigFrame across tenant changes (the CPU-side recycle resets did NOT
+      // clear it), so a new tenant's first classify consumed the OLD tenant's
+      // verdict as its own first read ([UnclassProbe] proved slot 226 seeding key
+      // 0x6c25c9f6's debounce with content measured 185 frames earlier under
+      // 0xdd92381e). Classification now only consumes state.eigFrame STRICTLY
+      // greater than this; every tenant/content reset re-fences it to the slot's
+      // current state.eigFrame so pre-reset verdicts are unreachable.
+      uint32_t lastEigConsumedFrame = 0;
+      // [FastJoin] FIX 1: this slot's class was committed on a SINGLE verdict
+      // because the cell was already Promoted for its candidate (joining a known
+      // class, not minting a new one - the 2-agree debounce guards minting).
+      // While provisional the class FREEZE is bypassed, so if the join came from
+      // a transient garbage read the next disagreeing sweeps can still swap away
+      // (a frozen wrong join would be sticky until a content rebind). Cleared by
+      // the first confirming (same-cell) verdict.
+      bool classProvisional = false;
     };
     std::unordered_map<const BlasEntry*, PromoInstance> m_promoSlotByBlas;
     // per-frame kernel work items (built in dispatchBuild, consumed by

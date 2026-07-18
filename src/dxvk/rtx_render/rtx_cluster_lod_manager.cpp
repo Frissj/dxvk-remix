@@ -1678,8 +1678,50 @@ namespace dxvk {
       //    Promoted instance against re-routing on a single transient garbage capture.
       bool classSwapped = false;
       const bool freshSolve = state.lastFrame != 0u && state.lastFrame != promoInstance.lastClassifiedFrame;
-      if (freshSolve) {
+      // [EigConsume] FIX 3 (consume side): verdict freshness keys on the EIGEN
+      // sweep counter, not the mode-0 solve counter. lastFrame advances on EVERY
+      // per-frame solve while eigLam only changes when an eigen sweep lands, so
+      // the old gate (a) "consumed" 37994 zero verdicts for slots that had never
+      // been swept (92% of all [UnclassProbe] lines were lam 0,0 = eigFrame 0)
+      // and (b) re-consumed one persisted verdict many times - slot 218 read
+      // sweep-55's cell twice (frames 80 and 240) and COMMITTED off a single
+      // sweep, silently defeating the 2-consecutive-agree debounce; slot 226 did
+      // the same across a tenant change, seeding the new key's debounce with the
+      // OLD tenant's content. Strictly-greater beats the fence set at reset sites.
+      const bool freshEig = state.eigFrame != 0u && state.eigFrame > promoInstance.lastEigConsumedFrame;
+      // [EigWait] why is an unclassified slot not classifying THIS pass? Aggregate
+      // per-frame census, emitted on frame change (single CS thread walks this map
+      // once per frame). neverSwept = no eigen sweep has EVER landed for the GPU
+      // slot; fenced = only pre-reset (other-tenant) verdicts exist, waiting for a
+      // post-fence sweep; debouncing = fresh verdicts flowing, 2-agree pending.
+      {
+        static uint32_t s_ewFrame = 0, s_ewNever = 0, s_ewFenced = 0, s_ewDebounce = 0, s_ewLastEmit = 0;
+        const uint32_t ewNow = m_device->getCurrentFrameId();
+        if (ewNow != s_ewFrame) {
+          if (s_ewFrame != 0u && (s_ewNever | s_ewFenced | s_ewDebounce) != 0u
+              && ewNow - s_ewLastEmit >= 10u) {
+            s_ewLastEmit = ewNow;
+            Logger::info(str::format("[EigWait] frame ", s_ewFrame,
+                                     " unclassified slots: neverSwept ", s_ewNever,
+                                     " fencedStale ", s_ewFenced,
+                                     " debouncing ", s_ewDebounce));
+          }
+          s_ewFrame = ewNow;
+          s_ewNever = 0; s_ewFenced = 0; s_ewDebounce = 0;
+        }
+        if (promoInstance.contentClassQ == INT32_MIN) {
+          if (state.eigFrame == 0u) {
+            ++s_ewNever;
+          } else if (!freshEig) {
+            ++s_ewFenced;
+          } else {
+            ++s_ewDebounce;
+          }
+        }
+      }
+      if (freshSolve && freshEig) {
         promoInstance.lastClassifiedFrame = state.lastFrame;
+        promoInstance.lastEigConsumedFrame = state.eigFrame;
         // Content id = the capture's trace-normalized eigenvalue pair quantized to
         // the eigenEpsilon grid (quantizeEigClass). Stable rigid/uniform-scale
         // invariant (unlike the old scale-variant capSig), so a cell change is a
@@ -1687,6 +1729,37 @@ namespace dxvk {
         // comes from the staggered eigen sweep and persists in the status buffer
         // between sweeps, so it is available (stable) every frame once a sweep lands.
         const int32_t newQ = quantizeEigClass(state.eigLam1Hat, state.eigLam2Hat);
+        // [UnclassProbe] why does a demoting slot stay UNCLASSIFIED? ([BucketCensus]
+        // showed the demote population is dominated by contentClassQ == INT32_MIN
+        // slots, and the CONTENT REBIND reset fired 0 times, so the class is never
+        // COMMITTED rather than being wiped.) Log every landed sweep verdict for a
+        // still-unclassified slot BEFORE the debounce mutates pending state, so
+        // consecutive lines per slot separate the three candidate mechanisms:
+        //   newQ alternates cells line-to-line -> the 2-consecutive-agree debounce
+        //     below can never confirm (livelock): the slot's content genuinely
+        //     multiplexes pieces across frames, and per-SLOT classification is the
+        //     wrong home for the class;
+        //   newQ agrees but lines are FAR apart (frame column) -> sweep starvation,
+        //     classification is just slow at 2 fps;
+        //   newQ == INT32_MIN runs -> degenerate captures (empty/mid-write), which
+        //     the commit path otherwise consumes SILENTLY (lastClassifiedFrame has
+        //     already advanced above, so a degenerate read still burns the sweep).
+        // Volume-bounded by the sweep stagger (one line per landed sweep, unclassified
+        // slots only). geometryHash is only set at establish time and can be 0 here;
+        // censusKey (stamped every routed frame) is the fallback identity.
+        if (promoInstance.contentClassQ == INT32_MIN) {
+          const uint64_t probeKey = promoInstance.geometryHash != 0 ? promoInstance.geometryHash
+                                                                    : promoInstance.censusKey;
+          Logger::info(str::format("[UnclassProbe] slot ", promoInstance.stateSlot,
+                                   " key 0x", std::hex, probeKey, std::dec,
+                                   " newQ ", newQ,
+                                   " pendingQ ", promoInstance.pendingClassQ,
+                                   " pendingN ", promoInstance.pendingClassCount,
+                                   " lam ", state.eigLam1Hat, ",", state.eigLam2Hat,
+                                   " eigFrame ", state.eigFrame,
+                                   " sweepFrame ", state.lastFrame,
+                                   " frame ", m_device->getCurrentFrameId()));
+        }
         if (newQ != INT32_MIN) {
           const bool unclassified = promoInstance.contentClassQ == INT32_MIN;
           // FREEZE: once classified into a currently-Promoted class, HOLD it - a
@@ -1698,10 +1771,41 @@ namespace dxvk {
           const RestClassState* curClsFreeze = unclassified ? nullptr
             : resolveRestClass(promoInstance.geometryHash, promoInstance.contentClassQ,
                                promoInstance.classSubId, false);
+          // [FastJoin] a PROVISIONAL (single-read) join is exempt from the freeze:
+          // if the join came from a transient garbage read, the disagreeing sweeps
+          // that follow must still be able to swap away - a frozen wrong join
+          // would be sticky until a content rebind (which fired 0 times/session).
           const bool classFrozen = !unclassified
                                  && curClsFreeze != nullptr
-                                 && curClsFreeze->phase == RestClassState::Phase::Promoted;
+                                 && curClsFreeze->phase == RestClassState::Phase::Promoted
+                                 && !promoInstance.classProvisional;
           if (unclassified) {
+            // [FastJoin] FIX 1: joining an ALREADY-PROMOTED class commits on ONE
+            // read. The 2-agree debounce exists to avoid MINTING a phantom class
+            // from a transient first read; joining a class this candidate already
+            // promoted is a different, far cheaper operation - and the wait was
+            // the demote window: [UnclassProbe] showed slots spending 100+ frames
+            // unclassified (demoting EVERY routed frame) between their first and
+            // second verdicts while the cell they eventually committed was already
+            // Promoted. Wrong-join risk is bounded by classProvisional (freeze
+            // bypass above + WRONG-JOIN log below).
+            const uint64_t joinKey = promoInstance.geometryHash != 0 ? promoInstance.geometryHash
+                                                                     : promoInstance.censusKey;
+            const RestClassState* joinCls = joinKey != 0
+              ? resolveRestClass(joinKey, newQ, 0, false) : nullptr;
+            if (joinCls != nullptr && joinCls->phase == RestClassState::Phase::Promoted) {
+              promoInstance.contentClassQ = newQ;
+              promoInstance.classSubId = 0;
+              promoInstance.classProvisional = true;
+              promoInstance.pendingClassQ = INT32_MIN;
+              promoInstance.pendingClassCount = 0;
+              Logger::info(str::format("[FastJoin] slot ", promoInstance.stateSlot,
+                                       " key 0x", std::hex, joinKey, std::dec,
+                                       " JOINED Promoted cell ", newQ,
+                                       " on one read (lam ", state.eigLam1Hat, ",", state.eigLam2Hat,
+                                       ", eigFrame ", state.eigFrame,
+                                       ", frame ", m_device->getCurrentFrameId(), ") - provisional"));
+            } else
             // DEBOUNCE THE INITIAL ADOPTION (same 2-consecutive-sweep confirm the swap
             // path below uses). A fresh/rebound slot's FIRST eigen read can be a
             // mid-update transient - valid-range but the WRONG cell (observed: a static
@@ -1733,6 +1837,17 @@ namespace dxvk {
               if (++promoInstance.pendingClassCount >= 2u) {
                 classSwapped = true;
                 m_swapCommitted++;
+                // [FastJoin] a swap away from a PROVISIONAL join = the single-read
+                // join was WRONG (transient landed on a Promoted cell by chance).
+                // This is the fast-join's failure mode - count every occurrence.
+                if (promoInstance.classProvisional) {
+                  promoInstance.classProvisional = false;
+                  Logger::info(str::format("[FastJoin] slot ", promoInstance.stateSlot,
+                                           " geom 0x", std::hex, promoInstance.geometryHash, std::dec,
+                                           " WRONG JOIN corrected: provisional cell ", promoInstance.contentClassQ,
+                                           " -> ", newQ,
+                                           " (frame ", m_device->getCurrentFrameId(), ")"));
+                }
                 promoInstance.residentGeometryId = ~0u;  // old cell's residency is stale
                 // direction 2: routing follows the NEW cell's class verdict
                 // automatically (getGeometryId reads the slot's current class),
@@ -1758,6 +1873,16 @@ namespace dxvk {
           } else {
             if (promoInstance.pendingClassQ != INT32_MIN) {
               m_swapPendingAbandoned++;  // [SwapDebounce] returned to committed cell = transient
+            }
+            // [FastJoin] same-cell verdict = the provisional single-read join is
+            // CONFIRMED; re-arm the freeze (classFrozen applies from here on).
+            if (promoInstance.classProvisional) {
+              promoInstance.classProvisional = false;
+              Logger::info(str::format("[FastJoin] slot ", promoInstance.stateSlot,
+                                       " geom 0x", std::hex, promoInstance.geometryHash, std::dec,
+                                       " cell ", promoInstance.contentClassQ,
+                                       " CONFIRMED by second read (frame ",
+                                       m_device->getCurrentFrameId(), ")"));
             }
             promoInstance.pendingClassQ = INT32_MIN;
             promoInstance.pendingClassCount = 0;
@@ -2395,6 +2520,26 @@ namespace dxvk {
             promoInstance.classSubId = 0;
             promoInstance.classSubId = 0;
             promoInstance.lastClassifiedFrame = 0;
+            // [EigConsume] FIX 3 (fence side): the GPU status slot still holds the
+            // OLD tenant's eigen verdict (eigLam/eigFrame persist across this CPU
+            // reset), and the pending debounce still holds the old tenant's cell -
+            // both would classify the NEW content as the OLD shape. Fence past
+            // every verdict that exists right now; only a sweep of the new
+            // tenant's capture (strictly newer eigFrame) is consumable.
+            promoInstance.pendingClassQ = INT32_MIN;
+            promoInstance.pendingClassCount = 0;
+            promoInstance.classProvisional = false;
+            if (m_promoStatesValid && promoInstance.stateSlot < m_promoStates.size()) {
+              const uint32_t fenceEig = m_promoStates[promoInstance.stateSlot].eigFrame;
+              if (fenceEig > promoInstance.lastEigConsumedFrame) {
+                promoInstance.lastEigConsumedFrame = fenceEig;
+              }
+              Logger::info(str::format("[TenantFence] slot ", promoInstance.stateSlot,
+                                       " (restWorld emit) recycled tenant -> new key 0x",
+                                       std::hex, hash, std::dec,
+                                       " fenced eigFrame <= ", promoInstance.lastEigConsumedFrame,
+                                       " (frame ", m_device->getCurrentFrameId(), ")"));
+            }
           }
           promoInstance.isRestWorld = true;
           promoInstance.geometryHash = hash;
@@ -2443,12 +2588,41 @@ namespace dxvk {
             // continuously-drawn candidate still emits at most once per interval.
             const uint32_t nowFrame = m_device->getCurrentFrameId();
             const bool eigStarved = nowFrame - promoInstance.lastEigEmitFrame > eigInterval;
+            // [SweepBoost] FIX 2: an UNCLASSIFIED slot sweeps on EVERY sighting
+            // until its first class commits. The stagger (and even the starvation
+            // escape, which allows only one emission per interval) meters out
+            // verdicts so slowly that the 2-read classification took 100+ frames
+            // ([UnclassProbe]: slots 216-227 waited 160 frames between first and
+            // second verdict, demoting every routed frame in between). Bounded:
+            // only the unclassified population boosts, and each slot stops the
+            // moment contentClassQ commits (fast-join makes that 1 read for
+            // known-Promoted cells).
+            const bool unclassifiedBoost = promoInstance.contentClassQ == INT32_MIN;
             if (eigInterval > 0 && candidate.probeVa != 0
-                && (eigStarved || ((nowFrame + promoInstance.stateSlot) % eigInterval) == 0)) {
+                && (eigStarved || unclassifiedBoost
+                    || ((nowFrame + promoInstance.stateSlot) % eigInterval) == 0)) {
               lodclusters_remix::PromotionEntry eigEntry = instEntry;
               eigEntry.mode = 2;  // PROMO_MODE_EIGEN
               m_framePromoEntries.push_back(eigEntry);
               promoInstance.lastEigEmitFrame = nowFrame;
+              // [SweepBoost] per-frame aggregate (single CS thread): how many eigen
+              // sweeps this frame exist ONLY because of the boost. Emitted on frame
+              // change, >=10-frame spacing.
+              if (unclassifiedBoost && !eigStarved
+                  && ((nowFrame + promoInstance.stateSlot) % eigInterval) != 0) {
+                static uint32_t s_sbFrame = 0, s_sbCount = 0, s_sbLastEmit = 0;
+                if (nowFrame != s_sbFrame) {
+                  if (s_sbFrame != 0u && s_sbCount != 0u && nowFrame - s_sbLastEmit >= 10u) {
+                    s_sbLastEmit = nowFrame;
+                    Logger::info(str::format("[SweepBoost] frame ", s_sbFrame,
+                                             " emitted ", s_sbCount,
+                                             " boost-only eigen sweeps (restWorld emit)"));
+                  }
+                  s_sbFrame = nowFrame;
+                  s_sbCount = 0;
+                }
+                ++s_sbCount;
+              }
             }
           }
 
@@ -2965,8 +3139,12 @@ namespace dxvk {
           // meanwhile. Same updatedInPlace test getGeometryId uses for Path-B routing.
           const bool srcUnsettled = blasEntry->frameLastUpdated == m_device->getCurrentFrameId()
                                  && blasEntry->frameLastUpdated != blasEntry->frameCreated;
+          // [SweepBoost] FIX 2 (promoted-slot emit site): an unclassified slot in
+          // the Path A branch sweeps every settled sighting too - same rationale
+          // as the restWorld site; sweepPending/srcUnsettled stay authoritative.
           if (instanceIt != m_promoSlotByBlas.end() && !instanceIt->second.sweepPending && !srcUnsettled
               && (instanceIt->second.eigenSuspect
+                  || instanceIt->second.contentClassQ == INT32_MIN
                   || ((m_device->getCurrentFrameId() + instanceIt->second.stateSlot) % sweepInterval) == 0)) {
             lodclusters_remix::PromotionEntry sweepEntry = promoEntry;
             sweepEntry.patchSlot = 0xFFFFFFFFu;
@@ -3799,6 +3977,16 @@ namespace dxvk {
         || (m_templateSystemMT != nullptr && !m_animatedGeometryByKey.empty());
   }
 
+  // [BucketCensus] per-candidate route tallies shared by the Path A and the demote
+  // branches of isClusterInstance (a function-local static can't span both blocks).
+  // Diagnostic only. pathA vs demotes per key is what separates the two readings:
+  //   demotes rising while pathA stays 0 -> dropped once, settled on Path B (benign)
+  //   BOTH rising together               -> genuine A<->B flapping (the visible bug)
+  namespace {
+    std::mutex g_bcRouteMutex;
+    std::unordered_map<uint64_t, uint64_t> g_bcPathA;
+  }
+
   bool ClusterLodManager::isClusterInstance(const RtInstance* instance, uint32_t& outGeometryId) {
     if (!ClusterLodOptions::enable()) {
       return false;
@@ -4064,6 +4252,25 @@ namespace dxvk {
                 slotIt->second.classSubId = 0;
                 slotIt->second.classSubId = 0;
                 slotIt->second.lastClassifiedFrame = 0;
+                // [EigConsume] FIX 3 (fence side, route recycle): this is the reset
+                // slot 226 went through - lastClassifiedFrame=0 re-armed freshSolve
+                // while the GPU slot still held sweep-55's verdict, so the new
+                // tenant consumed the OLD tenant's cell (106517) as its first read
+                // under a different key. Fence + clear the pending debounce.
+                slotIt->second.pendingClassQ = INT32_MIN;
+                slotIt->second.pendingClassCount = 0;
+                slotIt->second.classProvisional = false;
+                if (m_promoStatesValid && slotIt->second.stateSlot < m_promoStates.size()) {
+                  const uint32_t fenceEig = m_promoStates[slotIt->second.stateSlot].eigFrame;
+                  if (fenceEig > slotIt->second.lastEigConsumedFrame) {
+                    slotIt->second.lastEigConsumedFrame = fenceEig;
+                  }
+                  Logger::info(str::format("[TenantFence] slot ", slotIt->second.stateSlot,
+                                           " (route) recycled tenant, geom 0x",
+                                           std::hex, geometryHash, std::dec,
+                                           " fenced eigFrame <= ", slotIt->second.lastEigConsumedFrame,
+                                           " (frame ", currentFrame, ")"));
+                }
                 routeCls = nullptr;  // the class was resolved from the OLD tenant's classification
               } else if (slotIt != m_promoSlotByBlas.end()
                          && slotIt->second.geometryHash != 0
@@ -4086,6 +4293,18 @@ namespace dxvk {
                 slotIt->second.classSubId = 0;
                 slotIt->second.classSubId = 0;
                 slotIt->second.lastClassifiedFrame = 0;
+                // [EigConsume] FIX 3 (fence side, content rebind): same stale-verdict
+                // hazard as the tenant recycles - the persisted eigen verdict and the
+                // pending debounce both describe the OLD content.
+                slotIt->second.pendingClassQ = INT32_MIN;
+                slotIt->second.pendingClassCount = 0;
+                slotIt->second.classProvisional = false;
+                if (m_promoStatesValid && slotIt->second.stateSlot < m_promoStates.size()) {
+                  const uint32_t fenceEig = m_promoStates[slotIt->second.stateSlot].eigFrame;
+                  if (fenceEig > slotIt->second.lastEigConsumedFrame) {
+                    slotIt->second.lastEigConsumedFrame = fenceEig;
+                  }
+                }
                 // [ShapeClass] verify the handoff's ~4/34 "2 geom hashes under one BlasEntry"
                 // claim and how often the freeze actually releases here. Logs the OLD->NEW
                 // stable candidate key BEFORE the overwrite (blasFC constant proves the
@@ -4187,6 +4406,14 @@ namespace dxvk {
                 }
               }
 
+              // [BucketCensus] stamp the diagnostic candidate key on every routed
+              // slot (both outcomes below), so the census can group live slots by
+              // candidate without dereferencing this map's BlasEntry* keys.
+              if (slotIt != m_promoSlotByBlas.end()) {
+                slotIt->second.censusKey = geometryHash;
+                slotIt->second.censusFrame = currentFrame;
+              }
+
               // direction 2: route by the content class. A slot whose current
               // class is Promoted renders Path A; anything else falls through to
               // Path B below and keeps solving (buildPromotionEntries) so its
@@ -4198,6 +4425,10 @@ namespace dxvk {
                 slotIt->second.geometryHash = geometryHash;
                 slotIt->second.blasFrameCreated = blasEntry->frameCreated;
                 outGeometryId = kPromotedTag | (slotIt->second.stateSlot << kPromotedSlotShift) | found->second;
+                {  // [BucketCensus] tally the Path A side of the flap question
+                  std::lock_guard<std::mutex> bcRouteLock(g_bcRouteMutex);
+                  ++g_bcPathA[geometryHash];
+                }
                 markPathA();
                 logRoute("Path A (established)", 1u);
                 return true;
@@ -4212,7 +4443,12 @@ namespace dxvk {
                 static std::unordered_map<uint64_t, uint32_t> s_lastLogFrame;
                 std::lock_guard<std::mutex> lk2(s_m2);
                 uint32_t& last = s_lastLogFrame[geometryHash];
-                if (currentFrame - last > 300u || last == 0u) {
+                // Throttle was 300 frames per hash. At this game's ~2 fps that is 150
+                // seconds - longer than a whole session - so a hash that demoted EVERY
+                // frame still logged at most once, and the resulting "max 2 drops per
+                // hash, no oscillation" reading was an artifact of the throttle, not
+                // behaviour. Counted below instead; keep only a small emit throttle.
+                if (currentFrame - last >= 10u || last == 0u) {
                   last = currentFrame;
                   const char* why2 = classGated
                                    ? "content-class not Promoted ([ShapeClass] pending/gating/drift-demoted)"
@@ -4221,6 +4457,71 @@ namespace dxvk {
                                            " instance dropped to Path B: ", why2,
                                            " (stateSlot ", (slotIt != m_promoSlotByBlas.end() ? int64_t(slotIt->second.stateSlot) : int64_t(-1)),
                                            ")"));
+                }
+              }
+
+              // [BucketCensus] the (b) probe. Two questions the throttled log above
+              // cannot answer:
+              //   1. Do these candidates FLAP A<->B, or drop once and settle? Counted
+              //      per key (demotes vs Path A routes), unthrottled counters.
+              //   2. Does one candidate key really span several LIVE contents at once,
+              //      each needing its own reference? Counted as distinct contentClassQ
+              //      across the live slots sharing this key.
+              // Reads only PromoInstance value fields (censusKey/contentClassQ) - never
+              // dereferences the map's BlasEntry* keys, which may be freed or recycled.
+              // If distinctClasses is ~1 per key, the "7-17 contents under one hash"
+              // premise is about content seen OVER TIME (a rebinding slot), not
+              // concurrently - which would mean per-draw capture slots cannot separate
+              // them and option 1 is the wrong fix.
+              {
+                static std::mutex s_bcMutex;
+                static std::unordered_map<uint64_t, uint64_t> s_demotes;
+                static std::unordered_map<uint64_t, uint32_t> s_lastCensus;
+                std::lock_guard<std::mutex> bcLock(s_bcMutex);
+                ++s_demotes[geometryHash];
+                uint32_t& lastCensus = s_lastCensus[geometryHash];
+                if (currentFrame - lastCensus >= 10u || lastCensus == 0u) {
+                  lastCensus = currentFrame;
+                  uint32_t liveSlots = 0;
+                  uint32_t unclassified = 0;
+                  std::vector<int32_t> classes;
+                  for (const auto& kv : m_promoSlotByBlas) {
+                    if (kv.second.censusKey != geometryHash) {
+                      continue;
+                    }
+                    // "live" = routed within the last 10 frames, so slots for content
+                    // that has left the scene do not inflate the concurrency count.
+                    if (currentFrame - kv.second.censusFrame > 10u) {
+                      continue;
+                    }
+                    ++liveSlots;
+                    if (kv.second.contentClassQ == INT32_MIN) {
+                      ++unclassified;
+                      continue;
+                    }
+                    if (std::find(classes.begin(), classes.end(), kv.second.contentClassQ) == classes.end()) {
+                      classes.push_back(kv.second.contentClassQ);
+                    }
+                  }
+                  std::string classList;
+                  for (size_t ci = 0; ci < classes.size(); ++ci) {
+                    classList += (ci == 0 ? "" : ",");
+                    classList += std::to_string(classes[ci]);
+                  }
+                  uint64_t pathATotal = 0;
+                  {
+                    std::lock_guard<std::mutex> bcRouteLock(g_bcRouteMutex);
+                    const auto paIt = g_bcPathA.find(geometryHash);
+                    pathATotal = (paIt != g_bcPathA.end()) ? paIt->second : 0ull;
+                  }
+                  Logger::info(str::format("[BucketCensus] geometry 0x", std::hex, geometryHash, std::dec,
+                                           " frame ", currentFrame,
+                                           " demotesTotal ", s_demotes[geometryHash],
+                                           " pathATotal ", pathATotal,
+                                           " liveSlots ", liveSlots,
+                                           " unclassified ", unclassified,
+                                           " distinctClasses ", classes.size(),
+                                           " [", classList, "]"));
                 }
               }
             }
@@ -4559,6 +4860,133 @@ namespace dxvk {
         }
         restSnap.verticesHash = XXH3_64bits(restSnap.positions.data(),
                                             restSnap.positions.size() * sizeof(float));
+
+        // ---- [RestCapVerify] PRE-CLUSTERIZE content check (crash fix) ----
+        // The adoption-time content check runs AFTER the worker has already
+        // clusterized the snapshot and SAVED its .nvsngeo cache file - the
+        // handoff's "reject-only, cannot feed the clusterizer" claim was wrong.
+        // Proven crash chain (log 23:04, geometry 0x84974cdd class q180230):
+        //   bake #1 clusterized + cache saved -> RestCapVerify "WRONG content
+        //   (cell 184324)" discarded it TOO LATE -> re-stage -> bake #2, same
+        //   class = same snapshot hash, different verts -> nvpro opens bake #1's
+        //   cache file -> "geometry mismatches scene cache file" -> process down.
+        // Verify HERE, on the CPU copy, BEFORE enqueue: same referenced-set
+        // centered covariance the probe build computes (dedup indices, double
+        // accumulation), analytic symmetric-3x3 eigenvalues, trace-normalized,
+        // quantizeEigClass, +-1 cell tolerance. A mismatch discards the capture
+        // and re-arms the class to re-stage - nothing wrong-shaped is ever
+        // clusterized or cached. The adoption-time check stays as a backstop.
+        if (request.classQ != INT32_MIN) {
+          int32_t preCellQ = INT32_MIN;
+          uint64_t refPosHash = 0;
+          {
+            std::vector<uint8_t> seen(request.vertexCount, 0);
+            double vcx = 0.0, vcy = 0.0, vcz = 0.0;
+            uint32_t vRefCount = 0;
+            for (const uint32_t idx : restSnap.indices) {
+              if (idx < request.vertexCount && !seen[idx]) {
+                seen[idx] = 1;
+                vcx += restSnap.positions[size_t(idx) * 3 + 0];
+                vcy += restSnap.positions[size_t(idx) * 3 + 1];
+                vcz += restSnap.positions[size_t(idx) * 3 + 2];
+                vRefCount++;
+              }
+            }
+            // [RestSpace] content hash over the REFERENCED positions only, in
+            // deterministic vertex-index order. verticesHash is unusable as an
+            // identity: unreferenced slots hold stale VRAM garbage that churns
+            // it on every bake even for identical shapes.
+            {
+              std::vector<float> refPos;
+              refPos.reserve(size_t(vRefCount) * 3);
+              for (uint32_t v = 0; v < request.vertexCount; v++) {
+                if (seen[v]) {
+                  refPos.push_back(restSnap.positions[size_t(v) * 3 + 0]);
+                  refPos.push_back(restSnap.positions[size_t(v) * 3 + 1]);
+                  refPos.push_back(restSnap.positions[size_t(v) * 3 + 2]);
+                }
+              }
+              refPosHash = XXH3_64bits(refPos.data(), refPos.size() * sizeof(float));
+            }
+            if (vRefCount >= 4) {
+              vcx /= vRefCount; vcy /= vRefCount; vcz /= vRefCount;
+              double cov[6] = {};
+              for (uint32_t v = 0; v < request.vertexCount; v++) {
+                if (!seen[v]) {
+                  continue;
+                }
+                const double dx = restSnap.positions[size_t(v) * 3 + 0] - vcx;
+                const double dy = restSnap.positions[size_t(v) * 3 + 1] - vcy;
+                const double dz = restSnap.positions[size_t(v) * 3 + 2] - vcz;
+                cov[0] += dx * dx; cov[1] += dy * dy; cov[2] += dz * dz;
+                cov[3] += dx * dy; cov[4] += dx * dz; cov[5] += dy * dz;
+              }
+              for (int i = 0; i < 6; i++) {
+                cov[i] /= double(vRefCount);
+              }
+              const double covTr = cov[0] + cov[1] + cov[2];
+              if (covTr > 1e-20) {
+                // Smith's trigonometric analytic eigenvalues (same as blob build)
+                const double q = covTr / 3.0;
+                const double aa = cov[0] - q, bb = cov[1] - q, cc = cov[2] - q;
+                const double d = cov[3], e = cov[4], f = cov[5];
+                const double p2 = (aa * aa + bb * bb + cc * cc) / 6.0 + (d * d + e * e + f * f) / 3.0;
+                const double p = std::sqrt(std::max(0.0, p2));
+                double lam1 = q, lam2 = q;
+                if (p > 1e-20) {
+                  const double det = aa * (bb * cc - f * f) - d * (d * cc - f * e) + e * (d * f - bb * e);
+                  const double r = std::max(-1.0, std::min(1.0, det / (2.0 * p * p * p)));
+                  const double phi = std::acos(r) / 3.0;
+                  const double e1 = q + 2.0 * p * std::cos(phi);
+                  const double e3 = q + 2.0 * p * std::cos(phi + 2.0943951023931953);
+                  const double e2 = covTr - e1 - e3;
+                  lam1 = std::max(e1, std::max(e2, e3));
+                  lam2 = covTr - lam1 - std::min(e1, std::min(e2, e3));
+                }
+                preCellQ = quantizeEigClass(float(lam1 / covTr), float(lam2 / covTr));
+              }
+            }
+          }
+          const int32_t preDq1 = preCellQ != INT32_MIN
+            ? std::abs(preCellQ / 4096 - request.classQ / 4096) : INT32_MAX;
+          const int32_t preDq2 = preCellQ != INT32_MIN
+            ? std::abs(preCellQ % 4096 - request.classQ % 4096) : INT32_MAX;
+          if (preDq1 > 1 || preDq2 > 1) {
+            Logger::info(str::format("[RestCapVerify] geometry 0x", std::hex, request.geometryHash, std::dec,
+                                     " class q", request.classQ, " sub ", request.classSubId,
+                                     " PRE-CLUSTERIZE reject: captured cell ", preCellQ,
+                                     " (copyFrame ", request.copyFrame,
+                                     ") - discarding BEFORE clusterization, will re-stage"));
+            RestClassState* wrongCls = resolveRestClass(request.geometryHash, request.classQ,
+                                                        request.classSubId, false);
+            if (wrongCls != nullptr && wrongCls->ref == RestClassState::Ref::Requested) {
+              wrongCls->captureStaged = false;  // re-stage a fresh capture
+            }
+            it = m_restCaptureRequests.erase(it);
+            continue;
+          }
+          // [RestSpace] CONTENT-ADDRESSED snapshot identity (crash fix, part 2).
+          // The cell check above has a +-1 tolerance, so a re-bake of the same
+          // class can PASS with slightly different float content than the bake
+          // already cached under this class's snapshot hash - same .nvsngeo file,
+          // different bytes, and nvpro's "geometry mismatches scene cache file" /
+          // "completed / required mismatch" takes the process down (this exact
+          // chain crashed 0x84974cdd class q180230: bake #1 cached, discarded at
+          // adoption, bake #2 same identity different verts). Mix the referenced-
+          // content hash into the identity: byte-identical recapture -> same file
+          // (cache hit), ANY content difference -> its own file - a cache
+          // mismatch is structurally impossible. routeHash is value-carried
+          // through class state and sidecars, so the new identity plumbs through
+          // adoption/routing/restore untouched.
+          restHash ^= (refPosHash | 1ull);
+          restSnap.geometryHash = restHash;
+          Logger::info(str::format("[RestCapVerify] geometry 0x", std::hex, request.geometryHash, std::dec,
+                                   " class q", request.classQ, " sub ", request.classSubId,
+                                   " PRE-CLUSTERIZE pass: captured cell ", preCellQ,
+                                   " matches (copyFrame ", request.copyFrame,
+                                   ", contentHash 0x", std::hex, refPosHash, std::dec,
+                                   " -> rest identity 0x", std::hex, restHash, std::dec, ")"));
+        }
 
         // ---- [RestCapProbe] copy-fidelity + weld-structure verdict ----
         // Welds = exact-duplicate position triples. Affine-invariant: ANY faithful

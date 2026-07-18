@@ -1320,6 +1320,48 @@ namespace dxvk {
                                    " (capture content ambiguous for promotion solve)"));
         }
       }
+      // [MultiDrawContent] PREMISE PROBE for the "last draw wins is ambiguous"
+      // claim behind the [MultiDraw] guards. DrawCallCache::get can only hand the
+      // SAME BlasEntry to a second draw in one frame via exactMatch() (the loose
+      // branches are all gated on !updatedThisFrame, and the multi-entry loop
+      // skips frameLastTouched == currentFrame). exactMatch requires equal
+      // FullGeometryHash = positions|texcoord|layout|shader|indices|descriptor,
+      // plus equal material and boneHash - i.e. the redraw writes the SAME bytes
+      // and the capture is NOT ambiguous. If that invariant holds, DIFF never
+      // fires and the guards are blocking promotion for a non-reason (and the
+      // clusterizer crash blamed on removing them needs another explanation).
+      // Any DIFF line falsifies it and names the path that got around exactMatch.
+      {
+        const XXH64_hash_t incomingFull = drawCallState.getGeometryData().getHashForRule<rules::FullGeometryHash>();
+        const XXH64_hash_t cachedFull = pBlas->input.getGeometryData().getHashForRule<rules::FullGeometryHash>();
+        const bool captured = drawCallState.preCaptureVertexData != nullptr;
+        static std::mutex s_mdcMutex;
+        static uint64_t s_same = 0, s_diff = 0, s_diffCaptured = 0;
+        static uint32_t s_lastSummary = 0;
+        const uint32_t frame = m_device->getCurrentFrameId();
+        std::lock_guard<std::mutex> mdcLock(s_mdcMutex);
+        if (incomingFull == cachedFull) {
+          ++s_same;
+        } else {
+          ++s_diff;
+          if (captured) {
+            ++s_diffCaptured;
+          }
+          Logger::info(str::format("[MultiDrawContent] DIFF frame ", frame,
+                                   " captured ", (captured ? 1 : 0),
+                                   " cachedFull 0x", std::hex, cachedFull,
+                                   " incomingFull 0x", incomingFull, std::dec,
+                                   " (same-frame BlasEntry reuse with DIFFERENT content -"
+                                   " capture genuinely ambiguous)"));
+        }
+        if (frame - s_lastSummary >= 10u || s_lastSummary == 0u) {
+          s_lastSummary = frame;
+          Logger::info(str::format("[MultiDrawContent] summary frame ", frame,
+                                   ": sameContent ", s_same,
+                                   " diffContent ", s_diff,
+                                   " diffCaptured ", s_diffCaptured));
+        }
+      }
       pBlas->cacheMaterial(drawCallState.getMaterialData());
       return SceneManager::ObjectCacheState::kUpdateInstance;
     }
