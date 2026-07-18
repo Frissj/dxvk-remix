@@ -4952,18 +4952,84 @@ namespace dxvk {
           const int32_t preDq2 = preCellQ != INT32_MIN
             ? std::abs(preCellQ % 4096 - request.classQ % 4096) : INT32_MAX;
           if (preDq1 > 1 || preDq2 > 1) {
-            Logger::info(str::format("[RestCapVerify] geometry 0x", std::hex, request.geometryHash, std::dec,
-                                     " class q", request.classQ, " sub ", request.classSubId,
-                                     " PRE-CLUSTERIZE reject: captured cell ", preCellQ,
-                                     " (copyFrame ", request.copyFrame,
-                                     ") - discarding BEFORE clusterization, will re-stage"));
+            // ---- [RestRetarget] capture RETARGETING (direction 2, done at the
+            // measurement, not the order). The staging decision picked a slot whose
+            // contentClassQ said "class X", but that classification is gateLag
+            // frames old - by copy time a multiplexing slot has moved to different
+            // content, so the ordered class receives the wrong shape. Discarding
+            // wastes a faithful capture and loops forever on always-multiplexing
+            // geometry (0x6c25c9f6: class 143374 demoting every frame while 21
+            // rejects piled up). We MEASURED the true cell from the verified CPU
+            // copy above - so adopt the capture onto the class it actually IS, if
+            // that class wants a reference. The ordered class re-stages either way.
+            // Safety: the cell comes from the CPU copy itself (no GPU transient),
+            // content-addressed identity means a mis-adoption can't corrupt any
+            // cache, and the adoption-time check + gate remain downstream.
             RestClassState* wrongCls = resolveRestClass(request.geometryHash, request.classQ,
                                                         request.classSubId, false);
             if (wrongCls != nullptr && wrongCls->ref == RestClassState::Ref::Requested) {
-              wrongCls->captureStaged = false;  // re-stage a fresh capture
+              wrongCls->captureStaged = false;  // the ordered class re-stages a fresh capture
             }
-            it = m_restCaptureRequests.erase(it);
-            continue;
+            RestClassState* retargetCls = nullptr;
+            if (preCellQ != INT32_MIN) {
+              const auto rtClassesIt = m_restClassesByCandidate.find(request.geometryHash);
+              if (rtClassesIt != m_restClassesByCandidate.end()) {
+                // exact cell first, then the +-1 quantization-boundary neighbors;
+                // only classes that WANT a reference (Requested) are candidates -
+                // unprompted references for shared-fit (CandidateProbe) classes or
+                // replacement of an existing Own reference stay out of scope.
+                for (RestClassState& c : rtClassesIt->second) {
+                  if (c.classQ == preCellQ && c.ref == RestClassState::Ref::Requested) {
+                    retargetCls = &c;
+                    break;
+                  }
+                }
+                if (retargetCls == nullptr) {
+                  for (RestClassState& c : rtClassesIt->second) {
+                    if (c.ref != RestClassState::Ref::Requested) {
+                      continue;
+                    }
+                    const int32_t rDq1 = std::abs(c.classQ / 4096 - preCellQ / 4096);
+                    const int32_t rDq2 = std::abs(c.classQ % 4096 - preCellQ % 4096);
+                    if (rDq1 <= 1 && rDq2 <= 1) {
+                      retargetCls = &c;
+                      break;
+                    }
+                  }
+                }
+              }
+            }
+            if (retargetCls == nullptr) {
+              Logger::info(str::format("[RestCapVerify] geometry 0x", std::hex, request.geometryHash, std::dec,
+                                       " class q", request.classQ, " sub ", request.classSubId,
+                                       " PRE-CLUSTERIZE reject: captured cell ", preCellQ,
+                                       " (copyFrame ", request.copyFrame,
+                                       ") - no Requested class wants this content, discarding"));
+              it = m_restCaptureRequests.erase(it);
+              continue;
+            }
+            Logger::info(str::format("[RestRetarget] geometry 0x", std::hex, request.geometryHash, std::dec,
+                                     " capture ordered for q", request.classQ, " sub ", request.classSubId,
+                                     " actually holds cell ", preCellQ,
+                                     " -> RETARGET to class q", retargetCls->classQ,
+                                     " sub ", retargetCls->subId,
+                                     " (copyFrame ", request.copyFrame, ")"));
+            request.classQ = retargetCls->classQ;
+            request.classSubId = retargetCls->subId;
+            retargetCls->captureStaged = true;  // its reference is now in flight (this one)
+            // re-derive the class-salted identity + snapshot class fields for the
+            // NEW target (the top-of-block values were computed for the ordered
+            // class); the content term is mixed in below with the pass path
+            restHash = request.geometryHash ^ kRestSpaceTag;
+            restHash ^= (uint64_t(uint32_t(request.classQ)) * 0xBF58476D1CE4E5B9ull) | 1ull;
+            if (request.classSubId != 0) {
+              restHash ^= (uint64_t(uint32_t(request.classSubId)) * 0x94D049BB133111EBull) | 1ull;
+            }
+            restSnap.promoClassQ = request.classQ;
+            restSnap.promoClassSubId = request.classSubId;
+            restSnap.name = request.classSubId != 0
+              ? str::format(topo.name, "_rest_q", request.classQ, "_s", request.classSubId)
+              : str::format(topo.name, "_rest_q", request.classQ);
           }
           // [RestSpace] CONTENT-ADDRESSED snapshot identity (crash fix, part 2).
           // The cell check above has a +-1 tolerance, so a re-bake of the same
