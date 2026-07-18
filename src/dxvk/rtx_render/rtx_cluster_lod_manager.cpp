@@ -4087,6 +4087,87 @@ namespace dxvk {
       }
     };
 
+    // [RouteFlip] MEASUREMENT for the user-visible A<->B flicker. Per-INSTANCE
+    // route tracker keyed by (stable topology key, promo state slot) - the topo
+    // key survives this game's per-frame asset-hash churn and the slot separates
+    // simultaneous instances of one mesh, so a transition here is one on-screen
+    // object actually changing its render path. Every transition logs (direction,
+    // frame, gap since the previous route); rapid A->B->A alternation with small
+    // gaps IS the visible flipping. [RouteFlipSum] aggregates every 10 frames:
+    // how many instances flipped within the last 30 frames and the worst
+    // offender, so a glance separates "one-time promotes" (benign B->A waves)
+    // from sustained oscillation.
+    auto stampRoute = [&](bool isA) {
+      if (pathATopoKey == 0) {
+        return;
+      }
+      uint32_t rfSlot = ~0u;
+      {
+        const auto rfIt = m_promoSlotByBlas.find(blasEntry);
+        if (rfIt != m_promoSlotByBlas.end()) {
+          rfSlot = rfIt->second.stateSlot;
+        }
+      }
+      struct RouteFlipState {
+        int8_t lastA = -1;          // -1 unseen, else 0/1
+        uint32_t lastFrame = 0;
+        uint32_t flipsToB = 0;      // A->B transitions (the demote direction)
+        uint32_t flipsToA = 0;      // B->A transitions
+        uint32_t lastFlipFrame = 0;
+        uint64_t topoKey = 0;
+        uint32_t slot = ~0u;
+      };
+      static std::mutex s_rfMx;
+      static std::unordered_map<uint64_t, RouteFlipState> s_rf;
+      static uint32_t s_rfLastSum = 0;
+      const uint64_t rfKey = pathATopoKey ^ (uint64_t(rfSlot) * 0x9E3779B97F4A7C15ull);
+      std::lock_guard<std::mutex> rfLk(s_rfMx);
+      RouteFlipState& st = s_rf[rfKey];
+      st.topoKey = pathATopoKey;
+      st.slot = rfSlot;
+      if (st.lastA != -1 && (st.lastA != 0) != isA) {
+        if (isA) {
+          st.flipsToA++;
+        } else {
+          st.flipsToB++;
+        }
+        st.lastFlipFrame = currentFrame;
+        Logger::info(str::format("[RouteFlip] topo 0x", std::hex, pathATopoKey, std::dec,
+                                 " slot ", int64_t(rfSlot == ~0u ? -1 : int64_t(rfSlot)),
+                                 (isA ? " B->A" : " A->B"),
+                                 " frame ", currentFrame,
+                                 " gap ", currentFrame - st.lastFrame,
+                                 " (toB ", st.flipsToB, " toA ", st.flipsToA, ")"));
+      }
+      st.lastA = isA ? 1 : 0;
+      st.lastFrame = currentFrame;
+      if (currentFrame - s_rfLastSum >= 10u || s_rfLastSum == 0u) {
+        s_rfLastSum = currentFrame;
+        uint32_t recentFlippers = 0, worstFlips = 0;
+        uint64_t worstTopo = 0;
+        uint32_t worstSlot = ~0u;
+        for (const auto& kv : s_rf) {
+          const RouteFlipState& r = kv.second;
+          if (r.lastFlipFrame != 0 && currentFrame - r.lastFlipFrame <= 30u) {
+            recentFlippers++;
+            const uint32_t total = r.flipsToB + r.flipsToA;
+            if (total > worstFlips) {
+              worstFlips = total;
+              worstTopo = r.topoKey;
+              worstSlot = r.slot;
+            }
+          }
+        }
+        if (recentFlippers != 0) {
+          Logger::info(str::format("[RouteFlipSum] frame ", currentFrame,
+                                   " instances flipped in last 30 frames: ", recentFlippers,
+                                   " | worst topo 0x", std::hex, worstTopo, std::dec,
+                                   " slot ", int64_t(worstSlot == ~0u ? -1 : int64_t(worstSlot)),
+                                   " totalFlips ", worstFlips));
+        }
+      }
+    };
+
     // direction 2: does an instance of promoted candidate `candHash` holding the
     // content class (classQ, subId) route Path A this frame? NON-rest content
     // routes A by DEFAULT (the candidate itself is proven rigid) and drops to B
@@ -4147,6 +4228,7 @@ namespace dxvk {
                   || m_trivialGeometryIds.count(pinIt->second.residentGeometryId) == 0)) {
             outGeometryId = kPromotedTag | (pinIt->second.stateSlot << kPromotedSlotShift) | pinIt->second.residentGeometryId;
             markPathA();
+            stampRoute(true);  // [RouteFlip]
             logRoute("Path A (pinned)", 0u);
             return true;
           }
@@ -4430,6 +4512,7 @@ namespace dxvk {
                   ++g_bcPathA[geometryHash];
                 }
                 markPathA();
+                stampRoute(true);  // [RouteFlip]
                 logRoute("Path A (established)", 1u);
                 return true;
               }
@@ -4560,6 +4643,7 @@ namespace dxvk {
           }
         }
       }
+      stampRoute(false);  // [RouteFlip] Path B and classic both = "not Path A" on screen
       logRoute(routedPathB ? "Path B (cluster template)" : "classic (fell through - no cluster route)", routedPathB ? 2u : 3u);
       return routedPathB;
     }
