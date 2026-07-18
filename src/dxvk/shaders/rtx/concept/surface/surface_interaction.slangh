@@ -383,16 +383,20 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
   vec3 promoNormalRow0 = vec3(0.0f);
   vec3 promoNormalRow1 = vec3(0.0f);
   vec3 promoNormalRow2 = vec3(0.0f);
+  // Base address of this promoted instance's matrix rows, hoisted so the motion
+  // computation below can read the same slot's prevM without re-deriving the
+  // address (0 when not a promoted hit - never dereferenced in that case).
+  uint64_t promoRowsAddress = 0;
 
   if (isPromotedHit)
   {
     const uint64_t promotionStateAddress =
       (uint64_t(cb.promotionStateAddressHi) << 32) | uint64_t(cb.promotionStateAddressLo);
-    const uint64_t rowsAddress = promotionStateAddress + uint64_t(promoStateSlotPlusOne - 1) * 160;
+    promoRowsAddress = promotionStateAddress + uint64_t(promoStateSlotPlusOne - 1) * 160;
 
-    const float4 promoCurRow0 = *(Ptr<float4>(rowsAddress + 0));
-    const float4 promoCurRow1 = *(Ptr<float4>(rowsAddress + 16));
-    const float4 promoCurRow2 = *(Ptr<float4>(rowsAddress + 32));
+    const float4 promoCurRow0 = *(Ptr<float4>(promoRowsAddress + 0));
+    const float4 promoCurRow1 = *(Ptr<float4>(promoRowsAddress + 16));
+    const float4 promoCurRow2 = *(Ptr<float4>(promoRowsAddress + 32));
 
     promoNormalRow0 = cross(promoCurRow1.xyz, promoCurRow2.xyz);
     promoNormalRow1 = cross(promoCurRow2.xyz, promoCurRow0.xyz);
@@ -403,9 +407,9 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
     float4 promoRow2 = promoCurRow2;
     if (usePreviousPositions && !surface.isStatic)
     {
-      promoRow0 = *(Ptr<float4>(rowsAddress + 48));
-      promoRow1 = *(Ptr<float4>(rowsAddress + 64));
-      promoRow2 = *(Ptr<float4>(rowsAddress + 80));
+      promoRow0 = *(Ptr<float4>(promoRowsAddress + 48));
+      promoRow1 = *(Ptr<float4>(promoRowsAddress + 64));
+      promoRow2 = *(Ptr<float4>(promoRowsAddress + 80));
     }
 
     for (uint i = 0; i < 3; i++)
@@ -604,7 +608,42 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
       prevObjectPosition = interpolateHitAttribute(prevPositions, bary);
     }
 
-    const vec3 prevPosition = mul(surface.prevObjectToWorld, vec4(prevObjectPosition, 1.0f));
+    vec3 prevPosition;
+    if (isPromotedHit)
+    {
+      // NV-DXVK: a PROMOTED instance's transform is GPU-solved from the vertex
+      // capture every frame; surface.prevObjectToWorld is the CPU-written matrix
+      // this file already documents as MEANINGLESS for these instances (see the
+      // isPromotedHit block above, which is why objectToWorld/normalObjectToWorld
+      // are both bypassed there). hitPosition is interpolated from worldPositions,
+      // which for a promoted hit was built from the GPU-solved CURRENT M - so
+      // pairing it with the CPU prev matrix subtracts two unrelated lineages and
+      // turns the per-frame vertex-capture reconstruction wobble into phantom
+      // motion. That is the Path A motion-vector smear: TAA/DLSS drags the texture
+      // across geometry that never moved.
+      //
+      // The correct previous transform is last frame's SOLVED M, which
+      // promotion_solve.comp maintains as prevM at +48 in this same 160 B slot
+      // (+0 M, +48 prevM, +96 last-rigid M, +144 eigen baseline). Using it gives
+      // hitPosition and prevPosition a shared lineage, so the reconstruction
+      // wobble is common-mode and cancels, leaving only genuine object motion.
+      //
+      // prevObjectPosition is the CURRENT object-space position here: a promoted
+      // hit implies isClusterHit (promoStateSlotPlusOne is only set for cluster
+      // hits), so the previous-position-buffer branch above cannot have run. That
+      // is correct for rigid clusters - all motion comes from the M/prevM delta.
+      const float4 promoPrevRow0 = *(Ptr<float4>(promoRowsAddress + 48));
+      const float4 promoPrevRow1 = *(Ptr<float4>(promoRowsAddress + 64));
+      const float4 promoPrevRow2 = *(Ptr<float4>(promoRowsAddress + 80));
+      const vec4 prevObjPos = vec4(prevObjectPosition, 1.0f);
+      prevPosition = vec3(dot(promoPrevRow0, prevObjPos),
+                          dot(promoPrevRow1, prevObjPos),
+                          dot(promoPrevRow2, prevObjPos));
+    }
+    else
+    {
+      prevPosition = mul(surface.prevObjectToWorld, vec4(prevObjectPosition, 1.0f));
+    }
 
     surfaceInteraction.motion = prevPosition - hitPosition;
   }
