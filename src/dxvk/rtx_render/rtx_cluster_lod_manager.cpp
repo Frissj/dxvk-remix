@@ -896,6 +896,37 @@ namespace dxvk {
       topo.name = snapshot.name;
     }
 
+    // [RestCapVerify] CPU eigen cell of the CAPTURED content, over the SAME
+    // referenced set + covariance (refCov) the GPU sweeps. For a class-scoped rest
+    // capture this is the deterministic "which content did we actually capture"
+    // identity: adoption compares it to the class the capture was requested FOR and
+    // rejects mismatches (a multi-drawn geometry's shared capture buffer can hold a
+    // different draw's content than the class that asked). Analytic symmetric-3x3
+    // eigenvalues (Smith's trigonometric method), trace-normalized like the kernel.
+    int32_t contentCellQ = INT32_MIN;
+    if (snapshot.isRestCapture && snapshot.promoClassQ != INT32_MIN && !snapshot.promoRestored) {
+      const double covTr = refCov[0] + refCov[1] + refCov[2];
+      if (covTr > 1e-20) {
+        const double q = covTr / 3.0;
+        const double aa = refCov[0] - q, bb = refCov[1] - q, cc = refCov[2] - q;
+        const double d = refCov[3], e = refCov[4], f = refCov[5];
+        const double p2 = (aa * aa + bb * bb + cc * cc) / 6.0 + (d * d + e * e + f * f) / 3.0;
+        const double p = std::sqrt(std::max(0.0, p2));
+        double lam1 = q, lam2 = q;  // p ~ 0 => isotropic: all eigenvalues equal
+        if (p > 1e-20) {
+          const double det = aa * (bb * cc - f * f) - d * (d * cc - f * e) + e * (d * f - bb * e);
+          const double r = std::max(-1.0, std::min(1.0, det / (2.0 * p * p * p)));
+          const double phi = std::acos(r) / 3.0;
+          const double e1 = q + 2.0 * p * std::cos(phi);
+          const double e3 = q + 2.0 * p * std::cos(phi + 2.0943951023931953);  // + 2*pi/3
+          const double e2 = covTr - e1 - e3;
+          lam1 = std::max(e1, std::max(e2, e3));
+          lam2 = covTr - lam1 - std::min(e1, std::min(e2, e3));
+        }
+        contentCellQ = quantizeEigClass(float(lam1 / covTr), float(lam2 / covTr));
+      }
+    }
+
     {
       std::lock_guard<std::mutex> lock(m_promoPendingMutex);
       // rest probes key the ORIGINAL candidate (promoKeyHash) and carry the
@@ -909,6 +940,7 @@ namespace dxvk {
       pending.classQ = snapshot.promoClassQ;       // [ShapeClass] class-scoped rest probes land on their class
       pending.classSubId = snapshot.promoClassSubId;  // ... and on the right identity-by-fit sibling
       pending.restored = snapshot.promoRestored;   // [PromoRefs] sidecar adoptions skip the class-wipe
+      pending.contentCellQ = contentCellQ;         // [RestCapVerify] captured-content identity
       m_promoPendingProbes.push_back(pending);
     }
 
@@ -1009,6 +1041,33 @@ namespace dxvk {
         const auto existing = m_promoCandidates.find(pending.geometryHash);
         if (existing != m_promoCandidates.end()) {
           if (pending.routeHash != 0 && pending.classQ != INT32_MIN) {
+            // [RestCapVerify] content check BEFORE adoption: the capture's own CPU-
+            // computed eigen cell must match the class this reference was requested
+            // for (1-cell tolerance absorbs quantization boundary noise; genuinely
+            // different content sits many cells away - observed 3-30). A mismatch =
+            // the shared capture buffer held ANOTHER draw's content when the readback
+            // ran (multi-drawn geometry); adopting it would give the class a wrong-
+            // shape reference its gate can never pass. Discard and re-arm the class
+            // to re-stage on a later capture that actually holds its content.
+            if (pending.contentCellQ != INT32_MIN) {
+              const int32_t dq1 = std::abs(pending.contentCellQ / 4096 - pending.classQ / 4096);
+              const int32_t dq2 = std::abs(pending.contentCellQ % 4096 - pending.classQ % 4096);
+              if (dq1 > 1 || dq2 > 1) {
+                Logger::info(str::format("[RestCapVerify] geometry 0x", std::hex, pending.geometryHash, std::dec,
+                                         " class q", pending.classQ, " sub ", pending.classSubId,
+                                         " captured WRONG content (cell ", pending.contentCellQ,
+                                         ") - discarding, will re-stage"));
+                if (m_templateSystemMT != nullptr && pending.probeVa != 0) {
+                  m_templateSystemMT->freePromotionProbe(pending.probeVa);
+                }
+                RestClassState* wrongCls = resolveRestClass(pending.geometryHash, pending.classQ,
+                                                            pending.classSubId, false);
+                if (wrongCls != nullptr && wrongCls->ref == RestClassState::Ref::Requested) {
+                  wrongCls->captureStaged = false;  // re-stage a fresh capture
+                }
+                continue;
+              }
+            }
             // [ShapeClass] CLASS-scoped rest probe: this reference was captured
             // FROM a specific content class (the shared one failed it). Adopt it
             // onto that class; the candidate's shared reference stays untouched
@@ -1028,6 +1087,15 @@ namespace dxvk {
               cls = &classes.back();
               cls->classQ = pending.classQ;
               cls->subId = pending.classSubId;
+              // [ClassLife] PROBE: SILENT vector-growth path. A class-scoped rest probe
+              // arrived for a class that no longer exists, so a fresh entry is added
+              // WITHOUT a mint log. Repeated hits here inflate classes.size() past the
+              // logged mint count (the 12-mints-but-75-total discrepancy). Records
+              // candidate, cell, and the resulting size so the true add sequence shows.
+              Logger::info(str::format("[ClassLife] FRESH-ENTRY (probe for vanished class) geom 0x",
+                                       std::hex, pending.geometryHash, std::dec, " classQ ", pending.classQ,
+                                       " sub ", pending.classSubId, " -> ", classes.size(),
+                                       " classes total, frame ", m_device->getCurrentFrameId()));
             }
             if (m_templateSystemMT != nullptr && cls->probeVa != 0) {
               m_templateSystemMT->freePromotionProbe(cls->probeVa);
@@ -1036,7 +1104,21 @@ namespace dxvk {
             cls->routeHash = pending.routeHash;
             cls->vertexCount = pending.vertexCount;
             cls->ref = RestClassState::Ref::Own;
-            cls->phase = RestClassState::Phase::Probing;
+            // Go STRAIGHT to the gate - do not re-enter Probing. This reference was
+            // captured FROM this class's own content; the Probing stage's eigClean
+            // precondition would only re-prove vs the same probe what the full-mesh
+            // gate verifies anyway (same principle as the sibling-mint fast-path:
+            // "re-proving costs a full stuck ladder for zero information"). On
+            // multi-content geometry the Probing round-trip is the promotion
+            // bottleneck: a slot holds this class ~1/N of frames, x unambiguous-frame
+            // x settled-frame x sweep stagger at ~2 fps - observed 13/18 adopted
+            // classes never finishing Probing in a session, their instances demoting
+            // to Path B the whole time. gateStateSlot = ~0u lets ANY slot currently
+            // holding this class run the gate (the emission site supports the
+            // wildcard), maximizing the eligible window. A bad capture still cannot
+            // promote: the eigen gate itself rejects it (drift > eps -> not Promoted).
+            cls->phase = RestClassState::Phase::GateScheduled;
+            cls->lastGateTickFrame = m_device->getCurrentFrameId();
             cls->gateFrames = 0;
             cls->stuckFrames = 0;
             cls->gateStateSlot = ~0u;
@@ -1073,6 +1155,17 @@ namespace dxvk {
                     m_templateSystemMT->freePromotionProbe(c.probeVa);
                   }
                 }
+                // [ClassLife] PROBE: the TEARDOWN half of the re-mint cycle. A
+                // candidate-level (shared) rest reference was adopted, wiping ALL of
+                // this candidate's classes (they were judged vs the old reference).
+                // Pairs with the mint log to reveal wipe CADENCE and what keeps
+                // triggering repeated candidate-level rest adoptions for one candidate
+                // (the unconfirmed root of the 15-75 class churn / demotes).
+                Logger::info(str::format("[ClassLife] WIPE (candidate-level rest adopt) geom 0x",
+                                         std::hex, pending.geometryHash, std::dec, " destroyed ",
+                                         classesIt->second.size(), " classes, routeHash 0x",
+                                         std::hex, pending.routeHash, std::dec,
+                                         " frame ", m_device->getCurrentFrameId()));
                 m_restClassesByCandidate.erase(classesIt);
               }
             }
@@ -1325,7 +1418,17 @@ namespace dxvk {
             && candidate.restState == PromotionCandidate::RestState::Referenced) {
           break;
         }
-        if (state.rigidStreak >= rigidFrames) {
+        // Option 1 parity with the CLASS Probing handler: a clean permutation-
+        // invariant eigen verdict is gate-equivalent evidence and schedules the gate
+        // directly - the rigidStreak ladder alone starves intermittently-drawn
+        // candidates (rigidFrames CONSECUTIVE solves across rare sightings, knocked
+        // back by [PromoPin] pin switches; observed probing 315 frames on a mesh
+        // solved 9 / drawn 11). The probe path emits a Probing-phase eigen sweep on
+        // sighting (starvation-gated, buildPromotionEntries), so ONE sighting yields
+        // the verdict and the NEXT sighting runs the gate. The gate still has the
+        // final word - a transiently-clean deformer gets REJECTED there as before.
+        if (state.rigidStreak >= rigidFrames
+            || (state.eigFrame != 0u && state.eigDrift >= 0.0f && state.eigDrift <= eigenEps)) {
           candidate.phase = PromotionCandidate::Phase::GateScheduled;
           candidate.gateScheduledFrame = m_device->getCurrentFrameId();  // [PromoLat] Probing->Gate handoff
         } else if (ClusterLodOptions::Promotion::restCaptureReference()
@@ -1429,9 +1532,12 @@ namespace dxvk {
         if (++candidate.gateFrames >= gateLag) {
           // Option 1: eigen gate verdict (mode-2 entry emitted at GateScheduled).
           // eigDrift < 0 or eigFrame == 0 = no verdict landed -> reschedule below.
-          // The candidate's own stateSlot receives ONLY gate entries (instance
-          // sweeps run on per-instance slots), so no freshness mark is needed.
-          if (state.eigFrame != 0u && state.eigDrift >= 0.0f && state.eigDrift <= eigenEps) {
+          // FRESHNESS (gateEigMark): Probing-phase eigen sweeps land on this same
+          // slot now, so the verdict only counts once eigFrame ADVANCES past the
+          // value at gate emission - otherwise a stale Probing-era clean could
+          // promote before the gate's own (possibly dirty) verdict lands.
+          if (state.eigFrame != 0u && state.eigFrame != candidate.gateEigMark
+              && state.eigDrift >= 0.0f && state.eigDrift <= eigenEps) {
             candidate.phase = PromotionCandidate::Phase::Promoted;
             m_statsPromoted++;
             // [PromoLat] decompose the promotion latency. elapsedFrames = wall
@@ -1470,7 +1576,10 @@ namespace dxvk {
                                        : drawnCov < 0.5 ? "OFF-SCREEN-BOUND(game not drawing it)"
                                        : candidate.streakResets > 3 ? "STREAK-THRASH(non-rigid spikes)"
                                        : "solve-bound"));
-          } else if (state.eigFrame != 0u && state.eigDrift > eigenEps) {
+          } else if (state.eigFrame != 0u && state.eigFrame != candidate.gateEigMark
+                     && state.eigDrift > eigenEps) {
+            // (same freshness guard as the accept branch - REJECTION IS TERMINAL, a
+            // stale Probing-era verdict must never trigger it)
             candidate.phase = PromotionCandidate::Phase::Rejected;
             m_statsPromoRejected++;
             // DIAG: capVar (state.affineNonRigid, repurposed) vs refVar (diagAux).
@@ -2325,11 +2434,21 @@ namespace dxvk {
           // sweep so it costs ~1/interval of members per frame.
           {
             const uint32_t eigInterval = uint32_t(std::max(0, ClusterLodOptions::Promotion::fullSweepIntervalFrames()));
+            // STARVATION ESCAPE (see PromoInstance::lastEigEmitFrame): the stagger
+            // alone starves intermittently-drawn candidates - a batch composition the
+            // game draws on ~2% of frames almost never coincides with its stagger
+            // slot, leaving it in Probing for hundreds of frames (the "never
+            // promotes" population). If no sweep was emitted within one interval,
+            // sweep NOW - each sighting of a rare candidate is precious, and a
+            // continuously-drawn candidate still emits at most once per interval.
+            const uint32_t nowFrame = m_device->getCurrentFrameId();
+            const bool eigStarved = nowFrame - promoInstance.lastEigEmitFrame > eigInterval;
             if (eigInterval > 0 && candidate.probeVa != 0
-                && ((m_device->getCurrentFrameId() + promoInstance.stateSlot) % eigInterval) == 0) {
+                && (eigStarved || ((nowFrame + promoInstance.stateSlot) % eigInterval) == 0)) {
               lodclusters_remix::PromotionEntry eigEntry = instEntry;
               eigEntry.mode = 2;  // PROMO_MODE_EIGEN
               m_framePromoEntries.push_back(eigEntry);
+              promoInstance.lastEigEmitFrame = nowFrame;
             }
           }
 
@@ -2451,14 +2570,21 @@ namespace dxvk {
             // frames the permutation alternation denies). The streak route
             // stays as a second, faster path when correspondence holds.
             const uint32_t eigInterval = uint32_t(std::max(0, ClusterLodOptions::Promotion::fullSweepIntervalFrames()));
+            // STARVATION ESCAPE: same rationale as the probing-candidate site above -
+            // an intermittently-drawn Path B instance misses its stagger slot on
+            // nearly every sighting; sweep on sight when no sweep was emitted within
+            // one interval (see PromoInstance::lastEigEmitFrame).
+            const uint32_t nowFrameB = m_device->getCurrentFrameId();
+            const bool eigStarvedB = nowFrameB - pathBInst.lastEigEmitFrame > eigInterval;
             if (eigInterval > 0 && !pathBInst.sweepPending
-                && (pathBInst.eigenSuspect
-                    || ((m_device->getCurrentFrameId() + pathBInst.stateSlot) % eigInterval) == 0)) {
+                && (pathBInst.eigenSuspect || eigStarvedB
+                    || ((nowFrameB + pathBInst.stateSlot) % eigInterval) == 0)) {
               lodclusters_remix::PromotionEntry eigEntry = probeEntry;
               eigEntry.mode = 2;  // PROMO_MODE_EIGEN
               m_framePromoEntries.push_back(eigEntry);
               pathBInst.sweepPending = true;
               pathBInst.sweepLagFrames = 0;
+              pathBInst.lastEigEmitFrame = nowFrameB;
             }
 
             if (cls != nullptr) {
@@ -2621,13 +2747,44 @@ namespace dxvk {
         // runs all mode-0 solves, then a barrier, then the per-entry gates, so a
         // companion gate emitted this same frame reads the fresh M.
         m_framePromoEntries.push_back(promoEntry);
-        if (candidate.phase == PromotionCandidate::Phase::GateScheduled) {
+        // [MultiDraw] AMBIGUITY GUARD (restored - its removal crashed the nvpro
+        // clusterizer): on a frame the pinned probe BlasEntry was drawn more than
+        // once, the single capture buffer holds "last draw wins" content, so a gate
+        // verified against it - or a Probing sweep seeded from it - would promote a
+        // geometry whose capture is inconsistent frame-to-frame, and registering that
+        // for cluster templates makes the clusterizer hit "completed / required
+        // mismatch" and take the process down. Defer both to a single-draw frame;
+        // always-multi-drawn geometry correctly stays Path B (genuinely unclusterable).
+        const bool probeUnambiguous = probeBe == nullptr
+            || probeBe->multiDrawnFrame != m_device->getCurrentFrameId();
+        if (candidate.phase == PromotionCandidate::Phase::Probing && probeUnambiguous) {
+          // STARVATION-GATED Probing eigen sweep (see PromotionCandidate::
+          // lastEigEmitFrame): gives the Probing handler its gate-equivalent eigen
+          // verdict in ONE sighting instead of rigidFrames consecutive ones. At
+          // most one emission per fullSweepIntervalFrames per candidate - a
+          // continuously-drawn candidate adds no more load than the stagger.
+          const uint32_t eigInterval = uint32_t(std::max(0, ClusterLodOptions::Promotion::fullSweepIntervalFrames()));
+          const uint32_t nowFrame = m_device->getCurrentFrameId();
+          if (eigInterval > 0 && candidate.probeVa != 0
+              && nowFrame - candidate.lastEigEmitFrame > eigInterval) {
+            lodclusters_remix::PromotionEntry eigEntry = promoEntry;
+            eigEntry.mode = 2;  // PROMO_MODE_EIGEN
+            eigEntry.vertexCount = candidate.vertexCount;
+            m_framePromoEntries.push_back(eigEntry);
+            candidate.lastEigEmitFrame = nowFrame;
+          }
+        }
+        if (candidate.phase == PromotionCandidate::Phase::GateScheduled && probeUnambiguous) {
           lodclusters_remix::PromotionEntry gateEntry = promoEntry;
           gateEntry.mode = 2;  // Option 1: eigen gate (permutation-invariant)
           gateEntry.vertexCount = candidate.vertexCount;
           m_framePromoEntries.push_back(gateEntry);
           candidate.phase = PromotionCandidate::Phase::GateRunning;
           candidate.gateFrames = 0;
+          // freshness mark: the verdict is only the GATE's when eigFrame advances
+          // past this (Probing-phase sweeps land on this same slot now)
+          candidate.gateEigMark = (m_promoStatesValid && candidate.stateSlot < m_promoStates.size())
+            ? m_promoStates[candidate.stateSlot].eigFrame : 0;
         }
       }
     }
@@ -2725,7 +2882,21 @@ namespace dxvk {
         // instance routes Path A between demote windows - their solves flow
         // through HERE, so the staging/gate pairing must exist here too, or
         // the class wedges in Requested/GateScheduled)
-        if (promotedCls != nullptr && promotedCls->phase != RestClassState::Phase::Promoted) {
+        //
+        // [MultiDraw] AMBIGUITY GUARD (restored - removing it crashed the nvpro
+        // clusterizer): only capture a per-class rest reference, and only run its
+        // gate, on a frame where THIS geometry was drawn exactly once. On a
+        // multi-drawn frame the single capture buffer holds "last draw wins" content,
+        // so the reference/gate would judge a DIFFERENT draw's shape and could promote
+        // a geometry whose capture is inconsistent frame-to-frame; registering that
+        // for cluster templates makes the clusterizer hit "completed / required
+        // mismatch" and kill the process. The [RestCapVerify] content check is an
+        // ADDITIONAL correctness gate on top of this, not a replacement for it.
+        // Always-multi-drawn geometry correctly stays Path B (genuinely unclusterable).
+        const bool blasUnambiguousThisFrame =
+            blasEntry->multiDrawnFrame != m_device->getCurrentFrameId();
+        if (promotedCls != nullptr && promotedCls->phase != RestClassState::Phase::Promoted
+            && blasUnambiguousThisFrame) {
           if (promotedCls->ref == RestClassState::Ref::Requested && !promotedCls->captureStaged) {
             uint32_t topoVertexCount = 0;
             {

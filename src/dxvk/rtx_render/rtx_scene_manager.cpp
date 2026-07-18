@@ -1303,6 +1303,9 @@ namespace dxvk {
       // makes the capture content ambiguous (which draw's VS output does the promotion
       // solve read?) - candidate explanation for rigid buildings fitting with a steady
       // 0.09-0.26 residual. Log once per geometry per 600 frames, captured draws only.
+      // Stamp the ambiguity so cluster-LOD promotion skips capturing/gating a per-class
+      // rest reference on this (ambiguous) frame - see BlasEntry::multiDrawnFrame.
+      pBlas->multiDrawnFrame = m_device->getCurrentFrameId();
       if (drawCallState.preCaptureVertexData != nullptr) {
         static std::mutex s_mdMutex;
         static std::unordered_map<XXH64_hash_t, uint32_t> s_mdLastLog;

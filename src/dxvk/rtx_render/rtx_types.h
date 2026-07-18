@@ -971,6 +971,16 @@ struct BlasEntry {
   // Frame when the vertex data of this geometry was last updated, used to detect static geometries
   uint32_t frameLastUpdated = kInvalidFrameIndex;
 
+  // Frame in which this BlasEntry was drawn MORE THAN ONCE (multi-pass or multiple
+  // placements deduped to one hash). For vertex-captured geometry the single capture
+  // buffer then holds an AMBIGUOUS "last draw wins" content, so a content class cannot
+  // match even its own rest reference (observed: own-reference gates fail at eig drift
+  // ~0.29, only 2/17 promote). The cluster-LOD promotion gates its per-class rest
+  // capture + gate on this NOT equalling the current frame, so those references are
+  // only ever taken/verified from an unambiguous single-draw frame. Set at draw time
+  // (onSceneObjectUpdated), read at promotion-entry build.
+  uint32_t multiDrawnFrame = kInvalidFrameIndex;
+
   Rc<PooledBlas> dynamicBlas = nullptr;
 
   std::vector<VkAccelerationStructureGeometryKHR> buildGeometries;

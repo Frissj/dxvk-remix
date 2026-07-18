@@ -720,6 +720,19 @@ namespace dxvk {
       uint32_t gateScheduledFrame = 0;
       uint32_t streakResets = 0;
       uint32_t prevRigidStreak = 0;
+      // CPU frame id of the last Probing-phase eigen-sweep enqueue on the probe path
+      // (same starvation escape as PromoInstance::lastEigEmitFrame): intermittently-
+      // drawn candidates otherwise only advance via the rigidStreak ladder, needing
+      // rigidFrames sightings (with [PromoPin] pin-switch resets) - observed 315
+      // probing frames for a mesh solved 9/drawn 11. One clean eigen sweep is
+      // gate-equivalent evidence and reaches GateScheduled in a single sighting.
+      uint32_t lastEigEmitFrame = 0;
+      // Freshness mark for the candidate gate (same pattern as RestClassState::
+      // gateEigMark): with Probing-phase eigen sweeps now landing on this slot, the
+      // GateRunning verdict must require eigFrame to have ADVANCED past the value at
+      // gate emission - otherwise it could consume the stale Probing-era verdict and
+      // promote before the gate's own (possibly dirty) verdict lands.
+      uint32_t gateEigMark = 0;
       // ---- REST-CAPTURE reference (non-affine leftovers) ----
       // routeHash: residency hash instances route to when promoted (0 = the
       // candidate's own key). Set to the space-tagged rest hash once the probe
@@ -805,6 +818,16 @@ namespace dxvk {
       int32_t classQ = INT32_MIN; // [ShapeClass] class-scoped rest probe target; INT32_MIN = candidate-level
       int32_t classSubId = 0;     // identity-by-fit sibling the reference belongs to
       bool restored = false;      // [PromoRefs] sidecar restore: adoption skips the class-wipe
+      // [RestCapVerify] eigen cell of the CAPTURED reference content, computed
+      // CPU-side at blob build over the same referenced vertex set the GPU sweeps.
+      // Adoption compares it against classQ: a mismatch means the capture (taken
+      // from the shared "first draw wins" buffer of a multi-drawn geometry) holds a
+      // DIFFERENT content than the class it was requested for - adopting it would
+      // poison the class with a wrong-shape reference its gate can never pass.
+      // Deterministic content identity, replacing the draw-count heuristic that
+      // permanently starved always-multi-drawn geometry. INT32_MIN = not computed
+      // (candidate-level or sidecar-restored probes) - adoption skips the check.
+      int32_t contentCellQ = INT32_MIN;
     };
     std::mutex m_promoPendingMutex;
     std::vector<PendingProbe> m_promoPendingProbes;
@@ -1018,6 +1041,18 @@ namespace dxvk {
       // this slot only reports each sweep verdict into its current class.
       uint32_t lastEigenFrame = 0;
       bool eigenSuspect = false;
+      // CPU frame id of the last eigen-sweep ENQUEUE for this slot. Starvation escape
+      // for intermittently-drawn geometry: the (frame+slot)%interval stagger assumes
+      // continuous presence, so a candidate the game draws on ~2% of frames (this
+      // game's per-frame batch-composition churn fragments one mesh across many
+      // rarely-recurring candidate identities) statistically never lands on its
+      // stagger slot and starves in Probing for hundreds of frames (observed: solved
+      // 9/drawn 11 over 518 frames, probing 304). If no sweep was emitted within one
+      // interval, emit on sight - every sighting of a rare candidate counts, while a
+      // continuously-drawn one still sweeps at most once per interval (same rate as
+      // the stagger, no extra load). CPU-side stamp because state.eigFrame is a
+      // kernel-stamped counter, not comparable to getCurrentFrameId().
+      uint32_t lastEigEmitFrame = 0;
       // [EigSettle] VERIFY PROBE: was the source vertex buffer being rewritten in
       // place (updatedInPlace) on the frame the currently in-flight eigen sweep was
       // ENQUEUED? Stamped at enqueue, read when that sweep's result lands, to prove

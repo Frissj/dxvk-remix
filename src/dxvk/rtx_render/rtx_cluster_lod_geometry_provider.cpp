@@ -528,8 +528,33 @@ namespace dxvk {
                      [](const PromoRefEntry& a, const PromoRefEntry& b) {
                        return (a.classQ == INT32_MIN) > (b.classQ == INT32_MIN);
                      });
+    // DEFENSE-IN-DEPTH: reject entries whose classQ is not a valid eigen cell. A
+    // sidecar written under the OLD capSig class-key scheme (round(log2(spread)*16) -
+    // small, often negative ints) passes the identity + magic staleness checks above
+    // (the magic was NOT bumped across the capSig->eigen class-key switch), so its
+    // stale classQ is restored but matches no current eigen cell - every such entry
+    // then appends a garbage "fresh entry" to the candidate's class vector (observed:
+    // ~63 garbage classes/candidate, driving the multiplexing churn and demotes). A
+    // valid eigen classQ is a quantizeEigClass output: INT32_MIN (the shared/candidate-
+    // level reference, no class key), or q1*4096+q2 with q1>=1 (lam1>=1/3 always for a
+    // trace-normalized shape, so classQ>=4096) and q2<=q1 (lam2<=lam1). capSig garbage
+    // (|x|<~1000) fails classQ>=4096. Grid-independent - no eigenEpsilon dependency.
+    auto isValidEigenClassQ = [](int32_t q) -> bool {
+      if (q == INT32_MIN) {
+        return true;  // shared/candidate-level reference carries no class key
+      }
+      if (q < 4096) {
+        return false;  // q1==0 is impossible for a real shape (lam1 >= 1/3)
+      }
+      return (q % 4096) <= (q / 4096);  // q2 <= q1  <=>  lam2 <= lam1
+    };
     uint32_t restored = 0;
+    uint32_t rejected = 0;
     for (PromoRefEntry& e : file.entries) {
+      if (!isValidEigenClassQ(e.classQ)) {
+        rejected++;
+        continue;  // stale/garbage class key (e.g. old capSig-format sidecar) - do not inject
+      }
       lodclusters_remix::GeometrySnapshot rest;
       rest.geometryHash = e.restHash;
       rest.promoKeyHash = snapshot.geometryHash;
@@ -547,9 +572,12 @@ namespace dxvk {
       enqueueRestSnapshot(std::move(rest));
       restored++;
     }
-    if (restored > 0) {
+    if (restored > 0 || rejected > 0) {
       Logger::info(str::format("[PromoRefs] restored ", restored, " rest reference(s) for candidate 0x",
                                std::hex, snapshot.geometryHash, std::dec,
+                               rejected > 0 ? str::format(", REJECTED ", rejected,
+                                 " stale/garbage class entr(y/ies) (invalid eigen classQ - old-format sidecar)")
+                                 : std::string(),
                                " - re-enqueued through the rest pipeline"));
     }
   }
