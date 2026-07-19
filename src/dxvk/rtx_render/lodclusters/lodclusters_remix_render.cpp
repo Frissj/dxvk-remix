@@ -662,6 +662,13 @@ bool ClusterRenderSystem::init(const RenderDeviceInfo& deviceInfo, const RenderC
   return true;
 }
 
+void ClusterRenderSystem::setSubmitLockCallbacks(std::function<void()> lockFn, std::function<void()> unlockFn)
+{
+  Impl& impl = *m_impl;
+
+  impl.res.setSubmitLockFunctions(std::move(lockFn), std::move(unlockFn));
+}
+
 void ClusterRenderSystem::deinit()
 {
   Impl& impl = *m_impl;

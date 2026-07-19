@@ -3543,6 +3543,16 @@ namespace dxvk {
       return false;
     }
 
+    // Same P4c split as the template system above: init ran under the external lock, so the
+    // callbacks go in afterwards. The render system needs them for the CLAS buffer's sparse
+    // growth (vk_lod_clusters c19a250), whose vkQueueBindSparse shares this queue with dxvk.
+    {
+      DxvkDevice* device = m_device;
+      m_renderSystem->setSubmitLockCallbacks(
+        [device] { device->lockSubmission(); },
+        [device] { device->unlockSubmission(); });
+    }
+
     m_streamingActive = renderConfig.preferStreaming;
     m_asyncTransferActive = renderConfig.preferStreaming && renderConfig.useAsyncTransfer;
     // P4: kernel variants are picked at start; the HiZ feed follows this

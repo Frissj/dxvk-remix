@@ -499,6 +499,17 @@ namespace dxvk {
     enabledFeatures.vulkan12Features.uniformAndStorageBuffer8BitAccess = VK_TRUE;
     enabledFeatures.vulkan12Features.timelineSemaphore = VK_TRUE;
 
+    // NV-DXVK start: sparse binding for the RTX Mega Geometry cluster LOD CLAS buffer.
+    // The persistent CLAS allocator grows its buffer in chunks through
+    // nvvk::ResourceAllocator::resizeLargeBuffer, which rebinds sparse pages so the CLAS
+    // contents and their device addresses survive the growth. Enabled only when the device
+    // advertises support; ClusterLodManager falls back to a fixed-size CLAS buffer otherwise.
+    // Passed through from m_deviceFeatures rather than forced, so a device lacking either
+    // feature still creates successfully.
+    enabledFeatures.core.features.sparseBinding = m_deviceFeatures.core.features.sparseBinding;
+    enabledFeatures.core.features.sparseResidencyBuffer = m_deviceFeatures.core.features.sparseResidencyBuffer;
+    // NV-DXVK end
+
     // NV-DXVK start: RTXIO
 #ifdef WITH_RTXIO
     if (RtxIo::enabled()) {

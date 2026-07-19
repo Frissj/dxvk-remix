@@ -770,8 +770,8 @@ void ClusterTemplateSystem::setSubmitLockCallbacks(std::function<void()> lockFn,
 {
   Impl& impl = *m_impl;
 
-  impl.res.submitLockFn   = std::move(lockFn);
-  impl.res.submitUnlockFn = std::move(unlockFn);
+  // NV-DXVK: routes through Resources so the allocator's sparse binds take the same lock
+  impl.res.setSubmitLockFunctions(std::move(lockFn), std::move(unlockFn));
 }
 
 uint64_t ClusterTemplateSystem::uploadPromotionProbe(const void* data, size_t bytes)

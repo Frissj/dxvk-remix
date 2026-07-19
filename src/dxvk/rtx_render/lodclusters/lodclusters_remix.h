@@ -580,6 +580,12 @@ namespace lodclusters_remix {
     // Destroys everything; waits for device idle.
     void deinit();
 
+    // NV-DXVK: installs dxvk's submission lock. Required before the CLAS buffer can grow -
+    // vk_lod_clusters c19a250 rebinds sparse pages with vkQueueBindSparse, a queue operation
+    // needing the same external synchronization as our raw submits. Install after init(),
+    // which itself runs under the caller's lock.
+    void setSubmitLockCallbacks(std::function<void()> lockFn, std::function<void()> unlockFn);
+
     // Builds a new generation from per-geometry .nvsngeo cache files: assembles
     // the combined Scene (memory-mapped), uploads it (ScenePreloaded - or
     // seeds the persistent low-detail set when preferStreaming, with higher

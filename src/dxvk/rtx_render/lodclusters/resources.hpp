@@ -342,9 +342,50 @@ public:
     return m_allocator.createBuffer(buffer, bufferSize, bufferUsageFlags, vmaMemUsage, vmaAllocFlags, minAlignment, queueFamilies);
   }
 
-  VkResult createLargeBuffer(nvvk::LargeBuffer& buffer, VkDeviceSize bufferSize, VkBufferUsageFlagBits2 bufferUsageFlags)
+  // vk_lod_clusters c19a250: chunkSize / initialChunkCount let the CLAS buffer reserve its full
+  // address space up front while only committing (and later growing) part of it through sparse
+  // binding. Defaults keep every other caller on the previous single-allocation behaviour.
+  VkResult createLargeBuffer(nvvk::LargeBuffer&     buffer,
+                             VkDeviceSize           bufferSize,
+                             VkBufferUsageFlagBits2 bufferUsageFlags,
+                             VkDeviceSize           chunkSize         = nvvk::ResourceAllocator::DEFAULT_LARGE_CHUNK_SIZE,
+                             uint32_t               initialChunkCount = 0)
   {
-    return m_allocator.createLargeBuffer(buffer, bufferSize, bufferUsageFlags, m_queue.queue);
+    return m_allocator.createLargeBuffer(buffer, bufferSize, bufferUsageFlags, m_queue.queue, VK_NULL_HANDLE, chunkSize,
+                                         VMA_MEMORY_USAGE_AUTO, {}, 0, {}, initialChunkCount);
+  }
+
+  // vk_lod_clusters c19a250. NV-DXVK: pass a fence so the shim's bind path never falls back to
+  // vkQueueWaitIdle while holding dxvk's submission lock; we wait on the fence here, unlocked.
+  VkResult resizeLargeBuffer(nvvk::LargeBuffer& buffer, VkDeviceSize newSize)
+  {
+    VkFenceCreateInfo fenceInfo = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    VkFence           fence     = nullptr;
+    if(vkCreateFence(m_device, &fenceInfo, nullptr, &fence) != VK_SUCCESS)
+    {
+      return VK_ERROR_UNKNOWN;
+    }
+
+    bool           bindNeeded = false;
+    const VkResult result     = m_allocator.resizeLargeBuffer(buffer, newSize, bindNeeded, m_queue.queue, fence);
+
+    // the fence is only signalled when a bind was actually submitted
+    if(result == VK_SUCCESS && bindNeeded)
+    {
+      vkWaitForFences(m_device, 1, &fence, VK_TRUE, ~0ULL);
+    }
+
+    vkDestroyFence(m_device, fence, nullptr);
+    return result;
+  }
+
+  // NV-DXVK: installs dxvk's submission lock for both our own raw queue submits and the
+  // allocator's sparse binds (which are queue operations needing the same external sync).
+  void setSubmitLockFunctions(std::function<void()> lockFn, std::function<void()> unlockFn)
+  {
+    submitLockFn   = lockFn;
+    submitUnlockFn = unlockFn;
+    m_allocator.setQueueLockFunctions(std::move(lockFn), std::move(unlockFn));
   }
 
   VkDeviceSize getDeviceLocalHeapSize() const;
