@@ -62,7 +62,33 @@ namespace dxvk {
 
     const uint32_t LegacyAssetHash1 = (1 << (uint32_t)HashComponents::LegacyPositions1)
                                     | (1 << (uint32_t)HashComponents::LegacyIndices);
-    const uint32_t Total = 5;
+
+    // NV-DXVK (RTX Mega Geometry): identity of a CLUSTER geometry.
+    //
+    // INVARIANT: this rule must cover every vertex attribute that gets BAKED INTO a
+    // cluster. A cluster stores positions and texcoords (and normals when present) in
+    // its own blob, and the .nvsngeo disk cache is keyed by this hash - so any attribute
+    // that is baked but NOT in the key lets two different meshes collide onto one cluster
+    // geometry, and whichever is snapshotted first supplies that attribute for both.
+    //
+    // That is not hypothetical: cluster identity previously used the USER-FACING
+    // rtx.geometryAssetHashRule (default "positions,indices,geometrydescriptor", no
+    // texcoords), whose real job is texture tagging / replacement matching. Meshes
+    // sharing positions+indices but UV-mapped to different regions of a texture atlas -
+    // the normal case for this game's world geometry - collapsed onto one cluster
+    // geometry and rendered with the first mesh's UVs, so an object displayed another
+    // object's texture while its shape looked perfectly correct.
+    //
+    // Deliberately NOT FullGeometryHash: that also mixes in VertexLayout and
+    // VertexShader, which would split identical geometry across shader/layout variants
+    // and pay full clusterization for each duplicate.
+    //
+    // If clusters ever bake a further attribute, add its component here.
+    const uint32_t ClusterGeometryHash = (1 << (uint32_t)HashComponents::VertexPosition)
+                                       | (1 << (uint32_t)HashComponents::VertexTexcoord)
+                                       | TopologicalHash;
+
+    const uint32_t Total = 6;
   }
 
   // Structure contains data required to perform a hash operation on specific data
@@ -89,6 +115,11 @@ namespace dxvk {
       precombined[0] = getHashForRuleImpl<rules::TopologicalHash>();
       precombined[1] = getHashForRuleImpl<rules::VertexDataHash>();
       precombined[2] = getHashForRuleImpl<rules::FullGeometryHash>();
+      // precombined so cluster identity costs a switch + array read per draw call
+      // (onDrawCallGeometry hashes EVERY draw before its dedup fast path); an
+      // un-precombined rule would fall through to getHashForRuleImpl and recombine
+      // the components on that hot path instead.
+      precombined[5] = getHashForRuleImpl<rules::ClusterGeometryHash>();
       if (operator[](HashComponents::LegacyPositions0) != kEmptyHash) {
         precombined[3] = getHashForRuleImpl<rules::LegacyAssetHash0>();
       }
@@ -110,6 +141,8 @@ namespace dxvk {
         return precombined[3];
       case rules::LegacyAssetHash1:
         return precombined[4];
+      case rules::ClusterGeometryHash:
+        return precombined[5];
       }
       return getHashForRuleImpl<rule>();
     }
@@ -126,6 +159,8 @@ namespace dxvk {
         return getHashForRule<rules::LegacyAssetHash0>();
       case rules::LegacyAssetHash1:
         return getHashForRule<rules::LegacyAssetHash1>();
+      case rules::ClusterGeometryHash:
+        return getHashForRule<rules::ClusterGeometryHash>();
       }
       return getHashForRuleImpl(rule);
     }

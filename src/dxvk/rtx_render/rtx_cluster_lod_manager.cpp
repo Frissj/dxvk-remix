@@ -408,8 +408,20 @@ namespace dxvk {
     // (material rides the instance; opaqueStatus overrides per instance), so
     // keying on it would process + cache identical geometry once per material
     // variant AND make load-time keying (7.1a - no draw material exists yet)
-    // impossible. Same rule, geometry hashes only.
-    const XXH64_hash_t geometryHash = drawCallState.getGeometryData().getHashForRule(RtxOptions::geometryAssetHashRule());
+    // impossible. Geometry hashes only.
+    //
+    // Keyed on rules::ClusterGeometryHash, NOT the user-facing
+    // rtx.geometryAssetHashRule. A cluster BAKES positions and texcoords into its
+    // blob (and the .nvsngeo cache is keyed by this hash), so the key must cover
+    // every baked attribute - see the invariant on ClusterGeometryHash. The asset
+    // hash rule exists for texture tagging / replacement matching and defaults to
+    // "positions,indices,geometrydescriptor" with NO texcoords, so meshes sharing
+    // positions+indices but UV-mapped to different atlas regions collapsed onto one
+    // cluster geometry and rendered with the first-snapshotted mesh's UVs: an object
+    // displayed ANOTHER object's texture while its shape stayed correct. Using a
+    // dedicated rule also stops cluster correctness depending on a user setting.
+    // Both rules are precombined, so this stays a switch + array read per draw.
+    const XXH64_hash_t geometryHash = drawCallState.getGeometryData().getHashForRule<rules::ClusterGeometryHash>();
 
     // DIAG (DrawTrace/intake): this is the cluster manager's entry - a draw that
     // reaches here passed SceneManager but may still be dropped by the empty-hash
@@ -472,8 +484,9 @@ namespace dxvk {
     }
 
     // pure geometry hash - the exact key onDrawCallGeometry derives at draw
-    // time, so the draw-time lookup finds the load-time entry
-    const XXH64_hash_t geometryHash = geometryData.getHashForRule(RtxOptions::geometryAssetHashRule());
+    // time, so the draw-time lookup finds the load-time entry (ClusterGeometryHash:
+    // must stay identical to the intake rule or replacements never resolve)
+    const XXH64_hash_t geometryHash = geometryData.getHashForRule<rules::ClusterGeometryHash>();
     if (geometryHash == kEmptyHash) {
       return;
     }
@@ -2393,7 +2406,8 @@ namespace dxvk {
 
   uint64_t ClusterLodManager::resolvePromoCandidateKey(const RasterGeometry& geometryData) const {
     // direct hit: stable-hash geometry, or the exact frame the churned hash recurs
-    const XXH64_hash_t hash = geometryData.getHashForRule(RtxOptions::geometryAssetHashRule());
+    // (ClusterGeometryHash - m_promoCandidates is keyed by the intake identity)
+    const XXH64_hash_t hash = geometryData.getHashForRule<rules::ClusterGeometryHash>();
     if (m_promoCandidates.count(hash) != 0) {
       return hash;
     }
@@ -3184,7 +3198,7 @@ namespace dxvk {
             // (the raw draw hash churns per frame and would never match)
             const uint64_t ck = resolvePromoCandidateKey(be->input.getGeometryData());
             pathBHashesThisFrame.insert(ck != 0 ? ck
-              : be->input.getGeometryData().getHashForRule(RtxOptions::geometryAssetHashRule()));
+              : be->input.getGeometryData().getHashForRule<rules::ClusterGeometryHash>());
           }
         }
       }
@@ -4038,7 +4052,7 @@ namespace dxvk {
       if (!traceRoute) {
         return;
       }
-      const uint64_t gk = geometryData.getHashForRule(RtxOptions::geometryAssetHashRule());
+      const uint64_t gk = geometryData.getHashForRule<rules::ClusterGeometryHash>();
       const uint64_t candKey = resolvePromoCandidateKey(geometryData);
       const uint64_t key = candKey != 0 ? candKey : gk;
       static std::mutex s_mx;
@@ -4071,7 +4085,7 @@ namespace dxvk {
         t.firstSeen = std::chrono::steady_clock::now();
       }
       t.materialHash = blasEntry->input.getMaterialData().getHash();
-      t.lastGeomHash = geometryData.getHashForRule(RtxOptions::geometryAssetHashRule());
+      t.lastGeomHash = geometryData.getHashForRule<rules::ClusterGeometryHash>();
     }
     auto markPathA = [&]() {
       if (pathATopoKey == 0) {
@@ -4651,7 +4665,7 @@ namespace dxvk {
     // ---- P4c ladder: Path A when resident, interim templates while it loads ----
     if (m_renderSystem != nullptr && m_renderSystem->hasGeneration()) {
       // pure geometry hash - MUST match the intake's keying (see onDrawCallGeometry)
-      const XXH64_hash_t geometryHash = blasEntry->input.getGeometryData().getHashForRule(RtxOptions::geometryAssetHashRule());
+      const XXH64_hash_t geometryHash = blasEntry->input.getGeometryData().getHashForRule<rules::ClusterGeometryHash>();
 
       const auto found = m_geometryIdByHash.find(geometryHash);
       if (found != m_geometryIdByHash.end()) {
@@ -4826,7 +4840,7 @@ namespace dxvk {
       if (probeBlas != nullptr) {
         const auto& infos = m_renderSystem->getGeometryRenderInfos();
         const uint64_t expectedHash = resolvePromoCandidateKey(probeBlas->input.getGeometryData());
-        const uint64_t drawHash = probeBlas->input.getGeometryData().getHashForRule(RtxOptions::geometryAssetHashRule());
+        const uint64_t drawHash = probeBlas->input.getGeometryData().getHashForRule<rules::ClusterGeometryHash>();
         const uint64_t boundHash = plainGeometryId < infos.size() ? infos[plainGeometryId].geometryHash : 0;
         // The table is keyed by the RESIDENT hash. For a rest-referenced promoted
         // candidate that is the space-tagged REST hash - neither the draw hash nor the
