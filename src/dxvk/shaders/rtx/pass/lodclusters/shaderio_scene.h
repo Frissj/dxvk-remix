@@ -72,6 +72,14 @@ enum ClusterStateBits
 #define CLUSTER_TRIANGLE_COUNT 32
 #endif
 
+// vk_lod_clusters c53b731. NV-DXVK: Remix precompiles these kernels, and this macro is not a
+// //!variant axis, so it always resolves to this fallback. That matches ClusterLodManager's
+// clusterGroupSize default of 32. If clusterGroupSize is ever raised above 32, this must become
+// a real variant axis, otherwise traversal_blas_merging drops the clusters past bit 31.
+#ifndef GROUP_CLUSTER_COUNT
+#define GROUP_CLUSTER_COUNT 32
+#endif
+
 // if we have less triangles than vertices per cluster, store
 // cluster-uniform outputs perprimitive
 #ifndef USE_PERPRIMITIVE_OUT

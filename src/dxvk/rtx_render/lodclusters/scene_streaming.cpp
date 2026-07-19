@@ -700,11 +700,18 @@ uint32_t SceneStreaming::handleCompletedRequest(VkCommandBuffer      cmd,
 
   {
     const char* errorCause = nullptr;
+    uint32_t    errorValue = 0;
 
     if(request.shaderData->errorUpdate != 0)
+    {
       errorCause = "update";
+      errorValue = request.shaderData->errorUpdate;
+    }
     else if(request.shaderData->errorAgeFilter != 0)
+    {
       errorCause = "age filter";
+      errorValue = request.shaderData->errorAgeFilter;
+    }
     else if(request.shaderData->errorClasNotFound != 0)
       errorCause = "clas not found";
     else if(request.shaderData->errorClasAlloc != 0)
@@ -718,8 +725,9 @@ uint32_t SceneStreaming::handleCompletedRequest(VkCommandBuffer      cmd,
 
     if(errorCause)
     {
+      // vk_lod_clusters 37ef558: log before asserting, and include the raw value
+      LOGE("streaming: fatal error - %s (%u)\n", errorCause, errorValue);
       assert(0 && "streaming fatal error");
-      LOGE("streaming: fatal error - %s\n", errorCause);
       exit(-1);
     }
   }
@@ -983,6 +991,10 @@ uint32_t SceneStreaming::handleCompletedRequest(VkCommandBuffer      cmd,
     // stats
     transferBytes += groupInfo.sizeBytes;
   }
+
+  // vk_lod_clusters 37ef558: now that all loads are done, the removed groups' resident IDs can
+  // be recycled for future tasks
+  m_resident.flushRemovedGroups();
 
   updateTask.newClusterCount = clasBuildOffset;
 
@@ -1825,6 +1837,7 @@ bool SceneStreaming::initShadersAndPipelines()
   options.AddMacroDefinition("USE_16BIT_DISPATCH", fmt::format("{}", res.m_use16bitDispatch ? 1 : 0));
   options.AddMacroDefinition("CLUSTER_VERTEX_COUNT", fmt::format("{}", m_scene->m_maxClusterVertices));
   options.AddMacroDefinition("CLUSTER_TRIANGLE_COUNT", fmt::format("{}", m_scene->m_maxClusterTriangles));
+  options.AddMacroDefinition("GROUP_CLUSTER_COUNT", fmt::format("{}", m_scene->m_config.clusterGroupSize));
   options.AddMacroDefinition("HAS_ALPHA_TEST", m_scene->m_hasAlphaMask ? "1" : "0");
 
   shaderc::CompileOptions optionsRaster = options;
@@ -2242,7 +2255,11 @@ bool SceneStreaming::buildLowDetailClas(size_t firstGeometry, size_t geometryCou
         buildInfo.vertexBuffer             = clusterVA + sceneCluster.vertices;
         buildInfo.positionTruncateBitCount = m_clasTriangleInput.minPositionTruncateBitCount;
 
-        if(requiresMixedGeometryBuffer)
+        // vk_lod_clusters 0386980: without an alpha mask, initClas sets maxGeometryIndexValue = 0
+        // above, so any geometryIndex > 0 is illegal. The mixed path writes per-triangle indices of
+        // 1 for alpha-masked triangles, so it must not run at all in that case. Upstream accepts the
+        // consequence that mixing two-sided multi-materials needs alpha testing enabled globally.
+        if(m_scene->m_hasAlphaMask && requiresMixedGeometryBuffer)
         {
           assert((geometryOffset + buildInfo.triangleCount) <= (loClustersCount * m_scene->m_maxClusterTriangles));
 
@@ -2273,7 +2290,9 @@ bool SceneStreaming::buildLowDetailClas(size_t firstGeometry, size_t geometryCou
         }
         else
         {
-          if((sceneCluster.stateBits & shaderio::CLUSTER_STATE_ALPHAMASKED) != 0)
+          // vk_lod_clusters 0386980: same reason as above, geometryIndex 1 is out of range when
+          // maxGeometryIndexValue is 0.
+          if(m_scene->m_hasAlphaMask && (sceneCluster.stateBits & shaderio::CLUSTER_STATE_ALPHAMASKED) != 0)
             buildInfo.baseGeometryIndexAndGeometryFlags.geometryIndex = 1;
           else
             buildInfo.baseGeometryIndexAndGeometryFlags.geometryFlags = VK_CLUSTER_ACCELERATION_STRUCTURE_GEOMETRY_OPAQUE_BIT_NV;

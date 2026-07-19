@@ -140,6 +140,7 @@ void StreamingResident::init(Resources& res, const StreamingConfig& config, uint
   m_groupIndicesUpdateRange    = {};
   m_groups                     = {};
   m_activeGroupIndices         = {};
+  m_removedGroups              = {};
   m_mapGeometryGroup2Residency = {};
 
   // NV-DXVK P3: reserve the persistent prefix (see header). Group and cluster
@@ -307,6 +308,10 @@ void StreamingResident::deinitClas(Resources& res)
 
 void StreamingResident::reset(shaderio::StreamingResident& shaderData)
 {
+  // vk_lod_clusters 37ef558: pending removals reference groups no longer in the active list,
+  // their IDs must still be given back
+  flushRemovedGroups();
+
   // NV-DXVK P3: streamed entries live in slots starting at the fixed streamed
   // window base (== m_lowDetailGroupsCount without a reserved capacity)
   uint32_t streamedCount = m_activeGroupsCount - m_lowDetailGroupsCount;
@@ -357,6 +362,12 @@ void StreamingResident::uploadInitialState(Resources::BatchedUploader& uploader,
                                                    sizeof(shaderio::uint64_t) * m_activeClustersCount,
                                                    (uint64_t*)nullptr, Resources::DONT_FLUSH);
 
+  // vk_lod_clusters 37ef558: the persistent low-detail groups never had their geometryID /
+  // groupID uploaded, leaving those table entries undefined for the resident prefix.
+  uint32_t* shaderGroupIDs = uploader.uploadBuffer(m_residentBuffer, m_residentGroupIDsOffset,
+                                                   sizeof(shaderio::uint32_t) * m_lowDetailGroupsCount,
+                                                   (uint32_t*)nullptr, Resources::DONT_FLUSH);
+
   for(uint32_t g = 0; g < m_lowDetailGroupsCount; g++)
   {
     const Group& group = m_groups[g];
@@ -365,7 +376,9 @@ void StreamingResident::uploadInitialState(Resources::BatchedUploader& uploader,
     shaderio::StreamingGroup& shaderGroup = shaderGroups[g];
     shaderGroup.age                       = 0x1234;
     shaderGroup.lodLevel                  = group.lodLevel;
+    shaderGroup.geometryID                = group.geometryGroup.geometryID;
     shaderGroup.group                     = group.deviceAddress;
+    shaderGroupIDs[g]                     = group.geometryGroup.groupID;
     for(uint32_t c = 0; c < group.clusterCount; c++)
     {
       shaderClusters[group.clusterResidentID + c] = group.deviceAddress + sizeof(shaderio::Group) + sizeof(shaderio::Cluster) * c;
@@ -426,6 +439,13 @@ void StreamingResident::uploadAppendedPersistentGroups(Resources::BatchedUploade
       uploader.uploadBuffer(m_residentBuffer, m_residentClustersOffset + sizeof(uint64_t) * firstClusterResidentID,
                             sizeof(uint64_t) * clusterCount, (uint64_t*)nullptr, Resources::DONT_FLUSH);
 
+  // vk_lod_clusters 37ef558 upstream now uploads geometryID / groupID in uploadInitialState, but
+  // these groups are appended afterwards (they grow m_lowDetailGroupsCount past the range that
+  // ran), so the same two fields have to be written here to keep the invariant.
+  uint32_t* shaderGroupIDs =
+      uploader.uploadBuffer(m_residentBuffer, m_residentGroupIDsOffset + sizeof(shaderio::uint32_t) * firstGroupResidentID,
+                            sizeof(shaderio::uint32_t) * groupCount, (uint32_t*)nullptr, Resources::DONT_FLUSH);
+
   for(uint32_t g = 0; g < groupCount; g++)
   {
     const Group& group = m_groups[firstGroupResidentID + g];
@@ -434,9 +454,8 @@ void StreamingResident::uploadAppendedPersistentGroups(Resources::BatchedUploade
     shaderGroup.age                       = 0x1234;
     shaderGroup.lodLevel                  = group.lodLevel;
     shaderGroup.group                     = group.deviceAddress;
-    // uploadInitialState leaves geometryID uninitialized (unread for
-    // persistent groups); write it anyway so no undefined staging bytes upload
     shaderGroup.geometryID                = group.geometryGroup.geometryID;
+    shaderGroupIDs[g]                     = group.geometryGroup.groupID;
 
     for(uint32_t c = 0; c < group.clusterCount; c++)
     {
@@ -659,10 +678,22 @@ void StreamingResident::removeGroup(uint32_t groupResidentID)
   m_activeClustersCount -= group.clusterCount;
   m_activeTrianglesCount -= group.triangleCount;
 
-  m_groupAllocator.destroyID(groupResidentID);
-  m_clusterAllocator.destroyRangeID(group.clusterResidentID, group.clusterCount);
+  // vk_lod_clusters 37ef558: defer the ID frees to `flushRemovedGroups`, so loads within the
+  // same update task cannot reuse them (see header). Otherwise the update kernel's unload and
+  // load threads write the same resident table entries with no ordering guarantee.
+  m_removedGroups.push_back({groupResidentID, group.clusterResidentID, uint32_t(group.clusterCount)});
 
   group = {};
+}
+
+void StreamingResident::flushRemovedGroups()
+{
+  for(const RemovedGroup& removed : m_removedGroups)
+  {
+    m_groupAllocator.destroyID(removed.groupResidentID);
+    m_clusterAllocator.destroyRangeID(removed.clusterResidentID, removed.clusterCount);
+  }
+  m_removedGroups.clear();
 }
 
 //////////////////////////////////////////////////////////////////////////

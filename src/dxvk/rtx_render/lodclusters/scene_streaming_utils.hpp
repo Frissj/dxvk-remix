@@ -241,10 +241,16 @@ public:
   uint32_t getLoadActiveGroupsOffset() const;
   uint32_t getLoadActiveClustersOffset() const;
 
-  // first handle adding & removing
+  // first handle adding & removing.
+  // vk_lod_clusters 37ef558: removed groups keep their resident group/cluster IDs allocated
+  // until `flushRemovedGroups`, so a load within the same update task can never reuse them.
+  // Otherwise the update kernel's unload and load threads would write the same resident table
+  // entries without ordering guarantees.
   bool                      canAllocateGroup(uint32_t numClusters) const;
   StreamingResident::Group* addGroup(GeometryGroup geometryGroup, uint32_t clusterCount, uint32_t triangleCount);
   void                      removeGroup(uint32_t groupResidentID);
+  // call after all addGroup of a task were made
+  void                      flushRemovedGroups();
 
   // NV-DXVK P3: adds a persistently resident (lowest detail) group. With a
   // persistent capacity configured its group/cluster IDs and active-list slot
@@ -305,6 +311,15 @@ private:
 
   // index into above
   std::vector<uint32_t> m_activeGroupIndices;
+
+  // vk_lod_clusters 37ef558: removed groups whose IDs await `flushRemovedGroups`
+  struct RemovedGroup
+  {
+    uint32_t groupResidentID;
+    uint32_t clusterResidentID;
+    uint32_t clusterCount;
+  };
+  std::vector<RemovedGroup> m_removedGroups;
 
   uint32_t m_lowDetailGroupsCount;
   uint32_t m_lowDetailClustersCount;
