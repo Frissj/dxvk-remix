@@ -1278,9 +1278,35 @@ namespace dxvk {
         }
       }
 
+      struct TopologyHashData {
+        XXH64_hash_t previousHash;
+        XXH64_hash_t indexHash;
+        uint32_t primitiveOffset;
+        uint32_t firstVertex;
+      };
+
+      XXH64_hash_t newTopologyHash = kEmptyHash;
+      for (uint32_t geometryIndex = 0; geometryIndex < bucket->geometries.size(); ++geometryIndex) {
+        const BlasEntry* blasEntry = bucket->originalInstances[geometryIndex]->getBlas();
+        const TopologyHashData topologyHashData {
+          newTopologyHash,
+          blasEntry->modifiedGeometryData.hashes[HashComponents::Indices],
+          bucket->ranges[geometryIndex].primitiveOffset,
+          bucket->ranges[geometryIndex].firstVertex,
+        };
+        newTopologyHash = hashStructByMemory<TopologyHashData,
+            &TopologyHashData::previousHash,
+            &TopologyHashData::indexHash,
+            &TopologyHashData::primitiveOffset,
+            &TopologyHashData::firstVertex>(topologyHashData);
+      }
+
       // Must ensure that if we are updating an existing blas, rather than rebuilding, the blas is compatible with our new build info
       // Cannot update a blas that contains OMM instances, this leads to sporadic device lost errors
-      if (!bucket->hasOmmInstances && selectedBlas && validateUpdateMode(selectedBlas->buildInfo, buildInfo) && selectedBlas->primitiveCounts == bucket->primitiveCounts) {
+      if (!bucket->hasOmmInstances && selectedBlas &&
+          selectedBlas->topologyHash == newTopologyHash &&
+          validateUpdateMode(selectedBlas->buildInfo, buildInfo) &&
+          selectedBlas->primitiveCounts == bucket->primitiveCounts) {
         buildInfo.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR;
       }
 
@@ -1294,6 +1320,7 @@ namespace dxvk {
       }
       assert(selectedBlas);
       selectedBlas->frameLastTouched = currentFrame;
+      selectedBlas->topologyHash = newTopologyHash;
 
       // Record the assigned BLAS on the bucket so the per-bucket cache can capture it
       bucket->assignedBlas = selectedBlas;
@@ -1326,13 +1353,13 @@ namespace dxvk {
         // Geometry order is part of the merged BLAS layout and affects primitive
         // to surface mapping, so include the bucket order in the content hash.
         if (!contentHashData.empty()) {
-          newContentHash = hashStructArrayByMemory(contentHashData.data(), contentHashData.size(),
+          newContentHash = hashStructArrayByMemory<BucketGeometryContentHashData,
               &BucketGeometryContentHashData::vertexHash,
               &BucketGeometryContentHashData::indexHash,
               &BucketGeometryContentHashData::boneHash,
               &BucketGeometryContentHashData::transform,
               &BucketGeometryContentHashData::primitiveCount,
-              &BucketGeometryContentHashData::pad);
+              &BucketGeometryContentHashData::pad>(contentHashData.data(), contentHashData.size());
         }
       }
 

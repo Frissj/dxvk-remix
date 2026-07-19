@@ -152,12 +152,18 @@ namespace dxvk {
   namespace {
     template<int RtInstanceSize> struct CheckRtInstanceSize {
       // The second line of the build error should contain the new size of RtInstance in the template argument, i.e. `dxvk::CheckRtInstanceSize<newSize>`
-      // NV-DXVK: 768 -> 776. RTX Mega Geometry added isClusterLod / clusterGeometryId /
-      // isClusterTemplate to RtSurface (rtx_materials.h); RtSurface is the `surface`
-      // member, copied wholesale by copyInstanceDataFrom (`surface = src.surface`), so no
-      // copy-constructor change is needed. This guard only compiles in non-Debug builds,
-      // so the first release/debugoptimized build after the cluster work is where it fires.
-      static_assert(RtInstanceSize == 776, "RtInstance size has changed.  Fix the copy constructor above this message, then update the expected size.");
+      // NV-DXVK: 768 -> 784, from two independent +8 byte additions that BOTH landed on 776
+      // on their own side of the upstream merge, so git merged the old number silently:
+      //   +8  RTX Mega Geometry added isClusterLod / clusterGeometryId / isClusterTemplate to
+      //       RtSurface (rtx_materials.h). RtSurface is the `surface` member, copied wholesale
+      //       by copyInstanceDataFrom (`surface = src.surface`), so no copy change is needed.
+      //   +8  upstream b8d59d84 [REMIX-5629] added the m_emitterMotionState unique_ptr, which is
+      //       deliberately not synced (already listed in copyInstanceDataFrom's exclusion note).
+      // Both copy paths are therefore already correct; only the expected size needed updating.
+      // 784 assumes the two additions pack additively. This guard only compiles in non-Debug
+      // builds, so if padding makes the real size differ, the first release/debugoptimized
+      // build reports the true value in the template argument, i.e. `dxvk::CheckRtInstanceSize<N>`.
+      static_assert(RtInstanceSize == 784, "RtInstance size has changed.  Fix the copy constructor above this message, then update the expected size.");
     };
     CheckRtInstanceSize<sizeof(RtInstance)> _rtInstanceSizeTest;
   }
@@ -205,7 +211,7 @@ namespace dxvk {
     //   OMM request registration state,
     //   m_primInstanceOwner, buildGeometries, buildRanges,
     //   billboardIndices, indexOffsets, m_blasDirty,
-    //   m_billboardGeometryDirty
+    //   m_billboardGeometryDirty, m_emitterMotionState
   }
 
   void RtInstance::updateFromReference(const RtInstance& src, const bool preserveTransforms) {
