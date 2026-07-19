@@ -24,6 +24,8 @@
 // only place that translates between the plain boundary types and NVIDIA's
 // lodclusters::Scene types; it compiles as part of the C++20 lodclusters library.
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cinttypes>
 #include <cmath>
@@ -349,6 +351,125 @@ bool GeometryProcessor::processGeometry(const GeometrySnapshot& snapshot, const 
     LOGW("GeometryProcessor: processing failed (%d) for %s\n", int(result), snapshot.name.c_str());
     scene.deinit();
     return false;
+  }
+
+  // ---- [ClusterUV] BUILT-CLUSTER ATTRIBUTE DUMP ----------------------------------
+  // Raw, no thresholds: for the first few processed geometries, walk the clusters the
+  // builder actually produced and print, per vertex, the cluster's position AND its
+  // texcoord side by side, then cross-check that pair against the INPUT snapshot.
+  //
+  // Why the cross-check is the real test: the snapshot is consistent by construction
+  // (texcoords0[v] always pairs with positions[v]). The open question is what the
+  // clusterizer did - it re-orders and de-duplicates vertices into cluster-local
+  // blocks, so if positions and texcoords are permuted differently, every UV lands on
+  // the wrong vertex. That reads on screen as correct textures mapped onto the wrong
+  // geometry, which no amount of format decoding would explain (and [SnapTex] proved
+  // decoding is not the issue here: FORMAT 0 across 490 geometries).
+  //
+  // For each dumped cluster vertex we find the input vertex with a matching POSITION
+  // and compare that input vertex's UV to the cluster's UV:
+  //   uvMatch=1        -> builder kept position/texcoord paired; UVs are sound.
+  //   uvMatch=0        -> the permutation differs between the two attribute blocks:
+  //                       THIS is wrong-UV-on-right-geometry, and it is a builder /
+  //                       attribute-plumbing bug, not a decode or binding bug.
+  //   posMatch=0       -> the cluster vertex position is not in the input at all
+  //                       (welding/quantization changed it) - report separately so it
+  //                       is not mistaken for a UV fault.
+  // attrBits is printed so a cluster built WITHOUT TEX_0 is instantly distinguishable
+  // from one whose UVs are merely wrong.
+  {
+    static std::atomic<int> s_clusterUvDumps{0};
+    const int dumpIndex = s_clusterUvDumps.fetch_add(1);
+    if(dumpIndex < 8 && !snapshot.texcoords0.empty())
+    {
+      const lodclusters::Scene::GeometryView& geo = scene.getActiveGeometry(0);
+      LOGE("[ClusterUV] %s groups=%zu inputVerts=%u inputTexcoords=%zu\n", snapshot.name.c_str(),
+           geo.groupInfos.size(), snapshot.vertexCount, snapshot.texcoords0.size() / 2);
+
+      int clustersDumped = 0;
+      for(size_t g = 0; g < geo.groupInfos.size() && clustersDumped < 2; g++)
+      {
+        const lodclusters::Scene::GroupView groupView(geo.groupData, geo.groupInfos[g]);
+
+        for(size_t c = 0; c < groupView.clusters.size() && clustersDumped < 2; c++, clustersDumped++)
+        {
+          const shaderio::Cluster& cluster = groupView.clusters[c];
+          const uint32_t vertexCount = cluster.vertexCountMinusOne + 1;
+          const glm::vec3* clusterPositions = groupView.getClusterVertices(c);
+
+          // texcoords sit after positions (+ the packed normal word when present),
+          // 8-byte aligned - mirrors Cluster_getVertexTexCoords / the Remix shader.
+          const uint32_t elems = (cluster.attributeBits & shaderio::CLUSTER_ATTRIBUTE_VERTEX_NORMAL) == 0 ? 3u : 4u;
+          const size_t   texBase =
+              (size_t(&cluster) + ((cluster.vertices + 4 * elems * vertexCount) + 7) & ~size_t(7));
+          const float* clusterTexcoords = (const float*)texBase;
+
+          LOGE("[ClusterUV]   group %zu cluster %zu verts %u attrBits 0x%x tex0=%d nrm=%d\n", g, c, vertexCount,
+               cluster.attributeBits,
+               (cluster.attributeBits & shaderio::CLUSTER_ATTRIBUTE_VERTEX_TEX_0) ? 1 : 0,
+               (cluster.attributeBits & shaderio::CLUSTER_ATTRIBUTE_VERTEX_NORMAL) ? 1 : 0);
+
+          const uint32_t dumpVerts = std::min(vertexCount, 8u);
+          for(uint32_t v = 0; v < dumpVerts; v++)
+          {
+            const glm::vec3 cp = clusterPositions[v];
+            const float cu = (cluster.attributeBits & shaderio::CLUSTER_ATTRIBUTE_VERTEX_TEX_0) ? clusterTexcoords[v * 2 + 0] : 0.0f;
+            const float cv = (cluster.attributeBits & shaderio::CLUSTER_ATTRIBUTE_VERTEX_TEX_0) ? clusterTexcoords[v * 2 + 1] : 0.0f;
+
+            // Locate this position in the input snapshot. A position can appear MANY
+            // times with DIFFERENT UVs - that is a UV seam, where the mesh duplicates a
+            // vertex so the texture can wrap. Taking the first positional match and
+            // comparing its UV therefore produces FALSE mismatches at every seam, which
+            // is exactly what the first version of this probe did (14 "mismatches" whose
+            // cluster UVs were continuous with their neighbours). Scan ALL duplicates and
+            // accept the cluster UV if it matches ANY of them; report how many duplicates
+            // exist so a seam is distinguishable from a genuine fault:
+            //   dup>1 uvMatchAny=1 -> seam, builder picked a legitimate duplicate: CORRECT
+            //   dup=1 uvMatchAny=0 -> only one candidate UV and the cluster disagrees:
+            //                         a REAL position/texcoord permutation bug
+            //   dup>1 uvMatchAny=0 -> cluster UV matches no duplicate at this position:
+            //                         also a real fault (and not explainable by seams)
+            uint32_t dupCount     = 0;
+            int      firstIdx     = -1;
+            int      matchedIdx   = -1;
+            float    firstU = 0.0f, firstV = 0.0f;
+            for(uint32_t iv = 0; iv < snapshot.vertexCount; iv++)
+            {
+              if(snapshot.positions[size_t(iv) * 3 + 0] == cp.x && snapshot.positions[size_t(iv) * 3 + 1] == cp.y
+                 && snapshot.positions[size_t(iv) * 3 + 2] == cp.z)
+              {
+                const float iu  = snapshot.texcoords0[size_t(iv) * 2 + 0];
+                const float ivv = snapshot.texcoords0[size_t(iv) * 2 + 1];
+                if(dupCount == 0)
+                {
+                  firstIdx = int(iv);
+                  firstU   = iu;
+                  firstV   = ivv;
+                }
+                dupCount++;
+                if(matchedIdx < 0 && std::fabs(iu - cu) < 1e-5f && std::fabs(ivv - cv) < 1e-5f)
+                {
+                  matchedIdx = int(iv);
+                }
+              }
+            }
+
+            if(dupCount == 0)
+            {
+              LOGE("[ClusterUV]     v%u pos(%.4f, %.4f, %.4f) uv(%.4f, %.4f) posMatch=0 (not in input)\n", v, cp.x,
+                   cp.y, cp.z, cu, cv);
+            }
+            else
+            {
+              LOGE("[ClusterUV]     v%u pos(%.4f, %.4f, %.4f) clusterUV(%.4f, %.4f) dup %u firstIdx %d "
+                   "firstUV(%.4f, %.4f) matchedIdx %d posMatch=1 uvMatchAny=%d\n",
+                   v, cp.x, cp.y, cp.z, cu, cv, dupCount, firstIdx, firstU, firstV, matchedIdx,
+                   matchedIdx >= 0 ? 1 : 0);
+            }
+          }
+        }
+      }
+    }
   }
 
   fillStats(scene, outStats);

@@ -725,7 +725,29 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
         vec2 loadedTextureCoordinate;
         if (isClusterHit)
         {
-          loadedTextureCoordinate = clusterGeometryGetTexcoord0(clusterGeometry, currentIndex);
+          // Gate on the cluster ACTUALLY carrying texcoords, exactly as the vertex-normal
+          // path above gates on hasVertexNormals/hasNormals. Without this the fetch is
+          // unconditional: clusterGeometryGetTexcoord0 computes its address as
+          // verticesOffset + (hasNormals ? 4 : 3) * 4 * vertexCount, i.e. it assumes a
+          // texcoord block that a cluster built WITHOUT the TEX_0 attribute never has,
+          // so it reads whatever follows the vertex data (triangle indices / the next
+          // cluster) and returns garbage UVs - the mesh then samples its texture at
+          // meaningless coordinates and looks like it was given the WRONG texture.
+          //
+          // A cluster ends up without TEX_0 when the snapshot could not decode the
+          // game's vertex format (makeSnapshot only handles R32*_SFLOAT; half-float and
+          // packed-normalized UVs are dropped), which is what the vertex-format decode
+          // work addresses. Until that lands those meshes have no cluster texcoords at
+          // ALL, so there is nothing correct to read - fall back to zero, which renders
+          // them untextured rather than wrongly textured, and makes exactly which meshes
+          // still need the decode obvious on screen.
+          //
+          // No fallback to surface.texcoordBufferIndex is possible here: currentIndex is
+          // a CLUSTER-LOCAL uint8 index, while that buffer is indexed by the original
+          // global vertex index, which a cluster hit does not carry.
+          loadedTextureCoordinate = clusterGeometry.hasTexcoords0
+            ? clusterGeometryGetTexcoord0(clusterGeometry, currentIndex)
+            : vec2(0.0f);
         }
         else
         {

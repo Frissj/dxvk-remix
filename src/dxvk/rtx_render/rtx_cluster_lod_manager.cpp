@@ -4811,6 +4811,126 @@ namespace dxvk {
 
     m_slots[tlasType].push_back({ instance, geometryId });
 
+    // [GeoBind] WRONG-GEOMETRY PROBE. Everything downstream - the BLAS this instance
+    // renders, the clusters its ClusterIDs resolve to, and therefore the UVs its
+    // texture is sampled with - keys off plainGeometryId. If that id does not name
+    // THIS instance's geometry, the instance renders another mesh's clusters while
+    // keeping its own material: the texture lands on the wrong geometry.
+    // getGeometryRenderInfos()[id].geometryHash is the id's own record of which
+    // geometry it is (m_geometryIdByHash is built from exactly that field), so
+    // comparing it against the hash this instance resolved to is a direct identity
+    // check rather than an inference. MISMATCH lines are the smoking gun; a clean
+    // run prints only the one-time summary.
+    {
+      const BlasEntry* probeBlas = instance != nullptr ? instance->getBlas() : nullptr;
+      if (probeBlas != nullptr) {
+        const auto& infos = m_renderSystem->getGeometryRenderInfos();
+        const uint64_t expectedHash = resolvePromoCandidateKey(probeBlas->input.getGeometryData());
+        const uint64_t drawHash = probeBlas->input.getGeometryData().getHashForRule(RtxOptions::geometryAssetHashRule());
+        const uint64_t boundHash = plainGeometryId < infos.size() ? infos[plainGeometryId].geometryHash : 0;
+        // The table is keyed by the RESIDENT hash. For a rest-referenced promoted
+        // candidate that is the space-tagged REST hash - neither the draw hash nor the
+        // candidate key - so the first version of this check reported all 1955 of those
+        // as mismatches (every one traced back to a legitimate "probe re-referenced to
+        // REST CAPTURE 0x..." line). Consult the candidate's own routeHash, and its
+        // per-class routeHashes, which are exactly the identities residency routes to.
+        bool bindOk = (boundHash == drawHash) || (boundHash == expectedHash);
+        if (!bindOk) {
+          const auto candIt = m_promoCandidates.find(expectedHash);
+          if (candIt != m_promoCandidates.end() && candIt->second.routeHash == boundHash) {
+            bindOk = true;
+          }
+        }
+        if (!bindOk) {
+          const auto classesIt = m_restClassesByCandidate.find(expectedHash);
+          if (classesIt != m_restClassesByCandidate.end()) {
+            for (const RestClassState& c : classesIt->second) {
+              if (c.routeHash == boundHash) {
+                bindOk = true;
+                break;
+              }
+            }
+          }
+        }
+        static std::mutex s_gbMutex;
+        static std::unordered_set<uint64_t> s_gbSeen;
+        static uint32_t s_gbOk = 0, s_gbBad = 0;
+        std::lock_guard<std::mutex> gbLock(s_gbMutex);
+        if (bindOk) {
+          s_gbOk++;
+        } else {
+          s_gbBad++;
+        }
+        if (!bindOk || s_gbSeen.size() < 32u) {
+          if (s_gbSeen.insert(drawHash).second || !bindOk) {
+            Logger::info(str::format("[GeoBind] ", (bindOk ? "ok" : "*** MISMATCH ***"),
+                                     " geomId ", plainGeometryId,
+                                     " promoted ", (promoted ? 1 : 0),
+                                     " drawHash 0x", std::hex, drawHash,
+                                     " candKey 0x", expectedHash,
+                                     " boundHash 0x", boundHash, std::dec,
+                                     " (tableSize ", uint32_t(infos.size()),
+                                     ", okTotal ", s_gbOk, " badTotal ", s_gbBad, ")"));
+          }
+        }
+      }
+    }
+
+    // [MatBind] WRONG-TEXTURE PROBE. The snapshot->cluster chain is now verified end to
+    // end ([SnapTex] no format drops, [GeoBind] no misbindings, [ClusterUV] 128/128
+    // position+UV pairs correct), so the UVs a Path A surface samples with are right and
+    // belong to the right mesh. The remaining way to render "the wrong texture" is for
+    // the instance to carry the wrong MATERIAL - which is resolved by Remix's instance
+    // manager, entirely outside the cluster path. That would NOT be a regression from the
+    // cluster work: while Path A had no UVs every surface was effectively flat, so a
+    // mis-bound texture was invisible; making UVs work only exposed it.
+    //
+    // Compares the instance's material identity against the material of the draw call
+    // that produced its BlasEntry. Those must agree - the instance IS that draw.
+    //   MISMATCH -> the instance is rendering another draw's material: the wrong texture
+    //               on correct geometry, and the bug is in instance/material binding.
+    //   all ok   -> materials are right too, and the fault is the hit-side texcoord
+    //               *fetch* (index basis / transform), the last unexamined link.
+    // Also logs texcoord-affecting surface state, since a correct texture sampled through
+    // a wrong transform looks equally wrong: texcoordGenerationMode and the first row of
+    // textureTransform (identity => no transform applied).
+    {
+      const BlasEntry* matBlas = instance != nullptr ? instance->getBlas() : nullptr;
+      if (matBlas != nullptr) {
+        const XXH64_hash_t instMat = instance->getMaterialDataHash();
+        const XXH64_hash_t drawMat = matBlas->input.getMaterialData().getHash();
+        const bool matOk = (instMat == drawMat);
+        static std::mutex s_mbMutex;
+        static std::unordered_set<uint64_t> s_mbSeen;
+        static uint32_t s_mbOk = 0, s_mbBad = 0;
+        std::lock_guard<std::mutex> mbLock(s_mbMutex);
+        if (matOk) {
+          s_mbOk++;
+        } else {
+          s_mbBad++;
+        }
+        if (!matOk || s_mbSeen.size() < 24u) {
+          if (s_mbSeen.insert(uint64_t(instMat) ^ uint64_t(drawMat)).second || !matOk) {
+            Logger::info(str::format("[MatBind] ", (matOk ? "ok" : "*** MISMATCH ***"),
+                                     " geomId ", plainGeometryId,
+                                     " instMat 0x", std::hex, instMat,
+                                     " drawMat 0x", drawMat, std::dec,
+                                     " matIndex ", instance->surface.surfaceMaterialIndex,
+                                     // texgenMode != None means the shader SYNTHESIZES texcoords
+                                     // (e.g. from the view-space normal) and ignores the cluster's
+                                     // UVs entirely - which would look exactly like "wrong texture"
+                                     // on otherwise correct geometry.
+                                     " texgenMode ", int(instance->surface.texgenMode),
+                                     " xform[", instance->surface.textureTransform.data[0].x, ",",
+                                     instance->surface.textureTransform.data[1].x, ",",
+                                     instance->surface.textureTransform.data[0].y, ",",
+                                     instance->surface.textureTransform.data[1].y, "]",
+                                     " (okTotal ", s_mbOk, " badTotal ", s_mbBad, ")"));
+          }
+        }
+      }
+    }
+
     // pre-fill blasReference with the geometry's low-detail BLAS: the safe default
     // instance_assign_blas expects for skipped/culled builds
     VkAccelerationStructureInstanceKHR instanceData = blasInstance;

@@ -668,8 +668,12 @@ void geometryResolverVertexOutputDebugView(
       // streaming resident cluster table (0 = preloaded mode); see clusterGeometryCreate
       const uint64_t clusterResidentClustersAddress =
         (uint64_t(cb.clusterResidentClustersAddressHi) << 32) | uint64_t(cb.clusterResidentClustersAddressLo);
+      // & 0x3FFFF: clusterGeometryId packs (promoStateSlot + 1) into bits [30:18]
+      // (recordClusterInstance), so a PROMOTED instance's raw value is not a geometry
+      // table index - passing it unmasked indexes far past the table and decodes a
+      // bogus cluster. surface_interaction masks the same way; this call site did not.
       const ClusterGeometry clusterGeometry = clusterGeometryCreate(
-        clusterGeometriesTableAddress, surface.clusterGeometryId, rayInteraction.clusterId,
+        clusterGeometriesTableAddress, surface.clusterGeometryId & 0x3FFFF, rayInteraction.clusterId,
         clusterResidentClustersAddress);
 
       if (cb.debugView == DEBUG_VIEW_CLUSTER_LOD_LEVEL)

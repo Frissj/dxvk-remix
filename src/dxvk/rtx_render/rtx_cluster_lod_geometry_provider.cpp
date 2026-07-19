@@ -26,7 +26,9 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 
 #include "rtx_types.h"
@@ -807,8 +809,25 @@ namespace dxvk {
     }
 
     // texcoords -> tightly packed vec2 (same float32-only rule as GeometryBufferData)
+    // [SnapTex] DECODE-NEED PROBE: records, per geometry, exactly WHY this snapshot did
+    // or did not end up with texcoords. This is the authoritative answer to "is the
+    // vertex-format decode fix needed for this game?" - it is the only place a source
+    // texcoord buffer is inspected, and the float32-only test below is the drop.
+    //   drop=FORMAT   -> the buffer EXISTS but its VkFormat is not R32G32/B32/A32_SFLOAT.
+    //                    The decode fix IS needed; that format's UVs are silently lost and
+    //                    the cluster is built with no TEX_0 attribute.
+    //   drop=NOBUF    -> the draw supplied no texcoord buffer at all. Decode fix would NOT
+    //                    help; there are no UVs to recover.
+    //   drop=UNMAPPED -> format fine but mapPtr returned null (buffer not host-visible).
+    //   drop=SHORT    -> format fine but the buffer is too short for vertexCount.
+    //   ok            -> texcoords captured; this geometry needs no decode work.
+    // Logged once per geometry hash so the set of affected geometries is enumerable, and
+    // a running per-reason tally is emitted so the scale is visible without post-processing.
+    const char* snapTexDrop = nullptr;
+    uint32_t snapTexFormat = 0;
     if (texcoordBuffer.defined()) {
       const VkFormat texcoordFormat = texcoordBuffer.vertexFormat();
+      snapTexFormat = uint32_t(texcoordFormat);
       if (texcoordFormat == VK_FORMAT_R32G32_SFLOAT || texcoordFormat == VK_FORMAT_R32G32B32_SFLOAT
           || texcoordFormat == VK_FORMAT_R32G32B32A32_SFLOAT) {
         const uint8_t* texcoordPtr =
@@ -824,7 +843,43 @@ namespace dxvk {
             outSnapshot.texcoords0[size_t(v) * 2 + 0] = src[0];
             outSnapshot.texcoords0[size_t(v) * 2 + 1] = src[1];
           }
+        } else {
+          snapTexDrop = (texcoordPtr == nullptr) ? "UNMAPPED" : "SHORT";
         }
+      } else {
+        snapTexDrop = "FORMAT";
+      }
+    } else {
+      snapTexDrop = "NOBUF";
+    }
+    {
+      static std::mutex s_stMutex;
+      static std::unordered_set<uint64_t> s_stSeen;
+      static uint32_t s_stOk = 0, s_stFormat = 0, s_stNoBuf = 0, s_stUnmapped = 0, s_stShort = 0;
+      std::lock_guard<std::mutex> stLock(s_stMutex);
+      if (snapTexDrop == nullptr) {
+        s_stOk++;
+      } else if (snapTexDrop[0] == 'F') {
+        s_stFormat++;
+      } else if (snapTexDrop[0] == 'N') {
+        s_stNoBuf++;
+      } else if (snapTexDrop[0] == 'U') {
+        s_stUnmapped++;
+      } else {
+        s_stShort++;
+      }
+      if (s_stSeen.insert(geometryHash).second) {
+        Logger::info(str::format("[SnapTex] geometry 0x", std::hex, geometryHash, std::dec,
+                                 " verts ", vertexCount,
+                                 " texBuf ", (texcoordBuffer.defined() ? 1 : 0),
+                                 " vkFormat ", snapTexFormat,
+                                 " stride ", (texcoordBuffer.defined() ? uint32_t(texcoordBuffer.stride()) : 0u),
+                                 " -> ", (snapTexDrop == nullptr ? "ok" : snapTexDrop),
+                                 " | totals ok ", s_stOk,
+                                 " FORMAT ", s_stFormat,
+                                 " NOBUF ", s_stNoBuf,
+                                 " UNMAPPED ", s_stUnmapped,
+                                 " SHORT ", s_stShort));
       }
     }
 
