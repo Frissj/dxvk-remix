@@ -557,13 +557,8 @@ void RendererRayTraceClustersLod::render(VkCommandBuffer cmd, Resources& res, Re
 {
   VkMemoryBarrier memBarrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
 
-  {
-    glm::vec2 renderScale = res.getFramebufferWindow2RenderScale();
-    float     pixelScale  = std::min(renderScale.x, renderScale.y);
-
-    m_sceneBuildShaderio.errorOverDistanceThreshold =
-        clusterLodErrorOverDistance(frame.lodPixelError * pixelScale, frame.traversalFov, frame.traversalViewHeight);
-  }
+  // vk_lod_clusters c19a250: adaptive-aware LoD error (render-scale handling moved inside)
+  m_sceneBuildShaderio.errorOverDistanceThreshold = updateLodPixelError(res, rscene, frame);
 
   m_sceneBuildShaderio.traversalViewMatrix    = frame.traversalViewMatrix;
   m_sceneBuildShaderio.cullViewProjMatrix     = frame.cullViewProjMatrix;

@@ -593,6 +593,23 @@ void SceneStreaming::cmdBeginFrame(VkCommandBuffer         cmd,
     }
 #endif
 
+    // vk_lod_clusters c19a250
+    if(m_requiresClas && m_config.usePersistentClasAllocator)
+    {
+      // we might want to increase the CLAS allocator's memory based on usage.
+      const StreamingRequests::TaskInfo& growRequest = m_requests.getCompletedTask(popRequestIndex);
+
+      // A request recorded at or after the frame of the last grow does reflect
+      // the grown state in its readback, so the compensation delta is retired.
+      // Older in-flight requests still report the pre-grow state and need it.
+      if(growRequest.shaderData->frameIndexU32[0] >= m_clasGrowFrameIndex)
+      {
+        m_clasGrowMaxSizedLeftDelta = 0;
+      }
+
+      m_clasGrowMaxSizedLeftDelta += tryGrowClas(cmd, growRequest);
+    }
+
     uint32_t dependentIndex = handleCompletedRequest(cmd, cmdQueueState, asyncQueueState, settings, popRequestIndex);
     // check if immediate update to perform
     if(dependentIndex != INVALID_TASK_INDEX)
@@ -744,7 +761,7 @@ uint32_t SceneStreaming::handleCompletedRequest(VkCommandBuffer      cmd,
     {
       m_stats.usedClasBytes   = request.shaderData->clasCompactionUsedSize;
       m_stats.wastedClasBytes = 0;
-      m_stats.maxSizedLeft = uint32_t((m_config.maxClasMegaBytes * 1024 * 1024 - request.shaderData->clasCompactionUsedSize)
+      m_stats.maxSizedLeft = uint32_t((m_resident.getAllocatedClasBytes() - request.shaderData->clasCompactionUsedSize)
                                       / (m_clasSingleMaxSize * m_scene->m_config.clusterGroupSize));
     }
   }
@@ -839,13 +856,15 @@ uint32_t SceneStreaming::handleCompletedRequest(VkCommandBuffer      cmd,
   // one needs to see how much space is left for future allocations
   // - move clas to be compacted all the time
   uint64_t clasMovedUsedSize     = request.shaderData->clasCompactionUsedSize;
-  uint64_t clasMovedReservedSize = m_config.maxClasMegaBytes * 1024 * 1024;
+  uint64_t clasMovedReservedSize = m_resident.getAllocatedClasBytes();
   // - a persistent allocator implemented on the gpu.
-  uint32_t clasAllocatedMaxSizedLeft = request.shaderData->clasAllocatedMaxSizedLeft;
+  // vk_lod_clusters c19a250: when the clas storage was grown after this request was
+  // recorded, we may actually have more available than its readback reports
+  uint32_t clasAllocatedMaxSizedLeft = request.shaderData->clasAllocatedMaxSizedLeft + m_clasGrowMaxSizedLeftDelta;
 
   // Need to account for clas operations that happen on the gpu timeline after this request's
   // frame. They indirectly reduce the budget we are guaranteed to have left for building new clas.
-  StreamingUpdates::NewInfo futureNew = m_updates.getFutureNew(request.shaderData->frameIndex);
+  StreamingUpdates::NewInfo futureNew = m_updates.getFutureNew(request.shaderData->frameIndexU32[0]);
   clasMovedUsedSize += m_clasSingleMaxSize * futureNew.clusters;
   clasAllocatedMaxSizedLeft -= std::min(clasAllocatedMaxSizedLeft, futureNew.groups);
 
@@ -1533,7 +1552,7 @@ void SceneStreaming::cmdPostTraversal(VkCommandBuffer cmd, VkDeviceAddress clasS
     VkClusterAccelerationStructureMoveObjectsInputNV clasMoveInput = {VK_STRUCTURE_TYPE_CLUSTER_ACCELERATION_STRUCTURE_MOVE_OBJECTS_INPUT_NV};
     clasMoveInput.type          = VK_CLUSTER_ACCELERATION_STRUCTURE_TYPE_TRIANGLE_CLUSTER_NV;
     clasMoveInput.maxMovedBytes = uint32_t(
-        std::min(size_t(uint32_t(~0)), std::min(m_clasSingleMaxSize * oldClasCount, m_config.maxClasMegaBytes * 1024 * 1024)));
+        std::min(size_t(uint32_t(~0)), std::min(m_clasSingleMaxSize * oldClasCount, m_resident.getAllocatedClasBytes())));
     // old clusters can overlap themselves
     clasMoveInput.noMoveOverlap = VK_FALSE;
 
@@ -1686,13 +1705,19 @@ void SceneStreaming::getStats(StreamingStats& stats) const
   m_resident.getStats(stats);
   stats.persistentDataBytes = m_persistentGeometrySize;
   stats.persistentClasBytes = m_clasLowDetailSize;
+
+  // vk_lod_clusters c19a250: report the live committed size of the sparse CLAS buffer
+  if(m_requiresClas)
+  {
+    stats.reservedClasBytes = m_resident.getAllocatedClasBytes();
+  }
 }
 
 size_t SceneStreaming::getClasSize(bool reserved) const
 {
   if(reserved)
   {
-    return m_clasLowDetailSize + m_stats.reservedClasBytes;
+    return m_clasLowDetailSize + (m_requiresClas ? m_resident.getAllocatedClasBytes() : 0);
   }
   else
   {
@@ -1734,6 +1759,27 @@ size_t SceneStreaming::getGeometrySize(bool reserved) const
   {
     return m_persistentGeometrySize + stats.usedDataBytes;
   }
+}
+
+// vk_lod_clusters c19a250
+float SceneStreaming::getLoadFactor() const
+{
+  StreamingStats stats;
+  m_storage.getStats(stats);
+
+  float pct = stats.maxDataBytes ? float(double(stats.usedDataBytes) / double(stats.maxDataBytes)) : 0.0f;
+  if(m_requiresClas)
+  {
+    if(m_config.usePersistentClasAllocator && m_stats.maxSizedMax)
+    {
+      pct = std::max(pct, float(double(m_stats.maxSizedReserved - m_stats.maxSizedLeft) / double(m_stats.maxSizedMax)));
+    }
+    else if(!m_config.usePersistentClasAllocator && m_stats.maxClasBytes)
+    {
+      pct = std::max(pct, float(double(m_stats.usedClasBytes) / double(m_stats.maxClasBytes)));
+    }
+  }
+  return pct;
 }
 
 bool SceneStreaming::updateClasRequired(bool state)
@@ -1814,6 +1860,10 @@ void SceneStreaming::reset()
 
   // need to reset internal clock
   m_frameIndex = 1;
+
+  // vk_lod_clusters c19a250
+  m_clasGrowMaxSizedLeftDelta = 0;
+  m_clasGrowFrameIndex        = 0;
 
   Resources::BatchedUploader uploader(res);
   resetGeometryGroupAddresses(uploader);
@@ -1940,6 +1990,52 @@ void SceneStreaming::deinitShadersAndPipelines()
   res.destroyPipelines(m_pipelines);
 }
 
+// vk_lod_clusters c19a250
+uint32_t SceneStreaming::tryGrowClas(VkCommandBuffer cmd, const StreamingRequests::TaskInfo& request)
+{
+  const uint32_t kClasHeadroomGroups = STREAMING_MAX_ACTIVE_TASKS * m_config.maxPerFrameLoadRequests;
+
+  // account for a previous grow that this request's readback may not reflect yet,
+  // otherwise a stale low value would trigger another spurious grow.
+  uint32_t clasAllocatedMaxSizedLeft  = request.shaderData->clasAllocatedMaxSizedLeft + m_clasGrowMaxSizedLeftDelta;
+  StreamingUpdates::NewInfo futureNew = m_updates.getFutureNew(request.shaderData->frameIndexU32[0]);
+  clasAllocatedMaxSizedLeft -= std::min(clasAllocatedMaxSizedLeft, futureNew.groups);
+
+  if(clasAllocatedMaxSizedLeft >= kClasHeadroomGroups)
+  {
+    return 0;
+  }
+
+  if(m_resident.getAllocatedClasBytes() >= m_resident.getMaxClasBytes())
+  {
+    return 0;
+  }
+
+  size_t newAllocated = m_resident.getAllocatedClasBytes() + m_config.clasGrowMegaBytes * 1024 * 1024;
+  newAllocated        = std::min(newAllocated, m_resident.getMaxClasBytes());
+
+  if(!m_resident.growClas(*m_resources, newAllocated))
+  {
+    return 0;
+  }
+
+  const uint32_t delta = m_clasAllocator.growEffective(cmd, m_resident.getAllocatedClasBytes());
+
+  m_shaderData.resident.clasMaxSize = m_resident.getAllocatedClasBytes();
+  m_clasAllocator.applyShaderData(m_shaderData.clasAllocator);
+
+  m_stats.reservedClasBytes = m_resident.getAllocatedClasBytes();
+  m_stats.maxSizedReserved  = m_clasAllocator.getMaxSizedEffective();
+
+  if(delta)
+  {
+    // requests recorded from this frame on will reflect the grown state
+    m_clasGrowFrameIndex = m_frameIndex;
+  }
+
+  return delta;
+}
+
 bool SceneStreaming::initClas()
 {
   // reset streaming for now, easier.
@@ -1947,10 +2043,11 @@ bool SceneStreaming::initClas()
   // if were to exceed it.
   reset();
 
-  Resources& res            = *m_resources;
-  m_stats.reservedClasBytes = m_config.maxClasMegaBytes * 1024 * 1024;
-  m_clasOperationsSize      = 0;
-  m_blasSize                = 0;
+  // vk_lod_clusters c19a250: reservedClasBytes now tracks the committed sparse size and is
+  // set after StreamingResident::initClas below
+  Resources& res       = *m_resources;
+  m_clasOperationsSize = 0;
+  m_blasSize           = 0;
 
   m_requiresClas = true;
 
@@ -2071,17 +2168,19 @@ bool SceneStreaming::initClas()
   if(m_config.usePersistentClasAllocator)
   {
     // setup the gpu-side memory manage for persistent clas storage
-    m_clasAllocator.init(res, m_config.maxClasMegaBytes, uint32_t(m_clasSingleMaxSize) * m_scene->m_config.clusterGroupSize,
+    // vk_lod_clusters c19a250: laid out for the maximum, effective coverage starts at the
+    // initial committed size and follows growClas
+    m_clasAllocator.init(res, m_config.maxClasMegaBytes, m_config.startClasMegaBytes * 1024 * 1024,
+                         uint32_t(m_clasSingleMaxSize) * m_scene->m_config.clusterGroupSize,
                          clusterProps.clusterByteAlignment << m_config.clasAllocatorGranularityShift,
                          m_config.clasAllocatorSectorSizeShift, m_shaderData.clasAllocator);
-    m_clasOperationsSize += logMemoryUsage(m_clasAllocator.getOperationsSize(), "opertions", "clas alloc");
+    m_clasOperationsSize += logMemoryUsage(m_clasAllocator.getOperationsSize(), "operations", "clas alloc");
 
-    m_stats.maxSizedReserved = m_clasAllocator.getMaxSized();
+    m_stats.maxSizedReserved = m_clasAllocator.getMaxSizedEffective();
+    m_stats.maxSizedMax      = m_clasAllocator.getMaxSizedMax();
   }
-  else
-  {
-    m_stats.maxSizedReserved = uint32_t(m_stats.reservedClasBytes / (m_clasSingleMaxSize * m_scene->m_config.clusterGroupSize));
-  }
+
+  m_stats.maxClasBytes = uint64_t(m_config.maxClasMegaBytes) * 1024 * 1024;
 
   {
     uint32_t                        loGroupsCount           = 0;
@@ -2094,6 +2193,13 @@ bool SceneStreaming::initClas()
     assert(loGroupsCount == uint32_t(m_scene->getActiveGeometryCount()));
 
     m_clasOperationsSize += logMemoryUsage(m_resident.getClasOperationsSize(), "operations", "stream clas resident");
+
+    // vk_lod_clusters c19a250: the CLAS buffer now exists, report its actual committed size
+    m_stats.reservedClasBytes = m_resident.getAllocatedClasBytes();
+    if(!m_config.usePersistentClasAllocator)
+    {
+      m_stats.maxSizedReserved = uint32_t(m_stats.reservedClasBytes / (m_clasSingleMaxSize * m_scene->m_config.clusterGroupSize));
+    }
 
     // NV-DXVK P3: the actual build is range-callable so appendGeometries can
     // reuse it verbatim for appended batches
@@ -2474,6 +2580,13 @@ void SceneStreaming::deinitClas()
   }
   m_clasLowDetailBlasAppendBuffers.clear();
   m_stats.reservedClasBytes = 0;
+  // vk_lod_clusters c19a250
+  m_stats.maxClasBytes      = 0;
+  m_stats.usedClasBytes     = 0;
+  m_stats.wastedClasBytes   = 0;
+  m_stats.maxSizedLeft      = 0;
+  m_stats.maxSizedReserved  = 0;
+  m_stats.maxSizedMax       = 0;
 
   if(m_config.allowBlasCaching)
   {

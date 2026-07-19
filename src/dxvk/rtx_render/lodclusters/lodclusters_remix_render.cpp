@@ -759,6 +759,11 @@ bool ClusterRenderSystem::buildGeneration(const std::vector<std::string>& cacheF
   streamingConfig.maxTransferMegaBytes         = size_t(impl.config.maxTransferMegaBytes);
   streamingConfig.maxGeometryMegaBytes         = size_t(impl.config.maxGeometryMegaBytes);
   streamingConfig.maxClasMegaBytes             = size_t(impl.config.maxClasMegaBytes);
+  // vk_lod_clusters c19a250: sparse CLAS commit sizes. Start is clamped into [chunk, max]
+  // so StreamingResident::initClas' invariants (0 < start <= max) hold for any user config.
+  streamingConfig.startClasMegaBytes =
+      std::min(std::max(size_t(impl.config.startClasMegaBytes), size_t(128)), size_t(impl.config.maxClasMegaBytes));
+  streamingConfig.clasGrowMegaBytes            = std::max(size_t(impl.config.clasGrowMegaBytes), size_t(128));
   streamingConfig.clasAllocatorSectorSizeShift  = impl.config.clasAllocatorSectorSizeShift;
   streamingConfig.clasAllocatorGranularityShift = impl.config.clasAllocatorGranularityShift;
   // P4: BLAS caching (streaming-only; the renderer additionally requires BLAS
@@ -1086,6 +1091,7 @@ void ClusterRenderSystem::recordFrame(VkCommandBuffer                           
 
   frameConfig.windowSize                 = {frame.viewportWidth, frame.viewportHeight};
   frameConfig.lodPixelError              = frame.lodPixelError;
+  frameConfig.adaptiveError              = frame.adaptiveError;
   frameConfig.culledErrorScale           = frame.culledErrorScale;
   frameConfig.freezeCulling              = frame.freezeCulling;
   frameConfig.freezeLoD                  = frame.freezeLoD;

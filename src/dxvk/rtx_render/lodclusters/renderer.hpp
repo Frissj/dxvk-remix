@@ -195,15 +195,26 @@ public:
   // entries out into AccelManager's instance buffer.
   virtual const nvvk::Buffer& getTlasInstancesBuffer() const = 0;
 
+  // vk_lod_clusters c19a250: current (possibly adaptively raised) LoD pixel error
+  inline float getLodError() const { return m_lodPixelError; }
+
 protected:
   void initBasics(Resources& res, RenderScene& rscene, const RendererConfig& config);
   void deinitBasics(Resources& res);
+
+  // vk_lod_clusters c19a250: computes errorOverDistanceThreshold from frame.lodPixelError,
+  // optionally scaled up under streaming memory pressure (frame.adaptiveError). Replaces the
+  // old stateless clusterLodErrorOverDistance helper.
+  float updateLodPixelError(Resources& res, RenderScene& rscene, const FrameConfig& frame);
 
   RendererConfig m_config;
   uint32_t       m_maxRenderClusters = 0;
   uint32_t       m_maxTraversalTasks = 0;
   uint32_t       m_maxBlasBuilds     = 0;
   uint32_t       m_frameIndex        = 0;
+  // vk_lod_clusters c19a250: adaptive LoD error state
+  float          m_lodPixelError{};
+  float          m_smoothedLoadFactor{};
 
   nvvk::Buffer m_renderInstanceBuffer;
 
@@ -220,14 +231,8 @@ protected:
 
 //////////////////////////////////////////////////////////////////////////
 
-inline float clusterLodErrorOverDistance(float errorSizeInPixels, float fov, float resolution)
-{
-  // note we use half-pixel sizes: error taken as radius, not as diameter.
-  // otherwise there was more LoD popping.
-  return (tanf(fov * 0.5f) * errorSizeInPixels / resolution);
-}
-
-//////////////////////////////////////////////////////////////////////////
+// vk_lod_clusters c19a250: clusterLodErrorOverDistance removed, its math lives in
+// Renderer::updateLodPixelError now (which also applies the adaptive scaling)
 
 std::unique_ptr<Renderer> makeRendererRayTraceClustersLod();
 

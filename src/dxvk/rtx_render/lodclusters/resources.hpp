@@ -71,6 +71,8 @@ struct FrameConfig
   bool  showClusterBboxes  = false;
   bool  freezeCulling      = false;
   bool  freezeLoD          = false;
+  // vk_lod_clusters c19a250: raise lodPixelError dynamically under streaming memory pressure
+  bool  adaptiveError      = false;
   float lodPixelError      = 1.0f;
   // increase error by this for instances not having primary visibility in ray tracing
   float culledErrorScale = 2.0f;

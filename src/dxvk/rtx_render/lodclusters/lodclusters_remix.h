@@ -313,6 +313,10 @@ namespace lodclusters_remix {
     uint64_t maxTransferMegaBytes = 32;
     uint64_t maxGeometryMegaBytes = 2048;
     uint64_t maxClasMegaBytes = 2048;
+    // vk_lod_clusters c19a250: initial commit / growth step of the sparse CLAS buffer;
+    // maxClasMegaBytes is only the reserved ceiling
+    uint64_t startClasMegaBytes = 128;
+    uint64_t clasGrowMegaBytes = 128;
     uint32_t clasAllocatorSectorSizeShift = 10;
     uint32_t clasAllocatorGranularityShift = 0;
 
@@ -375,6 +379,8 @@ namespace lodclusters_remix {
     float farPlane = 10000.0f;
 
     float lodPixelError = 1.0f;
+    // vk_lod_clusters c19a250: raise lodPixelError dynamically under streaming memory pressure
+    bool adaptiveError = false;
     float culledErrorScale = 2.0f;
     uint32_t traversalPersistentThreads = 2048;
     // P4 debug: keep last frame's cull matrices + HiZ content (sample parity:

@@ -3513,7 +3513,11 @@ namespace dxvk {
     renderConfig.streamingMaxClusters = uint32_t(std::max(0, ClusterLodOptions::Streaming::maxClusters()));
     renderConfig.maxTransferMegaBytes = uint64_t(std::max(1, ClusterLodOptions::Streaming::maxTransferMegaBytes()));
     renderConfig.maxGeometryMegaBytes = uint64_t(std::max(64, ClusterLodOptions::Streaming::maxGeometryMegaBytes()));
-    renderConfig.maxClasMegaBytes = uint64_t(std::max(64, ClusterLodOptions::Streaming::maxClasMegaBytes()));
+    // vk_lod_clusters c19a250: min raised 64 -> 256. The sparse CLAS buffer works in 128 MiB
+    // chunks and StreamingResident::initClas requires the reserved maximum to exceed one chunk.
+    renderConfig.maxClasMegaBytes = uint64_t(std::max(256, ClusterLodOptions::Streaming::maxClasMegaBytes()));
+    renderConfig.startClasMegaBytes = uint64_t(std::max(128, ClusterLodOptions::Streaming::startClasMegaBytes()));
+    renderConfig.clasGrowMegaBytes = uint64_t(std::max(128, ClusterLodOptions::Streaming::clasGrowMegaBytes()));
     renderConfig.clasAllocatorSectorSizeShift = uint32_t(std::clamp(ClusterLodOptions::Streaming::clasAllocatorSectorSizeShift(), 6, 20));
     renderConfig.clasAllocatorGranularityShift = uint32_t(std::clamp(ClusterLodOptions::Streaming::clasAllocatorGranularityShift(), 0, 8));
     renderConfig.numRenderClusterBits = uint32_t(std::clamp(ClusterLodOptions::Render::numRenderClusterBits(), 10, 24));
@@ -5530,6 +5534,8 @@ namespace dxvk {
     frameParams.farPlane = camera.getFarPlane();
 
     frameParams.lodPixelError = std::max(0.01f, ClusterLodOptions::Render::lodPixelError());
+    // vk_lod_clusters c19a250: per-frame toggle, streaming-only (no-op in preloaded mode)
+    frameParams.adaptiveError = ClusterLodOptions::Render::adaptiveLodError();
     frameParams.culledErrorScale = ClusterLodOptions::Render::culledErrorScale();
     frameParams.traversalPersistentThreads = uint32_t(std::max(64, ClusterLodOptions::Render::traversalPersistentThreads()));
     // P3: per-frame streaming tunable (unlike the init-time budget options)

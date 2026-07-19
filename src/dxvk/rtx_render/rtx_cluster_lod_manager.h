@@ -140,6 +140,10 @@ namespace dxvk {
       RTX_OPTION("rtx.clusterLod.render", float, lodPixelError, 1.0f,
                  "Continuous-LOD error threshold in pixels; lower is more detail. The GPU traversal picks cluster\n"
                  "LODs whose projected error stays below this many pixels (0 converges to the source mesh).");
+      // vk_lod_clusters c19a250
+      RTX_OPTION("rtx.clusterLod.render", bool, adaptiveLodError, false,
+                 "Raise the effective lodPixelError dynamically while the streaming budgets (geometry / CLAS)\n"
+                 "run above ~85% load, recovering once pressure drops. Streaming mode only.");
       RTX_OPTION("rtx.clusterLod.render", float, culledErrorScale, 2.0f,
                  "LOD error multiplier for instances without primary visibility.");
       RTX_OPTION("rtx.clusterLod.render", bool, useSorting, false,
@@ -245,6 +249,14 @@ namespace dxvk {
                  "Device memory budget for streamed cluster-group geometry data (MiB).");
       RTX_OPTION("rtx.clusterLod.streaming", int, maxClasMegaBytes, 2048,
                  "Device memory budget for the CLAS of streamed cluster groups (MiB).");
+      // vk_lod_clusters c19a250: with the persistent CLAS allocator the buffer is sparse and
+      // maxClasMegaBytes is only reserved address space; actual memory is committed in
+      // 128 MiB chunks, starting at startClasMegaBytes and growing by clasGrowMegaBytes
+      // whenever the readback shows the worst-case headroom running out.
+      RTX_OPTION("rtx.clusterLod.streaming", int, startClasMegaBytes, 128,
+                 "Initially committed memory of the sparse streamed-CLAS buffer (MiB). Rounded up to 128 MiB chunks.");
+      RTX_OPTION("rtx.clusterLod.streaming", int, clasGrowMegaBytes, 128,
+                 "Growth step of the sparse streamed-CLAS buffer (MiB). Rounded up to 128 MiB chunks.");
       RTX_OPTION("rtx.clusterLod.streaming", bool, useAsyncTransfer, true,
                  "Uploads streamed cluster groups on the dedicated transfer queue instead of the graphics\n"
                  "queue command buffer. Default on (F4, 2026-07-04): Remix's transfer queue is mostly idle.\n"

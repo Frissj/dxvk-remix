@@ -205,6 +205,10 @@ public:
   size_t getGeometrySize(bool reserved) const;
   size_t getOperationsSize() const { return m_operationsSize + m_clasOperationsSize; }
 
+  // vk_lod_clusters c19a250: 0..1 pressure on the streaming budgets (geometry storage and
+  // CLAS allocator), intended to drive adaptive LoD error under memory pressure
+  float getLoadFactor() const;
+
   uint32_t getMaxCachedBlasBuilds() const { return m_updates.getMaxCachedBlasBuilds(); }
 
   void updateBindings(const nvvk::Buffer& sceneBuildingBuffer);
@@ -238,6 +242,15 @@ private:
   uint32_t        m_lastUpdateIndex;
   uint32_t        m_frameIndex;
   StreamingStats  m_stats;
+
+  // vk_lod_clusters c19a250: when growing the clas storage we may actually have more
+  // allocations left than a request's readback reports, given requests recorded prior to
+  // the grow may still be in flight.
+  // The delta accumulates grows and stays active until we pop a request that was recorded
+  // at or after the frame of the last grow, as only then the readback reflects the grown
+  // state.
+  uint32_t m_clasGrowMaxSizedLeftDelta = 0;
+  uint32_t m_clasGrowFrameIndex        = 0;
 
   // persistent scene data
 
@@ -354,6 +367,11 @@ private:
 
   bool initClas();
   void deinitClas();
+
+  // vk_lod_clusters c19a250: grows the sparse CLAS buffer + allocator coverage when the
+  // readback shows headroom running out. Command buffer may record fills clearing the
+  // allocation manager's new empty memory space. Returns the gained max-sized slots.
+  uint32_t tryGrowClas(VkCommandBuffer cmd, const StreamingRequests::TaskInfo& request);
 
   // shaders & pipelines
 
